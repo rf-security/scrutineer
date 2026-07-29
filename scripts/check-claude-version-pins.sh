@@ -9,13 +9,13 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 
 runner_amd64=$(sed -E -n \
   's/^ARG CLAUDE_AMD64_LOCK=v([0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 runner_arm64=$(sed -E -n \
   's/^ARG CLAUDE_ARM64_LOCK=v([0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 main_image=$(sed -E -n \
   's|^RUN npm install -g @anthropic-ai/claude-code@([0-9]+\.[0-9]+\.[0-9]+)$|\1|p' \
-  "$root/Dockerfile")
+  "$root/docker/cmd/Dockerfile")
 # Backticks in this pattern are literal Markdown delimiters, not shell syntax.
 # shellcheck disable=SC2016
 documented=$(sed -E -n \

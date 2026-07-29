@@ -5,8 +5,8 @@ RUN go mod download
 COPY . .
 # COMMIT is the git SHA being built. .git is excluded from the build context
 # (.dockerignore), so the Go VCS stamp is unavailable here; pass it explicitly
-# with `docker build --build-arg COMMIT=$(git rev-parse HEAD)` to surface it on
-# the settings page. Empty when not supplied.
+# with `docker build -f docker/cmd/Dockerfile --build-arg COMMIT=$(git rev-parse HEAD) .`
+# to surface it on the settings page. Empty when not supplied.
 ARG COMMIT=""
 RUN CGO_ENABLED=0 go build -ldflags "-X main.commit=${COMMIT}" -o /scrutineer ./cmd/scrutineer
 
@@ -14,6 +14,7 @@ FROM node:26-alpine@sha256:e88a35be04478413b7c71c455cd9865de9b9360e1f43456be5951
 RUN npm install -g @anthropic-ai/claude-code@2.1.216
 
 FROM python:3.15.0b3-alpine@sha256:c46e1b5012956890f42c4492c55cafde3ce675796854127cf93e9216f9f28f1a AS python-tools
+RUN apk add --no-cache build-base libgcc libffi-dev
 RUN pip install --no-cache-dir semgrep==1.167.0 "setuptools<81"
 
 FROM golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS go-tools
@@ -44,7 +45,7 @@ COPY --from=claude /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=claude /usr/local/bin/claude /usr/local/bin/claude
 
 # semgrep
-COPY --from=python-tools /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
+COPY --from=python-tools /usr/local/lib/python3.15/site-packages /usr/local/lib/python3.15/site-packages
 COPY --from=python-tools /usr/local/bin/semgrep* /usr/local/bin/
 COPY --from=python-tools /usr/local/bin/pysemgrep /usr/local/bin/
 
@@ -56,6 +57,9 @@ COPY --from=zizmor-build /out/bin/zizmor /usr/local/bin/zizmor
 
 # vid
 COPY --from=vid-build /out/vid /usr/local/bin/vid
+
+# Add docker cli to the  container
+RUN apk add --no-cache docker-cli
 
 # Non-root user (T1/T11: reduce blast radius)
 RUN adduser -D -h /home/scrutineer scrutineer && \

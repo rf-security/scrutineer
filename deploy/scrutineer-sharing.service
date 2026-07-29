@@ -1,0 +1,32 @@
+[Unit]
+Description=Scrutineer sharing portal (external maintainer disclosure UI)
+Documentation=https://github.com/alpha-omega-security/scrutineer
+# Reads the same YAML config as scrutineer for its (read-only) database
+# connection, so start it after the main service.
+After=network-online.target scrutineer.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scrutineer
+Group=scrutineer
+WorkingDirectory=/opt/scrutineer
+
+Environment=HOME=/opt/scrutineer
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# Secrets rendered by the deploy (0600, owned scrutineer:scrutineer):
+#   SCRUTINEER_SHARING_GITHUB_CLIENT_ID=...
+#   SCRUTINEER_SHARING_GITHUB_CLIENT_SECRET=...
+# Optional file (leading '-') so a manual restart before the first deploy
+# still starts; OAuth login fails without valid credentials.
+EnvironmentFile=-/opt/scrutineer/bin/scrutineer-sharing.env
+
+ExecStart=/opt/scrutineer/bin/scrutineer-sharing -config /opt/scrutineer/bin/scrutineer.yaml -base-url https://share.scrutineer.security.rustfoundation.org -addr 0.0.0.0:8081
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

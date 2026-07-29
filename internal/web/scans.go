@@ -391,6 +391,29 @@ func (s *Server) scansPauseQueued(w http.ResponseWriter, r *http.Request) {
 	s.redirect(w, r, "/scans?status=paused")
 }
 
+// scansCancelQueued cancels every queued scan across all repositories, leaving
+// running scans to finish. It is the global, queued-only companion to the
+// per-repo scansCancelAll (which also stops running scans) and the cancel
+// analogue of scansPauseQueued.
+func (s *Server) scansCancelQueued(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	// A single bulk UPDATE gated on status = queued: a scan the worker promotes
+	// to running no longer matches the predicate, so it keeps running, and there
+	// is no per-row round trip. RowsAffected is the number actually cancelled.
+	res := s.DB.Model(&db.Scan{}).Where("status = ?", db.ScanQueued).Updates(map[string]any{
+		statusKey:         db.ScanCancelled,
+		"status_priority": db.StatusPriorityFor(db.ScanCancelled),
+		errorKey:          "cancelled by user",
+		"finished_at":     &now,
+	})
+	if res.Error != nil {
+		http.Error(w, res.Error.Error(), http.StatusInternalServerError)
+		return
+	}
+	setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("%d queued scans cancelled", res.RowsAffected)})
+	s.redirect(w, r, "/scans?status=cancelled")
+}
+
 func scanStatusUpdates(status db.ScanStatus, msg string, finishedAt *time.Time, pausedUntil *time.Time) map[string]any {
 	return map[string]any{
 		statusKey:         status,

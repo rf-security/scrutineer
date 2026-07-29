@@ -139,3 +139,41 @@ func waitChan(t *testing.T, ch <-chan struct{}, msg string) {
 		t.Fatal(msg)
 	}
 }
+
+// TestNewNoSchema_skipsSchemaInstall confirms NewNoSchema builds a queue
+// without running the goqite DDL (so a read-only consumer like the sharing
+// portal can construct it), while New still installs the schema.
+func TestNewNoSchema_skipsSchemaInstall(t *testing.T) {
+	gdb, err := db.Open(filepath.Join(t.TempDir(), "q.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqldb, err := gdb.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	hasGoqite := func() bool {
+		var n int
+		if err := sqldb.QueryRow(
+			"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='goqite'").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+
+	if q := NewNoSchema(sqldb, log, 0, SQLite); q == nil {
+		t.Fatal("NewNoSchema returned nil")
+	}
+	if hasGoqite() {
+		t.Fatal("NewNoSchema created the goqite table; it must skip the DDL install")
+	}
+
+	if _, err := New(sqldb, log, 0, SQLite); err != nil {
+		t.Fatal(err)
+	}
+	if !hasGoqite() {
+		t.Fatal("New did not install the goqite schema")
+	}
+}

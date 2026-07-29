@@ -89,11 +89,27 @@ const (
 // rebuilt by Reconfigure). Both embedded schemas are idempotent, so running
 // them on every startup is safe.
 func New(sqldb *sql.DB, log *slog.Logger, concurrency int, dialect Dialect) (*Queue, error) {
-	if concurrency <= 0 {
-		concurrency = DefaultWorkerConcurrency
-	}
 	if err := installSchema(sqldb, dialect); err != nil {
 		return nil, fmt.Errorf("goqite schema: %w", err)
+	}
+	return newQueue(sqldb, log, concurrency, dialect), nil
+}
+
+// NewNoSchema builds a queue against an already-provisioned goqite schema,
+// skipping the DDL install that New runs. It exists for read-only consumers —
+// the sharing portal (cmd/sharing) — that need a *Queue only to construct the
+// web.Server and never enqueue: they may connect with a role that lacks
+// DDL/write privileges, so running the (idempotent) schema install would fail
+// even though the schema already exists.
+func NewNoSchema(sqldb *sql.DB, log *slog.Logger, concurrency int, dialect Dialect) *Queue {
+	return newQueue(sqldb, log, concurrency, dialect)
+}
+
+// newQueue wires the goqite queue without touching the schema; New and
+// NewNoSchema share it so they build an identical *Queue.
+func newQueue(sqldb *sql.DB, log *slog.Logger, concurrency int, dialect Dialect) *Queue {
+	if concurrency <= 0 {
+		concurrency = DefaultWorkerConcurrency
 	}
 	q := goqite.New(goqite.NewOpts{
 		DB:        sqldb,
@@ -103,7 +119,7 @@ func New(sqldb *sql.DB, log *slog.Logger, concurrency int, dialect Dialect) (*Qu
 	})
 	queue := &Queue{q: q, log: log, handlers: map[string]jobs.Func{}}
 	queue.concurrency.Store(int64(concurrency))
-	return queue, nil
+	return queue
 }
 
 // goqiteSchemaLockKey is a fixed 64-bit key ("goqite" in ASCII hex) for the

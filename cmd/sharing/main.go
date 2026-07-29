@@ -77,11 +77,10 @@ func run(log *slog.Logger) error {
 	// The portal never runs scans. Build an inert queue against the shared DB
 	// (needed only to construct the web.Server) but never start it, and a
 	// worker value used only for construction; triage writes (status/notes)
-	// write straight to the DB and enqueue nothing.
-	q, err := queue.New(sqldb, log, 0, queueDialect(cfg))
-	if err != nil {
-		return fmt.Errorf("queue: %w", err)
-	}
+	// write straight to the DB and enqueue nothing. NewNoSchema skips the goqite
+	// DDL install so the portal can connect with a read-only role (the schema
+	// already exists — the main app provisions it).
+	q := queue.NewNoSchema(sqldb, log, 0, queueDialect(cfg))
 	srv, err := web.New(gdb, q, log, web.NewBroker(), &worker.Worker{DB: gdb})
 	if err != nil {
 		return err

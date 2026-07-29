@@ -1,0 +1,31 @@
+# Deployed config TEMPLATE. deploy/deploy.sh renders this to
+# /opt/scrutineer/bin/scrutineer.yaml, substituting the __*__ placeholders with the
+# prod-environment DB secrets. Do NOT put real secrets in this committed file.
+addr: 0.0.0.0:8080
+
+skills:
+  - ./skills
+
+#models:
+#  - name: Sonnet
+#    id:   claude-sonnet-4-6
+#  - name: Opus
+#    id:   claude-opus-4-8
+#  - name: Mythos
+#    id:   claude-mythos-preview
+
+default_model: claude-opus-4-8
+runner_image: scrutineer-profile-rust:latest
+scan_timeout: 3h
+concurrency: 3
+
+database:
+  driver: postgres
+  dsn: postgres://scrutineer:__DB_PASSWORD__@localhost:5432/scrutineer?sslmode=disable
+
+allow_remote: true
+
+sharing:
+ database:
+   driver: postgres
+   dsn: postgres://scrutineer_readonly:__DB_READONLY_PASSWORD__@localhost:5432/scrutineer?sslmode=disable

@@ -65,11 +65,7 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	dataDir := cfg.Data
-	if dataDir == "" {
-		dataDir = defaultDataDir
-	}
-	gdb, err := db.Open(filepath.Join(dataDir, dbFileName))
+	gdb, err := db.OpenBackend(databaseOptions(cfg))
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
@@ -82,7 +78,7 @@ func run(log *slog.Logger) error {
 	// (needed only to construct the web.Server) but never start it, and a
 	// worker value used only for construction; triage writes (status/notes)
 	// write straight to the DB and enqueue nothing.
-	q, err := queue.New(sqldb, log, 0)
+	q, err := queue.New(sqldb, log, 0, queueDialect(cfg))
 	if err != nil {
 		return fmt.Errorf("queue: %w", err)
 	}
@@ -99,4 +95,25 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("scrutineer sharing portal listening", "addr", shareCfg.Addr, "base_url", shareCfg.BaseURL)
 	return httpSrv.ListenAndServe()
+}
+
+// databaseOptions maps the scrutineer config onto db.OpenBackend's Options,
+// mirroring cmd/scrutineer so the portal opens the same database (sqlite by
+// default, postgres when a database block is configured).
+func databaseOptions(cfg *config.Config) db.Options {
+	if cfg.Database.Driver == "postgres" {
+		return db.Options{Dialect: db.DialectPostgres, DSN: cfg.Database.DSN}
+	}
+	dataDir := cfg.Data
+	if dataDir == "" {
+		dataDir = defaultDataDir
+	}
+	return db.Options{Dialect: db.DialectSQLite, DSN: filepath.Join(dataDir, dbFileName)}
+}
+
+func queueDialect(cfg *config.Config) queue.Dialect {
+	if cfg.Database.Driver == "postgres" {
+		return queue.Postgres
+	}
+	return queue.SQLite
 }

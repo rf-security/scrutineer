@@ -127,6 +127,7 @@ type flags struct {
 	dbDSN             string
 	federationSalt    string
 	federationContact string
+	allowRemote       bool
 	skillLocal        skillDirs
 
 	// set records which flags were passed on the command line so merge
@@ -289,6 +290,9 @@ func (f *flags) merge(cfg *config.Config) {
 	if cfg.FederationContact != "" && !f.set["federation-contact"] {
 		f.federationContact = cfg.FederationContact
 	}
+	// AllowRemote is config-only (no CLI flag); the zero value keeps the
+	// localhost-only host-header check on (remote access denied).
+	f.allowRemote = cfg.AllowRemote
 
 	// Seed the model pick list from the active harness's own defaults,
 	// so a fresh install of any backend has a working list with correct
@@ -592,6 +596,7 @@ func run(log *slog.Logger) error {
 	srv.SetDefaultEffort(f.effort)
 	srv.FederationSalt = f.federationSalt
 	srv.FederationContact = f.federationContact
+	srv.AllowRemote = f.allowRemote
 
 	if f.recipientsFile != "" {
 		recs, err := loadRecipients(f.recipientsFile)

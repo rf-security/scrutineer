@@ -97,12 +97,15 @@ func run(log *slog.Logger) error {
 	return httpSrv.ListenAndServe()
 }
 
-// databaseOptions maps the scrutineer config onto db.OpenBackend's Options,
-// mirroring cmd/scrutineer so the portal opens the same database (sqlite by
-// default, postgres when a database block is configured).
+// databaseOptions maps the scrutineer config onto db.OpenBackend's Options for
+// the portal. It uses the sharing-resolved database (the root database config
+// overlaid with any sharing.database overrides), so the portal can run against
+// its own credentials while defaulting to the main database. sqlite still lives
+// under the data directory, matching cmd/scrutineer.
 func databaseOptions(cfg *config.Config) db.Options {
-	if cfg.Database.Driver == "postgres" {
-		return db.Options{Dialect: db.DialectPostgres, DSN: cfg.Database.DSN}
+	dbCfg := cfg.SharingDatabase()
+	if dbCfg.Driver == "postgres" {
+		return db.Options{Dialect: db.DialectPostgres, DSN: dbCfg.DSN}
 	}
 	dataDir := cfg.Data
 	if dataDir == "" {
@@ -112,7 +115,7 @@ func databaseOptions(cfg *config.Config) db.Options {
 }
 
 func queueDialect(cfg *config.Config) queue.Dialect {
-	if cfg.Database.Driver == "postgres" {
+	if cfg.SharingDatabase().Driver == "postgres" {
 		return queue.Postgres
 	}
 	return queue.SQLite

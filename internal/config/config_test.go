@@ -293,3 +293,56 @@ func TestLoad_parsesEffort(t *testing.T) {
 		t.Errorf("effort=%q, want max", c.Effort)
 	}
 }
+
+func TestSharingDatabase_resolution(t *testing.T) {
+	cases := []struct {
+		name       string
+		root, shar DatabaseConfig
+		want       DatabaseConfig
+	}{
+		{"unset falls back to root",
+			DatabaseConfig{Driver: "postgres", DSN: "root-dsn"}, DatabaseConfig{},
+			DatabaseConfig{Driver: "postgres", DSN: "root-dsn"}},
+		{"dsn-only override inherits root driver",
+			DatabaseConfig{Driver: "postgres", DSN: "root-dsn"}, DatabaseConfig{DSN: "portal-dsn"},
+			DatabaseConfig{Driver: "postgres", DSN: "portal-dsn"}},
+		{"full override",
+			DatabaseConfig{Driver: "postgres", DSN: "root-dsn"}, DatabaseConfig{Driver: "postgres", DSN: "portal-dsn"},
+			DatabaseConfig{Driver: "postgres", DSN: "portal-dsn"}},
+		{"root sqlite, portal unset stays sqlite",
+			DatabaseConfig{}, DatabaseConfig{}, DatabaseConfig{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{Database: tc.root, Sharing: SharingConfig{Database: tc.shar}}
+			if got := c.SharingDatabase(); got != tc.want {
+				t.Errorf("SharingDatabase() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_sharingDatabaseOverridesDSN(t *testing.T) {
+	path := write(t, "database:\n  driver: postgres\n  dsn: postgres://root@db/scrutineer\n"+
+		"sharing:\n  database:\n    dsn: postgres://portal_ro@db/scrutineer\n")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.SharingDatabase()
+	if got.Driver != "postgres" || got.DSN != "postgres://portal_ro@db/scrutineer" {
+		t.Errorf("resolved sharing db = %+v, want postgres + portal dsn", got)
+	}
+	// The main app's database is untouched.
+	if c.Database.DSN != "postgres://root@db/scrutineer" {
+		t.Errorf("root db dsn changed: %q", c.Database.DSN)
+	}
+}
+
+func TestLoad_rejectsInvalidSharingDatabase(t *testing.T) {
+	// Portal overrides driver to postgres but supplies no dsn (root is sqlite).
+	path := write(t, "sharing:\n  database:\n    driver: postgres\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for sharing postgres without a dsn")
+	}
+}

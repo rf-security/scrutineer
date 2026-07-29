@@ -15,6 +15,7 @@
 scrutineer.yaml
 scrutineer.*.yaml
 !scrutineer.sample.yaml
+!deploy/scrutineer.yaml
 
 # Vim swap/session/temp files
 [._]*.s[a-v][a-z]

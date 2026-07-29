@@ -1,0 +1,55 @@
+name: Deploy - scrutineer
+
+#on:
+#  push:
+#    branches:
+#      - rf-deploy
+
+  workflow_dispatch:
+
+concurrency:
+  group: rf-deploy
+  cancel-in-progress: false
+
+jobs:
+  job_id:
+    runs-on: ubuntu-latest
+    environment: prod
+
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+      - name: Checkout repo
+        uses: 'actions/checkout@v7'
+
+      - name: Authenticate workload
+        id: auth
+        uses: 'google-github-actions/auth@v3'
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          token_format: 'access_token'
+
+      - name: Set up gcloud
+        uses: 'google-github-actions/setup-gcloud@v3'
+
+      - name: Deploy to instance
+        env:
+          # GCP target (overridable via repo/environment vars; sensible defaults).
+          INSTANCE: ${{ vars.GCP_INSTANCE || 'scrutineer' }}
+          ZONE: ${{ vars.GCP_ZONE || 'us-central1-c' }}
+          # Source: the instance clones/fetches this repo at the pushed ref using
+          # the ephemeral GITHUB_TOKEN (works for the private repo).
+          GITHUB_TOKEN: ${{ github.token }}
+          DEPLOY_REF: ${{ github.sha }}
+          DEPLOY_BRANCH: rf-deploy
+          # prod-environment secrets.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          SCRUTINEER_DB_SECRET: ${{ secrets.SCRUTINEER_DB_SECRET }}
+          SCRUTINEER_DB_READONLY_SECRET: ${{ secrets.SCRUTINEER_DB_READONLY_SECRET }}
+          SCRUTINEER_SHARING_GITHUB_CLIENT_ID: ${{ secrets.SCRUTINEER_SHARING_GITHUB_CLIENT_ID }}
+          SCRUTINEER_SHARING_GITHUB_CLIENT_SECRET: ${{ secrets.SCRUTINEER_SHARING_GITHUB_CLIENT_SECRET }}
+        run: ./deploy/deploy.sh

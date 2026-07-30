@@ -61,7 +61,7 @@ var ErrInvalidRef = errors.New("invalid git ref")
 // API layer maps it to a 400 instead of reporting an internal server failure.
 var ErrInvalidRescanMode = errors.New("invalid rescan mode")
 
-//go:embed templates/*.html
+//go:embed templates/*.html templates/sharing/*.html
 var tmplFS embed.FS
 
 //go:embed static
@@ -279,7 +279,28 @@ func defaultResolveRemoteHead(ctx context.Context, repo db.Repository) (string, 
 	return worker.ResolveRemoteHead(ctx, url)
 }
 
-func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *worker.Worker) (*Server, error) {
+// Option customizes a Server built by New.
+type Option func(*serverOpts)
+
+type serverOpts struct {
+	// tmplGlob is the embedded glob the server parses its templates from.
+	// Defaults to the main UI's templates; the sharing portal points it at its
+	// own templates/sharing/ set so portal-specific markup stays fully separate.
+	tmplGlob string
+}
+
+// WithTemplateGlob makes the server render the embedded templates matching glob
+// instead of the default main-UI set. Used by cmd/sharing so the portal renders
+// templates/sharing/*.html.
+func WithTemplateGlob(glob string) Option {
+	return func(o *serverOpts) { o.tmplGlob = glob }
+}
+
+func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *worker.Worker, opts ...Option) (*Server, error) {
+	cfg := serverOpts{tmplGlob: "templates/*.html"}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	funcs := template.FuncMap{
 		"since": tmplSince,
 		"until": func(t *time.Time) string {
@@ -371,7 +392,7 @@ func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *work
 		},
 		"bytes": tmplBytes,
 	}
-	t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, "templates/*.html")
+	t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, cfg.tmplGlob)
 	if err != nil {
 		return nil, err
 	}
@@ -631,6 +652,17 @@ func (s *Server) redirect(w http.ResponseWriter, r *http.Request, path string) {
 	http.Redirect(w, r, path, http.StatusSeeOther)
 }
 
+// portalRepoStatusOrderExpr ranks repositories by their latest scan's status so
+// the sharing portal's default repository listing surfaces completed repos
+// first, then queued, then failed, then anything else, with never-scanned repos
+// last. It is applied only under a read-only (portal) scope; the local operator
+// keeps the recency default. Built from the db status constants so it stays in
+// lockstep with them.
+var portalRepoStatusOrderExpr = fmt.Sprintf(
+	`COALESCE((SELECT CASE s.status WHEN '%s' THEN 0 WHEN '%s' THEN 1 WHEN '%s' THEN 2 ELSE 3 END `+
+		`FROM scans s WHERE s.repository_id = repositories.id ORDER BY s.id DESC LIMIT 1), 4)`,
+	db.ScanDone, db.ScanQueued, db.ScanFailed)
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	s.repoList(w, r)
 }
@@ -790,6 +822,12 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 		q = q.Order(orderByExpr("COALESCE((SELECT MIN(status_priority) FROM scans WHERE scans.repository_id = repositories.id), 99)", dir, false)).Order("updated_at desc")
 	default:
 		sortCol, dir = defaultSort, ""
+		// The sharing portal lands committers on completed repositories first
+		// (then queued, then failed); the local operator keeps the recency
+		// default. updated_at stays the tiebreaker in both.
+		if isReadOnly(r) {
+			q = q.Order(portalRepoStatusOrderExpr)
+		}
 		q = q.Order("updated_at desc")
 	}
 	sort := joinSort(sortCol, dir)

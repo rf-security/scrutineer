@@ -1,0 +1,85 @@
+<div id="repos">
+<div class="flex items-center justify-end gap-2 mb-4">
+  <form method="get" action="/" class="inline-flex">
+    <input class="input" type="search" name="q" value="{{.Q}}" placeholder="Search repositories"
+           autocomplete="off" spellcheck="false">
+    <input type="hidden" name="language" value="{{.Language}}">
+    <input type="hidden" name="sort" value="{{.Sort}}">
+  </form>
+  <div class="dropdown-menu">
+    <button type="button" class="btn-outline" aria-haspopup="menu" aria-expanded="false">
+      <i data-lucide="filter"></i>
+      {{if .Language}}{{.Language}}{{else}}Language{{end}}
+      <i data-lucide="chevron-down"></i>
+    </button>
+    <div data-popover aria-hidden="true" data-align="end">
+      <div role="menu">
+        <a role="menuitem" href="/?q={{.Q}}&sort={{.Sort}}">All languages</a>
+        {{range .Languages}}
+          <a role="menuitem" href="/?q={{$.Q}}&language={{.}}&sort={{$.Sort}}"
+             {{if eq . $.Language}}aria-current="true"{{end}}>{{.}}</a>
+        {{end}}
+      </div>
+    </div>
+  </div>
+  <div class="dropdown-menu">
+    <button type="button" class="btn-outline" aria-haspopup="menu" aria-expanded="false">
+      <i data-lucide="arrow-down-wide-narrow"></i>
+      {{$sk := sortkey .Sort}}{{if eq $sk "name"}}Name{{else if eq $sk "stars"}}Stars{{else if eq $sk "language"}}Language{{else if eq $sk "findings"}}Findings{{else}}Newest{{end}}
+      <i data-lucide="chevron-down"></i>
+    </button>
+    <div data-popover aria-hidden="true" data-align="end">
+      <div role="menu">
+        {{range (list "newest" "findings" "name" "stars" "language")}}
+          <a role="menuitem" href="/?q={{$.Q}}&language={{$.Language}}&sort={{.}}"
+             {{if eq . (sortkey $.Sort)}}aria-current="true"{{end}}>{{.}}</a>
+        {{end}}
+      </div>
+    </div>
+  </div>
+</div>
+{{if .Rows}}
+  <table class="table">
+    <thead>
+      <tr>
+        {{template "th-sort" (dict "Sorter" .Sorter "Key" "name" "Def" "asc" "Label" "Repository" "Class" "")}}
+        {{template "th-sort" (dict "Sorter" .Sorter "Key" "language" "Def" "asc" "Label" "Language" "Class" "")}}
+        {{template "th-sort" (dict "Sorter" .Sorter "Key" "scanned" "Def" "desc" "Label" "Last scan" "Class" "")}}
+        {{template "th-sort" (dict "Sorter" .Sorter "Key" "status" "Def" "asc" "Label" "Status" "Class" "")}}
+        <th>Health</th>
+        {{template "th-sort" (dict "Sorter" .Sorter "Key" "findings" "Def" "desc" "Label" "Findings" "Class" "")}}
+        {{template "th-sort" (dict "Sorter" .Sorter "Key" "size" "Def" "desc" "Label" "Size" "Class" "")}}
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+    {{range .Rows}}
+      <tr id="repo-{{.ID}}">
+        <td>
+          <a href="/repositories/{{.ID}}">{{trimscheme .URL}}</a>
+          {{if .CloneError}}<span class="badge-destructive ml-1" role="img" aria-label="Clone error: {{.CloneError}}" data-tooltip="{{.CloneError}}"><i data-lucide="wifi-off"></i></span>{{end}}
+          {{range .Branches}}{{template "branch-tag" .}}{{end}}
+        </td>
+        <td class="text-muted-foreground">{{if .Languages}}{{.Languages}}{{else}}-{{end}}</td>
+        <td>{{if .LastScan}}<span title="{{.LastScan.CreatedAt.Format "2006-01-02 15:04:05 MST"}}">{{.LastScan.CreatedAt.Format "2006-01-02 15:04"}}</span>{{else}}never{{end}}</td>
+        <td>{{if .StatusScan}}{{template "status-badge" (status .StatusScan.Status)}}{{end}}</td>
+        <td>{{if .Health}}<span class="badge-outline">{{.Health}}</span>{{else}}-{{end}}</td>
+        <td>{{template "findings-badge" .FindingsTotal}}</td>
+        <td class="text-muted-foreground">{{if .DiskBytes}}{{bytes .DiskBytes}}{{else}}-{{end}}</td>
+        <td>
+          <form method="post" action="/repositories/{{.ID}}/scan"
+                hx-post="/repositories/{{.ID}}/scan" hx-swap="none">
+            <button type="submit" class="btn-sm-outline"><i data-lucide="refresh-cw"></i> Rescan</button>
+          </form>
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{template "pagination" .Page}}
+{{else if .Q}}
+  {{template "empty" (dict "Icon" "search-x" "Title" "No matches" "Body" "No repositories matched the search.")}}
+{{else}}
+  {{template "empty" (dict "Icon" "folder-git-2" "Title" "No repositories yet" "Body" "Add a git URL above to queue the first scan.")}}
+{{end}}
+</div>

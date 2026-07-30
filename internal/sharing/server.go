@@ -42,6 +42,7 @@ const (
 	kindList    resourceKind = iota // list pages; scoped by the query filter, no {id}
 	kindRepo                        // {id} is a repository ID
 	kindFinding                     // {id} is a finding ID
+	kindScan                        // {id} is a scan ID (resolved to its repository)
 )
 
 // route is a whitelisted path forwarded to the reused handler.
@@ -52,11 +53,12 @@ type route struct {
 
 // sharedRoutes is the entire surface the portal exposes. It is read-only: every
 // route is a GET. Anything not listed here 404s at the portal and never reaches
-// the inner handler — in particular /api, /api/v1, /events, /settings, /scans,
-// add-repo, delete, the source blob view, and the finding status/notes writes
-// are all withheld. (The ReadOnly view scope also refuses those writes at the
-// handler as defense in depth, but the portal never forwards them in the first
-// place.)
+// the inner handler — in particular /api, /api/v1, /events, /settings, add-repo,
+// delete, the source blob view, and the finding status/notes and scan
+// cancel/resume/retry writes are all withheld. (The ReadOnly view scope also
+// refuses those writes at the handler as defense in depth, but the portal never
+// forwards them in the first place.) List routes (kindList) are forwarded and
+// rely on the request's view scope to filter rows to the committer's repos.
 var sharedRoutes = []route{
 	{"GET /{$}", kindList},
 	{"GET /findings", kindList},
@@ -67,6 +69,9 @@ var sharedRoutes = []route{
 	{"GET /findings/{id}/csaf.json", kindFinding},
 	{"GET /findings/{id}/osv.json", kindFinding},
 	{"GET /findings/{id}/bundle.tar.gz", kindFinding},
+	{"GET /scans", kindList},
+	{"GET /scans/{id}", kindScan},
+	{"GET /scans/{id}/report.md", kindScan},
 }
 
 // Handler wires the portal: auth routes, the whitelisted authenticated surface,
@@ -195,6 +200,12 @@ func (s *Server) repoIDFor(ctx context.Context, kind resourceKind, id uint) (uin
 			return 0, err
 		}
 		return f.RepositoryID, nil
+	case kindScan:
+		var scan db.Scan
+		if err := s.db.WithContext(ctx).Select("repository_id").First(&scan, id).Error; err != nil {
+			return 0, err
+		}
+		return scan.RepositoryID, nil
 	default:
 		return 0, nil
 	}

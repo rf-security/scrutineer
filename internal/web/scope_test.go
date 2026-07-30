@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -137,6 +138,174 @@ func TestViewScope_emptyScopeMatchesNothing(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), "SSRF in alpha") {
 		t.Errorf("empty scope leaked a finding")
+	}
+}
+
+// TestViewScope_scansListScopedAndDefaultsToDone confirms the /scans list is
+// scoped to the visitor's repositories and defaults to completed scans under a
+// read-only (portal) scope, while status=all clears that default and the local
+// operator still sees every scan by default.
+func TestViewScope_scansListScopedAndDefaultsToDone(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	mkScan := func(repoID uint, st db.ScanStatus) uint {
+		sc := db.Scan{RepositoryID: repoID, Kind: "skill", SkillName: "security-deep-dive", Status: st}
+		if err := s.DB.Create(&sc).Error; err != nil {
+			t.Fatal(err)
+		}
+		return sc.ID
+	}
+	repoA := db.Repository{URL: "https://example.com/a", Name: "alpha"}
+	repoB := db.Repository{URL: "https://example.com/b", Name: "bravo"}
+	if err := s.DB.Create(&repoA).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&repoB).Error; err != nil {
+		t.Fatal(err)
+	}
+	doneA := mkScan(repoA.ID, db.ScanDone)
+	failedA := mkScan(repoA.ID, db.ScanFailed)
+	doneB := mkScan(repoB.ID, db.ScanDone)
+
+	row := func(id uint) string { return fmt.Sprintf(`id="scan-%d"`, id) }
+	scope := ViewScope{RepoIDs: map[uint]struct{}{repoA.ID: {}}, ReadOnly: true}
+	get := func(path string, sc *ViewScope) string {
+		r := localReq("GET", path)
+		if sc != nil {
+			r = r.WithContext(WithViewScope(r.Context(), *sc))
+		}
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		if w.Code != 200 {
+			t.Fatalf("%s status %d", path, w.Code)
+		}
+		return w.Body.String()
+	}
+
+	// Portal default: only repo a's DONE scan — its failed scan is hidden by the
+	// Done default and repo b's scan is out of scope.
+	def := get("/scans", &scope)
+	if !strings.Contains(def, row(doneA)) {
+		t.Errorf("portal default: in-scope done scan missing")
+	}
+	if strings.Contains(def, row(failedA)) {
+		t.Errorf("portal default: failed scan shown, want Done-only default")
+	}
+	if strings.Contains(def, row(doneB)) {
+		t.Errorf("portal default: out-of-scope scan leaked")
+	}
+
+	// status=all overrides the default: both of repo a's scans, still scoped.
+	all := get("/scans?status=all", &scope)
+	if !strings.Contains(all, row(doneA)) || !strings.Contains(all, row(failedA)) {
+		t.Errorf("status=all: expected both of repo a's scans")
+	}
+	if strings.Contains(all, row(doneB)) {
+		t.Errorf("status=all: out-of-scope scan leaked")
+	}
+
+	// Local operator (no scope): default shows every scan regardless of status.
+	op := get("/scans", nil)
+	if !strings.Contains(op, row(failedA)) || !strings.Contains(op, row(doneB)) {
+		t.Errorf("operator default should list all scans, unfiltered")
+	}
+}
+
+// TestViewScope_repoListPortalSortsByStatus confirms the sharing portal's
+// default repository ordering is completed → queued → failed (by each repo's
+// latest scan), overriding the operator's most-recently-updated default.
+func TestViewScope_repoListPortalSortsByStatus(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	// Create oldest→newest as done, queued, failed so recency (updated_at desc)
+	// would yield the REVERSE of the wanted status order — a pass proves the
+	// status ordering won.
+	mk := func(url, name string, st db.ScanStatus) uint {
+		repo := db.Repository{URL: url, Name: name}
+		if err := s.DB.Create(&repo).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DB.Create(&db.Scan{RepositoryID: repo.ID, Kind: "skill",
+			SkillName: "security-deep-dive", Status: st}).Error; err != nil {
+			t.Fatal(err)
+		}
+		return repo.ID
+	}
+	dID := mk("https://example.com/done", "d", db.ScanDone)
+	qID := mk("https://example.com/queued", "q", db.ScanQueued)
+	fID := mk("https://example.com/failed", "f", db.ScanFailed)
+
+	order := func(body string) (int, int, int) {
+		return strings.Index(body, "example.com/done"),
+			strings.Index(body, "example.com/queued"),
+			strings.Index(body, "example.com/failed")
+	}
+
+	// Portal (read-only scope over all three): done < queued < failed.
+	scope := ViewScope{RepoIDs: map[uint]struct{}{dID: {}, qID: {}, fID: {}}, ReadOnly: true}
+	r := localReq("GET", "/")
+	r = r.WithContext(WithViewScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("status %d", w.Code)
+	}
+	iD, iQ, iF := order(w.Body.String())
+	if iD < 0 || iQ < 0 || iF < 0 {
+		t.Fatalf("missing repos: done=%d queued=%d failed=%d", iD, iQ, iF)
+	}
+	if iD >= iQ || iQ >= iF {
+		t.Errorf("portal order = done@%d queued@%d failed@%d; want done < queued < failed", iD, iQ, iF)
+	}
+
+	// Operator (no scope) keeps recency: newest-created (failed) first.
+	wo := httptest.NewRecorder()
+	s.Handler().ServeHTTP(wo, localReq("GET", "/"))
+	oD, oQ, oF := order(wo.Body.String())
+	if oF >= oQ || oQ >= oD {
+		t.Errorf("operator order = done@%d queued@%d failed@%d; want recency failed < queued < done", oD, oQ, oF)
+	}
+}
+
+// TestSharingTemplates_renderAllPortalPages renders every page the sharing
+// portal can reach through the standalone templates/sharing/ set (parsed via
+// WithTemplateGlob). html/template resolves {{template}} references statically
+// during escaping — even in never-executed branches — so a missing sub-template
+// surfaces here as a 500, guarding the portal's template set stays complete.
+func TestSharingTemplates_renderAllPortalPages(t *testing.T) {
+	s, done := newTestServerWith(t, WithTemplateGlob("templates/sharing/*.html"))
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/a", Name: "alpha", Languages: "Go"}
+	if err := s.DB.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", SkillName: "security-deep-dive", Status: db.ScanDone}
+	if err := s.DB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	finding := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "SSRF in alpha",
+		Severity: "High", Location: "x.go:1", CWE: "CWE-79"}
+	if err := s.DB.Create(&finding).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	scope := ViewScope{RepoIDs: map[uint]struct{}{repo.ID: {}}, ReadOnly: true}
+	for _, p := range []string{
+		"/", "/findings", "/scans",
+		fmt.Sprintf("/repositories/%d", repo.ID),
+		fmt.Sprintf("/findings/%d", finding.ID),
+		fmt.Sprintf("/scans/%d", scan.ID),
+	} {
+		r := localReq("GET", p)
+		r = r.WithContext(WithViewScope(r.Context(), scope))
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		if w.Code != 200 {
+			t.Errorf("%s rendered %d via sharing templates (body: %.300s)", p, w.Code, w.Body.String())
+		}
 	}
 }
 

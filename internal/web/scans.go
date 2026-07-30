@@ -20,12 +20,20 @@ import (
 
 func (s *Server) jobs(w http.ResponseWriter, r *http.Request) {
 	q := s.DB.Model(&db.Scan{})
+	// The sharing portal restricts the list to the committer's repositories.
+	q = applyRepoScope(q, r, "repository_id")
 	skillName := r.URL.Query().Get("skill")
 	if skillName != "" {
 		q = q.Where("skill_name = ?", skillName)
 	}
 	status := r.URL.Query().Get(statusKey)
-	if status != "" {
+	// The portal defaults to completed scans; its filter menu emits an explicit
+	// status=all to clear that default so a committer can still see every scan.
+	// The local operator is unchanged: an empty status already means "all".
+	if status == "" && isReadOnly(r) {
+		status = string(db.ScanDone)
+	}
+	if status != "" && status != allStatusValue {
 		q = q.Where("status = ?", status)
 	}
 

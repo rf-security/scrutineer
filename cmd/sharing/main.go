@@ -86,7 +86,11 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("queue: %w", err)
 	}
-	srv, err := web.New(gdb, q, log, web.NewBroker(), &worker.Worker{DB: gdb})
+	// The portal renders its own template set (templates/sharing/), kept
+	// separate from the main UI so portal-specific markup can diverge without
+	// touching the operator templates.
+	srv, err := web.New(gdb, q, log, web.NewBroker(), &worker.Worker{DB: gdb},
+		web.WithTemplateGlob("templates/sharing/*.html"))
 	if err != nil {
 		return err
 	}

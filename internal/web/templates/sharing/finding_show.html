@@ -1,0 +1,752 @@
+{{template "head" .}}
+{{$f := .F}}
+{{$scan := .Scan}}
+{{$repo := .Repo}}
+
+{{template "crumbs" (crumbs
+  "Findings" "/findings"
+  $repo.Name (printf "/repositories/%d" $repo.ID)
+  (printf "scan #%d" $f.ScanID) (printf "/scans/%d" $f.ScanID)
+  (printf "finding #%d" $f.ID) "")}}
+
+<div class="flex items-start justify-between gap-4 mt-1 mb-4">
+  <h2 class="text-2xl font-semibold flex items-center gap-3">
+    {{$f.Title}}
+    {{template "finding-status" (fstatus $f.Status)}}
+  </h2>
+  <div class="flex gap-2 shrink-0">
+    <a href="/findings/{{$f.ID}}/report.md" class="btn-outline" download>
+      <i data-lucide="download"></i> Export report
+    </a>
+    <a href="/findings/{{$f.ID}}/bundle.tar.gz" class="btn-outline"
+       title="{{if .HasDependents}}OSV + CSAF VEX + markdown report + patch + manifest{{else}}OSV + markdown report + patch + manifest{{end}}, packaged for a disclosure recipient"
+       download>
+      <i data-lucide="package"></i> Disclosure bundle
+    </a>
+  </div>
+</div>
+
+{{if $f.Labels}}
+<div class="flex flex-wrap gap-1 mb-4">
+  {{range $f.Labels}}
+    <span class="badge-outline" style="border-color: {{.Color}}; color: {{.Color}}">{{.Name}}</span>
+  {{end}}
+</div>
+{{end}}
+
+{{template "finding_workflow" .Workflow}}
+
+<dl class="grid grid-cols-2 sm:grid-cols-6 gap-4 mb-6 text-sm">
+  <div>
+    <dt class="text-muted-foreground">Severity</dt>
+    <dd>{{$f.Severity}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">CWE</dt>
+    <dd>{{if $f.CWE}}{{$f.CWE}}{{else}}-{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Location</dt>
+    <dd>
+      {{$u := locurl $repo.ID $scan.Commit $f.Location}}
+      {{if $u}}<a href="{{$u}}" class="underline underline-offset-2">
+        <code>{{$f.Location}}</code></a>
+      {{else}}<code>{{$f.Location}}</code>{{end}}
+      {{if $f.ExtraLocationCount}}
+      <details class="mt-2">
+        <summary class="cursor-pointer text-muted-foreground">
+          {{$f.ExtraLocationCount}} more location{{if ne $f.ExtraLocationCount 1}}s{{end}}
+        </summary>
+        <ul class="mt-1 space-y-0.5">
+          {{range $i, $loc := $f.LocationList}}{{if $i}}
+          <li>
+            {{$lu := locurl $repo.ID $scan.Commit $loc}}
+            {{if $lu}}<a href="{{$lu}}"
+              class="underline underline-offset-2"><code class="text-xs">{{$loc}}</code></a>
+            {{else}}<code class="text-xs">{{$loc}}</code>{{end}}
+          </li>
+          {{end}}{{end}}
+        </ul>
+      </details>
+      {{end}}
+    </dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">VID</dt>
+    <dd>{{if $f.VID}}<code class="text-xs break-all"
+        title="Identifies the code at the sink, not the finding; computed from the function bytes so independent tools derive the same value">{{$f.VID}}</code>{{else}}-{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Affected</dt>
+    <dd>{{if $f.Affected}}{{$f.Affected}}{{else}}-{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Reachability</dt>
+    <dd>{{if $f.Reachability}}{{$f.Reachability}}{{else}}-{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Quality tier</dt>
+    <dd>{{if $f.QualityTier}}{{$f.QualityTier}}{{else}}-{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Sinks</dt>
+    <dd>{{if $f.Sinks}}<a href="/repositories/{{$repo.ID}}#rt10"
+        class="underline underline-offset-2"><code>{{$f.Sinks}}</code></a>{{else}}-{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Model</dt>
+    <dd>{{$scan.Model}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">First seen</dt>
+    <dd><a href="/scans/{{$f.ScanID}}" class="hover:underline">scan #{{$f.ScanID}}</a>
+      {{if $f.Commit}}<code class="text-xs text-muted-foreground">@{{short $f.Commit}}</code>{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Last seen</dt>
+    <dd>
+      {{if $f.LastSeenScanID}}
+        <a href="/scans/{{$f.LastSeenScanID}}" class="hover:underline">scan #{{$f.LastSeenScanID}}</a>
+        {{if $f.LastSeenCommit}}<code class="text-xs text-muted-foreground">@{{short $f.LastSeenCommit}}</code>{{end}}
+        {{if gt $f.SeenCount 1}}<span class="text-xs text-muted-foreground">({{$f.SeenCount}}x)</span>{{end}}
+      {{else}}-{{end}}
+    </dd>
+  </div>
+  {{if gt $f.MissedCount 0}}
+  <div>
+    <dt class="text-muted-foreground">Not seen</dt>
+    <dd>
+      <a href="/scans/{{$f.LastMissedScanID}}" class="hover:underline">scan #{{$f.LastMissedScanID}}</a>
+      <span class="text-xs text-muted-foreground">(missed {{$f.MissedCount}}x)</span>
+    </dd>
+  </div>
+  {{end}}
+  {{if $f.CVEID}}
+  <div>
+    <dt class="text-muted-foreground">CVE</dt>
+    <dd><code>{{$f.CVEID}}</code></dd>
+  </div>
+  {{end}}
+  {{if $f.GHSAID}}
+  <div>
+    <dt class="text-muted-foreground">GHSA</dt>
+    <dd><a class="hover:underline" href="{{if $repo.HTMLURL}}{{$repo.HTMLURL}}/security/advisories/{{$f.GHSAID}}{{else}}https://github.com/advisories/{{$f.GHSAID}}{{end}}"
+      rel="noopener" target="_blank"><code>{{$f.GHSAID}}</code></a></dd>
+  </div>
+  {{end}}
+  {{if $f.CVSSVector}}
+  <div class="col-span-2">
+    <dt class="text-muted-foreground">CVSS v3</dt>
+    <dd><code>{{$f.CVSSVector}}</code>{{if $f.CVSSScore}} ({{$f.CVSSScore}}){{end}}</dd>
+  </div>
+  {{end}}
+  {{if $f.CVSSv4Vector}}
+  <div class="col-span-2">
+    <dt class="text-muted-foreground">CVSS v4</dt>
+    <dd><code>{{$f.CVSSv4Vector}}</code>{{if $f.CVSSv4Score}} ({{$f.CVSSv4Score}}){{end}}</dd>
+  </div>
+  {{end}}
+  {{if $f.FixCommit}}
+  <div>
+    <dt class="text-muted-foreground">Fix commit</dt>
+    <dd><code>{{short $f.FixCommit}}</code></dd>
+  </div>
+  {{end}}
+  {{if $f.FixVersion}}
+  <div>
+    <dt class="text-muted-foreground">Fix version</dt>
+    <dd>{{$f.FixVersion}}</dd>
+  </div>
+  {{end}}
+  {{if $f.ReleaseTag}}
+  <div>
+    <dt class="text-muted-foreground">Released</dt>
+    <dd>
+      {{if $f.ReleaseURL}}<a class="hover:underline" href="{{$f.ReleaseURL}}" rel="noopener" target="_blank">{{$f.ReleaseTag}}</a>{{else}}{{$f.ReleaseTag}}{{end}}
+      {{if $f.ReleasedAt}}<span class="text-xs text-muted-foreground">on {{$f.ReleasedAt.Format "2006-01-02"}}</span>{{end}}
+    </dd>
+  </div>
+  {{end}}
+  {{if $f.Resolution}}
+  <div>
+    <dt class="text-muted-foreground">Resolution</dt>
+    <dd><span class="badge-outline">{{$f.Resolution}}</span></dd>
+  </div>
+  {{end}}
+  {{if $f.Assignee}}
+  <div>
+    <dt class="text-muted-foreground">Assignee</dt>
+    <dd>{{$f.Assignee}}</dd>
+  </div>
+  {{end}}
+  {{if eq $f.ExploitedInWild "yes"}}
+  <div>
+    <dt class="text-muted-foreground">Exploited in wild</dt>
+    <dd><span class="badge-destructive">yes</span></dd>
+  </div>
+  {{else if eq $f.ExploitedInWild "no"}}
+  <div>
+    <dt class="text-muted-foreground">Exploited in wild</dt>
+    <dd><span class="badge-outline">no</span></dd>
+  </div>
+  {{end}}
+</dl>
+
+<section class="accordion">
+  {{if $f.Trace}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Step 1: Trace
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 prose">{{md $f.Trace}}</section>
+  </details>
+  {{end}}
+
+  {{if $f.Boundary}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Step 2: Trust boundary
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 prose">{{md $f.Boundary}}</section>
+  </details>
+  {{end}}
+
+  {{if $f.Validation}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Step 3: Validation
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 prose">{{md $f.Validation}}</section>
+  </details>
+  {{end}}
+
+  {{if $f.PriorArt}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Step 4: Prior art
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 prose">{{md $f.PriorArt}}</section>
+  </details>
+  {{end}}
+
+  {{if $f.Reach}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Step 5: Reach
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 prose">{{md $f.Reach}}</section>
+  </details>
+  {{end}}
+
+  {{if $f.Rating}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Step 6: Rating
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 prose">{{md $f.Rating}}</section>
+  </details>
+  {{end}}
+
+  {{if and (not $.Sharing) .ShowExposure}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Dependent exposure
+        <span class="text-muted-foreground ml-auto mr-2 text-xs">{{len .Exposures}}</span>
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-3">
+      <div class="flex items-center gap-2">
+        <form method="post" action="/findings/{{$f.ID}}/exposure" hx-post="/findings/{{$f.ID}}/exposure" hx-swap="none" hx-confirm="Run exposure on up to 10 dependents? This can enqueue up to 10 full scans.">
+          <button type="submit" class="btn-sm">Run exposure on top-10 dependents</button>
+        </form>
+        <span class="text-xs text-muted-foreground">
+          Clones each dependent and audits whether this finding is reachable in its code.
+        </span>
+      </div>
+      {{if .Exposures}}
+      <table class="w-full text-sm">
+        <thead class="text-xs text-muted-foreground">
+          <tr><th class="text-left py-2">Dependent</th><th class="text-left">Status</th><th class="text-left">Justification</th><th class="text-left">Notes</th></tr>
+        </thead>
+        <tbody>
+          {{range .Exposures}}
+          <tr class="border-t align-top">
+            <td class="py-2"><code>{{.Dep.Name}}</code> <span class="text-xs text-muted-foreground">{{.Dep.Ecosystem}}</span></td>
+            <td>{{.Status}}</td>
+            <td>{{if .Justif}}<code class="text-xs">{{.Justif}}</code>{{else}}-{{end}}</td>
+            <td class="text-xs text-muted-foreground">{{.Why}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      {{else}}
+      <p class="text-xs text-muted-foreground">No exposure runs yet.</p>
+      {{end}}
+    </section>
+  </details>
+  {{end}}
+
+  {{if not $.Sharing}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Fix validation
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-3">
+      <p class="text-xs text-muted-foreground">
+        Re-scan a candidate fix ref with this finding's skill and re-run verify against it, then diff the
+        findings by fingerprint: resolved, surviving, or newly introduced. The validation report lands on
+        the scan it kicks off.
+      </p>
+      <form method="post" action="/repositories/{{$repo.ID}}/validate-fix"
+            hx-post="/repositories/{{$repo.ID}}/validate-fix" hx-swap="none"
+            class="flex flex-wrap items-center gap-2">
+        <input type="hidden" name="finding_ids" value="{{$f.ID}}">
+        <input class="input max-w-xs" type="text" name="ref" required
+               placeholder="fix branch, tag, or commit">
+        <button type="submit" class="btn-sm">
+          <i data-lucide="git-compare"></i> Validate fix
+        </button>
+      </form>
+    </section>
+  </details>
+  {{end}}
+
+  {{if $f.Mitigation}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Mitigation guidance
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-3">
+      <div class="prose prose-sm">{{md $f.Mitigation}}</div>
+      {{if $f.MitigationSemgrep}}
+      <div class="grid gap-1">
+        <div class="text-xs text-muted-foreground">Semgrep rule</div>
+        <pre class="log overflow-x-auto"><code>{{$f.MitigationSemgrep}}</code></pre>
+      </div>
+      {{end}}
+    </section>
+  </details>
+  {{end}}
+
+  {{if .Patch}}{{$p := .Patch}}{{$ps := .PatchScan}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Proposed patch
+        <span class="text-muted-foreground ml-auto mr-2 text-xs">scan #{{$ps.ID}}</span>
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-3">
+      {{if $p.Rationale}}
+        <p class="text-sm">{{$p.Rationale}}</p>
+      {{end}}
+      {{if $p.FilesChanged}}
+        <div class="text-xs text-muted-foreground">
+          Files changed:
+          {{range $i, $f := $p.FilesChanged}}{{if $i}}, {{end}}<code>{{$f}}</code>{{end}}
+        </div>
+      {{end}}
+      <div class="flex flex-wrap gap-2 items-center">
+        <a class="btn-sm" href="/findings/{{$f.ID}}/patch.diff">
+          <i data-lucide="download"></i> Download .patch
+        </a>
+        <a class="btn-sm-outline" href="/scans/{{$ps.ID}}">
+          <i data-lucide="arrow-up-right"></i> View scan
+        </a>
+        {{if $p.BaseCommit}}
+          <span class="text-xs text-muted-foreground">base <code>{{short $p.BaseCommit}}</code></span>
+        {{end}}
+        {{if $p.TestsAdded}}
+          <span class="badge-secondary">includes test</span>
+        {{end}}
+      </div>
+      <details class="group">
+        <summary class="text-xs text-muted-foreground cursor-pointer hover:underline">
+          How to apply
+        </summary>
+        <pre class="log mt-2">cd path/to/{{$repo.Name}}
+{{if $p.BaseCommit}}git checkout {{short $p.BaseCommit}}
+{{end}}git checkout -b fix/finding-{{$f.ID}}
+git apply --index ~/Downloads/finding-{{$f.ID}}.patch
+git commit -m "fix: {{$f.Title}}"</pre>
+      </details>
+      {{if $p.Notes}}
+        <div class="text-xs text-muted-foreground border-l-2 pl-3 mt-1">{{$p.Notes}}</div>
+      {{end}}
+      {{if $f.BreakingChange}}
+        <div class="mt-3 border rounded p-3 text-sm">
+          <div class="flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-muted-foreground uppercase">Breaking change</span>
+              <span class="font-medium">{{$f.BreakingChange}}</span>
+            </div>
+          </div>
+          {{if $f.BreakingChangeRationale}}
+            <pre class="whitespace-pre-wrap font-sans text-xs text-muted-foreground mt-2">{{$f.BreakingChangeRationale}}</pre>
+          {{end}}
+        </div>
+      {{end}}
+    </section>
+  </details>
+  {{end}}
+
+  {{if not $.Sharing}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Disclosure fields
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <form method="post" action="/findings/{{$f.ID}}/fields" class="form grid grid-cols-2 gap-3">
+        <div class="grid gap-1">
+          <label class="text-xs text-muted-foreground">Severity</label>
+          <input class="input" name="severity" value="{{$f.Severity}}" list="severity-options">
+          <datalist id="severity-options">
+            <option value="Critical"><option value="High"><option value="Medium"><option value="Low">
+          </datalist>
+        </div>
+        <div class="grid gap-1">
+          <label class="text-xs text-muted-foreground">CWE</label>
+          <input class="input" name="cwe" value="{{$f.CWE}}" placeholder="CWE-79">
+        </div>
+        <div class="grid gap-1">
+          <label class="text-xs text-muted-foreground">CVE ID</label>
+          <input class="input" name="cve_id" value="{{$f.CVEID}}" placeholder="CVE-2026-12345">
+        </div>
+        <div class="grid gap-1">
+          <label class="text-xs text-muted-foreground">GHSA ID</label>
+          <input class="input" name="ghsa_id" value="{{$f.GHSAID}}" placeholder="GHSA-xxxx-xxxx-xxxx"
+            pattern="[Gg][Hh][Ss][Aa](-[0-9A-Za-z]{4}){3}" title="GHSA-xxxx-xxxx-xxxx">
+        </div>
+        <div class="grid gap-1 col-span-2">
+          <label class="text-xs text-muted-foreground">CVSS v3 vector</label>
+          <input class="input font-mono text-xs" name="cvss_vector" value="{{$f.CVSSVector}}"
+                 placeholder="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H">
+        </div>
+        <div class="grid gap-1 col-span-2">
+          <label class="text-xs text-muted-foreground">CVSS v4 vector</label>
+          <input class="input font-mono text-xs" name="cvss_v4_vector" value="{{$f.CVSSv4Vector}}"
+                 placeholder="CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N">
+        </div>
+        <div class="grid gap-1">
+          <label class="text-xs text-muted-foreground">Affected versions</label>
+          <input class="input" name="affected" value="{{$f.Affected}}" placeholder=">=1.0, <2.3">
+        </div>
+        <div class="grid gap-1">
+          <label class="text-xs text-muted-foreground">Fix version</label>
+          <input class="input" name="fix_version" value="{{$f.FixVersion}}">
+        </div>
+        <div class="grid gap-1 col-span-2">
+          <label class="text-xs text-muted-foreground">Fix commit</label>
+          <input class="input font-mono text-xs" name="fix_commit" value="{{$f.FixCommit}}">
+        </div>
+        <div class="grid gap-1">
+          <label class="text-xs text-muted-foreground">Resolution</label>
+          <select class="input" name="resolution">
+            <option value=""{{if not $f.Resolution}} selected{{end}}>-</option>
+            {{range (list "fix" "migrate" "workaround" "adopt" "wontfix")}}
+              <option value="{{.}}"{{if eq (printf "%s" $f.Resolution) .}} selected{{end}}>{{.}}</option>
+            {{end}}
+          </select>
+        </div>
+        <div class="grid gap-1">
+          <label class="text-xs text-muted-foreground">Assignee</label>
+          <input class="input" name="assignee" value="{{$f.Assignee}}">
+        </div>
+        <div class="grid gap-1 col-span-2">
+          <label class="text-xs text-muted-foreground"
+                 title="File-level owners of the finding's location, from CODEOWNERS or recent non-bot committers">Suggested recipients</label>
+          <input class="input" name="suggested_recipients" value="{{$f.SuggestedRecipients}}">
+        </div>
+        <div class="grid gap-1 col-span-2">
+          <label class="text-xs text-muted-foreground">Disclosure draft</label>
+          <textarea class="input font-mono text-xs" name="disclosure_draft" rows="6">{{$f.DisclosureDraft}}</textarea>
+          {{if $f.DisclosureDraft}}
+          <a href="/findings/{{$f.ID}}/disclosure.html" target="_blank" rel="noopener"
+             class="text-xs text-muted-foreground hover:text-foreground hover:underline inline-flex items-center gap-1 justify-self-start"
+             title="Open the draft as styled HTML, then select-all and paste into a Gmail compose window">
+            <i data-lucide="external-link" class="size-3.5"></i> Open Gmail-ready HTML
+          </a>
+          {{end}}
+        </div>
+        <div class="col-span-2 flex justify-end">
+          <button type="submit" class="btn-sm">Save</button>
+        </div>
+      </form>
+    </section>
+  </details>
+  {{end}}
+
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Notes <span class="text-muted-foreground ml-auto mr-2 text-xs">{{len .Notes}}</span>
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-3">
+      <form method="post" action="/findings/{{$f.ID}}/notes" class="form grid gap-2">
+        <textarea class="input" name="body" rows="3" placeholder="Add a note..." required></textarea>
+        <div class="flex justify-end">
+          <button type="submit" class="btn-sm">Add note</button>
+        </div>
+      </form>
+      <ul class="grid gap-2">
+      {{range .Notes}}
+        <li class="border rounded p-3 text-sm">
+          <div class="text-xs text-muted-foreground mb-1">{{if .By}}{{.By}} · {{end}}{{.CreatedAt.Format "2006-01-02 15:04"}}</div>
+          <pre class="whitespace-pre-wrap font-sans">{{.Body}}</pre>
+        </li>
+      {{else}}
+        <li class="text-sm text-muted-foreground">No notes yet.</li>
+      {{end}}
+      </ul>
+    </section>
+  </details>
+
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Reviews <span class="text-muted-foreground ml-auto mr-2 text-xs">{{len .Reviews}}</span>
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-3">
+      {{if not $.Sharing}}
+      <form method="post" action="/findings/{{$f.ID}}/reviews" class="form grid gap-2">
+        <div class="flex gap-2">
+          <select class="input" name="verdict" required>
+            <option value="">Verdict...</option>
+            <option value="true_positive">true_positive</option>
+            <option value="false_positive">false_positive</option>
+            <option value="already_fixed">already_fixed</option>
+            <option value="uncertain">uncertain</option>
+          </select>
+          <input class="input" type="text" name="reviewer" placeholder="reviewer (optional)">
+        </div>
+        <textarea class="input" name="reason" rows="2" placeholder="Reason — why does this verdict apply?"></textarea>
+        {{if .LatestRevalidate}}
+          <div class="text-xs text-muted-foreground">Automation said: <strong>{{.LatestRevalidate}}</strong> (snapshotted on submit)</div>
+        {{end}}
+        <div class="flex justify-end">
+          <button type="submit" class="btn-sm">Record review</button>
+        </div>
+      </form>
+      {{end}}
+      <ul class="grid gap-2">
+      {{range .Reviews}}
+        <li class="border rounded p-3 text-sm">
+          <div class="text-xs text-muted-foreground mb-1">
+            {{if .Reviewer}}{{.Reviewer}} · {{end}}{{.CreatedAt.Format "2006-01-02 15:04"}}
+          </div>
+          <div class="flex items-center gap-2 mb-1">
+            <span class="font-medium">{{.Verdict}}</span>
+            {{if .AutomatedOutcome}}
+              <span class="text-xs text-muted-foreground">vs auto:&nbsp;<strong>{{.AutomatedOutcome}}</strong>{{if eq .Verdict .AutomatedOutcome}} (agreed){{else}} (overturned){{end}}</span>
+            {{end}}
+          </div>
+          {{if .Reason}}<pre class="whitespace-pre-wrap font-sans">{{.Reason}}</pre>{{end}}
+        </li>
+      {{else}}
+        <li class="text-sm text-muted-foreground">No reviews yet.</li>
+      {{end}}
+      </ul>
+    </section>
+  </details>
+
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Communications <span class="text-muted-foreground ml-auto mr-2 text-xs">{{len .Communications}}</span>
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-3">
+      {{if not $.Sharing}}
+      <form method="post" action="/findings/{{$f.ID}}/communications" class="form grid grid-cols-4 gap-2">
+        <select class="input" name="channel">
+          {{range (list "email" "ghsa" "issue" "pr" "direct" "registry")}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+        <select class="input" name="direction">
+          <option value="outbound">outbound</option>
+          <option value="inbound">inbound</option>
+        </select>
+        <input class="input" name="actor" placeholder="who / from whom" required>
+        <input class="input" type="date" name="at">
+        <select class="input col-span-1" name="offered_help">
+          <option value="">no offer</option>
+          <option value="pr">offered PR</option>
+          <option value="funding">offered funding</option>
+          <option value="adoption">offered adoption</option>
+        </select>
+        <textarea class="input col-span-3" name="body" rows="2" placeholder="message body..."></textarea>
+        <div class="col-span-4 flex justify-end">
+          <button type="submit" class="btn-sm">Log communication</button>
+        </div>
+      </form>
+      {{end}}
+      <ul class="grid gap-2">
+      {{range .Communications}}
+        <li class="border rounded p-3 text-sm">
+          <div class="text-xs text-muted-foreground mb-1">
+            <span class="badge-outline">{{.Channel}}</span>
+            <span class="badge-outline">{{.Direction}}</span>
+            {{.Actor}} · {{.At.Format "2006-01-02"}}
+            {{if .OfferedHelp}}<span class="badge-primary ml-2">offered {{.OfferedHelp}}</span>{{end}}
+          </div>
+          <pre class="whitespace-pre-wrap font-sans">{{.Body}}</pre>
+        </li>
+      {{else}}
+        <li class="text-sm text-muted-foreground">No communications yet.</li>
+      {{end}}
+      </ul>
+    </section>
+  </details>
+
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        References <span class="text-muted-foreground ml-auto mr-2 text-xs">{{len .References}}</span>
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-3">
+      {{if not $.Sharing}}
+      <form method="post" action="/findings/{{$f.ID}}/references" class="form grid grid-cols-3 gap-2">
+        <input class="input col-span-2" name="url" placeholder="https://..." required>
+        <input class="input" name="tags" placeholder="tags: issue, pr, cve, ghsa, patch">
+        <input class="input col-span-3" name="summary" placeholder="optional summary">
+        <div class="col-span-3 flex justify-end">
+          <button type="submit" class="btn-sm">Add reference</button>
+        </div>
+      </form>
+      {{end}}
+      <ul class="grid gap-2">
+      {{range .References}}
+        <li class="border rounded p-3 text-sm">
+          <div class="flex items-center gap-2">
+            <a href="{{.URL}}" target="_blank" rel="noopener" class="underline underline-offset-2 break-all">{{.URL}}</a>
+            {{if .Tags}}<span class="text-xs text-muted-foreground ml-auto">{{.Tags}}</span>{{end}}
+          </div>
+          {{if .Summary}}<div class="text-xs text-muted-foreground mt-1">{{.Summary}}</div>{{end}}
+        </li>
+      {{else}}
+        <li class="text-sm text-muted-foreground">No references yet.</li>
+      {{end}}
+      </ul>
+    </section>
+  </details>
+
+  {{if not $.Sharing}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Labels
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <form method="post" action="/findings/{{$f.ID}}/labels" class="form grid gap-2">
+        <div class="flex flex-wrap gap-3">
+          {{$sel := .Selected}}
+          {{range .AllLabels}}
+            <label class="flex items-center gap-1 text-sm">
+              <input type="checkbox" name="labels" value="{{.Name}}"
+                {{if index $sel .Name}}checked{{end}}>
+              <span style="color: {{.Color}}">{{.Name}}</span>
+            </label>
+          {{end}}
+        </div>
+        <div class="flex justify-end">
+          <button type="submit" class="btn-sm">Save labels</button>
+        </div>
+      </form>
+    </section>
+  </details>
+  {{end}}
+
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        History <span class="text-muted-foreground ml-auto mr-2 text-xs">{{.HistoryTotal}}</span>
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <ul class="grid gap-1 text-xs text-muted-foreground">
+      {{range .History}}
+        <li class="font-mono">
+          [{{.CreatedAt.Format "2006-01-02 15:04"}}] {{.Source}}{{if .By}} ({{.By}}){{end}}:
+          <code>{{.Field}}</code> = <code>{{.NewValue}}</code>
+          {{if .OldValue}}<span class="opacity-50">was <code>{{.OldValue}}</code></span>{{end}}
+        </li>
+      {{else}}
+        <li>No recorded changes.</li>
+      {{end}}
+      </ul>
+      {{template "row-cap" (dict "Shown" .History "Total" .HistoryTotal)}}
+    </section>
+  </details>
+
+  {{if .CWE}}
+  <details class="group border-b last:border-b-0">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        {{.CWE.ID}}: {{.CWE.Name}}
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 text-sm">
+      <p class="mb-2">{{.CWE.Description}}</p>
+      <a href="https://cwe.mitre.org/data/definitions/{{slice .CWE.ID 4}}.html"
+         target="_blank" rel="noopener"
+         class="text-muted-foreground hover:underline inline-flex items-center gap-1">
+        cwe.mitre.org<i data-lucide="external-link" class="size-3"></i>
+      </a>
+    </section>
+  </details>
+  {{end}}
+
+  <details class="group border-b last:border-b-0">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Chat{{if .Conversations}} <span class="badge-outline ml-1">{{len .Conversations}}</span>{{end}}
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      {{template "chat-panel" (dict "Action" (printf "/findings/%d/conversations" $f.ID) "Conversations" .Conversations "Placeholder" "Ask about this finding: exploitability, impact, a fix...")}}
+    </section>
+  </details>
+</section>
+
+{{template "foot" .}}

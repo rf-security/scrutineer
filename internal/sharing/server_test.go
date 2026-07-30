@@ -69,6 +69,45 @@ func TestAuthorizeBlocksOutOfScopeFinding(t *testing.T) {
 	}
 }
 
+func TestAuthorizeBlocksOutOfScopeScan(t *testing.T) {
+	s, inner := newServer(t)
+
+	repo := db.Repository{URL: "https://github.com/o/r", Name: "r"}
+	if err := s.db.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "security-deep-dive"}
+	if err := s.db.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	call := func(scopeIDs map[uint]struct{}) int {
+		inner.hit = false
+		h := s.authorize(kindScan, inner)
+		r := httptest.NewRequest("GET", "/scans/1", nil)
+		r.SetPathValue("id", strconv.FormatUint(uint64(scan.ID), 10))
+		r = r.WithContext(context.WithValue(r.Context(), userKey{}, &user{Login: "x", RepoIDs: scopeIDs}))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	// A scan whose repository is out of scope: 404 and never forwarded.
+	if code := call(map[uint]struct{}{999: {}}); code != http.StatusNotFound {
+		t.Fatalf("out-of-scope: want 404, got %d", code)
+	}
+	if inner.hit {
+		t.Fatal("out-of-scope scan was forwarded to inner handler")
+	}
+	// The scan's own repository is in scope: forwarded.
+	if code := call(map[uint]struct{}{repo.ID: {}}); code == http.StatusNotFound {
+		t.Fatalf("in-scope: unexpected 404")
+	}
+	if !inner.hit {
+		t.Fatal("in-scope scan was not forwarded")
+	}
+}
+
 func TestListRouteSkipsPerResourceCheck(t *testing.T) {
 	s, inner := newServer(t)
 	h := s.authorize(kindList, inner)

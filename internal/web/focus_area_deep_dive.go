@@ -82,7 +82,7 @@ func (s *Server) enqueueFocusAreaDeepDive(parent *db.Scan, skillID uint, group, 
 		return
 	}
 	if _, err := s.enqueueSkillWith(context.Background(), parent.RepositoryID, skillID, ScanOpts{
-		Model:          parent.Model,
+		Model:          s.focusAreaDeepDiveModel(parent),
 		Effort:         parent.Effort,
 		Profile:        parent.Profile,
 		SubPath:        parent.SubPath,
@@ -101,4 +101,29 @@ func (s *Server) enqueueFocusAreaDeepDive(parent *db.Scan, skillID uint, group, 
 		}
 		s.Log.Warn("focus-area deep dives: enqueue", "scan", parent.ID, "area", name, "err", err)
 	}
+}
+
+// focusAreaDeepDiveModel decides which model the fan-out passes to enqueueSkillWith.
+// A security-deep-dive is pinned to its own skill model (max), so by default we
+// return "" and let enqueueSkillWith apply that pin — a cheaper planning tier on
+// the threat-model parent must not silently downgrade deep security review.
+//
+// The one exception is an explicit per-run model choice: if the parent ran on a
+// model that differs from what its own skill would have resolved to, an operator
+// deliberately picked it, so we honor it and propagate it. Reconstructing the
+// parent's default mirrors enqueueSkillWith (overage downgrade + tier resolution)
+// so the comparison matches the value that was actually applied at parent enqueue.
+func (s *Server) focusAreaDeepDiveModel(parent *db.Scan) string {
+	if parent.Model == "" || parent.SkillID == nil {
+		return ""
+	}
+	var parentSkill db.Skill
+	if err := s.DB.Select("model").First(&parentSkill, *parent.SkillID).Error; err != nil {
+		return ""
+	}
+	pref := applyOverageDowngrade(parentSkill.Model, s.Worker.ShouldDowngradeModel())
+	if parent.Model == resolveModelPreference(s.DB, pref, s.DefaultModel()) {
+		return "" // parent ran on its skill default — defer to the deep-dive's own pin
+	}
+	return parent.Model // explicit choice — honor and propagate it
 }

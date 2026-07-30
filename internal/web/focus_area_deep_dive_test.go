@@ -207,3 +207,77 @@ func TestAutoEnqueueFocusAreaDeepDivesPreservesScope(t *testing.T) {
 			child.SubPath, child.Ref, child.ScanGroup, parent.SubPath, parent.Ref, parent.ScanGroup)
 	}
 }
+
+// A focus-area deep-dive inherits the threat-model parent's model ONLY when that
+// model was an explicit choice (differs from the parent skill's own default). A
+// parent that ran on its skill default lets the deep-dive use its own pin (max),
+// so a cheaper planning tier never downgrades deep review.
+func TestAutoEnqueueFocusAreaDeepDivesInheritsOnlyExplicitModel(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	// Deterministic pick list + tier mapping so resolution is not left to the
+	// built-in heuristic over an empty Models list.
+	oldModels := Models
+	Models = []Model{
+		{Name: "Sonnet", ID: "claude-sonnet-4-6", Tier: ModelTierMid},
+		{Name: "Opus", ID: "claude-opus-5", Tier: ModelTierHigh},
+		{Name: "Fable", ID: "claude-fable-5", Tier: ModelTierMax},
+	}
+	t.Cleanup(func() { Models = oldModels })
+	for k, v := range map[string]string{
+		db.SettingModelTierMid:  "claude-sonnet-4-6",
+		db.SettingModelTierHigh: "claude-opus-5",
+		db.SettingModelTierMax:  "claude-fable-5",
+	} {
+		if err := db.SetSetting(s.DB, k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Deep-dive pinned to max (fable); threat-model to high (opus).
+	deepDive := db.Skill{Name: deepDiveSkillName, Body: "b", OutputFile: "r.json", OutputKind: "findings", Active: true, Source: "ui", Model: ModelTierMax}
+	s.DB.Create(&deepDive)
+	threat := db.Skill{Name: threatModelSkillName, Body: "b", OutputFile: "r.json", OutputKind: "findings", Active: true, Source: "ui", Model: ModelTierHigh}
+	s.DB.Create(&threat)
+
+	scanConfig := `focus_areas:
+  - name: API parser
+    paths: [internal/api/**]
+    surface: API requests
+`
+	cases := []struct {
+		name        string
+		parentModel string
+		wantChild   string
+	}{
+		// Parent ran on the threat-model skill's own default (high=opus): the
+		// deep-dive is not forced onto it and uses its own pin (max=fable).
+		{"default_parent", "claude-opus-5", "claude-fable-5"},
+		// Parent ran on an explicitly chosen model differing from its skill
+		// default: the choice is honored and propagated to the fan-out.
+		{"explicit_parent", "claude-sonnet-4-6", "claude-sonnet-4-6"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := db.Repository{URL: "https://example.com/" + tc.name, Name: tc.name, ScanConfig: scanConfig}
+			s.DB.Create(&repo)
+			parent := db.Scan{
+				RepositoryID: repo.ID, Status: db.ScanDone,
+				SkillID: &threat.ID, SkillName: threatModelSkillName,
+				ScanGroup: "triage-" + tc.name, Model: tc.parentModel,
+			}
+			s.DB.Create(&parent)
+
+			s.autoEnqueueFocusAreaDeepDives(&parent)
+
+			var child db.Scan
+			if err := s.DB.Where("repository_id = ? AND skill_id = ?", repo.ID, deepDive.ID).First(&child).Error; err != nil {
+				t.Fatalf("load child deep-dive: %v", err)
+			}
+			if child.Model != tc.wantChild {
+				t.Errorf("child model = %q, want %q", child.Model, tc.wantChild)
+			}
+		})
+	}
+}

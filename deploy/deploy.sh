@@ -5,8 +5,8 @@
 # Runs on the GitHub Actions runner (after google-github-actions/auth has set up
 # gcloud creds). It:
 #   1. Renders secrets + config locally from the `prod` environment secrets.
-#   2. Ships them to the instance over an IAP SSH tunnel (never on a command
-#      line, so nothing leaks into `ps` or gcloud audit logs).
+#   2. Ships them to the instance over SSH (never on a command line, so nothing
+#      leaks into `ps` or gcloud audit logs).
 #   3. Clones-or-fetches the target ref into /opt/scrutineer.
 #   4. Runs deploy/update.sh on the instance: build binaries, install units,
 #      install secrets, restart services.
@@ -20,7 +20,8 @@
 #                       SCRUTINEER_SHARING_GITHUB_CLIENT_ID
 #                       SCRUTINEER_SHARING_GITHUB_CLIENT_SECRET
 #
-# Set SCRUTINEER_NO_IAP=1 to SSH over the instance's external IP instead of IAP.
+# SSHes over the instance's external IP by default; set SCRUTINEER_USE_IAP=1 to
+# tunnel through IAP instead (needs a firewall rule for the IAP range).
 set -euo pipefail
 
 INSTANCE="${INSTANCE:-scrutineer}"
@@ -45,8 +46,12 @@ require SCRUTINEER_DB_READONLY_SECRET
 require SCRUTINEER_SHARING_GITHUB_CLIENT_ID
 require SCRUTINEER_SHARING_GITHUB_CLIENT_SECRET
 
-TUNNEL_FLAG="--tunnel-through-iap"
-[[ "${SCRUTINEER_NO_IAP:-}" == "1" ]] && TUNNEL_FLAG=""
+# Default to a direct SSH connection over the instance's external IP: the
+# project's `default-allow-ssh` rule permits tcp:22, and there is no firewall
+# rule for the IAP range, so IAP tunneling would fail. Set SCRUTINEER_USE_IAP=1
+# to force IAP (requires a 35.235.240.0/20 -> tcp:22 rule to exist).
+TUNNEL_FLAG=""
+[[ "${SCRUTINEER_USE_IAP:-}" == "1" ]] && TUNNEL_FLAG="--tunnel-through-iap"
 
 # --- stage secrets + config locally ----------------------------------------
 WORK="$(mktemp -d)"

@@ -29,3 +29,8 @@ sharing:
  database:
    driver: postgres
    dsn: postgres://scrutineer_readonly:__DB_READONLY_PASSWORD__@localhost:5432/scrutineer?sslmode=disable
+
+egress_allow:
+ - "*.rust-lang.org"
+ - "*.crates.io"
+ 

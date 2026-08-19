@@ -114,8 +114,9 @@ func (s *Server) secure(next http.Handler) http.Handler {
 // requireAuth admits only requests with a valid session. On every request it
 // re-fetches the visitor's maintained repositories from GitHub so that changes
 // in repo access are reflected immediately without waiting for the session to
-// expire. If the GitHub fetch fails (e.g. the token was revoked) the session
-// cookie is cleared and the visitor is redirected to login.
+// expire. An invalid GitHub token clears the session and redirects to login;
+// transient upstream failures leave the session intact and return 503 so a
+// temporary GitHub outage cannot turn into a login loop.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(sessionCookie)
@@ -132,8 +133,12 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 		repos, err := fetchMaintainedRepos(r.Context(), sess.Token)
 		if err != nil {
 			s.log.Warn("fetch maintained repos failed", "login", sess.Login, "err", err)
-			clearCookie(w, sessionCookie)
-			s.redirectToLogin(w, r)
+			if isGitHubUnauthorized(err) {
+				clearCookie(w, sessionCookie)
+				s.redirectToLogin(w, r)
+				return
+			}
+			http.Error(w, "GitHub is temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		scope, err := resolveScope(r.Context(), s.db, repos)

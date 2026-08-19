@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
 	"scrutineer/internal/db"
 )
@@ -144,5 +145,77 @@ func TestHostAndRouteGuards(t *testing.T) {
 		if w.Code != http.StatusNotFound {
 			t.Fatalf("write route %s: want 404 (withheld), got %d", path, w.Code)
 		}
+	}
+}
+
+func TestRequireAuthGitHubFailureHandling(t *testing.T) {
+	tests := []struct {
+		name         string
+		githubCode   int
+		wantCode     int
+		wantRedirect bool
+		wantCleared  bool
+	}{
+		{
+			name:         "invalid token clears session",
+			githubCode:   http.StatusUnauthorized,
+			wantCode:     http.StatusSeeOther,
+			wantRedirect: true,
+			wantCleared:  true,
+		},
+		{
+			name:        "transient failure preserves session",
+			githubCode:  http.StatusServiceUnavailable,
+			wantCode:    http.StatusServiceUnavailable,
+			wantCleared: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/graphql" {
+					t.Errorf("path = %q, want /graphql", r.URL.Path)
+				}
+				w.WriteHeader(tt.githubCode)
+			}))
+			defer srv.Close()
+			old := githubAPI
+			githubAPI = srv.URL
+			defer func() { githubAPI = old }()
+
+			s, inner := newServer(t)
+			sealed, err := s.cfg.seal(session{
+				Login:     "octocat",
+				Token:     "tok",
+				ExpiresAt: time.Now().Add(time.Hour).Unix(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sealed})
+			w := httptest.NewRecorder()
+			s.requireAuth(inner).ServeHTTP(w, r)
+
+			if w.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d", w.Code, tt.wantCode)
+			}
+			if tt.wantRedirect && w.Header().Get("Location") != "/auth/login" {
+				t.Fatalf("Location = %q, want /auth/login", w.Header().Get("Location"))
+			}
+			if inner.hit {
+				t.Fatal("request reached inner handler after GitHub failure")
+			}
+			var cleared bool
+			for _, c := range w.Result().Cookies() {
+				if c.Name == sessionCookie && c.MaxAge < 0 {
+					cleared = true
+				}
+			}
+			if cleared != tt.wantCleared {
+				t.Fatalf("session cleared = %v, want %v", cleared, tt.wantCleared)
+			}
+		})
 	}
 }

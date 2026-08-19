@@ -206,6 +206,36 @@ func TestFetchMaintainedRepos(t *testing.T) {
 	}
 }
 
+func TestFetchMaintainedReposRetriesTransientGraphQLResponse(t *testing.T) {
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		if requests == 1 {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"viewer":{"repositories":{
+  "nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}
+}}}}`)
+	}))
+	defer srv.Close()
+	old := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = old }()
+
+	repos, err := fetchMaintainedRepos(context.Background(), "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 0 {
+		t.Fatalf("repos = %+v, want none", repos)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+}
+
 func TestFetchMaintainedReposGraphQLErrors(t *testing.T) {
 	tests := []struct {
 		name         string

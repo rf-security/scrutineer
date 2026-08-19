@@ -195,7 +195,10 @@ func githubGraphQL(ctx context.Context, token string, after *string) (*githubGra
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	// GraphQL uses POST for queries, but this operation is read-only and the
+	// bytes.Reader gives the request a GetBody function, so transient failures
+	// can safely replay the exact payload.
+	resp, err := httpx.DoRetryIdempotentPost(req, httpx.RetryOptions{})
 	if err != nil {
 		return nil, err
 	}

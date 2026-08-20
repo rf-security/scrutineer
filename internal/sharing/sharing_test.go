@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,43 +97,81 @@ func TestSessionTamperRejected(t *testing.T) {
 	}
 }
 
-func TestFetchMaintainedReposOwnedAndOrg(t *testing.T) {
-	// Directly owned repositories are included unconditionally.
-	owned := []githubRepo{{FullName: "me/owned", HTMLURL: "https://github.com/me/owned"}}
-
-	orgs := []githubOrg{{Login: "acme"}}
-	// Org repositories are filtered by the visitor's effective permission,
-	// carried in each listing entry's permissions object.
-	orgRepos := []githubRepo{
-		{FullName: "acme/admin", HTMLURL: "https://github.com/acme/admin"},
-		{FullName: "acme/maintain", HTMLURL: "https://github.com/acme/maintain"},
-		{FullName: "acme/push", HTMLURL: "https://github.com/acme/push"},
-		{FullName: "acme/readonly", HTMLURL: "https://github.com/acme/readonly"},
-	}
-	orgRepos[0].Permissions.Admin = true
-	orgRepos[1].Permissions.Maintain = true
-	orgRepos[2].Permissions.Push = true
-	// orgRepos[3] has no elevated permission and must be dropped.
-
+func TestFetchMaintainedRepos(t *testing.T) {
+	var requests int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodPost || r.URL.Path != "/graphql" {
+			t.Errorf("request = %s %s, want POST /graphql", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer tok" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		// One short page per endpoint ends pagination.
-		switch r.URL.Path {
-		case "/user/repos":
-			if aff := r.URL.Query().Get("affiliation"); aff != "owner" {
-				t.Errorf("owned listing affiliation = %q, want owner", aff)
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Errorf("Content-Type = %q, want application/json", got)
+		}
+		var body struct {
+			Query     string `json:"query"`
+			Variables struct {
+				First int     `json:"first"`
+				After *string `json:"after"`
+			} `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode GraphQL request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if body.Variables.First != githubPerPage {
+			t.Errorf("first = %d, want %d", body.Variables.First, githubPerPage)
+		}
+		for _, fragment := range []string{
+			"affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]",
+			"ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]",
+			"visibility: PUBLIC",
+			"viewerPermission",
+		} {
+			if !strings.Contains(body.Query, fragment) {
+				t.Errorf("query does not contain %q", fragment)
 			}
-			_ = json.NewEncoder(w).Encode(owned)
-		case "/user/orgs":
-			_ = json.NewEncoder(w).Encode(orgs)
-		case "/orgs/acme/repos":
-			_ = json.NewEncoder(w).Encode(orgRepos)
+		}
+
+		switch requests {
+		case 1:
+			if body.Variables.After != nil {
+				t.Errorf("first page after = %q, want null", *body.Variables.After)
+			}
+			_, _ = io.WriteString(w, `{
+  "data": {"viewer": {"repositories": {
+    "nodes": [
+      {"nameWithOwner":"me/owned","url":"https://github.com/me/owned","viewerPermission":"ADMIN"},
+      {"nameWithOwner":"acme/maintain","url":"https://github.com/acme/maintain","viewerPermission":"MAINTAIN"},
+      {"nameWithOwner":"acme/readonly","url":"https://github.com/acme/readonly","viewerPermission":"READ"},
+      {"nameWithOwner":"acme/triage","url":"https://github.com/acme/triage","viewerPermission":"TRIAGE"}
+    ],
+    "pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}
+  }}}
+}`)
+		case 2:
+			if body.Variables.After == nil || *body.Variables.After != "cursor-1" {
+				t.Errorf("second page after = %v, want cursor-1", body.Variables.After)
+			}
+			_, _ = io.WriteString(w, `{
+  "data": {"viewer": {"repositories": {
+    "nodes": [
+      {"nameWithOwner":"acme/write","url":"https://github.com/acme/write","viewerPermission":"WRITE"},
+      {"nameWithOwner":"outside/collaborator","url":"https://github.com/outside/collaborator","viewerPermission":"WRITE"},
+      {"nameWithOwner":"acme/none","url":"https://github.com/acme/none","viewerPermission":null}
+    ],
+    "pageInfo":{"hasNextPage":false,"endCursor":null}
+  }}}
+}`)
 		default:
-			t.Errorf("unexpected request path %q", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
+			t.Errorf("unexpected GraphQL request %d", requests)
+			w.WriteHeader(http.StatusInternalServerError)
 		}
 	}))
 	defer srv.Close()
@@ -149,16 +188,111 @@ func TestFetchMaintainedReposOwnedAndOrg(t *testing.T) {
 	for _, r := range repos {
 		got[r.FullName] = true
 	}
-	for _, want := range []string{"me/owned", "acme/admin", "acme/maintain", "acme/push"} {
+	for _, want := range []string{"me/owned", "acme/maintain", "acme/write", "outside/collaborator"} {
 		if !got[want] {
 			t.Errorf("expected %q in maintained set: %+v", want, repos)
 		}
 	}
-	if got["acme/readonly"] {
-		t.Fatal("read-only org repo leaked into maintained set")
+	for _, unwanted := range []string{"acme/readonly", "acme/triage", "acme/none"} {
+		if got[unwanted] {
+			t.Errorf("non-maintained repo %q leaked into maintained set", unwanted)
+		}
 	}
 	if len(repos) != 4 {
 		t.Fatalf("expected 4 maintained repos, got %d: %+v", len(repos), repos)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
+	}
+}
+
+func TestFetchMaintainedReposGraphQLErrors(t *testing.T) {
+	tests := []struct {
+		name         string
+		status       int
+		body         string
+		want         string
+		unauthorized bool
+	}{
+		{
+			name:         "unauthorized",
+			status:       http.StatusUnauthorized,
+			body:         `{"message":"Bad credentials"}`,
+			want:         "returned 401",
+			unauthorized: true,
+		},
+		{
+			name:   "graphql error",
+			status: http.StatusOK,
+			body:   `{"errors":[{"type":"RATE_LIMITED","message":"rate limit exceeded"}]}`,
+			want:   "GraphQL error (RATE_LIMITED)",
+		},
+		{
+			name:   "missing data",
+			status: http.StatusOK,
+			body:   `{"data":{}}`,
+			want:   "omitted repository data",
+		},
+		{
+			name:   "missing pagination cursor",
+			status: http.StatusOK,
+			body: `{"data":{"viewer":{"repositories":{
+  "nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":null}
+}}}}`,
+			want: "another page but no end cursor",
+		},
+		{
+			name:   "maintained repository missing URL",
+			status: http.StatusOK,
+			body: `{"data":{"viewer":{"repositories":{
+  "nodes":[{"nameWithOwner":"acme/broken","url":"","viewerPermission":"WRITE"}],
+  "pageInfo":{"hasNextPage":false,"endCursor":null}
+}}}}`,
+			want: "without a URL",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+			old := githubAPI
+			githubAPI = srv.URL
+			defer func() { githubAPI = old }()
+
+			_, err := fetchMaintainedRepos(context.Background(), "tok")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want containing %q", err, tt.want)
+			}
+			if got := isGitHubUnauthorized(err); got != tt.unauthorized {
+				t.Fatalf("isGitHubUnauthorized = %v, want %v", got, tt.unauthorized)
+			}
+		})
+	}
+}
+
+func TestFetchMaintainedReposRejectsRepeatedCursor(t *testing.T) {
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = io.WriteString(w, `{"data":{"viewer":{"repositories":{
+  "nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"same"}
+}}}}`)
+	}))
+	defer srv.Close()
+	old := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = old }()
+
+	_, err := fetchMaintainedRepos(context.Background(), "tok")
+	if err == nil || !strings.Contains(err.Error(), "repeated cursor") {
+		t.Fatalf("error = %v, want repeated cursor", err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want 2", requests)
 	}
 }
 

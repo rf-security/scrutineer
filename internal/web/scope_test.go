@@ -140,6 +140,84 @@ func TestViewScope_emptyScopeMatchesNothing(t *testing.T) {
 	}
 }
 
+// TestViewScope_repositoryAccessExplainsUnscannedRepos confirms the shared
+// repositories page distinguishes an authorized-but-unscanned GitHub repo from
+// repositories the current login is not authorized to see.
+func TestViewScope_repositoryAccessExplainsUnscannedRepos(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	scannedID := seedRepoWithFinding(t, s, "https://github.com/acme/scanned", "scanned", "visible finding")
+
+	scope := ViewScope{
+		RepoIDs:             map[uint]struct{}{scannedID: {}},
+		AuthorizedRepoCount: 2,
+		UnscannedRepositories: []ExternalRepository{{
+			Name: "acme/not-scanned",
+			URL:  "https://github.com/acme/not-scanned",
+		}},
+		InsufficientRepositories: []ExternalRepository{{
+			Name:   "acme/read-only",
+			URL:    "https://github.com/acme/read-only",
+			Access: "Read access",
+		}},
+		ReadOnly: true,
+	}
+	r := localReq("GET", "/")
+	r = r.WithContext(WithViewScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+
+	if w.Code != 200 {
+		t.Fatalf("status %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"GitHub authorizes this account for 2 public",
+		"Scrutineer has scanned 1; 1",
+		"acme/not-scanned",
+		"Not scanned",
+		"acme/read-only",
+		"Read access",
+		"below the required level",
+		"missing from every list",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("repository access explanation missing %q", want)
+		}
+	}
+}
+
+func TestViewScope_repositoryAccessExplainsEmptyAuthorization(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	r := localReq("GET", "/")
+	r = r.WithContext(WithViewScope(r.Context(), ViewScope{
+		RepoIDs: map[uint]struct{}{},
+		InsufficientRepositories: []ExternalRepository{{
+			Name:   "acme/triage-only",
+			URL:    "https://github.com/acme/triage-only",
+			Access: "Triage access",
+		}},
+		ReadOnly: true,
+	}))
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "GitHub did not report any public repositories") {
+		t.Errorf("empty authorization explanation missing")
+	}
+	if !strings.Contains(body, "No scanned repositories") {
+		t.Errorf("sharing-specific empty state missing")
+	}
+	if !strings.Contains(body, "acme/triage-only") || !strings.Contains(body, "Triage access") {
+		t.Errorf("insufficient-permission repository explanation missing")
+	}
+	if strings.Contains(body, "Add a git URL above") {
+		t.Errorf("local add-repository guidance leaked into sharing view")
+	}
+}
+
 // seedScannerFinding creates a repo with one scanner-skill (non-deep-dive)
 // finding, which is what the /findings "scanner" badge counts.
 func seedScannerFinding(t *testing.T, s *Server, url, name string) uint {

@@ -177,6 +177,9 @@ func TestRequireAuthGitHubFailureHandling(t *testing.T) {
 				if r.URL.Path != "/graphql" {
 					t.Errorf("path = %q, want /graphql", r.URL.Path)
 				}
+				if tt.githubCode == http.StatusServiceUnavailable {
+					w.Header().Set("Retry-After", "0")
+				}
 				w.WriteHeader(tt.githubCode)
 			}))
 			defer srv.Close()

@@ -35,9 +35,10 @@ type githubUser struct {
 // githubRepo is the slice of repository identity the portal needs to intersect
 // GitHub's answer with scrutineer's repositories.
 type githubRepo struct {
-	FullName string
-	HTMLURL  string
-	CloneURL string
+	FullName         string
+	HTMLURL          string
+	CloneURL         string
+	ViewerPermission string
 }
 
 type githubGraphQLRepo struct {
@@ -46,8 +47,12 @@ type githubGraphQLRepo struct {
 	ViewerPermission string `json:"viewerPermission"`
 }
 
-func (r githubGraphQLRepo) maintained() bool {
-	switch r.ViewerPermission {
+func (r githubRepo) maintained() bool {
+	return canSeeFindings(r.ViewerPermission)
+}
+
+func canSeeFindings(permission string) bool {
+	switch permission {
 	case "ADMIN", "MAINTAIN", "WRITE":
 		return true
 	default:
@@ -109,15 +114,16 @@ type githubGraphQLResponse struct {
 	} `json:"errors"`
 }
 
-// fetchMaintainedRepos returns every public repository the visitor owns,
-// collaborates on, or can access through organization membership with
-// write-or-better permission.
-func fetchMaintainedRepos(ctx context.Context, token string) ([]githubRepo, error) {
+// fetchRepositoryAccess returns every public repository GitHub reports for the
+// visitor's owner, collaborator, and organization memberships. The caller
+// still has to enforce viewerPermission: READ and TRIAGE repositories are
+// returned so the portal can explain why their findings remain hidden.
+func fetchRepositoryAccess(ctx context.Context, token string) ([]githubRepo, error) {
 	ctx, cancel := context.WithTimeout(ctx, githubTimeout)
 	defer cancel()
 
 	var (
-		maintained []githubRepo
+		repos      []githubRepo
 		after      *string
 		seenCursor = make(map[string]struct{})
 	)
@@ -140,19 +146,18 @@ func fetchMaintainedRepos(ctx context.Context, token string) ([]githubRepo, erro
 
 		connection := response.Data.Viewer.Repositories
 		for _, r := range connection.Nodes {
-			if r.maintained() {
-				if r.URL == "" {
-					return nil, fmt.Errorf("sharing: GitHub GraphQL returned a maintained repository without a URL")
-				}
-				maintained = append(maintained, githubRepo{
-					FullName: r.FullName,
-					HTMLURL:  r.URL,
-					CloneURL: strings.TrimSuffix(r.URL, "/") + ".git",
-				})
+			if r.URL == "" {
+				return nil, fmt.Errorf("sharing: GitHub GraphQL returned a repository without a URL")
 			}
+			repos = append(repos, githubRepo{
+				FullName:         r.FullName,
+				HTMLURL:          r.URL,
+				CloneURL:         strings.TrimSuffix(r.URL, "/") + ".git",
+				ViewerPermission: r.ViewerPermission,
+			})
 		}
 		if !connection.PageInfo.HasNextPage {
-			return maintained, nil
+			return repos, nil
 		}
 		if connection.PageInfo.EndCursor == nil || *connection.PageInfo.EndCursor == "" {
 			return nil, fmt.Errorf("sharing: GitHub GraphQL pagination has another page but no end cursor")
@@ -195,7 +200,10 @@ func githubGraphQL(ctx context.Context, token string, after *string) (*githubGra
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := http.DefaultClient.Do(req)
+	// GraphQL uses POST for queries, but this operation is read-only and the
+	// bytes.Reader gives the request a GetBody function, so transient failures
+	// can safely replay the exact payload.
+	resp, err := httpx.DoRetryIdempotentPost(req, httpx.RetryOptions{})
 	if err != nil {
 		return nil, err
 	}

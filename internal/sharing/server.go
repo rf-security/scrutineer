@@ -130,9 +130,9 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			s.redirectToLogin(w, r)
 			return
 		}
-		repos, err := fetchMaintainedRepos(r.Context(), sess.Token)
+		repos, err := fetchRepositoryAccess(r.Context(), sess.Token)
 		if err != nil {
-			s.log.Warn("fetch maintained repos failed", "login", sess.Login, "err", err)
+			s.log.Warn("fetch repository access failed", "login", sess.Login, "err", err)
 			if isGitHubUnauthorized(err) {
 				clearCookie(w, sessionCookie)
 				s.redirectToLogin(w, r)
@@ -148,7 +148,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), userKey{}, &user{Login: sess.Login, RepoIDs: scope.RepoIDs})
-		ctx = web.WithViewScope(ctx, web.ViewScope{RepoIDs: scope.RepoIDs, ReadOnly: true})
+		ctx = web.WithViewScope(ctx, scope)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

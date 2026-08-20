@@ -911,6 +911,12 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 		"Rows": rows, "Page": page, "Language": lang, "Sort": sort, "Languages": languages,
 		"Q": search,
 	}
+	if scope, ok := viewScopeFrom(r); ok {
+		data["AuthorizedRepoCount"] = scope.AuthorizedRepoCount
+		data["ScannedRepoCount"] = len(scope.RepoIDs)
+		data["UnscannedRepositories"] = scope.UnscannedRepositories
+		data["InsufficientRepositories"] = scope.InsufficientRepositories
+	}
 	if isHX(r) {
 		s.render(w, r, "repo_list.html", data)
 	} else {

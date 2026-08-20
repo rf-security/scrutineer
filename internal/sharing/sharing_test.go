@@ -97,7 +97,7 @@ func TestSessionTamperRejected(t *testing.T) {
 	}
 }
 
-func TestFetchMaintainedRepos(t *testing.T) {
+func TestFetchRepositoryAccess(t *testing.T) {
 	var requests int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
@@ -180,33 +180,33 @@ func TestFetchMaintainedRepos(t *testing.T) {
 	githubAPI = srv.URL
 	defer func() { githubAPI = old }()
 
-	repos, err := fetchMaintainedRepos(context.Background(), "tok")
+	repos, err := fetchRepositoryAccess(context.Background(), "tok")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := make(map[string]bool, len(repos))
+	got := make(map[string]githubRepo, len(repos))
 	for _, r := range repos {
-		got[r.FullName] = true
+		got[r.FullName] = r
 	}
 	for _, want := range []string{"me/owned", "acme/maintain", "acme/write", "outside/collaborator"} {
-		if !got[want] {
-			t.Errorf("expected %q in maintained set: %+v", want, repos)
+		if repo, ok := got[want]; !ok || !repo.maintained() {
+			t.Errorf("expected %q in findings-authorized set: %+v", want, repos)
 		}
 	}
-	for _, unwanted := range []string{"acme/readonly", "acme/triage", "acme/none"} {
-		if got[unwanted] {
-			t.Errorf("non-maintained repo %q leaked into maintained set", unwanted)
+	for _, insufficient := range []string{"acme/readonly", "acme/triage", "acme/none"} {
+		if repo, ok := got[insufficient]; !ok || repo.maintained() {
+			t.Errorf("expected %q in insufficient-permission set: %+v", insufficient, repos)
 		}
 	}
-	if len(repos) != 4 {
-		t.Fatalf("expected 4 maintained repos, got %d: %+v", len(repos), repos)
+	if len(repos) != 7 {
+		t.Fatalf("expected all 7 accessible repos, got %d: %+v", len(repos), repos)
 	}
 	if requests != 2 {
 		t.Fatalf("requests = %d, want 2", requests)
 	}
 }
 
-func TestFetchMaintainedReposRetriesTransientGraphQLResponse(t *testing.T) {
+func TestFetchRepositoryAccessRetriesTransientGraphQLResponse(t *testing.T) {
 	var requests int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests++
@@ -224,7 +224,7 @@ func TestFetchMaintainedReposRetriesTransientGraphQLResponse(t *testing.T) {
 	githubAPI = srv.URL
 	defer func() { githubAPI = old }()
 
-	repos, err := fetchMaintainedRepos(context.Background(), "tok")
+	repos, err := fetchRepositoryAccess(context.Background(), "tok")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestFetchMaintainedReposRetriesTransientGraphQLResponse(t *testing.T) {
 	}
 }
 
-func TestFetchMaintainedReposGraphQLErrors(t *testing.T) {
+func TestFetchRepositoryAccessGraphQLErrors(t *testing.T) {
 	tests := []struct {
 		name         string
 		status       int
@@ -293,7 +293,7 @@ func TestFetchMaintainedReposGraphQLErrors(t *testing.T) {
 			githubAPI = srv.URL
 			defer func() { githubAPI = old }()
 
-			_, err := fetchMaintainedRepos(context.Background(), "tok")
+			_, err := fetchRepositoryAccess(context.Background(), "tok")
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("error = %v, want containing %q", err, tt.want)
 			}
@@ -304,7 +304,7 @@ func TestFetchMaintainedReposGraphQLErrors(t *testing.T) {
 	}
 }
 
-func TestFetchMaintainedReposRejectsRepeatedCursor(t *testing.T) {
+func TestFetchRepositoryAccessRejectsRepeatedCursor(t *testing.T) {
 	var requests int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests++
@@ -317,7 +317,7 @@ func TestFetchMaintainedReposRejectsRepeatedCursor(t *testing.T) {
 	githubAPI = srv.URL
 	defer func() { githubAPI = old }()
 
-	_, err := fetchMaintainedRepos(context.Background(), "tok")
+	_, err := fetchRepositoryAccess(context.Background(), "tok")
 	if err == nil || !strings.Contains(err.Error(), "repeated cursor") {
 		t.Fatalf("error = %v, want repeated cursor", err)
 	}
@@ -440,8 +440,9 @@ func TestResolveScopeIntersectsByURL(t *testing.T) {
 	// GitHub says the visitor maintains "owned" (different casing / .git) and a
 	// repo scrutineer has never seen.
 	gh := []githubRepo{
-		{HTMLURL: "https://github.com/O/Owned", CloneURL: "https://github.com/o/owned.git"},
-		{HTMLURL: "https://github.com/o/unknown", CloneURL: "https://github.com/o/unknown.git"},
+		{FullName: "o/owned", HTMLURL: "https://github.com/O/Owned", CloneURL: "https://github.com/o/owned.git", ViewerPermission: "WRITE"},
+		{FullName: "o/unknown", HTMLURL: "https://github.com/o/unknown", CloneURL: "https://github.com/o/unknown.git", ViewerPermission: "MAINTAIN"},
+		{FullName: "o/other", HTMLURL: "https://github.com/o/other", CloneURL: "https://github.com/o/other.git", ViewerPermission: "READ"},
 	}
 	scope, err := resolveScope(context.Background(), gdb, gh)
 	if err != nil {
@@ -458,5 +459,22 @@ func TestResolveScopeIntersectsByURL(t *testing.T) {
 	}
 	if len(scope.RepoIDs) != 1 {
 		t.Fatalf("expected exactly one repo in scope, got %d", len(scope.RepoIDs))
+	}
+	if scope.AuthorizedRepoCount != 2 {
+		t.Fatalf("authorized repo count = %d, want 2", scope.AuthorizedRepoCount)
+	}
+	if len(scope.UnscannedRepositories) != 1 {
+		t.Fatalf("unscanned repositories = %+v, want one", scope.UnscannedRepositories)
+	}
+	unscanned := scope.UnscannedRepositories[0]
+	if unscanned.Name != "o/unknown" || unscanned.URL != "https://github.com/o/unknown" {
+		t.Errorf("unscanned repository = %+v, want o/unknown", unscanned)
+	}
+	if len(scope.InsufficientRepositories) != 1 {
+		t.Fatalf("insufficient repositories = %+v, want one", scope.InsufficientRepositories)
+	}
+	insufficient := scope.InsufficientRepositories[0]
+	if insufficient.Name != "o/other" || insufficient.Access != "Read access" {
+		t.Errorf("insufficient repository = %+v, want o/other with read access", insufficient)
 	}
 }

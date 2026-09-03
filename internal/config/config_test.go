@@ -70,6 +70,13 @@ scan_timeout: 30m
 max_turns: 200
 fork_org: fork-central
 metadata_dir: .ossprey/
+sharing:
+  access_grants:
+    - github_user_id: 583231
+      repositories:
+        - https://github.com/acme/widget
+      reason: External reviewer
+      expires_at: 2030-01-02T03:04:05Z
 `)
 	c, err := Load(path)
 	if err != nil {
@@ -110,6 +117,16 @@ metadata_dir: .ossprey/
 	}
 	if c.MetadataDir != ".ossprey/" {
 		t.Errorf("metadata_dir=%q, want .ossprey/", c.MetadataDir)
+	}
+	if len(c.Sharing.AccessGrants) != 1 {
+		t.Fatalf("sharing access grants: %+v", c.Sharing.AccessGrants)
+	}
+	grant := c.Sharing.AccessGrants[0]
+	if grant.GitHubUserID != 583231 || len(grant.Repositories) != 1 || grant.Repositories[0] != "https://github.com/acme/widget" {
+		t.Errorf("sharing access grant: %+v", grant)
+	}
+	if grant.Reason != "External reviewer" || grant.ExpiresAt == nil || !grant.ExpiresAt.Equal(time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Errorf("sharing access grant metadata: %+v", grant)
 	}
 }
 

@@ -146,6 +146,27 @@ type Config struct {
 	// hash match. Required when FederationSalt is set: startup refuses a
 	// salt without a contact.
 	FederationContact string `yaml:"federation_contact"`
+	// Sharing configures the separate external maintainer portal. AccessGrants
+	// are explicit, read-only additions to the repositories GitHub reports with
+	// write, maintain, or admin permission.
+	Sharing SharingConfig `yaml:"sharing"`
+}
+
+// SharingConfig holds non-secret settings for the sharing portal. OAuth and
+// session secrets remain environment-only in internal/sharing.
+type SharingConfig struct {
+	AccessGrants []SharingAccessGrant `yaml:"access_grants"`
+}
+
+// SharingAccessGrant gives one immutable GitHub user identity read access to
+// findings for an exact set of repositories. GitHubUserID is the numeric ID
+// returned by GET /user; a login is deliberately not accepted because it can
+// be renamed or reused. Repository entries are canonical https GitHub URLs.
+type SharingAccessGrant struct {
+	GitHubUserID int64      `yaml:"github_user_id"`
+	Repositories []string   `yaml:"repositories"`
+	Reason       string     `yaml:"reason"`
+	ExpiresAt    *time.Time `yaml:"expires_at"`
 }
 
 // ParseScanTimeout validates and parses a scan_timeout string. Empty

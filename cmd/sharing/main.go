@@ -16,6 +16,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -77,6 +78,13 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	grants, err := sharing.CompileStaticGrants(context.Background(), gdb, cfg.Sharing.AccessGrants)
+	if err != nil {
+		return err
+	}
+	log.Info("sharing access grants loaded",
+		"users", grants.UserCount(),
+		"repository_grants", grants.RepositoryGrantCount())
 
 	// The portal never runs scans. Build an inert queue against the shared DB
 	// (needed only to construct the web.Server) but never start it, and a
@@ -91,7 +99,7 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	portal := sharing.New(shareCfg, gdb, log, srv.Handler())
+	portal := sharing.New(shareCfg, gdb, log, srv.Handler(), grants)
 	httpSrv := &http.Server{
 		Addr:              shareCfg.Addr,
 		Handler:           portal.Handler(),

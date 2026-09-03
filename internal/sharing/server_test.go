@@ -23,7 +23,7 @@ func (s *sentinel) ServeHTTP(http.ResponseWriter, *http.Request) { s.hit = true 
 func newServer(t *testing.T) (*Server, *sentinel) {
 	t.Helper()
 	inner := &sentinel{}
-	s := New(testConfig(), openTestDB(t), slog.New(slog.NewTextHandler(io.Discard, nil)), inner)
+	s := New(testConfig(), openTestDB(t), slog.New(slog.NewTextHandler(io.Discard, nil)), inner, EmptyGrantSource())
 	return s, inner
 }
 
@@ -189,9 +189,10 @@ func TestRequireAuthGitHubFailureHandling(t *testing.T) {
 
 			s, inner := newServer(t)
 			sealed, err := s.cfg.seal(session{
-				Login:     "octocat",
-				Token:     "tok",
-				ExpiresAt: time.Now().Add(time.Hour).Unix(),
+				GitHubUserID: 1,
+				Login:        "octocat",
+				Token:        "tok",
+				ExpiresAt:    time.Now().Add(time.Hour).Unix(),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -220,5 +221,55 @@ func TestRequireAuthGitHubFailureHandling(t *testing.T) {
 				t.Fatalf("session cleared = %v, want %v", cleared, tt.wantCleared)
 			}
 		})
+	}
+}
+
+func TestRequireAuthAppliesGrantForExactNumericUser(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":{"viewer":{"repositories":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`)
+	}))
+	defer srv.Close()
+	old := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = old }()
+
+	gdb := openTestDB(t)
+	repo := db.Repository{URL: "https://github.com/acme/manual", Name: "manual"}
+	if err := gdb.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	grants := &StaticGrantSource{
+		byUser: map[int64]grantEntry{
+			583231: {RepositoryIDs: map[uint]struct{}{repo.ID: {}}},
+		},
+		now: time.Now,
+	}
+	inner := &sentinel{}
+	s := New(testConfig(), gdb, slog.New(slog.NewTextHandler(io.Discard, nil)), inner, grants)
+
+	call := func(userID int64) int {
+		inner.hit = false
+		sealed, err := s.cfg.seal(session{
+			GitHubUserID: userID,
+			Login:        "display-name-is-not-authority",
+			Token:        "tok",
+			ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodGet, "/repositories/1", nil)
+		r.SetPathValue("id", strconv.FormatUint(uint64(repo.ID), 10))
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sealed})
+		w := httptest.NewRecorder()
+		s.requireAuth(s.authorize(kindRepo, inner)).ServeHTTP(w, r)
+		return w.Code
+	}
+
+	if code := call(583231); code == http.StatusNotFound || !inner.hit {
+		t.Fatalf("configured numeric user was denied: status %d, forwarded %v", code, inner.hit)
+	}
+	if code := call(583232); code != http.StatusNotFound || inner.hit {
+		t.Fatalf("different numeric user inherited grant: status %d, forwarded %v", code, inner.hit)
 	}
 }

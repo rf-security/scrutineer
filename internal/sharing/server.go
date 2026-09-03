@@ -22,16 +22,20 @@ const localHost = "127.0.0.1"
 // Server is the maintainer portal: a thin authenticating, authorizing proxy in
 // front of the reused scrutineer web handler.
 type Server struct {
-	cfg   *Config
-	db    *gorm.DB
-	log   *slog.Logger
-	inner http.Handler // the reused web.Server handler
+	cfg    *Config
+	db     *gorm.DB
+	log    *slog.Logger
+	inner  http.Handler // the reused web.Server handler
+	grants GrantSource
 }
 
 // New builds a portal Server. inner is the handler returned by
 // (*web.Server).Handler(); the portal forwards its whitelisted routes to it.
-func New(cfg *Config, gdb *gorm.DB, log *slog.Logger, inner http.Handler) *Server {
-	return &Server{cfg: cfg, db: gdb, log: log, inner: inner}
+func New(cfg *Config, gdb *gorm.DB, log *slog.Logger, inner http.Handler, grants GrantSource) *Server {
+	if grants == nil {
+		grants = EmptyGrantSource()
+	}
+	return &Server{cfg: cfg, db: gdb, log: log, inner: inner, grants: grants}
 }
 
 // resourceKind classifies a whitelisted route so the authorization middleware
@@ -141,13 +145,23 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			http.Error(w, "GitHub is temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		scope, err := resolveScope(r.Context(), s.db, repos)
+		grantedRepoIDs, err := s.grants.RepositoryIDs(r.Context(), sess.GitHubUserID)
+		if err != nil {
+			s.log.Error("resolve configured grants failed", "login", sess.Login, "github_user_id", sess.GitHubUserID, "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		scope, err := resolveScope(r.Context(), s.db, repos, grantedRepoIDs)
 		if err != nil {
 			s.log.Error("resolve scope failed", "login", sess.Login, "err", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		ctx := context.WithValue(r.Context(), userKey{}, &user{Login: sess.Login, RepoIDs: scope.RepoIDs})
+		ctx := context.WithValue(r.Context(), userKey{}, &user{
+			GitHubUserID: sess.GitHubUserID,
+			Login:        sess.Login,
+			RepoIDs:      scope.RepoIDs,
+		})
 		ctx = web.WithViewScope(ctx, scope)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

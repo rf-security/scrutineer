@@ -172,7 +172,7 @@ func TestViewScope_repositoryAccessExplainsUnscannedRepos(t *testing.T) {
 	}
 	body := w.Body.String()
 	for _, want := range []string{
-		"GitHub authorizes this account for 2 public",
+		"This account is authorized for 2 public",
 		"Scrutineer has scanned 1; 1",
 		"acme/not-scanned",
 		"Not scanned",
@@ -204,7 +204,7 @@ func TestViewScope_repositoryAccessExplainsEmptyAuthorization(t *testing.T) {
 	s.Handler().ServeHTTP(w, r)
 
 	body := w.Body.String()
-	if !strings.Contains(body, "GitHub did not report any public repositories") {
+	if !strings.Contains(body, "This account is not authorized for any scanned repositories") {
 		t.Errorf("empty authorization explanation missing")
 	}
 	if !strings.Contains(body, "No scanned repositories") {

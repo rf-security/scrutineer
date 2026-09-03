@@ -176,6 +176,20 @@ type SharingConfig struct {
 	// block, and unset fields inherit the root database config (see
 	// Config.SharingDatabase), so setting only `dsn` reuses the root driver.
 	Database DatabaseConfig `yaml:"database"`
+	// AccessGrants are explicit, read-only additions to the repositories GitHub
+	// reports with write, maintain, or admin permission.
+	AccessGrants []SharingAccessGrant `yaml:"access_grants"`
+}
+
+// SharingAccessGrant gives one immutable GitHub user identity read access to
+// findings for an exact set of repositories. GitHubUserID is the numeric ID
+// returned by GET /user; a login is deliberately not accepted because it can
+// be renamed or reused. Repository entries are canonical https GitHub URLs.
+type SharingAccessGrant struct {
+	GitHubUserID int64      `yaml:"github_user_id"`
+	Repositories []string   `yaml:"repositories"`
+	Reason       string     `yaml:"reason"`
+	ExpiresAt    *time.Time `yaml:"expires_at"`
 }
 
 // SharingDatabase returns the database configuration the sharing portal

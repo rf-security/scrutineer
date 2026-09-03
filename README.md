@@ -401,6 +401,7 @@ See [SECURITY.md](SECURITY.md) for the reporting policy and [threatmodel.md](thr
 - [docs/backup.md](docs/backup.md) -- backing up and restoring the database (built-in `scrutineer backup`/`restore`, `sqlite3`, Litestream)
 - [docs/development.md](docs/development.md) -- project layout, regenerating embedded data, running tests
 - [docs/encrypted-sharing.md](docs/encrypted-sharing.md) -- encrypted findings sharing between contributors (age + SSH keys, team keyring management)
+- [docs/sharing.md](docs/sharing.md) -- external maintainer portal, GitHub authorization, and explicit read-only repository grants
 - [docs/interchange.md](docs/interchange.md) -- federation interchange format: in-toto record envelope, salted finding hashes, the claim-check endpoint
 - [docs/codex.md](docs/codex.md) -- the codex backend: what differs from claude, sandbox interaction, adding another harness
 - [docs/opencode.md](docs/opencode.md) -- the opencode backend: provider-agnostic credentials and egress

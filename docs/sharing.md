@@ -44,10 +44,12 @@ An authenticated user can inspect their ID with `gh api user --jq .id`.
 is running.
 
 Repository entries must be exact HTTPS `github.com/owner/repository` URLs and
-must already identify one repository in Scrutineer's database. Wildcards,
-organization-wide grants, query strings, and non-GitHub repositories are not
-accepted. Duplicate users or repositories, expired grants, malformed URLs,
-and missing or ambiguous repositories stop the sharing process at startup.
+must already identify one repository in Scrutineer's database. They are matched
+only against the repository's primary `url`; metadata-derived `html_url` values
+are ignored for authorization. Wildcards, organization-wide grants, query
+strings, and non-GitHub repositories are not accepted. Duplicate users or
+repositories, expired grants, malformed URLs, and missing or ambiguous primary
+URLs stop the sharing process at startup.
 
 Configured grants are additive: they do not remove GitHub-derived access and
 they never enable writes. The configuration is read once at startup, so adding

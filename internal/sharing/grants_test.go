@@ -20,6 +20,17 @@ func TestCompileStaticGrantsResolvesExactRepositoryAndIsolatesUsers(t *testing.T
 	if err := gdb.Create(&repo).Error; err != nil {
 		t.Fatal(err)
 	}
+	// A historical row may acquire the current repository's browser URL after
+	// a transfer. HTMLURL is display metadata and must neither create an
+	// ambiguity nor receive the grant.
+	historical := db.Repository{
+		URL:     "https://github.com/acme-archive/widget",
+		HTMLURL: "https://github.com/acme/widget",
+		Name:    "widget",
+	}
+	if err := gdb.Create(&historical).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	source, err := CompileStaticGrants(context.Background(), gdb, []appconfig.SharingAccessGrant{{
 		GitHubUserID: 583231,
@@ -39,6 +50,9 @@ func TestCompileStaticGrantsResolvesExactRepositoryAndIsolatesUsers(t *testing.T
 	}
 	if _, ok := ids[repo.ID]; !ok || len(ids) != 1 {
 		t.Fatalf("granted IDs = %+v, want only %d", ids, repo.ID)
+	}
+	if _, ok := ids[historical.ID]; ok {
+		t.Fatalf("grant matched historical row through html_url: %+v", ids)
 	}
 	delete(ids, repo.ID)
 	idsAgain, _ := source.RepositoryIDs(context.Background(), 583231)
@@ -140,5 +154,43 @@ func TestResolveScopeUnionsManualGrantsAndHidesGrantedReadRepo(t *testing.T) {
 	}
 	if len(scope.InsufficientRepositories) != 0 {
 		t.Fatalf("manually granted READ repository shown as insufficient: %+v", scope.InsufficientRepositories)
+	}
+}
+
+func TestResolveScopeMatchesOnlyPrimaryRepositoryURL(t *testing.T) {
+	gdb := openTestDB(t)
+	canonical := db.Repository{
+		URL:     "https://github.com/rust-lang/rust-clippy",
+		HTMLURL: "https://github.com/rust-lang/rust-clippy",
+		Name:    "rust-clippy",
+	}
+	historical := db.Repository{
+		URL:     "https://github.com/rust-lang-nursery/rust-clippy",
+		HTMLURL: "https://github.com/rust-lang/rust-clippy",
+		Name:    "rust-clippy",
+	}
+	for _, repo := range []*db.Repository{&canonical, &historical} {
+		if err := gdb.Create(repo).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	scope, err := resolveScope(context.Background(), gdb, []githubRepo{{
+		FullName:         "rust-lang/rust-clippy",
+		HTMLURL:          "https://github.com/rust-lang/rust-clippy",
+		CloneURL:         "https://github.com/rust-lang/rust-clippy.git",
+		ViewerPermission: "WRITE",
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := scope.RepoIDs[canonical.ID]; !ok {
+		t.Fatalf("canonical primary URL was not matched: %+v", scope.RepoIDs)
+	}
+	if _, ok := scope.RepoIDs[historical.ID]; ok {
+		t.Fatalf("historical row matched through html_url: %+v", scope.RepoIDs)
+	}
+	if len(scope.RepoIDs) != 1 {
+		t.Fatalf("scope IDs = %+v, want only %d", scope.RepoIDs, canonical.ID)
 	}
 }

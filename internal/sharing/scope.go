@@ -12,7 +12,7 @@ import (
 
 // resolveScope unions the visitor's GitHub-maintained repositories with exact
 // operator-configured repository IDs and returns a read-only view scope. Live
-// GitHub repositories are matched by host-qualified clone/HTML URL
+// GitHub repositories are matched to Scrutineer's primary repository URL
 // (github.com/owner/repo), avoiding cross-forge collisions. Configured IDs were
 // resolved and validated once at startup.
 func resolveScope(ctx context.Context, gdb *gorm.DB, repos []githubRepo, grantedRepoIDs map[uint]struct{}) (web.ViewScope, error) {
@@ -48,13 +48,14 @@ func resolveScope(ctx context.Context, gdb *gorm.DB, repos []githubRepo, granted
 		return scope, nil
 	}
 
-	// One pass over scrutineer's repositories; keep those whose URL or HTMLURL
-	// matches a maintained GitHub repo. The set of scrutineer repos is small
+	// One pass over scrutineer's repositories; keep those whose primary URL
+	// matches a maintained GitHub repo. HTMLURL is mutable display metadata and
+	// must not participate in authorization. The set of scrutineer repos is small
 	// (low thousands), so a single scan is cheaper than N per-repo lookups.
 	var rows []db.Repository
 	if err := gdb.WithContext(ctx).
 		Model(&db.Repository{}).
-		Select("id", "url", "html_url").
+		Select("id", "url").
 		Find(&rows).Error; err != nil {
 		return scope, err
 	}
@@ -65,14 +66,12 @@ func resolveScope(ctx context.Context, gdb *gorm.DB, repos []githubRepo, granted
 	for id := range grantedRepoIDs {
 		manualOnly[id] = struct{}{}
 	}
-	repoIDsByURL := make(map[string]uint, len(rows)*2)
+	repoIDsByURL := make(map[string]uint, len(rows))
 	for _, row := range rows {
-		for _, raw := range []string{row.URL, row.HTMLURL} {
-			if key := normURL(raw); key != "" {
-				repoIDsByURL[key] = row.ID
-			}
+		if key := normURL(row.URL); key != "" {
+			repoIDsByURL[key] = row.ID
 		}
-		indexes := matchingIndexes(want, row.URL, row.HTMLURL)
+		indexes := matchingIndexes(want, row.URL)
 		if len(indexes) > 0 {
 			scope.RepoIDs[row.ID] = struct{}{}
 			delete(manualOnly, row.ID)

@@ -54,22 +54,20 @@ func CompileStaticGrants(ctx context.Context, gdb *gorm.DB, configured []appconf
 	var rows []db.Repository
 	if err := gdb.WithContext(ctx).
 		Model(&db.Repository{}).
-		Select("id", "url", "html_url").
+		Select("id", "url").
 		Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("sharing: load repositories for access grants: %w", err)
 	}
-	byURL := make(map[string]map[uint]struct{}, len(rows)*2)
+	byURL := make(map[string]map[uint]struct{}, len(rows))
 	for _, row := range rows {
-		for _, raw := range []string{row.URL, row.HTMLURL} {
-			key := normURL(raw)
-			if !strings.HasPrefix(key, "github.com/") {
-				continue
-			}
-			if byURL[key] == nil {
-				byURL[key] = make(map[uint]struct{})
-			}
-			byURL[key][row.ID] = struct{}{}
+		key := normURL(row.URL)
+		if !strings.HasPrefix(key, "github.com/") {
+			continue
 		}
+		if byURL[key] == nil {
+			byURL[key] = make(map[uint]struct{})
+		}
+		byURL[key][row.ID] = struct{}{}
 	}
 
 	seenUsers := make(map[int64]struct{}, len(configured))

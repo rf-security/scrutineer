@@ -227,6 +227,15 @@ type Config struct {
 	// before this instance reports a finding. Requires FederationSalt:
 	// without the shared salt the hash sent to a peer cannot match theirs.
 	FederationPeers []string `yaml:"federation_peers"`
+	// AllowRemote permits remote (non-localhost) access to the web server. It
+	// defaults to false, which keeps the localhost-only host-header check (the
+	// DNS-rebinding protection in internal/web): requests are served only when
+	// the Host header is 127.0.0.1, localhost, or ::1 (the historical
+	// behaviour). Set it to true to also serve requests for any other Host —
+	// needed when scrutineer runs behind a reverse proxy or is reached over a
+	// LAN. Only enable it when a trusted front end already restricts who can
+	// connect, since it removes the DNS-rebinding protection.
+	AllowRemote bool `yaml:"allow_remote"`
 }
 
 // Codex groups settings that apply only to the Codex backend.

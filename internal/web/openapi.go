@@ -30,7 +30,7 @@ import (
 // discloses anything a reader could not fetch from GitHub.
 func (s *Server) openAPISpecHandler() http.Handler {
 	spec := http.HandlerFunc(s.openAPISpec)
-	fromHost := securityHeaders(spec)
+	fromHost := securityHeaders(s.AllowRemote, spec)
 	fromContainer := s.apiAuth(spec)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if localHost(r.Host) {

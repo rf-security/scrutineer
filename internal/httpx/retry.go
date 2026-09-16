@@ -32,6 +32,30 @@ func DoRetry(req *http.Request, opts RetryOptions) (*http.Response, error) {
 	if req.Method != http.MethodGet {
 		return nil, fmt.Errorf("retry helper only supports GET, got %s", req.Method)
 	}
+	return doRetry(req, opts)
+}
+
+// DoRetryIdempotentPost performs a semantically idempotent POST with the same
+// retry policy as DoRetry. The request body must be replayable: callers should
+// construct the request with bytes.Buffer, bytes.Reader, or strings.Reader so
+// http.NewRequest populates GetBody. Calling this function asserts that
+// replaying the POST is safe for the application protocol.
+func DoRetryIdempotentPost(req *http.Request, opts RetryOptions) (*http.Response, error) {
+	if req.Method != http.MethodPost {
+		return nil, fmt.Errorf("idempotent POST retry helper only supports POST, got %s", req.Method)
+	}
+	if req.Body != nil && req.GetBody == nil {
+		return nil, fmt.Errorf("idempotent POST retry helper requires a replayable request body")
+	}
+	return doRetry(req, opts)
+}
+
+func doRetry(req *http.Request, opts RetryOptions) (*http.Response, error) {
+	if req.Body != nil && req.GetBody != nil {
+		// Each attempt uses a fresh body below, so the original will not be sent
+		// (and therefore will not be closed by http.Client.Do).
+		defer func() { _ = req.Body.Close() }()
+	}
 	attempts := defaultedAttempts(opts.Attempts)
 	baseDelay := defaultedDuration(opts.BaseDelay, defaultBaseDelay)
 	maxDelay := defaultedDuration(opts.MaxDelay, defaultMaxDelay)
@@ -48,7 +72,15 @@ func DoRetry(req *http.Request, opts RetryOptions) (*http.Response, error) {
 			}
 			return nil, err
 		}
-		resp, err := http.DefaultClient.Do(req.Clone(req.Context()))
+		attemptReq := req.Clone(req.Context())
+		if req.Body != nil && req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, fmt.Errorf("recreate request body: %w", err)
+			}
+			attemptReq.Body = body
+		}
+		resp, err := http.DefaultClient.Do(attemptReq)
 		if err == nil && !retryableStatus(resp.StatusCode) {
 			return resp, nil
 		}

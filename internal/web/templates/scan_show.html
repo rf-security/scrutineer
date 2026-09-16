@@ -14,8 +14,8 @@
   </h2>
   {{if and (eq .Kind "skill") .SkillID}}
     <div class="flex items-center gap-2">
-      {{if .HasExportableReport}}
-      <a href="/scans/{{.ID}}/report.md" class="btn-outline" download>
+      {{if $.CanExportReport}}
+      <a href="/scans/{{.ID}}/report.md" class="btn-outline" download="{{scanReportFilename .}}">
         <i data-lucide="download"></i> Export as markdown
       </a>
       {{end}}
@@ -36,12 +36,19 @@
       </form>
       {{end}}
     </div>
-  {{else if .HasExportableReport}}
-    <a href="/scans/{{.ID}}/report.md" class="btn-outline" download>
+  {{else if $.CanExportReport}}
+    <a href="/scans/{{.ID}}/report.md" class="btn-outline" download="{{scanReportFilename .}}">
       <i data-lucide="download"></i> Export as markdown
     </a>
   {{end}}
 </div>
+
+{{with .VerificationFeedback}}
+<section class="border-b py-4 mb-4">
+  <h3 class="text-sm font-medium mb-2">Verification feedback</h3>
+  <pre class="text-sm whitespace-pre-wrap break-words font-sans">{{.}}</pre>
+</section>
+{{end}}
 
 <dl class="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-6 text-sm">
   <div>
@@ -167,6 +174,17 @@
   <div class="alert mb-6">
     <i data-lucide="triangle-alert"></i>
     <section>The deep-dive reported refused or skipped analysis. Review the refusal audit before treating coverage as complete.</section>
+  </div>
+{{end}}
+
+{{with $.DisclosureReviewID}}
+  <div class="alert mb-6">
+    <i data-lucide="circle-check"></i>
+    <section>
+      <strong>Disclosure draft generated</strong>
+      <p>The saved draft is ready for analyst review and editing.</p>
+      <a href="/findings/{{.}}#disclosure" class="btn-sm mt-1">Review disclosure</a>
+    </section>
   </div>
 {{end}}
 

@@ -6,6 +6,8 @@ import (
 	"path"
 	"slices"
 	"strings"
+
+	"scrutineer/internal/findingnorm"
 )
 
 // FindingHash is the salted federation identifier for one finding:
@@ -14,9 +16,10 @@ import (
 // sharing the salt derive the same hash for the same vulnerability
 // without exchanging finding bodies; without the salt the hash reveals
 // nothing enumerable. The canonicalisation here is a wire contract
-// shared across instances, so it is deliberately self-contained instead
-// of reusing findingnorm or the fingerprint helpers: an internal
-// normalisation tweak must never silently change every published hash.
+// shared across instances, so its transformations remain defined here
+// instead of reusing a higher-level location normaliser: an internal tweak
+// must never silently change every published hash. Only the positional
+// suffix grammar is shared so location producers agree on its syntax.
 func FindingHash(salt, repoURL, subPath, location, cwe string) string {
 	h := sha256.Sum256([]byte(strings.Join([]string{
 		salt,
@@ -60,7 +63,7 @@ func canonicalLocation(subPath, location string) string {
 	loc := strings.TrimSpace(strings.Split(location, "\n")[0])
 	for {
 		i := strings.LastIndexByte(loc, ':')
-		if i < 0 || !positionalSuffix(loc[i+1:]) {
+		if i < 0 || !findingnorm.IsPositionalSuffix(loc[i+1:]) {
 			break
 		}
 		loc = loc[:i]
@@ -81,26 +84,4 @@ func cleanPath(p string) string {
 		return ""
 	}
 	return path.Clean(p)
-}
-
-// positionalSuffix reports whether s is a line ("42") or range ("10-20")
-// location suffix.
-func positionalSuffix(s string) bool {
-	start, end, isRange := strings.Cut(s, "-")
-	if isRange {
-		return allDigits(start) && allDigits(end)
-	}
-	return allDigits(start)
-}
-
-func allDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
 }

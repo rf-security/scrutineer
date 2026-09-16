@@ -2,13 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "verify report",
   "type": "object",
-  "required": ["status"],
+  "required": ["status", "attack_tree", "severity_prerequisites", "attempts", "criteria"],
   "additionalProperties": false,
   "properties": {
     "status": {
       "type": "string",
-      "enum": ["confirmed", "fixed", "inconclusive", "deferred"],
-      "description": "confirmed = the finding still reproduces. fixed = the original reproduction no longer triggers (upstream fix applied between original scan and this run). inconclusive = could not run the reproduction; explain why in notes. deferred = the reproduction was not run because preflight classified it EXTERNAL-REACH; a human must run it in an environment with a callback listener."
+      "enum": ["confirmed", "fixed", "inconclusive", "deferred", "not_attempted"],
+      "description": "confirmed = all three attempts reproduce and all criteria pass; fixed = all three attempts reach current code without reproducing; inconclusive = execution leaves conflicting evidence; deferred = external-reach preflight prevents execution; not_attempted = setup never reaches the target."
     },
     "preflight": {
       "type": "object",
@@ -17,32 +17,491 @@
         "classification": {
           "type": "string",
           "enum": ["local-safe", "external-reach"],
-          "description": "local-safe = trigger uses only stdin/file input or connects only to loopback / a server the reproduction itself starts on loopback, and writes only under the workspace or OS temp. external-reach = resolves or connects to any other host, reads a credential file or credential env var, or writes outside the workspace and temp."
+          "description": "local-safe uses only local input, loopback and workspace/temp writes; external-reach contacts another host, reads credentials or writes outside those locations."
         },
         "justification": {
           "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
           "description": "The exact lines from the reproduction that decided the classification, quoted verbatim."
         }
       },
       "required": ["classification", "justification"]
     },
+    "attack_tree": {
+      "$ref": "#/$defs/attackTree"
+    },
+    "severity_prerequisites": {
+      "$ref": "#/$defs/severityPrerequisites"
+    },
+    "attempts": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/attempt" }
+    },
+    "criteria": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "poc_well_formed",
+        "reproduces_three_of_three",
+        "claimed_failure_class",
+        "public_interface_to_first_party_sink",
+        "deterministic",
+        "control_bypass"
+      ],
+      "properties": {
+        "poc_well_formed": { "$ref": "#/$defs/criterion" },
+        "reproduces_three_of_three": { "$ref": "#/$defs/criterion" },
+        "claimed_failure_class": { "$ref": "#/$defs/criterion" },
+        "public_interface_to_first_party_sink": { "$ref": "#/$defs/criterion" },
+        "deterministic": { "$ref": "#/$defs/criterion" },
+        "control_bypass": { "$ref": "#/$defs/controlBypass" }
+      }
+    },
     "reproducer": {
       "type": "string",
-      "description": "The exact reproduction you ran, verbatim: the full script, command line, or input you executed against ./src — not a description of it. This is what makes the evidence interpretable; without it the output below is meaningless. Include the language/runner so the analyst can re-run it (e.g. the .rb/.py file contents, or the shell commands)."
+      "description": "The exact reproduction run against ./src: script, commands, and crafted input, verbatim."
     },
     "evidence": {
       "type": "string",
-      "description": "The output produced by running the reproducer above: stdout, stderr, exit code, failing assertion, diff of behaviour. Paste the relevant excerpts, not a summary."
+      "description": "Relevant stdout, stderr, exit codes, traces, and observed behavior across the attempts."
     },
     "notes": {
-      "type": "string",
-      "description": "Short prose explaining what changed since the original scan, or why the reproduction was inconclusive or deferred. When status is inconclusive because a runtime is missing, prefix with 'env-blocked:' so the operator knows to fix the container profile rather than re-read the finding."
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "attackTree": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal", "root_id", "verdict", "nodes", "blockers"],
+      "properties": {
+        "goal": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "The claimed attacker-visible security effect being tested."
+        },
+        "root_id": {
+          "type": "string",
+          "pattern": "^AT[1-9][0-9]*$",
+          "description": "ID of the single root goal node. Semantic validation requires it to exist and have a null parent_id."
+        },
+        "verdict": {
+          "type": "string",
+          "enum": ["reachable", "blocked", "unproven", "not_attempted"],
+          "description": "Whether the complete supplied attack path reached its claimed effect, was stopped by a concrete dominant blocker, remains unproved, or could not be evaluated."
+        },
+        "nodes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/attackTreeNode" }
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "uniqueItems": true,
+          "description": "Concrete guards or unmet preconditions that block the supplied path; empty when no blocker was established."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "verdict": { "const": "blocked" } },
+            "required": ["verdict"]
+          },
+          "then": {
+            "properties": {
+              "blockers": { "minItems": 1 },
+              "nodes": {
+                "contains": {
+                  "properties": { "status": { "const": "blocked" } },
+                  "required": ["status"]
+                },
+                "minContains": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "verdict": { "const": "reachable" } },
+            "required": ["verdict"]
+          },
+          "then": {
+            "properties": {
+              "blockers": { "maxItems": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "attackTreeNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "parent_id", "kind", "description", "status", "evidence"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^AT[1-9][0-9]*$" },
+        "parent_id": {
+          "type": ["string", "null"],
+          "pattern": "^AT[1-9][0-9]*$",
+          "description": "Parent node ID, or null for the root goal only."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["goal", "precondition", "entry_point", "transition", "trust_boundary", "sink", "effect"]
+        },
+        "description": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "status": {
+          "type": "string",
+          "enum": ["satisfied", "blocked", "unproven", "not_attempted"]
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Source location, command output, attempt result, concrete blocker, or reason evaluation could not start."
+        }
+      }
+    },
+    "severityPrerequisites": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attacker_position", "user_interaction", "outcome_determinism", "impact", "existing_capability"],
+      "properties": {
+        "attacker_position": {
+          "allOf": [
+            { "$ref": "#/$defs/evidencedValue" },
+            { "properties": { "value": { "enum": ["remote_unauthenticated", "remote_authenticated", "internal_authenticated", "local", "host_shell", "long_term_physical", "unknown", "not_attempted"] } } }
+          ],
+          "description": "Minimum attacker position required before exercising the finding. Choose the strongest prerequisite actually required by the supplied path."
+        },
+        "user_interaction": {
+          "allOf": [
+            { "$ref": "#/$defs/evidencedValue" },
+            { "properties": { "value": { "enum": ["none", "required", "unknown", "not_attempted"] } } }
+          ]
+        },
+        "outcome_determinism": {
+          "allOf": [
+            { "$ref": "#/$defs/evidencedValue" },
+            { "properties": { "value": { "enum": ["deterministic", "probabilistic_llm", "unknown", "not_attempted"] } } }
+          ]
+        },
+        "impact": {
+          "allOf": [
+            { "$ref": "#/$defs/evidencedValue" },
+            { "properties": { "value": { "enum": ["code_execution_or_equivalent", "privilege_escalation", "sensitive_data_access", "availability", "other", "unknown", "not_attempted"] } } }
+          ]
+        },
+        "existing_capability": {
+          "allOf": [
+            { "$ref": "#/$defs/evidencedValue" },
+            { "properties": { "value": { "enum": ["none", "less_than_outcome", "support_channel_equivalent", "equivalent_or_greater", "unknown", "not_attempted"] } } }
+          ],
+          "description": "How the claimed outcome compares with capabilities the attacker must already possess."
+        }
+      }
+    },
+    "evidencedValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "evidence"],
+      "properties": {
+        "value": { "type": "string" },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Repository source, runtime evidence, or the concrete proof gap supporting the classification."
+        }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number", "outcome", "evidence", "failure_class", "crash_site"],
+      "properties": {
+        "number": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "outcome": {
+          "type": "string",
+          "enum": ["reproduced", "not_reproduced", "not_attempted"],
+          "description": "Whether this independent run reproduced the claimed failure, reached the target without it, or never reached the target."
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Attempt-specific output, or the concrete reason this attempt could not start."
+        },
+        "failure_class": {
+          "type": "string",
+          "description": "Observed failure class; empty when no target failure occurred."
+        },
+        "crash_site": {
+          "type": "string",
+          "description": "First-party crash/sink site; empty when it could not be established."
+        }
+      }
+    },
+    "criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "method", "evidence", "counterevidence", "proof_gap", "confidence"],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["pass", "fail", "not_attempted"]
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "How this criterion was checked, such as executing the PoC, tracing the stack or inspecting callers."
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Positive facts supporting this criterion's verdict."
+        },
+        "counterevidence": {
+          "type": "string",
+          "description": "Facts that weaken or contradict the verdict; empty only when none were found."
+        },
+        "proof_gap": {
+          "type": "string",
+          "description": "What could not be established and what evidence would resolve it; empty only when there is no gap."
+        },
+        "confidence": {
+          "type": "string",
+          "enum": ["high", "medium", "low"],
+          "description": "Confidence in this criterion's verdict based on the recorded method and evidence."
+        }
+      }
+    },
+    "controlBypass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["matched_controls", "assessments"],
+      "properties": {
+        "matched_controls": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "pattern": "\\S" },
+          "uniqueItems": true,
+          "description": "The exact control IDs supplied by scrutineer.controls.ids; empty when no controls were matched or no controls block was staged."
+        },
+        "assessments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/controlAssessment" },
+          "description": "Exactly one assessment for every matched control. The worker enforces ID set equality and uniqueness."
+        },
+        "unavailable_reason": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "The exact scrutineer.controls.unavailable_reason staged by the host when control resolution failed; omitted when resolution succeeded or no controls exist."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["unavailable_reason"] },
+          "then": {
+            "properties": {
+              "matched_controls": { "maxItems": 0 },
+              "assessments": { "maxItems": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "controlAssessment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["control_id", "disposition", "evidence"],
+      "properties": {
+        "control_id": { "type": "string", "minLength": 1, "pattern": "\\S" },
+        "disposition": {
+          "type": "string",
+          "enum": ["bypassed", "held", "not_applicable", "unresolved", "not_attempted"],
+          "description": "bypassed = execution defeated the claimed control; held = evidenced control enforcement blocked the path; not_applicable = evidence shows the matched control does not govern this path; unresolved = neither bypass nor enforcement was established; not_attempted = evaluation could not start."
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "Concrete bypass or enforcement evidence, the reason the control does not apply, or the proof gap preventing assessment."
+        }
+      }
+    },
+    "notAttemptedCriteria": {
+      "type": "object",
+      "properties": {
+        "poc_well_formed": { "properties": { "verdict": { "const": "not_attempted" } } },
+        "reproduces_three_of_three": { "properties": { "verdict": { "const": "not_attempted" } } },
+        "claimed_failure_class": { "properties": { "verdict": { "const": "not_attempted" } } },
+        "public_interface_to_first_party_sink": { "properties": { "verdict": { "const": "not_attempted" } } },
+        "deterministic": { "properties": { "verdict": { "const": "not_attempted" } } },
+        "control_bypass": {
+          "properties": {
+            "assessments": {
+              "items": { "properties": { "disposition": { "const": "not_attempted" } } }
+            }
+          }
+        }
+      }
+    },
+    "notAttemptedSeverityPrerequisites": {
+      "type": "object",
+      "properties": {
+        "attacker_position": { "properties": { "value": { "const": "not_attempted" } } },
+        "user_interaction": { "properties": { "value": { "const": "not_attempted" } } },
+        "outcome_determinism": { "properties": { "value": { "const": "not_attempted" } } },
+        "impact": { "properties": { "value": { "const": "not_attempted" } } },
+        "existing_capability": { "properties": { "value": { "const": "not_attempted" } } }
+      }
+    },
+    "attemptedSeverityPrerequisites": {
+      "type": "object",
+      "properties": {
+        "attacker_position": { "properties": { "value": { "not": { "const": "not_attempted" } } } },
+        "user_interaction": { "properties": { "value": { "not": { "const": "not_attempted" } } } },
+        "outcome_determinism": { "properties": { "value": { "not": { "const": "not_attempted" } } } },
+        "impact": { "properties": { "value": { "not": { "const": "not_attempted" } } } },
+        "existing_capability": { "properties": { "value": { "not": { "const": "not_attempted" } } } }
+      }
     }
   },
   "allOf": [
     {
-      "if": { "properties": { "status": { "const": "deferred" } } },
-      "then": { "required": ["preflight"] }
+      "if": { "properties": { "status": { "enum": ["confirmed", "fixed", "inconclusive"] } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "severity_prerequisites": { "$ref": "#/$defs/attemptedSeverityPrerequisites" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "deferred" } }, "required": ["status"] },
+      "then": {
+        "required": ["preflight"],
+        "properties": {
+          "preflight": {
+            "properties": { "classification": { "const": "external-reach" } }
+          },
+          "attempts": {
+            "items": { "properties": { "outcome": { "const": "not_attempted" } } }
+          },
+          "criteria": { "$ref": "#/$defs/notAttemptedCriteria" },
+          "severity_prerequisites": { "$ref": "#/$defs/notAttemptedSeverityPrerequisites" },
+          "attack_tree": {
+            "properties": {
+              "verdict": { "const": "not_attempted" },
+              "nodes": { "items": { "properties": { "status": { "const": "not_attempted" } } } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "not_attempted" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "attempts": {
+            "items": { "properties": { "outcome": { "const": "not_attempted" } } }
+          },
+          "criteria": { "$ref": "#/$defs/notAttemptedCriteria" },
+          "severity_prerequisites": { "$ref": "#/$defs/notAttemptedSeverityPrerequisites" },
+          "attack_tree": {
+            "properties": {
+              "verdict": { "const": "not_attempted" },
+              "nodes": { "items": { "properties": { "status": { "const": "not_attempted" } } } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "confirmed" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "attempts": {
+            "items": { "properties": { "outcome": { "const": "reproduced" } } }
+          },
+          "criteria": {
+            "properties": {
+              "poc_well_formed": { "properties": { "verdict": { "const": "pass" } } },
+              "reproduces_three_of_three": { "properties": { "verdict": { "const": "pass" } } },
+              "claimed_failure_class": { "properties": { "verdict": { "const": "pass" } } },
+              "public_interface_to_first_party_sink": { "properties": { "verdict": { "const": "pass" } } },
+              "deterministic": { "properties": { "verdict": { "const": "pass" } } },
+              "control_bypass": {
+                "properties": {
+                  "assessments": {
+                    "items": { "properties": { "disposition": { "enum": ["bypassed", "not_applicable"] } } }
+                  }
+                }
+              }
+            }
+          },
+          "attack_tree": {
+            "properties": {
+              "verdict": { "const": "reachable" },
+              "nodes": {
+                "allOf": [
+                  { "contains": { "properties": { "kind": { "const": "entry_point" } }, "required": ["kind"] }, "minContains": 1 },
+                  { "contains": { "properties": { "kind": { "const": "sink" } }, "required": ["kind"] }, "minContains": 1 }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "fixed" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "attempts": {
+            "items": { "properties": { "outcome": { "const": "not_reproduced" } } }
+          },
+          "criteria": {
+            "properties": {
+              "reproduces_three_of_three": { "properties": { "verdict": { "const": "fail" } } },
+              "control_bypass": {
+                "properties": {
+                  "assessments": {
+                    "items": { "properties": { "disposition": { "enum": ["bypassed", "held", "not_applicable"] } } }
+                  }
+                }
+              }
+            }
+          },
+          "attack_tree": {
+            "properties": {
+              "verdict": { "const": "blocked" },
+              "blockers": { "minItems": 1 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "inconclusive" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "attack_tree": {
+            "properties": { "verdict": { "enum": ["blocked", "unproven"] } }
+          }
+        }
+      }
     }
   ]
 }

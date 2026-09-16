@@ -2,12 +2,15 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
 )
@@ -286,6 +289,64 @@ func TestFindingCSAF_404ForMissingFinding(t *testing.T) {
 	w := getCSAF(t, s, 99999)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status %d, want 404", w.Code)
+	}
+}
+
+// failQueries makes every query matching pred fail with err.
+func failQueries(t *testing.T, s *Server, pred func(*gorm.DB) bool, err error) {
+	t.Helper()
+	if regErr := s.DB.Callback().Query().Before("gorm:query").Register("test:fail_lookup", func(tx *gorm.DB) {
+		if pred(tx) {
+			_ = tx.AddError(err)
+		}
+	}); regErr != nil {
+		t.Fatal(regErr)
+	}
+}
+
+func tableQuery(name string) func(*gorm.DB) bool {
+	return func(tx *gorm.DB) bool { return tx.Statement.Table == name }
+}
+
+// dependentRowsQuery matches the Dependent row load and not the eligibility
+// count, which hits the same table with an *int64 destination.
+func dependentRowsQuery(tx *gorm.DB) bool {
+	_, ok := tx.Statement.Dest.(*[]db.Dependent)
+	return ok
+}
+
+func TestFindingCSAF_handlesLookupErrors(t *testing.T) {
+	dbErr := errors.New("database unavailable")
+	for _, tt := range []struct {
+		name       string
+		pred       func(*gorm.DB) bool
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "finding failure", pred: tableQuery("findings"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load finding"},
+		{name: "repository missing", pred: tableQuery("repositories"), err: gorm.ErrRecordNotFound, wantStatus: http.StatusNotFound, wantBody: "404 page not found"},
+		{name: "repository failure", pred: tableQuery("repositories"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load repository"},
+		{name: "finding_references", pred: tableQuery("finding_references"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load finding references"},
+		{name: "packages", pred: tableQuery("packages"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load repository packages"},
+		{name: "finding_dependents", pred: tableQuery("finding_dependents"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load finding dependents"},
+		{name: "dependents", pred: dependentRowsQuery, err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load dependents"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+
+			f := seedCSAFFinding(t, s, nil)
+			dep := db.Dependent{RepositoryID: f.RepositoryID, Name: "linked-app", Ecosystem: "npm"}
+			s.DB.Create(&dep)
+			s.DB.Create(&db.FindingDependent{FindingID: f.ID, DependentID: dep.ID, Status: db.ExposureKnownAffected})
+			failQueries(t, s, tt.pred, tt.err)
+
+			w := getCSAF(t, s, f.ID)
+			if body := strings.TrimSpace(w.Body.String()); w.Code != tt.wantStatus || body != tt.wantBody {
+				t.Errorf("status = %d, body = %q; want %d, %q", w.Code, body, tt.wantStatus, tt.wantBody)
+			}
+		})
 	}
 }
 

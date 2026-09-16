@@ -24,7 +24,22 @@
           "registry_url":           { "type": "string" },
           "latest_release_at":      { "type": "string" },
           "dependent_packages_url": { "type": "string" },
-          "metadata":               {}
+          "metadata":               {},
+          "risk_flags": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "enum": ["single_maintainer", "no_security_policy", "native_extension", "stale_release", "maintainer_domain_expired"]
+                },
+                "evidence": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
         }
       }
     }

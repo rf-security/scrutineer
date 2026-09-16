@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "critic attack-path assessment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "production_viability",
+    "source_state",
+    "reason",
+    "counterevidence",
+    "attacker_position",
+    "preconditions",
+    "impact",
+    "likelihood",
+    "applied_adjustments",
+    "facts_that_would_change_the_result"
+  ],
+  "properties": {
+    "production_viability": {
+      "type": "string",
+      "enum": ["VIABLE", "NON_VIABLE", "SAMPLE_OR_TEST", "CONDITIONAL_VIABLE"]
+    },
+    "source_state": {
+      "type": "string",
+      "enum": ["PRESENT", "MOVED", "MISSING", "UNKNOWN"]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Release/build conclusion with concrete repository evidence."
+    },
+    "counterevidence": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "attacker_position": {
+      "type": "string",
+      "minLength": 1
+    },
+    "preconditions": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "impact": {
+      "type": "string",
+      "minLength": 1
+    },
+    "likelihood": {
+      "type": "string",
+      "enum": ["likely", "plausible", "unlikely", "unknown"]
+    },
+    "applied_adjustments": {
+      "type": "array",
+      "maxItems": 0,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "reason", "severity_before", "severity_after"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 },
+          "severity_before": { "type": "string", "enum": ["Critical", "High", "Medium", "Low"] },
+          "severity_after": { "type": "string", "enum": ["Critical", "High", "Medium", "Low"] }
+        }
+      }
+    },
+    "facts_that_would_change_the_result": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "source_state": { "enum": ["MOVED", "MISSING"] } },
+        "required": ["source_state"]
+      },
+      "then": {
+        "properties": {
+          "production_viability": { "not": { "const": "NON_VIABLE" } }
+        }
+      }
+    }
+  ]
+}

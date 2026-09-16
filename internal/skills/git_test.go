@@ -2,11 +2,15 @@ package skills
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/git-pkgs/clone"
 
 	"scrutineer/internal/testutil"
 )
@@ -22,8 +26,8 @@ func TestParseRepoSpec(t *testing.T) {
 		{"shorthand branch with slash", "org/skills@feature/foo", "https://github.com/org/skills", "feature/foo", false},
 		{"https no ref", "https://github.com/org/skills", "https://github.com/org/skills", "", false},
 		{"https with tag", "https://github.com/org/skills@v0.3.1", "https://github.com/org/skills", "v0.3.1", false},
-		{"https with credential no ref", "https://token@github.com/org/skills", "https://token@github.com/org/skills", "", false},
-		{"https with credential and ref", "https://token@github.com/org/skills@v1.0", "https://token@github.com/org/skills", "v1.0", false},
+		{"https with credential no ref", "https://token@github.com/org/skills", "", "", true},
+		{"https with credential and ref", "https://token@github.com/org/skills@v1.0", "", "", true},
 		{"https slash-bearing ref not supported", "https://gitlab.com/org/skills@refs/heads/main", "https://gitlab.com/org/skills@refs/heads/main", "", false},
 		{"trims whitespace", "  org/skills@main  ", "https://github.com/org/skills", "main", false},
 		{"empty", "", "", "", true},
@@ -45,6 +49,17 @@ func TestParseRepoSpec(t *testing.T) {
 				t.Errorf("got (%q,%q) want (%q,%q)", url, ref, c.wantURL, c.wantRef)
 			}
 		})
+	}
+}
+
+func TestParseRepoSpec_rejectsUserinfoWithoutEcho(t *testing.T) {
+	const secret = "private-skills-token"
+	_, _, err := ParseRepoSpec("https://user:" + secret + "@github.com/org/skills")
+	if err == nil {
+		t.Fatal("expected URL userinfo to be rejected")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("parser error leaked repository credential: %v", err)
 	}
 }
 
@@ -104,7 +119,7 @@ func TestCloneOrPull_noRefUsesDefaultBranch(t *testing.T) {
 	}
 	origin, _, headSHA, _ := initOrigin(t)
 	dst := filepath.Join(t.TempDir(), "dst")
-	got, err := CloneOrPull(context.Background(), origin, "", dst, false)
+	got, err := CloneOrPull(context.Background(), origin, "", dst, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +136,7 @@ func TestCloneOrPull_pinsTagToResolvedSHA(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "dst")
 	// fullClone=true so the tag fetch always works regardless of how the
 	// initial clone hydrated refs.
-	got, err := CloneOrPull(context.Background(), origin, tag, dst, true)
+	got, err := CloneOrPull(context.Background(), origin, tag, dst, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +151,7 @@ func TestCloneOrPull_unknownRefErrors(t *testing.T) {
 	}
 	origin, _, _, _ := initOrigin(t)
 	dst := filepath.Join(t.TempDir(), "dst")
-	_, err := CloneOrPull(context.Background(), origin, "no-such-ref", dst, true)
+	_, err := CloneOrPull(context.Background(), origin, "no-such-ref", dst, true, "")
 	if err == nil {
 		t.Fatal("expected error for unknown ref")
 	}
@@ -148,14 +163,14 @@ func TestCloneOrPull_secondCallReusesClone(t *testing.T) {
 	}
 	origin, _, headSHA, _ := initOrigin(t)
 	dst := filepath.Join(t.TempDir(), "dst")
-	if _, err := CloneOrPull(context.Background(), origin, "", dst, true); err != nil {
+	if _, err := CloneOrPull(context.Background(), origin, "", dst, true, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Second call must hit the fetch path (.git exists already).
 	if _, err := os.Stat(filepath.Join(dst, ".git")); err != nil {
 		t.Fatalf(".git missing: %v", err)
 	}
-	got, err := CloneOrPull(context.Background(), origin, "", dst, true)
+	got, err := CloneOrPull(context.Background(), origin, "", dst, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,9 +180,122 @@ func TestCloneOrPull_secondCallReusesClone(t *testing.T) {
 }
 
 func TestCloneOrPull_rejectsNonHTTPS(t *testing.T) {
-	_, err := CloneOrPull(context.Background(), "git://host/path", "", t.TempDir(), false)
+	_, err := CloneOrPull(context.Background(), "git://host/path", "", t.TempDir(), false, "")
 	if err == nil || !strings.Contains(err.Error(), "https://") {
 		t.Fatalf("expected https rejection, got %v", err)
+	}
+}
+
+func TestCloneOrPull_tokenUsesAskPassWithoutArgvLeak(t *testing.T) {
+	const token = "private-skills-token"
+	var (
+		askpassPath string
+		askpassOut  string
+		script      string
+		gotArgs     []string
+		askpassMode os.FileMode
+	)
+	retry := clone.Retry{
+		Attempts: 1,
+		Run: func(_ context.Context, _ string, env []string, args ...string) (string, error) {
+			gotArgs = append([]string{}, args...)
+			var tokenEnv string
+			for _, value := range env {
+				if strings.HasPrefix(value, "GIT_ASKPASS=") {
+					askpassPath = strings.TrimPrefix(value, "GIT_ASKPASS=")
+				}
+				if strings.HasPrefix(value, skillsRepoTokenEnv+"=") {
+					tokenEnv = value
+				}
+			}
+			if askpassPath == "" || tokenEnv != skillsRepoTokenEnv+"="+token {
+				return "", fmt.Errorf("missing askpass environment: %q", env)
+			}
+			body, err := os.ReadFile(askpassPath)
+			if err != nil {
+				return "", err
+			}
+			info, err := os.Stat(askpassPath)
+			if err != nil {
+				return "", err
+			}
+			askpassMode = info.Mode().Perm()
+			script = string(body)
+			cmd := exec.Command(askpassPath, "Password for https://skills.test")
+			cmd.Env = env
+			out, err := cmd.Output()
+			askpassOut = strings.TrimSpace(string(out))
+			if err != nil {
+				return "", err
+			}
+			return "", errors.New("stop after inspecting git invocation")
+		},
+	}
+
+	dst := filepath.Join(t.TempDir(), "skills-cache", "checkout")
+	_, err := cloneOrPullWithRetry(context.Background(), retry,
+		"https://skills.test/org/private-skills", "", dst, false, token)
+	if err == nil {
+		t.Fatal("expected the inspecting runner to stop the clone")
+	}
+	if strings.Contains(strings.Join(gotArgs, " "), token) {
+		t.Fatalf("token leaked into git argv: %q", gotArgs)
+	}
+	if len(gotArgs) < 2 || gotArgs[0] != "-c" || gotArgs[1] != "credential.helper=" {
+		t.Fatalf("git argv does not disable ambient credential helpers: %q", gotArgs)
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("token leaked into clone error: %v", err)
+	}
+	if askpassOut != token {
+		t.Errorf("askpass output = %q, want configured token", askpassOut)
+	}
+	if filepath.Dir(askpassPath) != filepath.Dir(dst) {
+		t.Errorf("askpass directory = %q, want skills cache %q", filepath.Dir(askpassPath), filepath.Dir(dst))
+	}
+	if strings.Contains(script, token) {
+		t.Fatal("temporary askpass script contains the token")
+	}
+	if askpassMode != askpassPerm {
+		t.Errorf("askpass mode = %o, want 700", askpassMode)
+	}
+	if _, statErr := os.Stat(askpassPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("askpass file was not removed: %v", statErr)
+	}
+}
+
+func TestWithSkillsRepoToken_excludesLocalGitCommands(t *testing.T) {
+	const token = "private-skills-token"
+	var gotEnv []string
+	retry, cleanup, err := withSkillsRepoToken(clone.Retry{
+		Run: func(_ context.Context, _ string, env []string, _ ...string) (string, error) {
+			gotEnv = append([]string{}, env...)
+			return "", nil
+		},
+	}, token, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if _, err := retry.Run(context.Background(), "", nil, "rev-parse", "HEAD"); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range gotEnv {
+		if strings.Contains(value, token) || strings.HasPrefix(value, "GIT_ASKPASS=") {
+			t.Fatalf("local git command received authentication environment: %q", gotEnv)
+		}
+	}
+}
+
+func TestCloneOrPull_rejectsMultilineToken(t *testing.T) {
+	const token = "first-line\nsecond-line"
+	_, err := cloneOrPullWithRetry(context.Background(), clone.Retry{},
+		"https://skills.test/org/private-skills", "", t.TempDir(), false, token)
+	if err == nil || !strings.Contains(err.Error(), "single line") {
+		t.Fatalf("expected single-line token rejection, got %v", err)
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("token leaked into validation error: %v", err)
 	}
 }
 

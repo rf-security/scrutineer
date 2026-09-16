@@ -90,7 +90,8 @@ def result_location(r):
         return "unknown"
     sym = locations[0].get("symbolic") or {}
     key = sym.get("key") or {}
-    path = key.get("local", {}).get("given_path") or key.get("Local", {}).get("given_path") or "workflow"
+    local = key.get("local") or key.get("Local") or {}
+    path = local.get("given_path") or local.get("verbatim_path") or "workflow"
     row = locations[0].get("concrete", {}).get("location", {}).get("start_point", {}).get("row")
     return f"{path}:{row + 1}" if row is not None else path
 

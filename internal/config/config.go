@@ -237,9 +237,11 @@ type Config struct {
 	// connect, since it removes the DNS-rebinding protection.
 	AllowRemote bool `yaml:"allow_remote"`
 	// Sharing holds settings specific to the external maintainer portal
-	// (cmd/sharing). It is optional; unset values fall back to the matching
-	// root config, so a deployment that runs the portal against the same
-	// database as the main app needs no sharing block at all.
+	// (cmd/sharing): an optional separate database connection and explicit
+	// read-only access grants on top of the repositories GitHub reports with
+	// write, maintain, or admin permission. Unset values fall back to the
+	// matching root config, so a deployment that runs the portal against the
+	// same database as the main app needs no sharing block at all.
 	Sharing SharingConfig `yaml:"sharing"`
 }
 
@@ -395,6 +397,10 @@ type SharingConfig struct {
 	// block, and unset fields inherit the root database config (see
 	// Config.SharingDatabase), so setting only `dsn` reuses the root driver.
 	Database DatabaseConfig `yaml:"database"`
+	// AccessGrants are explicit, read-only additions to the repositories
+	// GitHub reports with write, maintain, or admin permission. OAuth and
+	// session secrets remain environment-only in internal/sharing.
+	AccessGrants []SharingAccessGrant `yaml:"access_grants"`
 }
 
 // SharingDatabase returns the database configuration the sharing portal
@@ -421,6 +427,17 @@ func (c *Config) SharingDatabase() DatabaseConfig {
 type DatabaseConfig struct {
 	Driver string `yaml:"driver"`
 	DSN    string `yaml:"dsn"`
+}
+
+// SharingAccessGrant gives one immutable GitHub user identity read access to
+// findings for an exact set of repositories. GitHubUserID is the numeric ID
+// returned by GET /user; a login is deliberately not accepted because it can
+// be renamed or reused. Repository entries are canonical https GitHub URLs.
+type SharingAccessGrant struct {
+	GitHubUserID int64      `yaml:"github_user_id"`
+	Repositories []string   `yaml:"repositories"`
+	Reason       string     `yaml:"reason"`
+	ExpiresAt    *time.Time `yaml:"expires_at"`
 }
 
 // ParseScanTimeout validates and parses a scan_timeout string. Empty

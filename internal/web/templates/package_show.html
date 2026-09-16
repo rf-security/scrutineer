@@ -58,6 +58,13 @@
   {{end}}
 </div>
 
+{{$flags := riskflags $p.RiskFlags}}
+{{if $flags}}
+<div class="flex flex-wrap gap-2 mb-6">
+  {{range $flags}}<span class="badge-secondary">{{risklabel .}}</span>{{end}}
+</div>
+{{end}}
+
 {{if .Meta}}
 <section class="accordion">
   <details class="group border-b">

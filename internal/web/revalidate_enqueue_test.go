@@ -79,6 +79,47 @@ func TestAutoChainVerify_nilScanDetectsFresh(t *testing.T) {
 	}
 }
 
+func TestAutoChainRevalidate_truePositiveAlwaysQueuesCritic(t *testing.T) {
+	s, done, verify, newFinding := chainTestSetup(t)
+	defer done()
+	critic := db.Skill{Name: criticSkillName, OutputFile: "report.json", OutputKind: "critic", Version: 1, Active: true}
+	s.DB.Create(&critic)
+	f := newFinding("Medium")
+	parent := db.Scan{RepositoryID: f.RepositoryID, Status: db.ScanDone, SkillName: revalidateSkillName, Profile: "go"}
+	s.DB.Create(&parent)
+
+	s.autoChainVerifyAfterRevalidate(&parent, f, "true_positive", "Medium")
+
+	var criticScan db.Scan
+	if err := s.DB.Where("finding_id = ? AND skill_id = ?", f.ID, critic.ID).First(&criticScan).Error; err != nil {
+		t.Fatalf("critic scan not enqueued: %v", err)
+	}
+	if criticScan.Profile != "go" {
+		t.Errorf("critic profile = %q, want inherited go profile", criticScan.Profile)
+	}
+	var verifyCount int64
+	s.DB.Model(&db.Scan{}).Where("finding_id = ? AND skill_id = ?", f.ID, verify.ID).Count(&verifyCount)
+	if verifyCount != 0 {
+		t.Fatalf("Medium finding queued %d verify scans, want 0", verifyCount)
+	}
+}
+
+func TestAutoChainRevalidate_nonTruePositiveQueuesNeitherAssessment(t *testing.T) {
+	s, done, verify, newFinding := chainTestSetup(t)
+	defer done()
+	critic := db.Skill{Name: criticSkillName, OutputFile: "report.json", OutputKind: "critic", Version: 1, Active: true}
+	s.DB.Create(&critic)
+	f := newFinding("High")
+
+	s.autoChainVerifyAfterRevalidate(nil, f, "uncertain", "High")
+
+	var count int64
+	s.DB.Model(&db.Scan{}).Where("finding_id = ? AND skill_id IN ?", f.ID, []uint{critic.ID, verify.ID}).Count(&count)
+	if count != 0 {
+		t.Fatalf("non-true-positive queued %d downstream scans, want 0", count)
+	}
+}
+
 func TestAutoChainVerify_doesNotDoubleQueueConcurrently(t *testing.T) {
 	s, done, verify, newFinding := chainTestSetup(t)
 	defer done()

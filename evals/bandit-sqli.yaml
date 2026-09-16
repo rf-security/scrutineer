@@ -1,0 +1,14 @@
+given: a Python route builds a SQL query from request input
+fixture: fixtures/sqli-basic
+skill: bandit
+should_find:
+  - finding: hardcoded_sql_expressions
+    severity: Medium
+    cwe: CWE-89
+    path: app.py
+    required: true
+should_not_find:
+  # bandit's own scale stops at HIGH, so no hit may reach Critical.
+  - finding: hardcoded_sql_expressions
+    severity: Critical
+    path: app.py

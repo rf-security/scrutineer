@@ -24,6 +24,29 @@
 # and are slower for large repos — only flip if a skill needs history.
 # clone: shallow
 
+# Monorepo sub-package handling. A repo submitted as `url#sub/dir` (or a
+# GitHub `.../tree/<branch>/<sub/dir>` URL) scans just that sub-package.
+#
+# subproject_scope controls how such a scan stages its workspace:
+#   "hard" (default) prunes sibling packages from the workspace, leaving just the
+#     sub-folder (and .git), so the agent, its build, and its findings are
+#     confined to the sub-package. If the sub-package cannot resolve its
+#     dependencies in isolation, the scan widens to the whole tree and re-runs.
+#   "soft" stages the whole clone and treats the sub-path as an advisory focus
+#     hint (the pre-monorepo behaviour).
+# Pick "hard" for independently-published packages (each builds on its own).
+# Pick "soft" for tightly-coupled monorepos (e.g. Rails-style) whose sub-packages
+# depend on unreleased sibling versions and cannot build in isolation — otherwise
+# most sub-package scans just fail the isolated build and fall back to soft anyway.
+# A per-scan override is stored on the scan, so retries reproduce the mode.
+# subproject_scope: hard
+#
+# monorepo_attribution links published packages, advisories, maintainers and
+# the disclosure channel to the sub-package they belong to (matched by
+# manifest name) instead of rolling them up flat under the repository. Set to
+# false to keep the pre-monorepo repo-wide behaviour. Default: true.
+# monorepo_attribution: true
+
 # Additional local directories to load SKILL.md files from. Scrutineer's
 # built-in skills are embedded in the binary; a same-named skill from one of
 # these directories overrides its bundled copy. Repeatable via -skills on the
@@ -38,6 +61,10 @@
 # on every scan so two runs a week apart can be told apart.
 # skills_repo: https://github.com/alpha-omega-security/scrutineer-skills
 # skills_repo: alpha-omega-security/scrutineer-skills@v0.3.1
+# For a private repository, keep credentials out of skills_repo and set the
+# token here. This key is config-file-only so the token never enters argv.
+# Keep this file owner-readable only (`chmod 600 scrutineer.yaml`).
+# skills_repo_token: replace-with-a-repository-read-token
 
 # Container runtime: docker (default), podman, or Apple's container runtime
 # (`apple`, experimental). Rootless podman is detected automatically and
@@ -62,6 +89,14 @@
 # retained back-compat alias for this key.)
 # no_container: false
 
+# Run the listed skills with claude directly on the host (no isolation) while
+# every other skill keeps its container. Meant for a codebase whose build
+# toolchain only exists on the host. Host runs skip the egress proxy and reach
+# the skill API on the loopback address. Refused with hardened: true and with
+# non-claude backends, like no_container; redundant when no_container is set.
+# host_skills:
+#   - verify
+
 # Strict sandbox mode. Forces the container runner (no --no-container fallback),
 # restricts the egress allowlist to *.anthropic.com plus the runtime's host
 # endpoint, mounts the container rootfs read-only, sets no-new-privileges, and
@@ -85,6 +120,55 @@
 # Container image used for per-scan containers.
 # runner_image: ghcr.io/alpha-omega-security/scrutineer-runner:latest
 
+# A file-backed ChatGPT account login for the Codex backend. Create it with:
+#   CODEX_HOME=~/.config/scrutineer/codex-rubygems \
+#     codex -c cli_auth_credentials_store=file login --device-auth
+# Then point this at that home's auth.json. Scrutineer requires mode 0600,
+# mounts only this file into each scan's private CODEX_HOME, and serializes
+# scans so Codex can safely rotate its refresh token. CODEX_API_KEY and
+# OPENAI_API_KEY must be unset when this is configured, preventing accidental
+# use of Platform API credits.
+# codex:
+#   auth_file: ~/.config/scrutineer/codex-rubygems/auth.json
+
+# Provider-scoped OpenCode settings. The key matches the provider prefix in a
+# model id. api_key_env is read from Scrutineer's host environment and converted
+# to provider-only OpenCode auth. pass_env names native provider variables
+# instead. A derived runner_image can add a pinned adapter or supporting binary;
+# it must be based on the Scrutineer runner so language profiles still compose.
+# config_file and state_dir are host paths; relative paths start beside this
+# config file. Every configured provider must declare its API/auth hostnames
+# under egress_allow, or a host_port for a model server on the host loopback
+# (Ollama, LM Studio). Only the selected provider's hosts and port are added
+# to a scan, including in hardened mode.
+# opencode:
+#   providers:
+#     groq:
+#       api_key_env: GROQ_API_KEY
+#       egress_allow:
+#         - api.groq.com
+#     ollama:
+#       config_file: ./opencode/ollama.json
+#       host_port: 11434
+#     kiro:
+#       runner_image: registry.example/scrutineer-opencode-kiro@sha256:...
+#       config_file: ./opencode/kiro.json
+#       pass_env:
+#         - KIRO_API_KEY
+#       required_binaries:
+#         - kiro-cli
+#       egress_allow:
+#         - q.us-east-1.amazonaws.com
+#         - runtime.us-east-1.kiro.dev
+#         - management.us-east-1.kiro.dev
+#         - prod.us-east-1.auth.desktop.kiro.dev
+#     github-copilot:
+#       state_dir: ~/.local/share/scrutineer/opencode/github-copilot
+#       egress_allow:
+#         - github.com
+#         - api.github.com
+#         - "*.githubcopilot.com"
+
 # Directory containing per-ecosystem runner profiles. Each profile is a
 # Dockerfile under <dir>/<name>/Dockerfile; the worker auto-detects the
 # right profile from the cloned source via `brief` and builds the image
@@ -100,6 +184,23 @@
 # egress_allow:
 #   - artifactory.internal
 #   - "*.mycorp.net"
+
+# Enrich repositories from ecosyste.ms: the per-repository cache refreshed
+# before each scan, the eager warm when a repository is added, and the PURL to
+# repository resolution behind SBOM and dependency import. false stops every
+# lookup scrutineer's own process makes, so a restricted-egress host produces
+# no partial state and no failed outbound calls of its own.
+#
+# It does NOT touch egress_allow above: the bundled metadata, packages and
+# advisories skills fetch ecosyste.ms themselves and replace the repository's
+# whole row set from what they return, so denying them the domain would let an
+# empty result wipe packages and advisories already recorded. Denying the
+# runner is your network policy to write.
+#
+# The per-repository dependents cache is filled only by this enrichment, so
+# false also leaves the Dependents tab empty and dependent-exposure analysis
+# with nothing to run against. Flag: -ecosystems-enrichment.
+# ecosystems_enrichment: true
 
 # How many scans run in parallel. Default is 4; raise on bigger hosts,
 # lower if you want model calls serialised.
@@ -146,13 +247,11 @@
 # with the built-in list the tiers are inferred (Sonnet = mid, latest Opus =
 # max).
 # models:
-#   - name: Sonnet 4.6
-#     id:   claude-sonnet-4-6
-#     tier: mid
 #   - name: Sonnet 5.0
 #     id:   claude-sonnet-5
+#     tier: mid
 #   - name: Opus
-#     id:   claude-opus-4-7
+#     id:   claude-opus-5
 #     tier: max
 
 # Pin the default model id. When set, this wins over the "first entry
@@ -160,7 +259,7 @@
 # each tier (mid, high, max) to a configured model. A skill can declare
 # scrutineer.model in SKILL.md metadata as either a tier or exact model,
 # and an explicit per-scan model wins over the skill preference.
-# default_model: claude-sonnet-4-6
+# default_model: claude-sonnet-5
 
 # GitHub organisation the fork skill stages scanned repositories into as
 # private repos. Empty disables the fork skill. Also exposed as
@@ -186,6 +285,29 @@
 # disables encrypted import.
 # identity_file: ~/.ssh/id_ed25519
 
+# Provider-neutral, data-less age identity plugins (the `age -j` contract)
+# used to decrypt imports and encrypted federation feeds. Each name resolves
+# to age-plugin-NAME through PATH. Plugins may be combined with identity_file
+# and are launched only when decryption needs them. For example,
+# age-plugin-1p and the 1Password op CLI must both be installed separately for
+# this configuration; Scrutineer never receives or writes the SSH private key.
+# identity_plugins:
+#   - 1p
+
+# Submit reviewed findings to CERT/CC VINCE. The action is disabled when
+# api_key is empty. Reporter values prefill the editable submission page.
+# scrutineer.yaml contains the long-lived key, so keep the file owner-only
+# (`chmod 600 scrutineer.yaml`) and exclude it from backups and source control.
+# vince:
+#   base_url: https://kb.cert.org
+#   api_key: ""
+#   reporter:
+#     name: ""
+#     organization: ""
+#     email: ""
+#     phone: ""
+#     pgp_key: ""
+
 # Secret shared out of band between federation members, mixed into
 # interchange finding hashes so members derive matching hashes without
 # publishing anything enumerable (see docs/interchange.md). Config-file
@@ -198,3 +320,29 @@
 # finding-hash match, so they can coordinate before reporting the same
 # finding upstream. Required when federation_salt is set.
 # federation_contact: security@example.com
+
+# Git remote the public interchange feed is pushed to hourly: opt-outs,
+# disclosure routes and clean fix-audit certificates, in the clear, for
+# anyone to clone. Empty disables the public export.
+# federation_public_feed: "git@github.com:example/scrutineer-public-feed.git"
+
+# Git remote the members-only feed is pushed to: the non-clean fix-audit
+# certificates, each naming a repository whose advertised fix does not
+# hold, so every record is age-encrypted to recipients_file. Requires
+# recipients_file (or it would push them in the clear) and at least one
+# decryption source from identity_file or identity_plugins (or it could not
+# read back what it published, and would re-encrypt the whole feed on every
+# tick). Empty disables the members export.
+# federation_members_feed: "git@github.com:example/scrutineer-members-feed.git"
+
+# Peer feed git remotes cloned read-only and ingested hourly. An imported
+# opt-out stops this instance scanning that repository; an imported route
+# fills a disclosure channel this instance does not have.
+# federation_import_feeds:
+#   - "https://github.com/peer/scrutineer-public-feed.git"
+
+# Peer base URLs asked over POST /claim-check before this instance reports a
+# finding. A match refuses the attempt and names the peer's contact so you
+# coordinate first; the next attempt goes through. Requires federation_salt.
+# federation_peers:
+#   - "https://peer.example.com"

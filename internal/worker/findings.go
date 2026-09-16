@@ -29,7 +29,7 @@ func (w *Worker) PersistStreamedFinding(scan *db.Scan, raw []byte) (*db.Finding,
 	if strings.TrimSpace(sf.Title) == "" || strings.TrimSpace(sf.Severity) == "" || strings.TrimSpace(sf.Location) == "" {
 		return nil, fmt.Errorf("%w: title, severity and location are required", ErrInvalidFinding)
 	}
-	f := sf.toFinding(scan.ID, scan.RepositoryID, scan.Commit, scan.SubPath)
+	f := sf.toFinding(scan.ID, scan.RepositoryID, scan.Commit, scan.SubPath, scan.Model)
 	f.Fingerprint = db.FingerprintFinding(scan.SkillName, f.SubPath, f.CWE, f.Location, f.Title)
 
 	srcDir := filepath.Join(w.scanWorkRoot(scan), "src")
@@ -102,10 +102,10 @@ func parseReport(raw []byte) (scanReport, error) {
 	return r, nil
 }
 
-func (r scanReport) toFindings(scanID, repoID uint, commit, subPath string) []db.Finding {
+func (r scanReport) toFindings(scanID, repoID uint, commit, subPath, model string) []db.Finding {
 	out := make([]db.Finding, 0, len(r.Findings))
 	for _, f := range r.Findings {
-		out = append(out, f.toFinding(scanID, repoID, commit, subPath))
+		out = append(out, f.toFinding(scanID, repoID, commit, subPath, model))
 	}
 	return out
 }
@@ -140,12 +140,13 @@ func validDiscoveredVia(via string) bool {
 	}
 }
 
-func (f scanFinding) toFinding(scanID, repoID uint, commit, subPath string) db.Finding {
+func (f scanFinding) toFinding(scanID, repoID uint, commit, subPath, model string) db.Finding {
 	return db.Finding{
 		ScanID:       scanID,
 		RepositoryID: repoID,
 		Commit:       commit,
 		SubPath:      subPath,
+		Model:        model,
 		FindingID:    f.ID,
 		Sinks:        strings.Join(f.Sinks, ", "),
 		Title:        f.Title,
@@ -168,13 +169,19 @@ func (f scanFinding) toFinding(scanID, repoID uint, commit, subPath string) db.F
 	}
 }
 
+// toReferences maps a report's references onto rows, keeping the first mention
+// of each URL. A skill listing one URL twice under different tags means one
+// reference, and (finding_id, url) is unique, so passing both through would
+// fail the insert that creates the finding.
 func toReferences(refs []scanReference) []db.FindingReference {
 	out := make([]db.FindingReference, 0, len(refs))
+	seen := make(map[string]bool, len(refs))
 	for _, r := range refs {
 		url := strings.TrimSpace(r.URL)
-		if url == "" {
+		if url == "" || seen[url] {
 			continue
 		}
+		seen[url] = true
 		out = append(out, db.FindingReference{
 			URL:     url,
 			Summary: strings.TrimSpace(r.Summary),

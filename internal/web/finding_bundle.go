@@ -99,6 +99,10 @@ type bundleEntry struct {
 }
 
 func (s *Server) bundleEntries(f *db.Finding, repo *db.Repository) ([]bundleEntry, error) {
+	return s.bundleEntriesAt(f, repo, time.Now())
+}
+
+func (s *Server) bundleEntriesAt(f *db.Finding, repo *db.Repository, generatedAt time.Time) ([]bundleEntry, error) {
 	// Coordinator bundles need to fail loudly: a silent half-build that
 	// drops references or packages can produce an advisory that looks
 	// complete but is missing crucial context. Each Find() is tolerant
@@ -116,7 +120,10 @@ func (s *Server) bundleEntries(f *db.Finding, repo *db.Repository) ([]bundleEntr
 	if err := s.DB.Where("finding_id = ?", f.ID).Find(&fdRows).Error; err != nil {
 		return nil, fmt.Errorf("load finding dependents: %w", err)
 	}
-	deps := loadFindingDependents(s, fdRows)
+	deps, err := loadFindingDependents(s, fdRows)
+	if err != nil {
+		return nil, fmt.Errorf("load dependents: %w", err)
+	}
 	hasDependents, err := repoHasDependents(s.DB, f.RepositoryID)
 	if err != nil {
 		return nil, fmt.Errorf("count dependents: %w", err)
@@ -153,7 +160,7 @@ func (s *Server) bundleEntries(f *db.Finding, repo *db.Repository) ([]bundleEntr
 		contents["csaf.json"] = "CSAF 2.0 document (with VEX product_status for dependents)"
 	}
 
-	report := renderFindingReport(s.DB, f, &scan, repo)
+	report := renderFindingReportAt(s.DB, f, &scan, repo, generatedAt)
 	entries = append(entries, bundleEntry{Name: "report.md", Data: []byte(report)})
 	contents["report.md"] = "Human-readable markdown report for the recipient"
 
@@ -168,7 +175,7 @@ func (s *Server) bundleEntries(f *db.Finding, repo *db.Repository) ([]bundleEntr
 	}
 
 	manifest := bundleManifest{
-		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt:  generatedAt.UTC().Format(time.RFC3339),
 		GeneratorURL: "https://github.com/alpha-omega-security/scrutineer",
 		FindingID:    f.ID,
 		Repository:   firstNonEmpty(repo.FullName, repo.Name, repo.URL),
@@ -193,11 +200,14 @@ func (s *Server) bundleEntries(f *db.Finding, repo *db.Repository) ([]bundleEntr
 // at the archive root with 0644; the bundle is meant to be unpacked,
 // inspected, and forwarded by a coordinator, not installed.
 func buildTarGz(entries []bundleEntry) ([]byte, error) {
+	return buildTarGzAt(entries, time.Now())
+}
+
+func buildTarGzAt(entries []bundleEntry, generatedAt time.Time) ([]byte, error) {
 	const filePerm = 0o644
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
-	now := time.Now()
 	for _, e := range entries {
 		mode := e.Mode
 		if mode == 0 {
@@ -207,7 +217,7 @@ func buildTarGz(entries []bundleEntry) ([]byte, error) {
 			Name:    e.Name,
 			Mode:    mode,
 			Size:    int64(len(e.Data)),
-			ModTime: now,
+			ModTime: generatedAt,
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return nil, err

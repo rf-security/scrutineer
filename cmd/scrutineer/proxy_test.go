@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"flag"
 	"reflect"
 	"strings"
 	"testing"
@@ -77,6 +78,25 @@ func TestParseProxyConfig_RequiresTokenAndAllow(t *testing.T) {
 	}
 }
 
+func TestParseProxyConfig_RequiredCapability(t *testing.T) {
+	env := envMap(map[string]string{
+		"SCRUTINEER_PROXY_TOKEN": "tok",
+		"SCRUTINEER_PROXY_ALLOW": "example.com",
+	})
+	if _, err := parseProxyConfig([]string{"--require-capability=" + worker.ProxyCapabilityDenyAPIConnect}, env); err != nil {
+		t.Fatalf("supported capability rejected: %v", err)
+	}
+	if _, err := parseProxyConfig([]string{"--require-capability=unknown"}, env); err == nil {
+		t.Fatal("unsupported required capability accepted")
+	}
+	if _, err := parseProxyConfig([]string{"--require-capability=unknown", "-h"}, env); err == nil || errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("unsupported capability hidden by help: %v", err)
+	}
+	if _, err := parseProxyConfig([]string{"--require-capability=" + worker.ProxyCapabilityDenyAPIConnect, "-h"}, env); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("supported capability with help: got %v, want flag.ErrHelp", err)
+	}
+}
+
 func TestSplitAllow(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -103,6 +123,7 @@ func TestEgressSidecarEnvContract(t *testing.T) {
 		Token:     "tok",
 		Allow:     []string{"*.anthropic.com", "host.docker.internal"},
 		APIPort:   "8080",
+		HostPorts: []string{"11434"},
 		GatewayIP: "192.0.2.9",
 	}
 	env := map[string]string{}
@@ -123,6 +144,9 @@ func TestEgressSidecarEnvContract(t *testing.T) {
 	}
 	if got.apiPort != cfg.APIPort {
 		t.Errorf("api port: host set %q, sidecar read %q", cfg.APIPort, got.apiPort)
+	}
+	if !reflect.DeepEqual(got.hostPorts, cfg.HostPorts) {
+		t.Errorf("host ports: host set %v, sidecar read %v", cfg.HostPorts, got.hostPorts)
 	}
 	if got.listen != worker.SidecarListenFirstIface+":3128" {
 		t.Errorf("listen: sidecar read %q, want %s:3128", got.listen, worker.SidecarListenFirstIface)

@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/git-pkgs/clone"
+	"github.com/git-pkgs/clone/gogit"
+	"github.com/git-pkgs/magic"
 
 	"scrutineer/internal/db"
 	"scrutineer/internal/worker"
@@ -18,8 +20,8 @@ import (
 // browser; larger files render as a "too large" notice.
 const maxBrowserBytes = 2 << 20
 
-// repoBlob reads one file via `git show <commit>:<path>` from the worker's
-// repo-cache, so historical commits resolve even after rescans move HEAD.
+// repoBlob reads one file at <commit>:<path> from the worker's repo-cache,
+// so historical commits resolve even after rescans move HEAD.
 func (s *Server) repoBlob(w http.ResponseWriter, r *http.Request) {
 	id64, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -71,7 +73,7 @@ func (s *Server) repoBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, binary, truncated, err := gitShowBlob(r.Context(), cacheSrc, commit, cleanPath)
+	blob, err := gitShowBlob(r.Context(), cacheSrc, commit, cleanPath)
 	if err != nil {
 		s.render(w, r, "code_browser.html", map[string]any{
 			"Repo":      repo,
@@ -82,28 +84,37 @@ func (s *Server) repoBlob(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	renderable := renderableBlob(blob.Detection)
+	content := ""
+	if renderable {
+		content = string(blob.Content)
+	}
 
 	s.render(w, r, "code_browser.html", map[string]any{
-		"Repo":      repo,
-		"Commit":    commit,
-		"Path":      cleanPath,
-		"Highlight": parseHighlight(r.URL.Query().Get("line")),
-		"Binary":    binary,
-		"Truncated": truncated,
-		"Content":   content,
-		"Language":  highlightLang(cleanPath),
+		"Repo":        repo,
+		"Commit":      commit,
+		"Path":        cleanPath,
+		"Highlight":   parseHighlight(r.URL.Query().Get("line")),
+		"Unsupported": !renderable,
+		"Truncated":   blob.Truncated,
+		"Content":     content,
+		"Language":    highlightLang(cleanPath, blob.Detection.Format),
 	})
 }
 
 // sanitizeBlobPath rejects absolute paths, traversal segments and NUL bytes,
-// and returns the slash-form path safe to feed `git show <commit>:<path>`.
-// Also used by forge_link.go for its own path checks.
+// and returns the slash-form path safe to pass as a blob path to either
+// reader. Also used by forge_link.go for its own path checks.
 func sanitizeBlobPath(p string) (string, bool) { return clone.SanitizePath(p) }
 
-// gitShowBlob wraps clone.Blob at the code browser's fixed byte cap.
-func gitShowBlob(ctx context.Context, repoDir, commit, blobPath string) (string, bool, bool, error) {
-	raw, binary, truncated, err := clone.Blob(ctx, repoDir, commit, blobPath, maxBrowserBytes)
-	return string(raw), binary, truncated, err
+// gitShowBlob reads through go-git (with a git-CLI fallback) at the code
+// browser's fixed byte cap.
+func gitShowBlob(ctx context.Context, repoDir, commit, blobPath string) (clone.BlobResult, error) {
+	return gogit.InspectBlob(ctx, repoDir, commit, blobPath, maxBrowserBytes)
+}
+
+func renderableBlob(result magic.Result) bool {
+	return result.Kind == magic.KindText && (result.Encoding == "" || result.Encoding == "utf-8")
 }
 
 // parseHighlight decodes `line=N` or `line=N-M` into an inclusive range.
@@ -128,8 +139,9 @@ func parseHighlight(raw string) [2]int {
 }
 
 // highlightLang returns the highlight.js language hint for path,
+// falling back to the sniffed content format for extensionless files,
 // or "" to let the library auto-detect.
-func highlightLang(p string) string {
+func highlightLang(p, format string) string {
 	switch strings.ToLower(filepath.Ext(p)) {
 	case ".go":
 		return "go"
@@ -173,6 +185,12 @@ func highlightLang(p string) string {
 		return "markdown"
 	case ".toml":
 		return "toml"
+	}
+	switch format {
+	case magic.FormatJSON:
+		return "json"
+	case magic.FormatXML, magic.FormatHTML, magic.FormatSVG:
+		return "xml"
 	}
 	return ""
 }

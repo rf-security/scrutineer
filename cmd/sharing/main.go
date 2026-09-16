@@ -65,11 +65,7 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	dataDir := cfg.Data
-	if dataDir == "" {
-		dataDir = defaultDataDir
-	}
-	gdb, err := db.Open(filepath.Join(dataDir, dbFileName))
+	gdb, err := db.OpenBackend(databaseOptions(cfg))
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
@@ -81,11 +77,10 @@ func run(log *slog.Logger) error {
 	// The portal never runs scans. Build an inert queue against the shared DB
 	// (needed only to construct the web.Server) but never start it, and a
 	// worker value used only for construction; triage writes (status/notes)
-	// write straight to the DB and enqueue nothing.
-	q, err := queue.New(sqldb, log, 0)
-	if err != nil {
-		return fmt.Errorf("queue: %w", err)
-	}
+	// write straight to the DB and enqueue nothing. NewNoSchema skips the goqite
+	// DDL install so the portal can connect with a read-only role (the schema
+	// already exists — the main app provisions it).
+	q := queue.NewNoSchema(sqldb, log, 0, queueDialect(cfg))
 	// The portal renders its own template set (templates/sharing/), kept
 	// separate from the main UI so portal-specific markup can diverge without
 	// touching the operator templates.
@@ -103,4 +98,28 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("scrutineer sharing portal listening", "addr", shareCfg.Addr, "base_url", shareCfg.BaseURL)
 	return httpSrv.ListenAndServe()
+}
+
+// databaseOptions maps the scrutineer config onto db.OpenBackend's Options for
+// the portal. It uses the sharing-resolved database (the root database config
+// overlaid with any sharing.database overrides), so the portal can run against
+// its own credentials while defaulting to the main database. sqlite still lives
+// under the data directory, matching cmd/scrutineer.
+func databaseOptions(cfg *config.Config) db.Options {
+	dbCfg := cfg.SharingDatabase()
+	if dbCfg.Driver == "postgres" {
+		return db.Options{Dialect: db.DialectPostgres, DSN: dbCfg.DSN}
+	}
+	dataDir := cfg.Data
+	if dataDir == "" {
+		dataDir = defaultDataDir
+	}
+	return db.Options{Dialect: db.DialectSQLite, DSN: filepath.Join(dataDir, dbFileName)}
+}
+
+func queueDialect(cfg *config.Config) queue.Dialect {
+	if cfg.SharingDatabase().Driver == "postgres" {
+		return queue.Postgres
+	}
+	return queue.SQLite
 }

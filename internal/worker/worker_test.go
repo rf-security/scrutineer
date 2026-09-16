@@ -666,7 +666,7 @@ func TestWorker_resumeAccountPaused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	q, err := queue.New(sqldb, slog.New(slog.NewTextHandler(io.Discard, nil)), 1)
+	q, err := queue.New(sqldb, slog.New(slog.NewTextHandler(io.Discard, nil)), 1, queue.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -722,7 +722,7 @@ func TestWorker_resumeAccountPausedUsesUTCComparison(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	q, err := queue.New(sqldb, slog.New(slog.NewTextHandler(io.Discard, nil)), 1)
+	q, err := queue.New(sqldb, slog.New(slog.NewTextHandler(io.Discard, nil)), 1, queue.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -800,7 +800,7 @@ func TestWorker_resumeAccountPausedRestoreOnEnqueueError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	q, err := queue.New(sqldb, slog.New(slog.NewTextHandler(io.Discard, nil)), 1)
+	q, err := queue.New(sqldb, slog.New(slog.NewTextHandler(io.Discard, nil)), 1, queue.SQLite)
 	if err != nil {
 		t.Fatal(err)
 	}

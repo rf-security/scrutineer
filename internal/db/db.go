@@ -1,8 +1,11 @@
 // Package db holds GORM setup and the persistent models.
 //
-// SQLite is the default backend. GORM speaks PostgreSQL with a one-line
-// driver swap (gorm.io/driver/postgres) and the schema below uses nothing
-// SQLite-specific, so the migration path is "change the Open call".
+// SQLite is the default backend; PostgreSQL is selected via the database
+// block in the config file (see OpenBackend). The GORM models are shared
+// across both dialects, and the handful of dialect-specific SQL sites
+// branch on gdb.Dialector.Name() ("sqlite" vs "postgres"). SQLite-only
+// operations (VACUUM INTO backups, PRAGMA-based introspection) are guarded
+// so they never run against PostgreSQL.
 package db
 
 import (
@@ -15,9 +18,28 @@ import (
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+// Dialect names a supported database backend. It matches both the config
+// file's driver value and the string gorm's Dialector.Name() reports, so
+// callers can compare gdb.Dialector.Name() against these constants.
+type Dialect string
+
+const (
+	DialectSQLite   Dialect = "sqlite"
+	DialectPostgres Dialect = "postgres"
+)
+
+// Options selects and locates the backend OpenBackend connects to. For
+// SQLite, DSN is the database file path (an in-memory DSN in tests); for
+// PostgreSQL it is a pgx/libpq connection string or URL.
+type Options struct {
+	Dialect Dialect
+	DSN     string
+}
 
 type Repository struct {
 	ID   uint   `gorm:"primarykey"`
@@ -1578,41 +1600,77 @@ func withPragmas(dsn string) string {
 	return dsn + sep + connectionPragmas
 }
 
-// Connect opens dsn with the standard pragmas and logger but performs no
-// migration. Open is Connect plus the full migration path.
+// Connect opens a SQLite dsn with the standard pragmas and logger but
+// performs no migration. Open is Connect plus the full migration path.
 func Connect(dsn string) (*gorm.DB, error) {
+	return ConnectBackend(Options{Dialect: DialectSQLite, DSN: dsn})
+}
+
+// ConnectBackend connects to the backend named by opts without migrating.
+// SQLite gets the per-connection pragmas appended to its DSN (foreign_keys,
+// busy_timeout, WAL); PostgreSQL takes the DSN verbatim.
+func ConnectBackend(opts Options) (*gorm.DB, error) {
 	cfg := &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
 	}
-	gdb, err := gorm.Open(sqlite.Open(withPragmas(dsn)), cfg)
+	var (
+		dialector gorm.Dialector
+		openErr   string
+	)
+	switch opts.Dialect {
+	case DialectPostgres:
+		dialector, openErr = postgres.Open(opts.DSN), "open postgres"
+	case DialectSQLite, "":
+		dialector, openErr = sqlite.Open(withPragmas(opts.DSN)), "open sqlite"
+	default:
+		return nil, fmt.Errorf("unknown database dialect %q", opts.Dialect)
+	}
+	gdb, err := gorm.Open(dialector, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, fmt.Errorf("%s: %w", openErr, err)
+	}
+	if opts.Dialect == DialectPostgres {
+		// PostgreSQL rejects NUL bytes / invalid UTF-8 in text columns, which
+		// SQLite accepts. Scrub captured text on every write so a stray byte in
+		// scan/finding/chat output cannot fail the write (and strand a scan in
+		// 'running'). See registerTextSanitizer.
+		if err := registerTextSanitizer(gdb); err != nil {
+			return nil, fmt.Errorf("register text sanitizer: %w", err)
+		}
 	}
 	return gdb, nil
 }
 
+// Open connects to a SQLite database at dsn (a file path or in-memory DSN)
+// and runs migrations. It is the historical single-argument entrypoint,
+// retained for tests and any SQLite-only caller; OpenBackend is the
+// config-driven path that also handles PostgreSQL.
 func Open(dsn string) (*gorm.DB, error) {
-	gdb, err := Connect(dsn)
+	return OpenBackend(Options{Dialect: DialectSQLite, DSN: dsn})
+}
+
+// OpenBackend connects to the backend named by opts, then runs the
+// pre-migration fixups, AutoMigrate, and creates the extra composite indexes.
+// AutoMigrate is dialect-portable, so the same model set builds the schema on
+// either backend. The PRAGMA-based schema version stamp is SQLite-only and is
+// skipped on PostgreSQL.
+func OpenBackend(opts Options) (*gorm.DB, error) {
+	gdb, err := ConnectBackend(opts)
 	if err != nil {
 		return nil, err
 	}
-	foundSchemaVersion, err := checkDatabaseSchemaVersion(gdb)
-	if err != nil {
-		return nil, err
+	isSQLite := gdb.Name() != string(DialectPostgres)
+	foundSchemaVersion := databaseSchemaVersion
+	if isSQLite {
+		foundSchemaVersion, err = checkDatabaseSchemaVersion(gdb)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := preMigrate(gdb); err != nil {
 		return nil, fmt.Errorf("premigrate: %w", err)
 	}
-	if err := gdb.AutoMigrate(
-		&Repository{}, &Scan{},
-		&Finding{}, &FindingLabel{}, &FindingNote{},
-		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{}, &FindingVerification{}, &FindingAttackPath{},
-		&RemediationAttempt{}, &RemediationValidation{}, &AuditEvent{},
-		&Dependency{}, &ExpectedFinding{}, &Package{}, &PackageAlternative{}, &Dependent{}, &FindingDependent{}, &Advisory{}, &AdvisoryAudit{},
-		&Maintainer{}, &Skill{}, &Subproject{},
-		&SBOMUpload{}, &SBOMPackage{}, &CNA{}, &Setting{},
-		&Conversation{}, &ChatMessage{}, &InterchangeRecord{},
-	); err != nil {
+	if err := migrate(gdb); err != nil {
 		return nil, fmt.Errorf("automigrate: %w", err)
 	}
 	gdb.Exec(`CREATE INDEX IF NOT EXISTS idx_scans_priority_id ON scans (status_priority, id DESC)`)
@@ -1629,12 +1687,47 @@ func Open(dsn string) (*gorm.DB, error) {
 		gdb.Exec(`DELETE FROM subprojects WHERE id NOT IN (SELECT MIN(id) FROM subprojects GROUP BY repository_id, path)`)
 		gdb.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_subprojects_repo_path ON subprojects (repository_id, path)`)
 	}
-	if foundSchemaVersion < databaseSchemaVersion {
+	if isSQLite && foundSchemaVersion < databaseSchemaVersion {
 		if err := gdb.Exec(fmt.Sprintf("PRAGMA user_version = %d", databaseSchemaVersion)).Error; err != nil {
 			return nil, fmt.Errorf("record database schema version: %w", err)
 		}
 	}
 	return gdb, nil
+}
+
+// models is the full set AutoMigrate manages, parents ahead of children.
+// scans.finding_id and findings.scan_id reference each other, so the set
+// contains a foreign-key cycle no ordering can linearise.
+func models() []any {
+	return []any{
+		&Repository{}, &Scan{},
+		&Finding{}, &FindingLabel{}, &FindingNote{},
+		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{}, &FindingVerification{}, &FindingAttackPath{},
+		&RemediationAttempt{}, &RemediationValidation{}, &AuditEvent{},
+		&Dependency{}, &ExpectedFinding{}, &Package{}, &PackageAlternative{}, &Dependent{}, &FindingDependent{}, &Advisory{}, &AdvisoryAudit{},
+		&Maintainer{}, &Skill{}, &Subproject{},
+		&SBOMUpload{}, &SBOMPackage{}, &CNA{}, &Setting{},
+		&Conversation{}, &ChatMessage{}, &InterchangeRecord{},
+	}
+}
+
+// migrate runs AutoMigrate over every model. SQLite migrates in one pass:
+// it accepts an inline REFERENCES to a table created later, so the
+// scans<->findings foreign-key cycle is fine. PostgreSQL rejects a forward
+// reference at CREATE TABLE, so it takes two passes — first create every
+// table with foreign-key constraints suppressed, then a second pass that
+// adds the constraints now that all tables exist. The end state (all tables,
+// all FKs, cascade deletes) is identical on both backends.
+func migrate(gdb *gorm.DB) error {
+	if gdb.Name() == string(DialectPostgres) {
+		gdb.DisableForeignKeyConstraintWhenMigrating = true
+		err := gdb.AutoMigrate(models()...)
+		gdb.DisableForeignKeyConstraintWhenMigrating = false
+		if err != nil {
+			return err
+		}
+	}
+	return gdb.AutoMigrate(models()...)
 }
 
 func checkDatabaseSchemaVersion(gdb *gorm.DB) (int, error) {

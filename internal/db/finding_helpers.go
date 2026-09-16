@@ -371,7 +371,7 @@ func conditionalFindingUpdate(gdb *gorm.DB, findingID uint, column string, oldVa
 }
 
 func findingWriteRetryDelay(err error, attempt int) (time.Duration, bool) {
-	if errors.Is(err, errFindingWriteConflict) {
+	if errors.Is(err, errFindingWriteConflict) || isPostgresSerializationFailure(err) {
 		return 0, true
 	}
 	var sqliteErr interface{ Code() int }
@@ -384,6 +384,26 @@ func findingWriteRetryDelay(err error, attempt int) (time.Duration, bool) {
 		return 0, true
 	}
 	return retry.BackoffDelay(attempt, time.Millisecond, findingWriteMaxDelay), true
+}
+
+// isPostgresSerializationFailure is the Postgres analogue of the SQLite busy
+// check in findingWriteRetryDelay: pgx
+// reports a serialization_failure (SQLSTATE 40001) or deadlock_detected (40P01)
+// when a concurrent transaction wins the compare-and-swap. Like the SQLite
+// case, the owned transaction must be restarted against a fresh snapshot. The
+// SQLState() method is matched structurally so the db package keeps no direct
+// pgconn dependency.
+func isPostgresSerializationFailure(err error) bool {
+	var pgErr interface{ SQLState() string }
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.SQLState() {
+	case "40001", "40P01":
+		return true
+	default:
+		return false
+	}
 }
 
 // findingTimeFieldAccessor mirrors findingFieldAccessor for timestamp

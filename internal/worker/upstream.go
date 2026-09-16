@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // validateScheduleURL is the scheduler's counterpart to validateGitURL:
@@ -61,12 +62,26 @@ func resolveRemoteHead(ctx context.Context, retry gitRetry, cloneURL string) (st
 // the per-URL lock serialises it against the scan cache's clone/fetch on the
 // same repository. Pushing uses the ambient git credentials (credential
 // helper, gh auth); only the terminal prompt is disabled so a missing
-// credential fails fast.
-func (w *Worker) SyncUpstream(ctx context.Context, repoURL, upstreamURL string) error {
-	return w.syncUpstream(ctx, gitRetry{}, repoURL, upstreamURL)
+// credential fails fast. headTimeout bounds only the remote HEAD probes used
+// to decide whether a sync is needed. Clone, fetch, and push retain the parent
+// context so a large first-time mirror is not discarded solely for exceeding
+// a scheduler probe deadline.
+func (w *Worker) SyncUpstream(
+	ctx context.Context,
+	repoURL string,
+	upstreamURL string,
+	headTimeout time.Duration,
+) error {
+	return w.syncUpstream(ctx, gitRetry{}, repoURL, upstreamURL, headTimeout)
 }
 
-func (w *Worker) syncUpstream(ctx context.Context, retry gitRetry, repoURL, upstreamURL string) error {
+func (w *Worker) syncUpstream(
+	ctx context.Context,
+	retry gitRetry,
+	repoURL string,
+	upstreamURL string,
+	headTimeout time.Duration,
+) error {
 	if err := validateScheduleURL(repoURL); err != nil {
 		return fmt.Errorf("repo: %w", err)
 	}
@@ -74,11 +89,17 @@ func (w *Worker) syncUpstream(ctx context.Context, retry gitRetry, repoURL, upst
 		return fmt.Errorf("upstream: %w", err)
 	}
 	policy := retry.resolved()
-	repoHead, err := resolveRemoteHead(ctx, branchPickerRetry(policy), repoURL)
+	headCtx := ctx
+	if headTimeout > 0 {
+		var cancelHead context.CancelFunc
+		headCtx, cancelHead = context.WithTimeout(ctx, headTimeout)
+		defer cancelHead()
+	}
+	repoHead, err := resolveRemoteHead(headCtx, branchPickerRetry(policy), repoURL)
 	if err != nil {
 		return fmt.Errorf("resolve repo HEAD: %w", err)
 	}
-	upstreamHead, err := resolveRemoteHead(ctx, branchPickerRetry(policy), upstreamURL)
+	upstreamHead, err := resolveRemoteHead(headCtx, branchPickerRetry(policy), upstreamURL)
 	if err != nil {
 		return fmt.Errorf("resolve upstream HEAD: %w", err)
 	}

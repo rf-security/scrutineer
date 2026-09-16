@@ -12,6 +12,10 @@ import (
 // See skills/revalidate/SKILL.md.
 const revalidateSkillName = "revalidate"
 
+// criticSkillName is the release-build viability assessment chained after a
+// true-positive revalidate verdict.
+const criticSkillName = "critic"
+
 // verifySkillName is shared with server.go: the heavier
 // reproduction-running checker chained after revalidate when a
 // High/Critical finding is judged a true positive.
@@ -73,14 +77,15 @@ func (s *Server) hasOpenFindingScopedScan(findingID, skillID uint) bool {
 	return s.hasOpenScan("finding_id = ? AND skill_id = ?", findingID, skillID)
 }
 
-// hasOpenScan reports whether a queued or running scan matching the given
-// scope predicate already exists. Shared by the finding-scoped and
-// repo-scoped open-scan guards so the "open" definition (queued or running)
-// lives in one place.
+// hasOpenScan reports whether an in-flight scan matching the given scope
+// predicate already exists. Shared by the finding-scoped, repo-scoped and
+// batch-cohort guards so the "open" definition lives in one place, and it is
+// inFlightScanStatuses(): a paused scan has not finished and will resume, so
+// every one of these guards wants to treat it as still open.
 func (s *Server) hasOpenScan(scope string, args ...any) bool {
 	var n int64
 	if err := s.DB.Model(&db.Scan{}).
-		Where("status IN ?", []db.ScanStatus{db.ScanQueued, db.ScanRunning}).
+		Where("status IN ?", inFlightScanStatuses()).
 		Where(scope, args...).
 		Count(&n).Error; err != nil {
 		return false
@@ -89,12 +94,9 @@ func (s *Server) hasOpenScan(scope string, args ...any) bool {
 }
 
 // autoChainVerifyAfterRevalidate is wired onto Worker.OnRevalidateVerdict.
-// The cheap revalidate pass acts as the gate for the expensive verify
-// step: a finding the model has just judged a real bug at High or
-// Critical severity is worth running the reproduction against. Anything
-// revalidate downgraded, called noise, or could not decide stays off the
-// queue. Severity is read post-adjustment so a Critical revalidate marks
-// down to Medium correctly stops the chain.
+// Every true positive gets the static release-viability critic. The expensive
+// reproduction-running verify remains limited to High/Critical findings.
+// These chains are independent: an absent critic does not suppress verify.
 //
 // Errors are logged and swallowed; failing to chain verify must not
 // roll back the revalidate verdict.
@@ -103,9 +105,6 @@ func (s *Server) autoChainVerifyAfterRevalidate(scan *db.Scan, f *db.Finding, ve
 		return
 	}
 	if verdict != "true_positive" {
-		return
-	}
-	if !db.SeverityAtLeast(severity, "High") {
 		return
 	}
 	// Carry the revalidate scan's resolved profile so verify reproduces on the
@@ -117,7 +116,25 @@ func (s *Server) autoChainVerifyAfterRevalidate(scan *db.Scan, f *db.Finding, ve
 	if scan != nil {
 		profile = scan.Profile
 	}
-	s.enqueueVerifyForFinding(context.Background(), f, profile)
+	ctx := context.Background()
+	s.enqueueCriticForFinding(ctx, f, profile)
+	if db.SeverityAtLeast(severity, "High") {
+		s.enqueueVerifyForFinding(ctx, f, profile)
+	}
+}
+
+// enqueueCriticForFinding looks up the active critic skill and enqueues one
+// finding-scoped assessment. Missing or inactive critic installations retain
+// the previous revalidate -> verify behavior.
+func (s *Server) enqueueCriticForFinding(ctx context.Context, f *db.Finding, profile string) {
+	var skill db.Skill
+	if err := s.DB.Where("name = ? AND active = ?", criticSkillName, true).First(&skill).Error; err != nil {
+		return
+	}
+	if err := s.enqueueFindingScopedSkillIfIdle(ctx, f.RepositoryID, f.ID, skill.ID, ScanOpts{Profile: profile}); err != nil {
+		s.Log.Warn("auto-chain critic after revalidate",
+			"finding", f.ID, "repo", f.RepositoryID, "skill", criticSkillName, "err", err)
+	}
 }
 
 // enqueueVerifyForFinding looks up the active verify skill and enqueues a

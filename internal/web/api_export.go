@@ -193,24 +193,18 @@ func (s *Server) apiExportRepoFindings(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "encrypt requires format=bundle")
 		return
 	}
-	// scope=findings curates the bundle to the Findings bucket (deep-dive,
-	// vuln-scan, imports), dropping per-repo scanner noise. Like encrypt it only
-	// applies to the bundle format; reject it elsewhere rather than silently
-	// returning the full set a caller asked to narrow.
-	scope := r.URL.Query().Get("scope")
-	if scope != "" && scope != "findings" {
+	// scope=findings curates either format to the Findings bucket (deep-dive,
+	// vuln-scan, imports), dropping per-repo scanner noise. Unknown values are
+	// rejected rather than silently returning the full set a caller asked to
+	// narrow.
+	if scope := r.URL.Query().Get("scope"); scope != "" && scope != "findings" {
 		writeAPIError(w, http.StatusBadRequest, "unsupported scope: findings")
-		return
-	}
-	if scope != "" && format != "bundle" {
-		writeAPIError(w, http.StatusBadRequest, "scope requires format=bundle")
 		return
 	}
 	// include=all promotes the bundle to the archival superset (the operator's
 	// enrichment, disclosure work product, and notes/comms/refs child records).
-	// Like encrypt and scope it only applies to the bundle format; reject it
-	// elsewhere rather than silently returning the lean default a caller asked
-	// to widen.
+	// Like encrypt it only applies to the bundle format; reject it elsewhere
+	// rather than silently returning the lean default a caller asked to widen.
 	include := r.URL.Query().Get("include")
 	if include != "" && include != "all" {
 		writeAPIError(w, http.StatusBadRequest, "unsupported include: all")
@@ -302,6 +296,10 @@ type sharingFinding struct {
 	Reach        string `json:"reach,omitempty"`
 	Rating       string `json:"rating,omitempty"`
 	FixCommit    string `json:"fix_commit,omitempty"`
+	// Model is provenance like Commit and VID — which model produced the
+	// finding on the exporting instance — so it rides the default bundle
+	// and survives the round-trip into the receiver's Finding.Model.
+	Model string `json:"model,omitempty"`
 
 	// Sinks rides the default bundle. Everything below it is populated only for
 	// include=all; omitempty keeps a default bundle byte-identical to the
@@ -321,6 +319,7 @@ type sharingFinding struct {
 	BreakingChangeRationale string `json:"breaking_change_rationale,omitempty"`
 	DupCheck                string `json:"dup_check,omitempty"`
 	DisclosureDraft         string `json:"disclosure_draft,omitempty"`
+	DisclosureTitle         string `json:"disclosure_title,omitempty"`
 	SuggestedRecipients     string `json:"suggested_recipients,omitempty"`
 	ExploitedInWild         string `json:"exploited_in_wild,omitempty"`
 	ExploitedInWildEvidence string `json:"exploited_in_wild_evidence,omitempty"`
@@ -370,13 +369,6 @@ func (s *Server) apiExportRepoBundle(w http.ResponseWriter, r *http.Request, rep
 	var findings []db.Finding
 	q := s.DB.Where("repository_id = ?", repo.ID).
 		Order("id desc")
-	if r.URL.Query().Get("scope") == "findings" {
-		// Curate to the Findings bucket — drop semgrep/zizmor scanner noise,
-		// keep deep-dive, vuln-scan, and operator imports (nonScannerScanFilter,
-		// the same predicate the Findings tab uses). Validated in
-		// apiExportRepoFindings; the default (no scope) shares every finding.
-		q = q.Where(nonScannerScanFilter)
-	}
 	if includeAll {
 		// Load the child records only for the archival superset. Ordered so the
 		// bundle is deterministic (byte-stable re-exports) and reads in the same
@@ -425,6 +417,7 @@ func (s *Server) apiExportRepoBundle(w http.ResponseWriter, r *http.Request, rep
 			Reach:        f.Reach,
 			Rating:       f.Rating,
 			FixCommit:    f.SuggestedFixCommit,
+			Model:        f.Model,
 			Sinks:        f.Sinks,
 		}
 		if includeAll {
@@ -441,6 +434,7 @@ func (s *Server) apiExportRepoBundle(w http.ResponseWriter, r *http.Request, rep
 			sf.BreakingChangeRationale = f.BreakingChangeRationale
 			sf.DupCheck = f.DupCheck
 			sf.DisclosureDraft = f.DisclosureDraft
+			sf.DisclosureTitle = f.DisclosureTitle
 			sf.SuggestedRecipients = f.SuggestedRecipients
 			sf.ExploitedInWild = f.ExploitedInWild
 			sf.ExploitedInWildEvidence = f.ExploitedInWildEvidence
@@ -622,13 +616,41 @@ func (s *Server) apiExportScans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := s.DB.Model(&db.Scan{}).Order("id desc")
-	if v := r.URL.Query().Get(statusKey); v != "" {
+	params := r.URL.Query()
+	if params.Has("repository_id") {
+		id, err := strconv.ParseInt(params.Get("repository_id"), 10, 64)
+		if err != nil || id <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "repository_id must be a positive integer")
+			return
+		}
+		q = q.Where("repository_id = ?", id)
+	}
+	if v := params.Get("kind"); v != "" {
+		q = q.Where("kind = ?", v)
+	}
+	if params.Has("since") {
+		since, err := time.Parse(time.RFC3339, params.Get("since"))
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "since must be an RFC3339 timestamp")
+			return
+		}
+		q = scanExportSince(q, since)
+	}
+	if v := params.Get(statusKey); v != "" {
 		q = q.Where("status = ?", v)
 	}
-	if v := r.URL.Query().Get("skill"); v != "" {
+	if v := params.Get("skill"); v != "" {
 		q = q.Where("skill_name = ?", v)
 	}
 	streamJSONL(w, q, s.Log, scanExport)
+}
+
+func scanExportSince(q *gorm.DB, since time.Time) *gorm.DB {
+	// SQLite timestamps retain local offsets. Compare seconds and the fraction
+	// separately: text ordering ignores offsets, while julianday loses nanoseconds.
+	return q.Where(`(unixepoch(created_at),
+		CASE WHEN substr(created_at, 20, 1) = '.' THEN CAST(substr(created_at, 20) AS REAL) ELSE 0 END
+	) >= (?, ?)`, since.Unix(), float64(since.Nanosecond())/float64(time.Second))
 }
 
 // repositoryExport maps a repositoryExportRow to the public JSON object. Repos
@@ -674,13 +696,13 @@ func validateExportFormat(w http.ResponseWriter, r *http.Request) bool {
 		writeAPIError(w, http.StatusBadRequest, "encrypt is only supported on per-repository bundle exports")
 		return false
 	}
-	// scope curates the per-repository bundle and has no meaning on these
-	// cross-repo NDJSON dumps; reject it rather than silently ignore it.
+	// scope is only accepted on the per-repository findings export; reject it
+	// here rather than silently ignore it.
 	if r.URL.Query().Get("scope") != "" {
-		writeAPIError(w, http.StatusBadRequest, "scope is only supported on per-repository bundle exports")
+		writeAPIError(w, http.StatusBadRequest, "scope is only supported on per-repository exports")
 		return false
 	}
-	// include selects the archival bundle superset; likewise bundle-only.
+	// include selects the archival bundle superset; like encrypt, bundle-only.
 	if r.URL.Query().Get("include") != "" {
 		writeAPIError(w, http.StatusBadRequest, "include is only supported on per-repository bundle exports")
 		return false
@@ -689,11 +711,23 @@ func validateExportFormat(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func applyFindingFilters(q *gorm.DB, r *http.Request) *gorm.DB {
-	if v := r.URL.Query().Get("severity"); v != "" {
+	params := r.URL.Query()
+	if v := params.Get("severity"); v != "" {
 		q = q.Where("severity = ?", v)
 	}
-	if v := r.URL.Query().Get(statusKey); v != "" {
+	if v := params.Get(statusKey); v != "" {
 		q = q.Where("status = ?", v)
+	}
+	// sub_path narrows an export to a single monorepo sub-package, so a repo
+	// like rails/rails can be exported (or bundled/encrypted) one gem at a
+	// time. Empty means the whole repository, as before.
+	if v := strings.TrimSpace(params.Get("sub_path")); v != "" {
+		q = q.Where("sub_path = ?", v)
+	}
+	// scope=findings curates to the bucket the Findings tab shows; the callers
+	// validate the value.
+	if params.Get("scope") == "findings" {
+		q = q.Where(nonScannerScanFilter)
 	}
 	return q
 }
@@ -756,46 +790,50 @@ func handleJSONLStreamError(w http.ResponseWriter, log *slog.Logger, err error, 
 // ...) are exposed via dedicated endpoints, not inlined here.
 func findingExport(f db.Finding) map[string]any {
 	return map[string]any{
-		"id":                   f.ID,
-		"scan_id":              f.ScanID,
-		"repository_id":        f.RepositoryID,
-		"commit":               f.Commit,
-		"sub_path":             f.SubPath,
-		"fingerprint":          f.Fingerprint,
-		"last_seen_scan_id":    f.LastSeenScanID,
-		"last_seen_commit":     f.LastSeenCommit,
-		"seen_count":           f.SeenCount,
-		"missed_count":         f.MissedCount,
-		"last_missed_scan_id":  f.LastMissedScanID,
-		"finding_id":           f.FindingID,
-		"sinks":                f.Sinks,
-		"title":                f.Title,
-		"severity":             f.Severity,
-		statusKey:              string(f.Status),
-		"cwe":                  f.CWE,
-		"location":             f.Location,
-		"vid":                  f.VID,
-		"affected":             f.Affected,
-		"reachability":         f.Reachability,
-		"quality_tier":         f.QualityTier,
-		"cve_id":               f.CVEID,
-		"ghsa_id":              f.GHSAID,
-		"cvss_vector":          f.CVSSVector,
-		"cvss_score":           f.CVSSScore,
-		"fix_version":          f.FixVersion,
-		"fix_commit":           f.FixCommit,
-		"resolution":           string(f.Resolution),
-		"disclosure_draft":     f.DisclosureDraft,
-		"suggested_recipients": f.SuggestedRecipients,
-		"assignee":             f.Assignee,
-		"trace":                f.Trace,
-		"boundary":             f.Boundary,
-		"validation":           f.Validation,
-		"prior_art":            f.PriorArt,
-		"reach":                f.Reach,
-		"rating":               f.Rating,
-		"created_at":           f.CreatedAt,
-		"updated_at":           f.UpdatedAt,
+		"id":                              f.ID,
+		"scan_id":                         f.ScanID,
+		"repository_id":                   f.RepositoryID,
+		"commit":                          f.Commit,
+		"sub_path":                        f.SubPath,
+		"model":                           f.Model,
+		"fingerprint":                     f.Fingerprint,
+		"last_seen_scan_id":               f.LastSeenScanID,
+		"last_seen_commit":                f.LastSeenCommit,
+		"seen_count":                      f.SeenCount,
+		"missed_count":                    f.MissedCount,
+		"last_missed_scan_id":             f.LastMissedScanID,
+		"finding_id":                      f.FindingID,
+		"sinks":                           f.Sinks,
+		"title":                           f.Title,
+		"severity":                        f.Severity,
+		"severity_caps":                   f.SeverityCapList(),
+		"severity_calibration_incomplete": f.SeverityCalibrationIncomplete,
+		statusKey:                         string(f.Status),
+		"cwe":                             f.CWE,
+		"location":                        f.Location,
+		"vid":                             f.VID,
+		"affected":                        f.Affected,
+		"reachability":                    f.Reachability,
+		"quality_tier":                    f.QualityTier,
+		"cve_id":                          f.CVEID,
+		"ghsa_id":                         f.GHSAID,
+		"cvss_vector":                     f.CVSSVector,
+		"cvss_score":                      f.CVSSScore,
+		"fix_version":                     f.FixVersion,
+		"fix_commit":                      f.FixCommit,
+		"resolution":                      string(f.Resolution),
+		"disclosure_draft":                f.DisclosureDraft,
+		"disclosure_title":                f.DisclosureTitle,
+		"suggested_recipients":            f.SuggestedRecipients,
+		"assignee":                        f.Assignee,
+		"trace":                           f.Trace,
+		"boundary":                        f.Boundary,
+		"validation":                      f.Validation,
+		"prior_art":                       f.PriorArt,
+		"reach":                           f.Reach,
+		"rating":                          f.Rating,
+		"created_at":                      f.CreatedAt,
+		"updated_at":                      f.UpdatedAt,
 	}
 }
 
@@ -833,6 +871,10 @@ func scanExport(sc db.Scan) map[string]any {
 		"updated_at":         sc.UpdatedAt,
 	}
 	out["refusal_audit"] = sc.RefusalAudit
+	out["verification_feedback"] = sc.VerificationFeedback
+	out["triage_scan_id"] = sc.TriageScanID
+	out["exploration_mode"] = sc.ExplorationMode
+	out["exploration_path"] = sc.ExplorationPath
 	out["refusal_audit_warning"] = sc.RefusalAuditWarning
 	return out
 }

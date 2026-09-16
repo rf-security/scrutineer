@@ -83,13 +83,17 @@ func TestValidateReportSemanticsDeepDiveSinkDispositions(t *testing.T) {
 	}
 }
 
-func TestValidateSkillReportAppliesSemanticsOnlyToDeepDive(t *testing.T) {
+func TestValidateSkillReportAppliesSkillSpecificSemantics(t *testing.T) {
 	incomplete := `{"inventory":[{"id":"S1"}],"findings":[],"ruled_out":[]}`
 	if got := ValidateSkillReport("posture", semanticValidationTestSchema, incomplete); got != "" {
 		t.Fatalf("other skill validation = %q, want schema-valid report", got)
 	}
 	if got := ValidateSkillReport(deepDiveSkillName, semanticValidationTestSchema, incomplete); !strings.Contains(got, "inventory sink S1 has no disposition") {
 		t.Fatalf("deep-dive validation = %q, want unresolved sink", got)
+	}
+	invalidVerify := strings.Replace(confirmedVerificationReport(t), `"number":2`, `"number":1`, 1)
+	if got := ValidateSkillReport(verifySkillName, `{"type":"object"}`, invalidVerify); !strings.Contains(got, "not unique") {
+		t.Fatalf("verify validation = %q, want duplicate attempt number", got)
 	}
 }
 
@@ -136,5 +140,28 @@ func TestRepairSchemaReportRepairsSemanticFailure(t *testing.T) {
 		if strings.Contains(event.Text, "still does not validate") {
 			t.Fatalf("repair should have revalidated semantic output: %#v", events)
 		}
+	}
+}
+
+func TestRepairSchemaReportRepairsVerifySemanticFailure(t *testing.T) {
+	valid := confirmedVerificationReport(t)
+	invalid := strings.Replace(valid, `"number":2`, `"number":1`, 1)
+	runner := &sequenceRunner{results: []SkillResult{{Report: valid}}}
+	skill := &db.Skill{Name: verifySkillName, SchemaJSON: `{"type":"object"}`}
+	scan := &db.Scan{SessionID: "session-1"}
+	w := &Worker{
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Runner:       runner,
+		SchemaStrict: true,
+	}
+	report, err := w.repairAndParseSkillOutput(context.Background(), skill, scan, SkillJob{}, invalid, func(Event) {})
+	if err != nil {
+		t.Fatalf("repairAndParseSkillOutput: %v", err)
+	}
+	if report != valid {
+		t.Fatalf("report was not replaced with the valid repair")
+	}
+	if len(runner.jobs) != 1 || !strings.Contains(runner.jobs[0].ResumePrompt, "not unique") {
+		t.Fatalf("verify semantic failure did not reach repair prompt: %+v", runner.jobs)
 	}
 }

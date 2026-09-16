@@ -1146,7 +1146,7 @@ func VerifyProxyBinary(ctx context.Context, rt ContainerRuntime, image string) e
 	out, err := exec.CommandContext(ctx, runtimeBin(rt), args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("runner image %q does not support the hardened egress proxy policy "+
-			"required by this scrutineer binary (update it or rebuild it from Dockerfile.runner): %w: %s",
+			"required by this scrutineer binary (update it or rebuild it from docker/runner/Dockerfile.runner): %w: %s",
 			image, err, strings.TrimSpace(string(out)))
 	}
 	return nil

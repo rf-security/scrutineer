@@ -10,34 +10,34 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 
 runner_amd64=$(sed -E -n \
   's/^ARG CLAUDE_AMD64_LOCK=v([0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 runner_arm64=$(sed -E -n \
   's/^ARG CLAUDE_ARM64_LOCK=v([0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 main_image=$(sed -E -n \
   's|^RUN npm install -g @anthropic-ai/claude-code@([0-9]+\.[0-9]+\.[0-9]+)$|\1|p' \
-  "$root/Dockerfile")
+  "$root/docker/cmd/Dockerfile")
 codex_amd64=$(sed -E -n \
   's/^ARG CODEX_AMD64_LOCK=(rust-v[0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 codex_arm64=$(sed -E -n \
   's/^ARG CODEX_ARM64_LOCK=(rust-v[0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 codex_catalog=$(sed -E -n \
   's/^const CodexModelCatalogRelease = "(rust-v[0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' \
   "$root/internal/worker/harness.go")
 opencode_amd64=$(sed -E -n \
   's/^ARG OPENCODE_AMD64_LOCK=(v[0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 opencode_arm64=$(sed -E -n \
   's/^ARG OPENCODE_ARM64_LOCK=(v[0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 copilot_amd64=$(sed -E -n \
   's/^ARG COPILOT_AMD64_LOCK=(v[0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 copilot_arm64=$(sed -E -n \
   's/^ARG COPILOT_ARM64_LOCK=(v[0-9]+\.[0-9]+\.[0-9]+)@sha256:[0-9a-f]{64}$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 
 require_single() {
   local label=$1
@@ -94,10 +94,10 @@ require_pair 'Copilot' "$copilot_amd64" "$copilot_arm64"
 # when Renovate is updating an existing branch past its minimumGroupSize gate.
 zizmor_main=$(sed -E -n \
   's/^RUN cargo install --locked --root \/out zizmor@([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$/\1/p' \
-  "$root/Dockerfile")
+  "$root/docker/cmd/Dockerfile")
 zizmor_runner=$(sed -E -n \
   's/^RUN cargo install --locked --root \/out zizmor@([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$/\1/p' \
-  "$root/Dockerfile.runner")
+  "$root/docker/runner/Dockerfile.runner")
 zizmor_workflow=$(sed -E -n \
   's/^[[:space:]]*run: pipx install zizmor==([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$/\1/p' \
   "$root/.github/workflows/tests.yml")

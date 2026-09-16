@@ -5,8 +5,8 @@ RUN go mod download
 COPY . .
 # COMMIT is the git SHA being built. .git is excluded from the build context
 # (.dockerignore), so the Go VCS stamp is unavailable here; pass it explicitly
-# with `docker build --build-arg COMMIT=$(git rev-parse HEAD)` to surface it on
-# the settings page. Empty when not supplied.
+# with `docker build -f docker/cmd/Dockerfile --build-arg COMMIT=$(git rev-parse HEAD) .`
+# to surface it on the settings page. Empty when not supplied.
 ARG COMMIT=""
 RUN CGO_ENABLED=0 go build -ldflags "-X main.commit=${COMMIT}" -o /scrutineer ./cmd/scrutineer
 
@@ -66,6 +66,9 @@ COPY --from=zizmor-build /out/bin/zizmor /usr/local/bin/zizmor
 
 # vid
 COPY --from=vid-build /out/vid /usr/local/bin/vid
+
+# Add docker cli to the container
+RUN apk add --no-cache docker-cli
 
 # Non-root user (T1/T11: reduce blast radius)
 RUN adduser -D -h /home/scrutineer scrutineer && \

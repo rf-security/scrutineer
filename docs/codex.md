@@ -10,7 +10,7 @@ where it differs from claude, and what's still rough.
 ## Setup
 
 The runner image already bundles the static musl `codex` binary and its
-version-matched `codex-code-mode-host` (sha256-pinned in `Dockerfile.runner`),
+version-matched `codex-code-mode-host` (sha256-pinned in `docker/runner/Dockerfile.runner`),
 so there's nothing to install. Set the credential and start scrutineer:
 
     export CODEX_API_KEY=sk-...
@@ -194,7 +194,7 @@ rather than being dropped. Reports of rough edges welcome on #211.
 
 Opencode (and any other agent CLI) slots in the same way: a struct
 implementing `Harness` in its own `internal/worker/harness_<name>.go`, an
-entry in the `harnesses` registry map, the binary in `Dockerfile.runner`, and a
+entry in the `harnesses` registry map, the binary in `docker/runner/Dockerfile.runner`, and a
 README/docs note. Opencode's discovery paths are
 `./.opencode/skill/{name}/SKILL.md` and `AGENTS.md` (both follow symlinks), its
 state dir is `OPENCODE_CONFIG_DIR` plus `OPENCODE_DB`, and its headless command

@@ -212,8 +212,6 @@ For round-trip pairs, the reproduction is the round-trip. Construct values conta
 
 If the reproduction fails — the sink is gated by a check you missed, the input is sanitised on the way in, the type system prevents it — write what stopped it and move to the next sink. One exception: when the same pattern recurs elsewhere in the tree, carry the sink into Step 4 before you stop. The count there is what separates a slip from a house idiom, so a rule-out citing it is worth more than one saying only that this site did not reproduce.
 
-Rust .crate files are gzipped tarballs.
-
 ### Step 4: Prior art
 
 Check scrutineer's advisory cache first: `GET {api_base}/repositories/{repository_id}/advisories`. Every advisory already published against this repository's packages shows up here, with CVSS, classification, packages affected, and the original URL. Anything that overlaps with your finding is prior art — cite the advisory uuid and url.

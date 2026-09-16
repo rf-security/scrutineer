@@ -83,6 +83,7 @@ func (s *Server) validateFix(w http.ResponseWriter, r *http.Request) {
 		Model:          model,
 		Ref:            ref,
 		SubPath:        baseline.SubPath,
+		ScopeMode:      baseline.ScopeMode, // match the baseline's scope so the fix comparison is apples-to-apples
 		BaselineScanID: &baselineScanID,
 	})
 	if err != nil {
@@ -158,8 +159,12 @@ func parseFindingIDs(r *http.Request) ([]uint, error) {
 // dedup pass for everything else. Both inspect committed state, so order does
 // not matter; autoEnqueueFindingDedup already skips anchor scans.
 func (s *Server) onScanFinalized(scan *db.Scan) {
+	s.autoUpdateThreatModel(scan)
+	s.autoSeedRepoScanConfig(scan)
+	s.autoEnqueueFocusAreaDeepDives(scan)
 	s.autoComputeFixValidation(scan)
 	s.autoEnqueueFindingDedup(scan)
+	s.autoEnqueueAdvisoryAudit(scan)
 }
 
 // autoComputeFixValidation is the anchor half of onScanFinalized. For a scan

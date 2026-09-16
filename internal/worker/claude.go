@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/alpha-omega-security/harness"
+
 	"scrutineer/internal/db"
 )
 
@@ -26,10 +28,24 @@ type MaxTurnsReachedError struct{}
 
 func (MaxTurnsReachedError) Error() string { return "hit max turns cap" }
 
-// SkillRunner executes one skill scan. Tests and the docker-backed runner
+// SkillRunner executes one skill scan. Tests and the container-backed runner
 // substitute the process launch without touching the queue plumbing.
 type SkillRunner interface {
 	RunSkill(ctx context.Context, sj SkillJob, emit func(Event)) (SkillResult, error)
+	// SkillDir is where the worker stages SKILL.md/schema.json before
+	// calling RunSkill, so the runner's harness discovers it. The path
+	// varies per harness (.claude/skills/{name}, skills/{name},
+	// .opencode/skill/{name}); the staged content does not.
+	SkillDir(workRoot, name string) string
+}
+
+// BackendReporter is an optional SkillRunner extension: a runner that
+// knows which harness it drives reports it here so wrap() can stamp the
+// scan row before RunSkill starts. That closes the window where a server
+// restart mid-run leaves a scan with a session_id but no backend, which
+// resumeOpts then misreads as a claude session and refuses to resume.
+type BackendReporter interface {
+	Backend() string
 }
 
 // SkillJob is a scan driven by an on-disk claude-code skill. The runner
@@ -45,11 +61,17 @@ type SkillRunner interface {
 type SkillJob struct {
 	Repo db.Repository
 	// ScanID identifies the scan that owns this job. Required when the
-	// runner is hardened: it disambiguates the per-scan docker network so
+	// runner is hardened: it disambiguates the per-scan network so
 	// concurrent scans can never share one. A zero value collapses
 	// distinct scans onto a single network and defeats the isolation, so
-	// the docker runner refuses to start hardened with ScanID == 0.
-	ScanID       uint
+	// the container runner refuses to start hardened unless ScanID or
+	// IsolationKey is set.
+	ScanID uint
+	// IsolationKey overrides ScanID when naming the hardened network and
+	// egress sidecar. A job with no scan row (a chat turn) sets it to its own
+	// namespaced id so it neither lands on the shared "0" namespace nor
+	// collides with the scan whose id happens to match.
+	IsolationKey string
 	WorkRoot     string
 	SubPath      string
 	Model        string
@@ -59,7 +81,11 @@ type SkillJob struct {
 	Ref          string // git ref to checkout; empty = default branch
 	MaxTurns     int    // per-skill cap; 0 = use runner default
 	Effort       string // per-scan claude --effort; "" = use runner default
-	AllowedTools string // comma-separated; "" = full tool set under bypassPermissions
+	// AllowedTools is comma-separated; "" = full tool set under
+	// bypassPermissions. claude-only: the other harnesses have no equivalent
+	// switch, so a tool restriction is enforced there by the container and the
+	// prompt, not by the agent CLI.
+	AllowedTools string
 	// SrcReady declares that WorkRoot/src is already populated by the
 	// caller (e.g. by the exposure handler copying from a dependent
 	// cache). When true the runner skips its own clone and reads HEAD
@@ -67,7 +93,7 @@ type SkillJob struct {
 	SrcReady bool
 	// Profile names a runner profile (docker/profiles/<name>/). Empty
 	// means "auto-detect from the clone"; "default" forces the default
-	// runner image. Only the docker runner honours this; the local
+	// runner image. Only the container runner honours this; the local
 	// runner ignores it (no per-profile image to swap to).
 	Profile string
 	// RequiresProfile pins the skill to a named profile. When set, the
@@ -83,11 +109,51 @@ type SkillJob struct {
 	// prompt. It lets callers resume the same conversation with targeted
 	// corrective instructions, such as rewriting an invalid report.json.
 	ResumePrompt string
-	// ClaudeConfigDir is a host directory the docker runner mounts as the
-	// container's CLAUDE_CONFIG_DIR so the resumable session store persists
-	// across container restarts. Empty disables the mount (the local runner
-	// ignores it and relies on the host's own ~/.claude).
-	ClaudeConfigDir string
+	// Prompt, when non-empty, replaces the default skill-activation prompt on
+	// a fresh (non-resume) run, letting a caller drive the agent with an
+	// arbitrary instruction instead of "use the <skill> skill": the chat
+	// runner passes the user's message and the conversation framing here.
+	// Unused on a resume, where ResumePrompt applies, except as the fallback
+	// when that resume finds no session: a caller that sets both gets a fresh
+	// restart in place instead of a hard failure.
+	Prompt string
+	// StateDir is a host directory the container runner mounts at
+	// /harness-state and points the harness at via Harness.StateEnv, so
+	// the resumable session store persists across container restarts.
+	// Empty disables the mount (the local runner ignores it and relies on
+	// the host's own ~/.claude).
+	StateDir string
+}
+
+// toJob resolves the runner-level defaults into a harness.Job so the module's
+// Args() (which takes only resolved values) receives what buildClaudeArgs used
+// to compute. ValidationHint carries scrutineer's API-endpoint instruction so
+// the module's generic default hint is replaced with the exact wording the
+// bundled skills already expect.
+func (sj SkillJob) toJob(effort string, maxTurns int, baseURL string) harness.Job {
+	return harness.Job{
+		Workspace:       sj.WorkRoot,
+		SkillName:       sj.Name,
+		Prompt:          sj.Prompt,
+		Model:           sj.Model,
+		Effort:          effectiveEffort(sj.Effort, effort),
+		MaxTurns:        effectiveMaxTurns(sj.MaxTurns, maxTurns),
+		OutputFile:      sj.OutputFile,
+		ValidationHint:  scrutineerValidationHint(sj.OutputFile, sj.AllowedTools),
+		AllowedTools:    sj.AllowedTools,
+		BaseURL:         baseURL,
+		ResumeSessionID: sj.ResumeSessionID,
+		ResumePrompt:    sj.ResumePrompt,
+	}
+}
+
+// isolationKey names this job's hardened network and egress sidecar. Scans key
+// on their scan id; a job without one supplies IsolationKey instead.
+func (sj SkillJob) isolationKey() string {
+	if sj.IsolationKey != "" {
+		return sj.IsolationKey
+	}
+	return strconv.FormatUint(uint64(sj.ScanID), 10)
 }
 
 type SkillResult struct {
@@ -97,8 +163,19 @@ type SkillResult struct {
 	// default runner image ran. The worker persists this on the scan
 	// so retries and the UI can show what was picked.
 	Profile string
-	// SessionID is the claude session this run belonged to, as seen in the
-	// stream. The worker already persists it live via the emit callback;
+	// Backend is the harness that ran this scan (HarnessName). Persisted on
+	// the scan so a retry after switching -backend knows the SessionID
+	// belongs to a different agent CLI and starts fresh instead of passing
+	// e.g. a codex thread id to claude --resume.
+	Backend string
+	// Provider is the provider prefix selected from an OpenCode model id.
+	// RunnerImage and RunnerImageDigest identify the provider base image before
+	// any repository language profile is layered on it.
+	Provider          string
+	RunnerImage       string
+	RunnerImageDigest string
+	// SessionID is the harness session this run belonged to, as seen in
+	// the stream. The worker already persists it live via the emit callback;
 	// this is a backstop so the final save reflects the latest value (e.g.
 	// after a resume-fallback started a fresh session).
 	SessionID string
@@ -110,10 +187,18 @@ type LocalClaude struct {
 	MaxTurns  int
 }
 
+// SkillDir is fixed at claude's discovery path: the no-container
+// fallback is claude-only by design.
+func (LocalClaude) SkillDir(workRoot, name string) string {
+	return ClaudeHarness{}.SkillDir(workRoot, name)
+}
+
+func (LocalClaude) Backend() string { return HarnessName(ClaudeHarness{}) }
+
 // RunSkill runs claude against a staged skill in a local workspace. The
 // workspace layout is:
 //
-//	{DataDir}/scan-{id}/src/                clone (read-only in docker)
+//	{DataDir}/scan-{id}/src/                clone (read-only in the container)
 //	{DataDir}/scan-{id}/.claude/skills/NAME staged skill (read by claude-code)
 //	{DataDir}/scan-{id}/OutputFile          where the skill writes, if any
 func (l LocalClaude) RunSkill(ctx context.Context, sj SkillJob, emit func(Event)) (SkillResult, error) {
@@ -141,18 +226,23 @@ func (l LocalClaude) RunSkill(ctx context.Context, sj SkillJob, emit func(Event)
 	}
 
 	emit(Event{Kind: KindText, Text: "$ claude -p <skill:" + sj.Name + ">"})
-	planLimitText := ""
+	accountErrText := ""
+	var rateLimitReset *RateLimitInfo
 	wrappedEmit := func(e Event) {
-		if planLimitText == "" {
-			planLimitText = claudePlanLimitText(e.Text)
+		accountErrText = preferAccountErrText(accountErrText, ClaudeHarness{}.AccountErrorText(e.Text))
+		if e.Kind == KindRateLimit && e.RateLimit != nil {
+			rateLimitReset = preferRateLimitReset(rateLimitReset, e.RateLimit)
 		}
 		emit(e)
 	}
-	args := buildClaudeArgs(sj, l.Effort, l.MaxTurns)
+	args := ClaudeHarness{}.Args(sj.toJob(l.Effort, l.MaxTurns, ""))
 	hitMaxTurns, sessionID, waitErr := l.runClaudeOnce(ctx, args, work, wrappedEmit)
 
-	if waitErr != nil && sj.ResumeSessionID != "" && sessionID == "" && planLimitText == "" {
-		if sj.ResumePrompt != "" {
+	if waitErr != nil && sj.ResumeSessionID != "" && sessionID == "" && accountErrText == "" {
+		if sj.ResumePrompt != "" && sj.Prompt == "" {
+			// A bare resume prompt is a corrective nudge ("rewrite the invalid
+			// report.json") that means nothing to a fresh agent, and there is
+			// no fresh framing to fall back on.
 			emit(Event{Kind: KindText, Text: "resume of session " + sj.ResumeSessionID + " failed; " + resumePromptNoFreshFallbackText})
 			return SkillResult{Commit: commit}, fmt.Errorf("claude exited: %w", waitErr)
 		}
@@ -163,7 +253,7 @@ func (l LocalClaude) RunSkill(ctx context.Context, sj SkillJob, emit func(Event)
 		emit(Event{Kind: KindText, Text: "resume of session " + sj.ResumeSessionID + " failed; restarting fresh"})
 		fresh := sj
 		fresh.ResumeSessionID = ""
-		args = buildClaudeArgs(fresh, l.Effort, l.MaxTurns)
+		args = ClaudeHarness{}.Args(fresh.toJob(l.Effort, l.MaxTurns, ""))
 		hitMaxTurns, sessionID, waitErr = l.runClaudeOnce(ctx, args, work, wrappedEmit)
 	}
 
@@ -175,8 +265,8 @@ func (l LocalClaude) RunSkill(ctx context.Context, sj SkillJob, emit func(Event)
 		if hitMaxTurns {
 			return res, &MaxTurnsReachedError{}
 		}
-		if planLimitText != "" {
-			return res, &ClaudePlanLimitError{Detail: planLimitText}
+		if accountErrText != "" {
+			return res, &AccountError{Detail: accountErrText, ResetAt: resumableReset(accountErrText, rateLimitReset)}
 		}
 		return res, fmt.Errorf("claude exited: %w", waitErr)
 	}
@@ -210,7 +300,7 @@ func (l LocalClaude) runClaudeOnce(ctx context.Context, args []string, work stri
 		}
 		emit(e)
 	}
-	ParseStream(stdout, wrappedEmit)
+	ClaudeHarness{}.ParseStream(stdout, wrappedEmit)
 	waitErr = cmd.Wait()
 	if cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
@@ -230,14 +320,32 @@ const maxReportBytes = 50 << 20
 // at path, or an empty string if the file doesn't exist. Oversize files
 // are truncated and a log line is emitted to the scan so the operator
 // knows the report was clipped.
+//
+// The report is whatever the agent left under that name in a workspace it
+// controls, so the read goes through a root opened at the parent directory
+// and accepts only a regular file: a link to a host file, or to the
+// context.json beside it, yields no report rather than that file's contents.
+// The parent is the workspace root itself — validateSkillPaths keeps
+// output_file to a bare name — which the agent cannot replace from inside its
+// bind mount.
 func readCappedReport(path string, emit func(Event)) string {
-	f, err := os.Open(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = root.Close() }()
+	name := filepath.Base(path)
+	entryInfo, err := root.Lstat(name)
+	if err != nil || !entryInfo.Mode().IsRegular() {
+		return ""
+	}
+	f, err := root.Open(name)
 	if err != nil {
 		return ""
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
-	if err != nil {
+	if err != nil || !info.Mode().IsRegular() || !os.SameFile(entryInfo, info) {
 		return ""
 	}
 	if info.Size() > maxReportBytes {
@@ -248,45 +356,6 @@ func readCappedReport(path string, emit func(Event)) string {
 		return ""
 	}
 	return string(b)
-}
-
-// buildClaudeArgs assembles the `claude -p` argv shared by the local and
-// docker runners. When the skill declares an allowed-tools list the agent
-// is held to it under acceptEdits (writes to report.json still go through
-// unprompted, arbitrary Bash does not); otherwise it falls back to the
-// historical bypassPermissions behaviour.
-func buildClaudeArgs(sj SkillJob, effort string, globalMaxTurns int) []string {
-	args := []string{
-		"-p",
-		"--output-format", "stream-json",
-		"--verbose",
-		"--model", sj.Model,
-	}
-	if sj.AllowedTools != "" {
-		args = append(args,
-			"--permission-mode", "acceptEdits",
-			"--allowedTools", sj.AllowedTools+",Skill",
-		)
-	} else {
-		args = append(args, "--permission-mode", "bypassPermissions")
-	}
-	if e := effectiveEffort(sj.Effort, effort); e != "" {
-		args = append(args, "--effort", e)
-	}
-	if sj.ResumeSessionID != "" {
-		args = append(args, "--resume", sj.ResumeSessionID)
-	}
-	args = append(args, "--max-turns", strconv.Itoa(effectiveMaxTurns(sj.MaxTurns, globalMaxTurns)))
-	if sj.ResumeSessionID != "" {
-		if sj.ResumePrompt != "" {
-			args = append(args, sj.ResumePrompt)
-		} else {
-			args = append(args, buildResumePrompt(sj.Name, sj.OutputFile))
-		}
-	} else {
-		args = append(args, buildSkillPrompt(sj.Name, sj.OutputFile))
-	}
-	return args
 }
 
 // effectiveMaxTurns resolves the turn cap: per-skill wins, then global, then
@@ -310,49 +379,63 @@ func effectiveEffort(perScan, runnerDefault string) string {
 	return runnerDefault
 }
 
-// buildSkillPrompt is the activation prompt handed to claude. It's a thin
-// wrapper: the skill's SKILL.md holds the actual instructions, we just tell
-// claude which skill to use and where the repo lives.
-func buildSkillPrompt(name, outputFile string) string {
-	p := fmt.Sprintf("Use the %q skill on the repository cloned at ./src.", name)
-	if outputFile != "" {
-		p += fmt.Sprintf(" Write your structured output to ./%s as the skill specifies.", outputFile)
-		p += schemaValidationHint(outputFile)
+// toolsAllowShell reports whether a skill's allowed-tools list lets the agent
+// run shell commands, which is what the API validation route needs. An empty
+// list is the unrestricted case (see Job.AllowedTools), so it allows Bash.
+// Entries may carry a scope qualifier ("Bash(git:*)"), so only the tool name
+// in front of the parenthesis is compared.
+func toolsAllowShell(allowedTools string) bool {
+	if strings.TrimSpace(allowedTools) == "" {
+		return true
 	}
-	return p
+	for _, tool := range strings.Split(allowedTools, ",") {
+		name, _, _ := strings.Cut(tool, "(")
+		if strings.EqualFold(strings.TrimSpace(name), "Bash") {
+			return true
+		}
+	}
+	return false
 }
 
-// schemaValidationHint tells claude to validate its JSON output against the
-// skill's schema via scrutineer's API instead of installing a JSON Schema
-// library inside the runner container. The package-install route wastes turns
-// (the container has no pip/gem) and is unreliable (Ruby's json_schemer chokes
-// on contentMediaType annotations); the endpoint reuses the harness's own
-// validator, so a pass here means the post-scan check will also pass. Only
-// emitted for JSON outputs, since the endpoint validates against schema.json.
-func schemaValidationHint(outputFile string) string {
-	if !strings.HasSuffix(outputFile, ".json") {
+// scrutineerValidationHint is the ValidationHint scrutineer supplies on every
+// harness.Job so the agent validates its JSON output via scrutineer's API
+// instead of installing a JSON Schema library inside the runner container.
+// The package-install route wastes turns (the container has no pip/gem) and
+// is unreliable (Ruby's json_schemer chokes on contentMediaType annotations);
+// the endpoint reuses scrutineer's own validator, so a pass here means the
+// post-scan check will also pass. The harness module appends this after the
+// OutputFile clause when OutputFile ends in .json.
+//
+// The POST route needs Bash, so a skill whose allowed-tools omits it gets the
+// read-based wording instead (#834): recon was told to POST on every run and
+// burned its turn budget failing to. Returning "" for those skills is not an
+// option -- the harness substitutes its own generic "Validate ./x against
+// ./schema.json before finishing" for an empty hint on any .json output, which
+// is the same unexecutable instruction minus the don't-install guard.
+func scrutineerValidationHint(outputFile, allowedTools string) string {
+	if outputFile == "" {
 		return ""
 	}
-	return fmt.Sprintf(" To check ./%s against ./schema.json, POST it to {scrutineer.api_base}/scans/{scrutineer.scan_id}/validate-report (header \"Authorization: Bearer {scrutineer.token}\", values in ./context.json); {\"valid\":true} means it conforms. Don't install a schema validator.", outputFile)
+	if !toolsAllowShell(allowedTools) {
+		return fmt.Sprintf("To check ./%s against ./schema.json, read both files and compare them yourself; your tool set has no shell, so don't install a schema validator.", outputFile)
+	}
+	return fmt.Sprintf("To check ./%s against ./schema.json, POST it to {scrutineer.api_base}/scans/{scrutineer.scan_id}/validate-report (header \"Authorization: Bearer {scrutineer.token}\", values in ./context.json); {\"valid\":true} means it conforms. Don't install a schema validator.", outputFile)
 }
 
 // buildLoggedPrompt is what scrutineer records on scan.Prompt for the UI. It
-// pairs the activation invocation with the rendered SKILL.md so the Prompt
-// tab shows the actual instructions Claude executed (#308), not just the
-// "use the X skill" wrapper.
-func buildLoggedPrompt(skill *db.Skill) string {
-	return buildSkillPrompt(skill.Name, skill.OutputFile) +
-		"\n\n--- SKILL.md ---\n\n" + renderSkillMD(skill)
-}
-
-// buildResumePrompt is the nudge handed to a `--resume`d run. The prior
-// turns are already in context, so this just tells the agent to carry on and
-// restates the deliverable — the report file is the whole point of the run,
-// and a resumed agent should not forget to write it.
-func buildResumePrompt(name, outputFile string) string {
-	p := fmt.Sprintf("Continue the %q skill on the repository at ./src from where you left off.", name)
-	if outputFile != "" {
-		p += fmt.Sprintf(" Write your structured output to ./%s as the skill specifies.", outputFile)
+// pairs the selected harness's activation invocation with the rendered
+// SKILL.md so the Prompt tab shows the instructions the agent received (#308),
+// not just an activation wrapper.
+func buildLoggedPrompt(skill *db.Skill, backend string) string {
+	h, err := HarnessByName(backend)
+	if err != nil {
+		h = ClaudeHarness{}
 	}
-	return p
+	prompt := h.Prompt(harness.Job{
+		SkillName:      skill.Name,
+		OutputFile:     skill.OutputFile,
+		ValidationHint: scrutineerValidationHint(skill.OutputFile, skill.AllowedTools),
+	})
+	return prompt +
+		"\n\n--- SKILL.md ---\n\n" + renderSkillMD(skill)
 }

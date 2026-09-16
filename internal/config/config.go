@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"regexp"
 	"slices"
+	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
+
+	"scrutineer/internal/vince"
 )
 
 // DefaultPath is the path scrutineer checks for when -config is not set.
@@ -29,17 +33,70 @@ type Config struct {
 	Models       []Model  `yaml:"models"`
 	Skills       []string `yaml:"skills"`
 	SkillsRepo   string   `yaml:"skills_repo"`
-	NoDocker     *bool    `yaml:"no_docker"`
-	// Hardened enforces the strictest sandbox mode: docker is required (no
-	// --no-docker fallback), egress is restricted to *.anthropic.com plus
-	// host.docker.internal, the container rootfs is read-only, and the
-	// runner attaches to an internal docker network whose only route out
-	// is scrutineer's allowlisting proxy. egress_allow is ignored under
+	// SkillsRepoToken authenticates an HTTPS skills repository without putting
+	// the credential in the repository URL or Git's command-line arguments.
+	// It is config-file-only because a CLI flag would expose it through argv.
+	SkillsRepoToken string `yaml:"skills_repo_token"`
+	// Backend selects the agent CLI the container runner execs:
+	// "claude" (default), "codex", or "opencode". Empty leaves the
+	// built-in default (claude). Non-claude backends require the
+	// containerised runner: --no-container with a non-claude backend
+	// is rejected at startup. Validated against worker.HarnessByName
+	// so the set of accepted values stays in one place.
+	Backend string `yaml:"backend"`
+	// Codex holds settings specific to the Codex backend. AuthFile points at a
+	// host-side ChatGPT account credential created by `codex login`; it is
+	// config-file-only because credential paths should not be exposed through
+	// process arguments.
+	Codex Codex `yaml:"codex"`
+	// Opencode holds provider-specific runner settings. The map key is the
+	// provider prefix from an OpenCode model id (for example, "groq" in
+	// "groq/llama-3.3-70b-versatile"). It is config-file-only because it can
+	// name credential environment variables and host paths.
+	Opencode Opencode `yaml:"opencode"`
+	// NoContainer disables the containerised runner so claude runs directly on
+	// the host (no isolation). NoDocker is the pre-rename alias, still honoured
+	// so existing configs keep working; no_container wins when both are set
+	// (coalesced in Load).
+	NoContainer *bool `yaml:"no_container"`
+	NoDocker    *bool `yaml:"no_docker"`
+	// HostSkills names skills that run claude directly on the host (no
+	// isolation) while every other skill keeps the containerised runner.
+	// Config-file-only. Refused with --hardened and with non-claude backends,
+	// like no_container.
+	HostSkills []string `yaml:"host_skills"`
+	// Runtime selects the container engine: "docker" (default), "podman", or
+	// "apple" (Apple's container runtime, experimental). Empty leaves the
+	// built-in default (docker). Rootless podman is detected automatically and gets
+	// --userns=keep-id so bind-mount output stays host-owned. There is no
+	// auto-detection: a non-docker host must set this (or pass --runtime)
+	// explicitly.
+	Runtime string `yaml:"runtime"`
+	// SELinux controls bind-mount relabeling for the container runner: "auto"
+	// (default/empty -- relabel only when SELinux is detected on the host), "on"
+	// (always), or "off" (never). On an SELinux-enabled host the runner must
+	// relabel its bind mounts (":z") or the container cannot read the clone or
+	// write its output. Non-SELinux hosts are unaffected. See docs/podman.md.
+	SELinux string `yaml:"selinux"`
+	// Hardened enforces the strictest sandbox mode: a container runtime is
+	// required (no --no-container fallback), egress is restricted to the
+	// harness's model API plus the runtime's host endpoint, the container rootfs is
+	// read-only, and the runner attaches to an internal network whose only route
+	// out is scrutineer's allowlisting proxy. egress_allow is ignored under
 	// hardened mode; the operator must drop hardened to widen it.
-	Hardened    *bool  `yaml:"hardened"`
-	RunnerImage string `yaml:"runner_image"`
-	ProfilesDir string `yaml:"profiles_dir"`
-	// EgressAllow extends the docker runner's egress proxy allowlist with
+	Hardened *bool `yaml:"hardened"`
+	// HardenedRuntimeOnly applies the non-network half of hardened mode
+	// (read-only rootfs + no-new-privileges + the 2 GiB post-clone workspace cap)
+	// without the per-scan --internal network. It is the fallback when the
+	// verified sidecar path is unavailable. See docs/podman.md.
+	HardenedRuntimeOnly *bool `yaml:"hardened_runtime_only"`
+	// HardenedRootlessRuntime is the deprecated alias for HardenedRuntimeOnly.
+	HardenedRootlessRuntime *bool  `yaml:"hardened_rootless_runtime"`
+	RunnerImage             string `yaml:"runner_image"`
+	// ProfilesDir is a pointer so an omitted value keeps the built-in default
+	// while an explicit empty string disables per-ecosystem runner profiles.
+	ProfilesDir *string `yaml:"profiles_dir"`
+	// EgressAllow extends the container runner's egress proxy allowlist with
 	// extra hostnames. Entries are appended to worker.DefaultEgressAllow,
 	// not replacing it. "*.example.com" matches subdomains.
 	EgressAllow []string `yaml:"egress_allow"`
@@ -54,11 +111,17 @@ type Config struct {
 	ScanTimeout string `yaml:"scan_timeout"`
 	// MaxTurns is passed as --max-turns to claude-code. 0 means no limit.
 	MaxTurns int `yaml:"max_turns"`
-	// AnthropicBaseURL overrides the default Anthropic API endpoint. When
-	// set, the hostname is automatically added to the egress allowlist and
-	// the value is passed as ANTHROPIC_BASE_URL to the claude-code process.
-	// Falls back to the ANTHROPIC_BASE_URL environment variable if empty.
-	AnthropicBaseURL string `yaml:"anthropic_base_url"`
+	// ModelBaseURL overrides the default model API endpoint for the
+	// active backend. When set, the hostname is automatically added to
+	// the egress allowlist. Each harness applies it its own way (claude:
+	// ANTHROPIC_BASE_URL env; codex: -c openai_base_url=...). For
+	// compatibility, only the claude backend also falls back to the
+	// ANTHROPIC_BASE_URL environment variable when this is unset.
+	ModelBaseURL string `yaml:"model_base_url"`
+	// LegacyAnthropicBaseURL is the former name of ModelBaseURL, kept so
+	// existing configs keep working. Load merges it into ModelBaseURL
+	// when that is unset; remove after one release.
+	LegacyAnthropicBaseURL string `yaml:"anthropic_base_url"`
 	// Theme selects the colour scheme: "claude" (default), "ocean-breeze",
 	// "catppuccin", "sunset-horizon", "midnight-bloom", or "northern-lights".
 	Theme string `yaml:"theme"`
@@ -78,13 +141,230 @@ type Config struct {
 	// emitted to the scan log and the kind-specific parser still runs.
 	// Intended as a development aid while iterating on a skill.
 	SchemaStrict *bool `yaml:"schema_strict"`
+	// DowngradeOnOverage falls the model tier back from max/high to the mid tier
+	// for newly enqueued scans while the Claude subscription is past its included
+	// quota (on overage), restoring it when the window resets. Only a
+	// subscription token reports overage. Off by default; the switch is logged
+	// and shown on the jobs page and /usage.
+	DowngradeOnOverage *bool `yaml:"downgrade_on_overage"`
 	// RecipientsFile is a flat text file of public keys (one per line,
 	// age X25519 or SSH) used to encrypt format=bundle exports. Empty
 	// disables encrypted export.
 	RecipientsFile string `yaml:"recipients_file"`
 	// IdentityFile is an age identity file or SSH private key used to
-	// decrypt encrypted imports. Empty disables encrypted import.
+	// decrypt encrypted imports and encrypted federation members feeds.
+	// Can be combined with IdentityPlugins; decryption is disabled only
+	// when both are empty.
 	IdentityFile string `yaml:"identity_file"`
+	// IdentityPlugins names data-less age identity plugins (the age -j
+	// contract) used to decrypt encrypted imports and encrypted federation
+	// members feeds through the age plugin protocol. Can be combined with
+	// IdentityFile; decryption is disabled only when both are empty.
+	IdentityPlugins []string `yaml:"identity_plugins"`
+	// AutoRejectMissedCount is the threshold of consecutive missed rescans at
+	// which an open finding is automatically transitioned to 'rejected'.
+	// 0 (the default) means this feature is disabled.
+	AutoRejectMissedCount int `yaml:"auto_reject_missed_count"`
+	// EcosystemsEnrichment gates every ecosyste.ms lookup scrutineer's own
+	// process makes: the per-repository cache the worker refreshes before a
+	// scan, the eager warm on repo add, and the PURL to repository resolution
+	// behind SBOM and dependency import. It leaves the container egress
+	// allowlist alone, since the bundled metadata / packages / advisories
+	// skills fetch ecosyste.ms themselves and replace the repository's whole
+	// row set from the result, so denying them the domain would let an empty
+	// answer wipe rows already recorded. Nil (the default) leaves enrichment on.
+	EcosystemsEnrichment *bool `yaml:"ecosystems_enrichment"`
+	// FederationSalt is the secret shared out of band between federation
+	// members and mixed into interchange finding hashes, so members derive
+	// matching hashes without publishing anything enumerable by outsiders.
+	// Empty disables federation: POST /claim-check answers 404. On purpose
+	// it has no CLI flag: a secret in argv leaks via ps and shell history.
+	FederationSalt string `yaml:"federation_salt"`
+	// FederationContact is how peers reach this instance's operator to
+	// coordinate on a shared finding; returned by POST /claim-check on a
+	// hash match. Required when FederationSalt is set: startup refuses a
+	// salt without a contact.
+	FederationContact string `yaml:"federation_contact"`
+	// SubprojectScope selects how a subproject-scoped scan stages its
+	// workspace: "hard" (default when empty) copies only the sub-folder into
+	// the scan workspace so the agent, its build, and its findings are
+	// confined to that sub-package; "soft" stages the whole clone and treats
+	// the sub-path as an advisory focus hint (the pre-monorepo behaviour). A
+	// hard-scoped scan whose isolated dependency resolution fails falls back
+	// to a whole-tree (soft) stage for that run. Per-scan overrides ride on
+	// Scan.ScopeMode. Validated by ValidateSubprojectScope.
+	SubprojectScope string `yaml:"subproject_scope"`
+	// MonorepoAttribution turns on per-subproject attribution of registry
+	// data: published packages, advisories, maintainers, and the disclosure
+	// channel are linked to the sub-package they belong to (matched by
+	// manifest name) instead of rolling up flat under the repository. A
+	// pointer so an omitted key keeps the built-in default (on); set false to
+	// keep the pre-monorepo repo-wide behaviour.
+	MonorepoAttribution *bool `yaml:"monorepo_attribution"`
+	// VINCE configures the native CERT/CC vulnerability-report submission
+	// action. The API key is config-file only so it does not leak through
+	// process arguments.
+	VINCE vince.Config `yaml:"vince"`
+	// FederationPublicFeed is the git remote the public interchange feed is
+	// pushed to: opt-outs, disclosure routes and clean certificates, in the
+	// clear, for anyone to clone. Empty disables the public export.
+	FederationPublicFeed string `yaml:"federation_public_feed"`
+	// FederationMembersFeed is the git remote the members-only feed is
+	// pushed to: the non-clean certificates, each naming a repository whose
+	// advertised fix does not hold, age-encrypted to recipients_file.
+	// Empty disables the members export; a value without recipients_file is
+	// refused at startup rather than pushing those records in the clear.
+	FederationMembersFeed string `yaml:"federation_members_feed"`
+	// FederationImportFeeds are peer feed git remotes cloned read-only and
+	// ingested by the import job.
+	FederationImportFeeds []string `yaml:"federation_import_feeds"`
+	// FederationPeers are peer base URLs asked over POST /claim-check
+	// before this instance reports a finding. Requires FederationSalt:
+	// without the shared salt the hash sent to a peer cannot match theirs.
+	FederationPeers []string `yaml:"federation_peers"`
+}
+
+// Codex groups settings that apply only to the Codex backend.
+type Codex struct {
+	AuthFile string `yaml:"auth_file"`
+}
+
+// Opencode groups settings that apply only to the OpenCode backend.
+type Opencode struct {
+	Providers map[string]OpencodeProvider `yaml:"providers"`
+}
+
+// OpencodeProvider describes what one OpenCode provider needs in addition to
+// the stock harness. RunnerImage is optional: built-in providers keep the
+// global runner, while plugin or binary-backed providers can select a derived
+// image. APIKeyEnv names a host environment variable whose value is converted
+// to a provider-only OPENCODE_AUTH_CONTENT document. PassEnv is for providers
+// that require their native multi-variable credential chain instead.
+type OpencodeProvider struct {
+	RunnerImage      string            `yaml:"runner_image"`
+	ConfigFile       string            `yaml:"config_file"`
+	APIKeyEnv        string            `yaml:"api_key_env"`
+	AuthMetadata     map[string]string `yaml:"auth_metadata"`
+	PassEnv          []string          `yaml:"pass_env"`
+	RequiredBinaries []string          `yaml:"required_binaries"`
+	EgressAllow      []string          `yaml:"egress_allow"`
+	// HostPort is a TCP port on the host machine's loopback the scan
+	// container may reach through the egress proxy at
+	// host.docker.internal:<port>. Use it for a host-local model server
+	// (Ollama, LM Studio, llama.cpp) instead of egress_allow. A provider
+	// with only host_port needs no egress_allow entry.
+	HostPort int `yaml:"host_port"`
+	// StateDir is a provider-specific host directory mounted as OpenCode's
+	// XDG data directory. It keeps rotating OAuth credentials between scans
+	// without exposing another provider's auth.json.
+	StateDir string `yaml:"state_dir"`
+}
+
+const maxTCPPort = 65535
+
+var (
+	opencodeProviderID = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
+	environmentName    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	binaryName         = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]*$`)
+)
+
+var reservedOpencodePassEnv = map[string]bool{
+	"ALL_PROXY":                     true,
+	"all_proxy":                     true,
+	"HOME":                          true,
+	"HTTP_PROXY":                    true,
+	"http_proxy":                    true,
+	"HTTPS_PROXY":                   true,
+	"https_proxy":                   true,
+	"NO_PROXY":                      true,
+	"no_proxy":                      true,
+	"OPENCODE_AUTH_CONTENT":         true,
+	"OPENCODE_CONFIG_CONTENT":       true,
+	"OPENCODE_CONFIG_DIR":           true,
+	"OPENCODE_DB":                   true,
+	"OPENCODE_DISABLE_AUTOUPDATE":   true,
+	"OPENCODE_DISABLE_MODELS_FETCH": true,
+	"OPENCODE_DISABLE_SHARE":        true,
+	"OPENCODE_LOG_LEVEL":            true,
+	"OPENCODE_PRINT_LOGS":           true,
+	"XDG_DATA_HOME":                 true,
+}
+
+// ValidateOpencode checks the provider map before any scan can use it. The
+// fields are later copied into container arguments, so provider ids and env
+// names stay within the formats their consumers accept and network/state
+// variables owned by the sandbox cannot be overridden through pass_env.
+func ValidateOpencode(c Opencode) error {
+	for id, provider := range c.Providers {
+		if err := validateOpencodeProvider(id, provider); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateOpencodeProvider(id string, provider OpencodeProvider) error {
+	if !opencodeProviderID.MatchString(id) {
+		return fmt.Errorf("opencode.providers: invalid provider id %q", id)
+	}
+	if provider.APIKeyEnv != "" && !environmentName.MatchString(provider.APIKeyEnv) {
+		return fmt.Errorf("opencode.providers.%s.api_key_env: invalid environment variable %q", id, provider.APIKeyEnv)
+	}
+	if provider.StateDir != "" && provider.APIKeyEnv != "" {
+		return fmt.Errorf("opencode.providers.%s: state_dir and api_key_env cannot be combined", id)
+	}
+	if len(provider.AuthMetadata) > 0 && provider.APIKeyEnv == "" {
+		return fmt.Errorf("opencode.providers.%s.auth_metadata requires api_key_env", id)
+	}
+	if err := validateOpencodePassEnv(id, provider.PassEnv); err != nil {
+		return err
+	}
+	if err := validateOpencodeBinaries(id, provider.RequiredBinaries); err != nil {
+		return err
+	}
+	if provider.HostPort < 0 || provider.HostPort > maxTCPPort {
+		return fmt.Errorf("opencode.providers.%s.host_port: %d is out of range", id, provider.HostPort)
+	}
+	if len(provider.EgressAllow) == 0 && provider.HostPort == 0 {
+		return fmt.Errorf("opencode.providers.%s: egress_allow or host_port is required", id)
+	}
+	for _, host := range provider.EgressAllow {
+		if strings.TrimSpace(host) != host || host == "" || strings.Contains(host, "://") || strings.ContainsAny(host, "/:") {
+			return fmt.Errorf("opencode.providers.%s.egress_allow: %q must be a hostname without a scheme, path, or port", id, host)
+		}
+	}
+	return nil
+}
+
+func validateOpencodePassEnv(id string, names []string) error {
+	seen := map[string]bool{}
+	for _, name := range names {
+		if !environmentName.MatchString(name) {
+			return fmt.Errorf("opencode.providers.%s.pass_env: invalid environment variable %q", id, name)
+		}
+		if reservedOpencodePassEnv[name] {
+			return fmt.Errorf("opencode.providers.%s.pass_env: %s is managed by scrutineer", id, name)
+		}
+		if seen[name] {
+			return fmt.Errorf("opencode.providers.%s.pass_env: duplicate environment variable %q", id, name)
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
+func validateOpencodeBinaries(id string, names []string) error {
+	seen := map[string]bool{}
+	for _, name := range names {
+		if !binaryName.MatchString(name) {
+			return fmt.Errorf("opencode.providers.%s.required_binaries: invalid executable name %q", id, name)
+		}
+		if seen[name] {
+			return fmt.Errorf("opencode.providers.%s.required_binaries: duplicate executable name %q", id, name)
+		}
+		seen[name] = true
+	}
+	return nil
 }
 
 // ParseScanTimeout validates and parses a scan_timeout string. Empty
@@ -115,12 +395,50 @@ func ValidateClone(s string) error {
 	}
 }
 
-// Model is a display-name plus the claude model id it resolves to. The
-// shape matches web.Model so main.go can pipe one into the other without
-// the two packages depending on each other.
+// ValidateRuntime returns an error when s is neither empty, "docker", "podman",
+// nor "apple". Exposed so the CLI flag can use the same rule as the YAML
+// field.
+func ValidateRuntime(s string) error {
+	switch s {
+	case "", "docker", "podman", "apple":
+		return nil
+	default:
+		return fmt.Errorf("runtime: must be \"docker\", \"podman\", or \"apple\", got %q", s)
+	}
+}
+
+// ValidateSELinux returns an error when s is not one of "", "auto", "on", or
+// "off". Exposed so the CLI flag can use the same rule as the YAML field.
+func ValidateSELinux(s string) error {
+	switch s {
+	case "", "auto", "on", "off":
+		return nil
+	default:
+		return fmt.Errorf("selinux: must be \"auto\", \"on\", or \"off\", got %q", s)
+	}
+}
+
+// ValidateSubprojectScope returns an error when s is neither empty, "hard",
+// nor "soft". Exposed so the CLI flag can use the same rule as the YAML field.
+func ValidateSubprojectScope(s string) error {
+	switch s {
+	case "", "hard", "soft":
+		return nil
+	default:
+		return fmt.Errorf("subproject_scope: must be \"hard\" or \"soft\", got %q", s)
+	}
+}
+
+// Model is a display-name plus the model id it resolves to. The shape
+// matches web.Model so main.go can pipe one into the other without the
+// two packages depending on each other. Tier optionally tags the entry
+// as the default for one of the mid/high/max model tiers so operators
+// with a non-Anthropic model list get sensible tier defaults without
+// setting each one in /settings.
 type Model struct {
 	Name string `yaml:"name"`
 	ID   string `yaml:"id"`
+	Tier string `yaml:"tier"`
 }
 
 // Themes lists every valid theme name.
@@ -169,7 +487,23 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	// no_container is the canonical key; no_docker is the retained alias.
+	// Fold the alias into NoContainer so the rest of the code reads one field.
+	if c.NoContainer == nil {
+		c.NoContainer = c.NoDocker
+	}
+	// model_base_url replaced anthropic_base_url; fold the old key so
+	// existing configs keep working. Remove after one release.
+	if c.ModelBaseURL == "" && c.LegacyAnthropicBaseURL != "" {
+		c.ModelBaseURL = c.LegacyAnthropicBaseURL
+	}
 	if err := ValidateClone(c.Clone); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := ValidateRuntime(c.Runtime); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := ValidateSELinux(c.SELinux); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if _, err := ParseScanTimeout(c.ScanTimeout); err != nil {
@@ -180,6 +514,17 @@ func Load(path string) (*Config, error) {
 	}
 	if err := ValidateEffort(c.Effort); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := ValidateSubprojectScope(c.SubprojectScope); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := ValidateOpencode(c.Opencode); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if c.VINCE.Enabled() {
+		if _, err := c.VINCE.Endpoint(); err != nil {
+			return nil, fmt.Errorf("parse config %s: %w", path, err)
+		}
 	}
 	return &c, nil
 }

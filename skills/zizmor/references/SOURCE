@@ -1,0 +1,6 @@
+Adapted Warden GitHub Actions workflow references
+
+Source: https://github.com/getsentry/warden-skills/tree/9111d2524f6c03388861a63dfc81825b4ba911e1/skills/wrdn-gha-workflows/references
+Revision: 9111d2524f6c03388861a63dfc81825b4ba911e1
+Adaptation: Warden-specific activation configuration and internal Sentry references were removed, and the guidance was organized for Scrutineer's scanner-authoritative zizmor enrichment flow.
+License: MIT; see LICENSE.warden in this directory.

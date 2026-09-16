@@ -97,6 +97,70 @@ func TestHandleImportSARIF(t *testing.T) {
 	}
 }
 
+func TestHandleImport_multiResultFailureRollsBackAllRows(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	if err := s.DB.Create(&db.Skill{
+		Name: metadataSkillName, OutputFile: "report.json",
+		OutputKind: "repo_metadata", Version: 1, Active: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&db.Skill{
+		Name: revalidateSkillName, OutputFile: "report.json",
+		OutputKind: "revalidate", Version: 1, Active: true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{
+		"version": "2.1.0",
+		"runs": [
+			{
+				"tool": {"driver": {"name": "first"}},
+				"versionControlProvenance": [{
+					"repositoryUri": "https://example.com/first",
+					"revisionId": "abc123"
+				}],
+				"results": [{
+					"ruleId": "rule-1",
+					"level": "error",
+					"message": {"text": "first finding"}
+				}]
+			},
+			{
+				"tool": {"driver": {"name": "second"}},
+				"results": [{
+					"ruleId": "rule-2",
+					"level": "warning",
+					"message": {"text": "second finding"}
+				}]
+			}
+		]
+	}`
+	w := postImport(t, s, "/api/v1/import", body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), "repository unknown") {
+		t.Fatalf("body = %q, want repository error", w.Body.String())
+	}
+
+	for name, model := range map[string]any{
+		"repositories": &db.Repository{},
+		"scans":        &db.Scan{},
+		"findings":     &db.Finding{},
+	} {
+		var count int64
+		if err := s.DB.Model(model).Count(&count).Error; err != nil {
+			t.Fatalf("count %s: %v", name, err)
+		}
+		if count != 0 {
+			t.Errorf("%s rows = %d, want 0 after rollback", name, count)
+		}
+	}
+}
+
 func TestHandleImportDedupesOnReimport(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -150,6 +214,61 @@ func TestHandleImportRepoOverride(t *testing.T) {
 	}
 }
 
+func TestHandleImportRevalidateToggle(t *testing.T) {
+	cases := []struct {
+		name       string
+		query      string
+		wantQueued int64
+	}{
+		// Omitting the param must behave exactly as before: revalidate runs.
+		// This is the no-interface-change guard.
+		{"default runs", "", 1},
+		{"explicit true runs", "&revalidate=true", 1},
+		{"false skips", "&revalidate=false", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+			revalidate := db.Skill{Name: "revalidate", OutputFile: "report.json", OutputKind: "revalidate", Version: 1, Active: true}
+			s.DB.Create(&revalidate)
+
+			body := `{"findings":[{"title":"x","cwe":"CWE-1","location":"a.go:1"}]}`
+			w := postImport(t, s, "/api/v1/import?repo=https://github.com/acme/thing"+tc.query, body)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+			}
+			var queued int64
+			s.DB.Model(&db.Scan{}).
+				Where("skill_id = ? AND status = ?", revalidate.ID, db.ScanQueued).
+				Count(&queued)
+			if queued != tc.wantQueued {
+				t.Errorf("queued revalidate scans = %d, want %d", queued, tc.wantQueued)
+			}
+		})
+	}
+}
+
+func TestHandleImportRejectsBadRevalidate(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	body := `{"findings":[{"title":"x","cwe":"CWE-1","location":"a.go:1"}]}`
+	w := postImport(t, s, "/api/v1/import?repo=https://github.com/acme/thing&revalidate=banana", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "revalidate") {
+		t.Errorf("body = %q, want it to name the bad param", w.Body.String())
+	}
+	// A malformed toggle must abort the whole import, not import-then-ignore.
+	var findings int64
+	s.DB.Model(&db.Finding{}).Count(&findings)
+	if findings != 0 {
+		t.Errorf("findings created = %d, want 0 (request rejected)", findings)
+	}
+}
+
 func TestHandleImportRejectsNoRepo(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -160,6 +279,54 @@ func TestHandleImportRejectsNoRepo(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "repository unknown") {
 		t.Errorf("body = %q", w.Body.String())
+	}
+}
+
+func TestHandleImportRejectsUnavailableSenderLocalRepository(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	missing := t.TempDir() + "/racc"
+	body, err := json.Marshal(map[string]any{
+		"repository": LocalScheme + missing,
+		"tool":       "scrutineer",
+		"findings": []map[string]string{{
+			"title": "local-only finding", "severity": "High",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := postImport(t, s, "/api/v1/import", string(body))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "?repo=https://forge/owner/repo") {
+		t.Errorf("error does not explain the clone URL override: %s", w.Body)
+	}
+	var repos, findings int64
+	s.DB.Model(&db.Repository{}).Count(&repos)
+	s.DB.Model(&db.Finding{}).Count(&findings)
+	if repos != 0 || findings != 0 {
+		t.Errorf("rejected import persisted repos=%d findings=%d, want 0/0", repos, findings)
+	}
+}
+
+func TestHandleImportSenderLocalRepositoryAllowsRemoteOverride(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	body := `{"repository":"file:///sender/tmp/racc","tool":"scrutineer","findings":[{"title":"portable finding","severity":"High"}]}`
+	w := postImport(t, s, "/api/v1/import?repo=https://github.com/ruby/racc&revalidate=false", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body = %s", w.Code, w.Body.String())
+	}
+	var repo db.Repository
+	if err := s.DB.Where("url = ?", "https://github.com/ruby/racc").First(&repo).Error; err != nil {
+		t.Fatalf("remote override repository not created: %v", err)
+	}
+	if repo.IsLocal() {
+		t.Error("remote override created a local repository")
 	}
 }
 

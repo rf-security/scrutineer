@@ -2,6 +2,24 @@
 
 <h1 class="text-2xl font-semibold mb-6">Settings</h1>
 
+{{if .Meta.Stale}}
+<div class="alert alert-warning mb-6" role="status">
+  <i data-lucide="triangle-alert"></i>
+  <section>
+    <strong>Runner image is {{.Meta.StaleDays}} days old.</strong>
+    A newer build of the analysis toolchain is available. Update to pick it up:
+    <span class="inline-flex items-center gap-1.5">
+      <code class="font-mono">{{.Meta.PullCommand}}</code>
+      <button type="button" class="btn-icon-ghost copy-btn" data-copy="{{.Meta.PullCommand}}"
+              aria-label="Copy command" title="Copy command">
+        <i data-lucide="copy" class="copy-icon"></i>
+        <i data-lucide="check" class="copied-icon"></i>
+      </button>
+    </span>
+  </section>
+</div>
+{{end}}
+
 <div class="grid gap-6">
 
 <section class="card">
@@ -106,6 +124,22 @@
         </div>
         <p class="text-xs text-muted-foreground">Turn cap for skills that set none. Applies to the next scan.</p>
       </form>
+      {{$sched := .ScanSchedule}}
+      {{$isCron := and $sched (ne $sched "daily") (ne $sched "weekly")}}
+      <form method="post" action="/settings/scan-schedule" hx-post="/settings/scan-schedule" hx-swap="none" class="grid gap-2">
+        <label for="scan_schedule">Default scan schedule</label>
+        <div class="flex gap-2">
+          <select id="scan_schedule" class="select" name="scan_schedule">
+            <option value="off" {{if not $sched}}selected{{end}}>Off</option>
+            <option value="daily" {{if eq $sched "daily"}}selected{{end}}>Daily</option>
+            <option value="weekly" {{if eq $sched "weekly"}}selected{{end}}>Weekly</option>
+            <option value="custom" {{if $isCron}}selected{{end}}>Custom cron</option>
+          </select>
+          <input class="input" type="text" name="scan_schedule_cron" value="{{if $isCron}}{{$sched}}{{end}}" placeholder="cron, e.g. 0 3 * * 1">
+          <button type="submit" class="btn">Save</button>
+        </div>
+        <p class="text-xs text-muted-foreground">Recurring scans for every repository without its own schedule. Runs skip when the remote HEAD is unchanged since the last completed scan.</p>
+      </form>
     </div>
     <div id="concurrency-confirm"></div>
   </section>
@@ -168,7 +202,7 @@
 <section class="card">
   <header>
     <h2>About</h2>
-    <p class="text-muted-foreground text-sm">Versions of Scrutineer and the analysis tools that run inside the runner image. Scanner versions are read from the running image and may be unavailable when Docker is not in use.</p>
+    <p class="text-muted-foreground text-sm">Versions of Scrutineer and the analysis tools that run inside the runner image. Scanner versions are read from the running image and may be unavailable when no container runtime is in use.</p>
   </header>
   <section>
     {{define "metarow"}}
@@ -178,12 +212,13 @@
       </div>
     {{end}}
     <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
-      {{template "metarow" (dict "Label" "Scrutineer commit" "Value" (short .Commit))}}
-      {{template "metarow" (dict "Label" "Claude Code" "Value" .Meta.Claude)}}
+      {{template "metarow" (dict "Label" "Scrutineer version" "Value" .Version)}}
+      {{template "metarow" (dict "Label" (printf "Backend (%s)" .Meta.Backend) "Value" .Meta.Harness)}}
       {{template "metarow" (dict "Label" "Semgrep" "Value" .Meta.Semgrep)}}
       {{template "metarow" (dict "Label" "Zizmor" "Value" .Meta.Zizmor)}}
-      {{template "metarow" (dict "Label" "Docker" "Value" .Meta.Docker)}}
-      {{template "metarow" (dict "Label" "Runner image" "Value" .Meta.RunnerImage)}}
+      {{template "metarow" (dict "Label" "Bandit" "Value" .Meta.Bandit)}}
+      {{template "metarow" (dict "Label" "Container runtime" "Value" .Meta.Runtime)}}
+      {{template "metarow" (dict "Label" "Runner image" "Value" .Meta.RunnerImageRef)}}
     </div>
   </section>
 </section>

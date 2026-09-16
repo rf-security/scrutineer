@@ -1,327 +1,180 @@
+// This file re-exports github.com/alpha-omega-security/harness/egress under
+// the names the rest of scrutineer already uses, so the swap is one file
+// rather than forty call sites. The package-name prefix that would be
+// redundant with the egress package (EgressProxy vs egress.Proxy) is kept
+// here for now; a follow-up rename can drop it once the harness core PR has
+// landed and the churn settles.
 package worker
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"fmt"
-	"io"
-	"log/slog"
-	"maps"
+	"context"
+	"crypto/subtle"
+	"encoding/base64"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/alpha-omega-security/harness/egress"
 )
-
-// HostGatewayAlias is the hostname containers use to reach the host. The
-// proxy rewrites it to 127.0.0.1 when dialing so skills can call the
-// scrutineer API even though the web server only listens on loopback.
-const HostGatewayAlias = "host.docker.internal"
-
-// HardenedEgressAllow is the strict allowlist used when --hardened is
-// set. Only the Anthropic API and the host skill API (reached through
-// host.docker.internal) are permitted; anything else returns 403 at
-// the proxy. Skills that need ecosyste.ms or a package registry must
-// route through the host API, or the operator must drop hardened mode.
-var HardenedEgressAllow = []string{
-	"*.anthropic.com",
-	HostGatewayAlias,
-}
-
-// DefaultEgressAllow is the built-in host allowlist for the docker
-// runner's egress proxy. It covers what the bundled skills actually
-// reach: the Anthropic API, ecosyste.ms services, the major code forges,
-// the package registries those forges publish to, and the advisory
-// sources the security skills consult. Entries are matched
-// case-insensitively against the CONNECT/request host with the port
-// stripped; a leading "*." matches any subdomain.
-var DefaultEgressAllow = []string{
-	// model
-	"*.anthropic.com",
-
-	// scrutineer skill API on the host
-	HostGatewayAlias,
-
-	// ecosyste.ms (packages, repos, advisories, commits, issues, ...)
-	"*.ecosyste.ms",
-
-	// forges
-	"github.com",
-	"api.github.com",
-	"raw.githubusercontent.com",
-	"objects.githubusercontent.com",
-	"codeload.github.com",
-	"gitlab.com",
-	"codeberg.org",
-	"bitbucket.org",
-
-	// package registries — API, content, web, and stats endpoints for the
-	// ecosystems packages.ecosyste.ms covers. Grouped so adding a new
-	// registry stays a focused diff.
-	// npm
-	"registry.npmjs.org",
-	"api.npmjs.org",
-	"www.npmjs.com",
-	// PyPI
-	"pypi.org",
-	"files.pythonhosted.org",
-	"pypistats.org",
-	// RubyGems
-	"rubygems.org",
-	"index.rubygems.org",
-	// crates.io
-	"crates.io",
-	"static.crates.io",
-	"index.crates.io",
-	// Go
-	"proxy.golang.org",
-	"sum.golang.org",
-	"pkg.go.dev",
-	// Packagist (PHP)
-	"packagist.org",
-	"repo.packagist.org",
-	// Hex (Elixir/Erlang)
-	"hex.pm",
-	"repo.hex.pm",
-	// NuGet (.NET)
-	"api.nuget.org",
-	"www.nuget.org",
-	// Maven Central (Java)
-	"repo.maven.apache.org",
-	"repo1.maven.org",
-	"search.maven.org",
-	"central.sonatype.com",
-	// Conda
-	"anaconda.org",
-	"conda.anaconda.org",
-	// CocoaPods (Swift / Objective-C)
-	"cocoapods.org",
-	"trunk.cocoapods.org",
-	// CPAN (Perl)
-	"metacpan.org",
-	"fastapi.metacpan.org",
-	// CRAN (R)
-	"cran.r-project.org",
-	// Homebrew
-	"formulae.brew.sh",
-	// Pub (Dart / Flutter)
-	"pub.dev",
-	// Conan (C / C++)
-	"conan.io",
-	"center.conan.io",
-
-	// advisory / rule sources
-	"semgrep.dev",
-	"osv.dev",
-	"api.osv.dev",
-	"nvd.nist.gov",
-	"services.nvd.nist.gov",
-	"cwe.mitre.org",
-}
-
-// EgressProxy is a small forward proxy the docker runner points
-// HTTPS_PROXY/HTTP_PROXY at. It only tunnels to hosts on Allow. Clients
-// must present Token via Proxy-Authorization basic auth (any username);
-// the proxy listens on all interfaces so the docker bridge can reach it,
-// and the token stops it being an open relay on the LAN.
-type EgressProxy struct {
-	Allow   []string
-	Token   string
-	APIPort string // only this port is allowed for HostGatewayAlias
-	Log     *slog.Logger
-
-	transport *http.Transport
-	once      sync.Once
-}
 
 const (
-	egressDialTimeout = 10 * time.Second
-	egressCopyBuf     = 32 << 10
-	egressIdlePerHost = 4
+	HostGatewayAlias        = egress.HostGatewayAlias
+	SidecarListenFirstIface = egress.ListenFirstIface
+	// ProxyCapabilityDenyAPIConnect is required by the host when a runner
+	// image supplies the hardened egress sidecar binary. Older binaries do not
+	// recognise the corresponding flag and therefore fail closed.
+	ProxyCapabilityDenyAPIConnect = "deny-api-connect-v1"
 )
 
-func (p *EgressProxy) init() {
-	p.once.Do(func() {
-		p.transport = &http.Transport{
-			DialContext:         (&net.Dialer{Timeout: egressDialTimeout}).DialContext,
-			ForceAttemptHTTP2:   false,
-			MaxIdleConnsPerHost: egressIdlePerHost,
+var (
+	DefaultEgressAllow  = egress.DefaultAllow
+	HardenedEgressAllow = egress.HardenedAllow
+)
+
+type EgressProxy = egress.Proxy
+
+const egressProxyReadHeaderTimeout = 10 * time.Second
+
+func NewProxyToken() string                               { return egress.NewToken() }
+func ProxyURLForHost(token, host string, port int) string { return egress.ProxyURL(token, host, port) }
+func ProxyURLForEndpoint(token, endpoint string) string   { return egress.EndpointURL(token, endpoint) }
+func FirstIfaceIPv4() (string, error)                     { return egress.FirstIfaceIPv4() }
+
+// StartEgressProxy starts the process-wide proxy used by ordinary container
+// scans. Scrutineer owns the listener so every proxy shape shares the API
+// CONNECT guard, including versions of harness that still allow that tunnel.
+func StartEgressProxy(p *EgressProxy) (int, error) {
+	if err := validateEgressProxy(p); err != nil {
+		return 0, err
+	}
+	ln, err := net.Listen("tcp", ":0")
+	if err != nil {
+		return 0, err
+	}
+	srv := newEgressProxyServer(p, "")
+	go func() { _ = srv.Serve(ln) }()
+	return ln.Addr().(*net.TCPAddr).Port, nil
+}
+
+// ServeEgressProxy runs the fixed-address proxy used by hardened sidecars.
+func ServeEgressProxy(p *EgressProxy, addr string) error {
+	if err := validateEgressProxy(p); err != nil {
+		return err
+	}
+	srv := newEgressProxyServer(p, addr)
+	return srv.ListenAndServe()
+}
+
+func WaitHostAPIReachable(ctx context.Context, host, port string) error {
+	return egress.WaitHostAPIReachable(ctx, host, port)
+}
+
+func VerifyUpstreamDNS(ctx context.Context, allow []string) error {
+	return egress.VerifyUpstreamDNS(ctx, allow)
+}
+
+func validateEgressProxy(p *EgressProxy) error {
+	if p == nil {
+		return errors.New("egress: proxy is required")
+	}
+	if p.Token == "" {
+		return errors.New("egress: Token is required")
+	}
+	return nil
+}
+
+func newEgressProxyServer(p *EgressProxy, addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           apiConnectGuard(p),
+		ReadHeaderTimeout: egressProxyReadHeaderTimeout,
+	}
+}
+
+// apiConnectGuard keeps the host skill API on the proxy's parsed HTTP path.
+// A raw tunnel would let scan code choose a second Host header after the proxy
+// has authorized and rewritten the outer destination, turning the proxy into a
+// deputy for the host-only operator routes. HostPorts remain tunnelable because
+// they are separate, explicit grants for host-local model services.
+func apiConnectGuard(p *EgressProxy) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			host, port := splitProxyTarget(r.Host)
+			if port == p.APIPort && proxyAPIHost(p, host) {
+				// Own authentication for this forbidden target instead of delegating
+				// invalid credentials to harness. That keeps the denial fail-closed
+				// if a future harness release changes what credentials it accepts.
+				if !validProxyAuthorization(p.Token, r.Header.Get("Proxy-Authorization")) {
+					w.Header().Set("Proxy-Authenticate", `Basic realm="harness"`)
+					http.Error(w, "proxy authorization required", http.StatusProxyAuthRequired)
+					return
+				}
+				if p.Log != nil {
+					p.Log.Warn("egress denied", "method", http.MethodConnect, "host", host, "port", port,
+						"reason", "host skill API requires inspected HTTP")
+				}
+				http.Error(w, "CONNECT to the host skill API is denied; use an HTTP proxy request", http.StatusForbidden)
+				return
+			}
 		}
+		p.ServeHTTP(w, r)
 	})
 }
 
-func (p *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p.init()
-	if !p.checkAuth(r) {
-		w.Header().Set("Proxy-Authenticate", `Basic realm="scrutineer"`)
-		http.Error(w, "proxy authorization required", http.StatusProxyAuthRequired)
-		return
-	}
-	if r.Method == http.MethodConnect {
-		p.serveConnect(w, r)
-		return
-	}
-	p.serveForward(w, r)
-}
-
-func (p *EgressProxy) checkAuth(r *http.Request) bool {
-	if p.Token == "" {
-		return true
-	}
+func validProxyAuthorization(token, header string) bool {
 	const prefix = "Basic "
-	h := r.Header.Get("Proxy-Authorization")
-	if !strings.HasPrefix(h, prefix) {
+	if !strings.HasPrefix(header, prefix) {
 		return false
 	}
-	_, pass, ok := decodeBasic(h[len(prefix):])
-	return ok && pass == p.Token
+	decoded, err := base64.StdEncoding.DecodeString(header[len(prefix):])
+	if err != nil {
+		return false
+	}
+	_, password, ok := strings.Cut(string(decoded), ":")
+	return ok && subtle.ConstantTimeCompare([]byte(password), []byte(token)) == 1
 }
 
-func (p *EgressProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
-	host, port := splitTarget(r.Host)
-	if !HostAllowed(p.Allow, host) {
-		p.Log.Warn("egress denied", "method", "CONNECT", "host", host)
-		http.Error(w, "egress to "+host+" is not on the allowlist", http.StatusForbidden)
-		return
+func splitProxyTarget(hostport string) (host, port string) {
+	if host, port, err := net.SplitHostPort(hostport); err == nil {
+		return host, port
 	}
-	if strings.EqualFold(host, HostGatewayAlias) && p.APIPort != "" && port != p.APIPort {
-		p.Log.Warn("egress denied", "method", "CONNECT", "host", host, "port", port, "allowed_port", p.APIPort)
-		http.Error(w, "egress to "+host+" is only allowed on port "+p.APIPort, http.StatusForbidden)
-		return
-	}
-	upstream, err := net.DialTimeout("tcp", dialTarget(host, port), egressDialTimeout)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		_ = upstream.Close()
-		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
-		return
-	}
-	client, _, err := hj.Hijack()
-	if err != nil {
-		_ = upstream.Close()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	pipe(client, upstream)
+	return hostport, "443"
 }
 
-func (p *EgressProxy) serveForward(w http.ResponseWriter, r *http.Request) {
-	if !r.URL.IsAbs() {
-		http.Error(w, "absolute URI required", http.StatusBadRequest)
-		return
+func proxyAPIHost(p *EgressProxy, host string) bool {
+	hosts := p.APIHosts
+	if len(hosts) == 0 {
+		hosts = []string{HostGatewayAlias}
 	}
-	host, port := splitTarget(r.URL.Host)
-	if !HostAllowed(p.Allow, host) {
-		p.Log.Warn("egress denied", "method", r.Method, "host", host)
-		http.Error(w, "egress to "+host+" is not on the allowlist", http.StatusForbidden)
-		return
-	}
-	if strings.EqualFold(host, HostGatewayAlias) && p.APIPort != "" && port != p.APIPort {
-		p.Log.Warn("egress denied", "method", r.Method, "host", host, "port", port, "allowed_port", p.APIPort)
-		http.Error(w, "egress to "+host+" is only allowed on port "+p.APIPort, http.StatusForbidden)
-		return
-	}
-	out := r.Clone(r.Context())
-	out.RequestURI = ""
-	out.URL.Host = dialTarget(host, port)
-	out.Header.Del("Proxy-Authorization")
-	out.Header.Del("Proxy-Connection")
-	resp, err := p.transport.RoundTrip(out)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-	maps.Copy(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-}
-
-// HostAllowed reports whether host matches any entry in allow. Matching is
-// case-insensitive on the bare hostname (port already stripped). An entry
-// "*.example.com" matches any subdomain of example.com but not the apex;
-// list the apex separately if needed.
-func HostAllowed(allow []string, host string) bool {
-	host = strings.ToLower(host)
-	for _, a := range allow {
-		a = strings.ToLower(a)
-		if rest, ok := strings.CutPrefix(a, "*."); ok {
-			if strings.HasSuffix(host, "."+rest) {
-				return true
-			}
-			continue
-		}
-		if host == a {
+	for _, apiHost := range hosts {
+		if strings.EqualFold(host, apiHost) {
 			return true
 		}
 	}
 	return false
 }
 
-// StartEgressProxy listens on all interfaces on an ephemeral port and
-// serves p in a goroutine. It returns the chosen port. The caller embeds
-// the port and p.Token into the proxy URL handed to containers.
-func StartEgressProxy(p *EgressProxy) (int, error) {
+// StartScopedEgressProxy starts a host proxy whose lifetime is one scan. The
+// harness package's process-wide starter intentionally has no close hook, so
+// provider-specific allowlists use this variant to avoid leaking listeners.
+func StartScopedEgressProxy(p *EgressProxy) (int, func(), error) {
+	noop := func() {}
+	if err := validateEgressProxy(p); err != nil {
+		return 0, noop, err
+	}
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
-		return 0, err
+		return 0, noop, err
 	}
-	srv := &http.Server{Handler: p, ReadHeaderTimeout: egressDialTimeout}
-	// The proxy lives for the process lifetime: it is started once from
-	// main.setupRunner and every container talks through it. There is no
-	// per-scan teardown, so no Shutdown wiring is needed; process exit
-	// closes the listener.
+	srv := newEgressProxyServer(p, "")
 	go func() { _ = srv.Serve(ln) }()
-	return ln.Addr().(*net.TCPAddr).Port, nil
-}
-
-// NewProxyToken returns 32 hex chars of crypto/rand for Proxy-Authorization.
-func NewProxyToken() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
-
-// ProxyURL builds the http_proxy-style URL for containers.
-func ProxyURL(token string, port int) string {
-	return fmt.Sprintf("http://scrutineer:%s@%s:%d", token, HostGatewayAlias, port)
-}
-
-func splitTarget(hostport string) (host, port string) {
-	if h, p, err := net.SplitHostPort(hostport); err == nil {
-		return h, p
-	}
-	return hostport, "443"
-}
-
-func dialTarget(host, port string) string {
-	if strings.EqualFold(host, HostGatewayAlias) {
-		host = "127.0.0.1"
-	}
-	return net.JoinHostPort(host, port)
-}
-
-func pipe(a, b net.Conn) {
-	done := make(chan struct{})
-	cp := func(dst, src net.Conn) {
-		buf := make([]byte, egressCopyBuf)
-		_, _ = io.CopyBuffer(dst, src, buf)
-		_ = dst.Close()
-		done <- struct{}{}
-	}
-	go cp(a, b)
-	go cp(b, a)
-	<-done
-	<-done
-}
-
-func decodeBasic(enc string) (user, pass string, ok bool) {
-	r := &http.Request{Header: http.Header{"Authorization": {"Basic " + enc}}}
-	return r.BasicAuth()
+	// srv.Close only closes listeners Serve has already tracked; if the Serve
+	// goroutine has not been scheduled yet, srv.listeners is empty and ln stays
+	// open until Serve eventually runs. Closing ln directly makes the returned
+	// cleanup synchronous regardless of goroutine scheduling; the second close
+	// on an already-closed listener is a discarded error.
+	closeProxy := func() { _ = srv.Close(); _ = ln.Close() }
+	return ln.Addr().(*net.TCPAddr).Port, closeProxy, nil
 }

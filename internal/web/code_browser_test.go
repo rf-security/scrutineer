@@ -11,11 +11,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/git-pkgs/clone"
+	"github.com/git-pkgs/magic"
+
 	"scrutineer/internal/db"
+	"scrutineer/internal/testutil"
 	"scrutineer/internal/worker"
 )
 
-func TestCommitRE(t *testing.T) {
+func TestValidCommit(t *testing.T) {
 	cases := []struct {
 		in   string
 		want bool
@@ -30,8 +34,8 @@ func TestCommitRE(t *testing.T) {
 		{"", false},
 	}
 	for _, tc := range cases {
-		if got := commitRE.MatchString(tc.in); got != tc.want {
-			t.Errorf("commitRE(%q) = %v, want %v", tc.in, got, tc.want)
+		if got := clone.ValidCommit(tc.in); got != tc.want {
+			t.Errorf("ValidCommit(%q) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }
@@ -82,6 +86,30 @@ func TestParseHighlight(t *testing.T) {
 	}
 }
 
+func TestHighlightLang(t *testing.T) {
+	cases := []struct {
+		path   string
+		format string
+		want   string
+	}{
+		{"main.go", "", "go"},
+		{"lib/foo.RB", "", "ruby"},
+		{"config.json", magic.FormatText, "json"},
+		{"Pipfile.lock", magic.FormatJSON, "json"},
+		{".eslintrc", magic.FormatJSON, "json"},
+		{"pom", magic.FormatXML, "xml"},
+		{"index", magic.FormatHTML, "xml"},
+		{"logo", magic.FormatSVG, "xml"},
+		{"README", magic.FormatText, ""},
+		{"README", "", ""},
+	}
+	for _, c := range cases {
+		if got := highlightLang(c.path, c.format); got != c.want {
+			t.Errorf("highlightLang(%q, %q) = %q, want %q", c.path, c.format, got, c.want)
+		}
+	}
+}
+
 // seedRepoCache makes a real git repo at the cache path the handler will
 // resolve, with two commits so `git show <commit>:<path>` works for both.
 func seedRepoCache(t *testing.T, dataDir, url string) (commit1, commit2 string) {
@@ -92,6 +120,7 @@ func seedRepoCache(t *testing.T, dataDir, url string) (commit1, commit2 string) 
 	}
 	run := func(args ...string) string {
 		cmd := exec.Command("git", append([]string{"-C", cacheSrc}, args...)...)
+		cmd.Env = testutil.GitEnv()
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
@@ -104,7 +133,10 @@ func seedRepoCache(t *testing.T, dataDir, url string) (commit1, commit2 string) 
 	if err := os.WriteFile(filepath.Join(cacheSrc, "hello.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	run("add", "hello.go")
+	if err := os.WriteFile(filepath.Join(cacheSrc, "image.png"), []byte("\x89PNG\r\n\x1a\ncontent without nul"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "hello.go", "image.png")
 	run("commit", "--quiet", "-m", "first")
 	commit1 = run("rev-parse", "HEAD")
 
@@ -115,6 +147,40 @@ func seedRepoCache(t *testing.T, dataDir, url string) (commit1, commit2 string) 
 	run("commit", "--quiet", "-m", "second")
 	commit2 = run("rev-parse", "HEAD")
 	return commit1, commit2
+}
+
+func TestRepoBlob_doesNotRenderUnsupportedContent(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	s, done := newTestServer(t)
+	defer done()
+
+	dataDir := t.TempDir()
+	s.Worker = &worker.Worker{DataDir: dataDir}
+
+	repo := db.Repository{URL: "https://example.com/foo", Name: "foo"}
+	s.DB.Create(&repo)
+	commit, _ := seedRepoCache(t, dataDir, repo.URL)
+
+	id := strconv.FormatUint(uint64(repo.ID), 10)
+	req := localReq("GET", "/repositories/"+id+"/blob/"+commit+"/image.png")
+	req.SetPathValue("id", id)
+	req.SetPathValue("commit", commit)
+	req.SetPathValue("path", "image.png")
+	rec := httptest.NewRecorder()
+	s.repoBlob(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "not UTF-8 text") {
+		t.Errorf("body missing unsupported-content notice:\n%s", body)
+	}
+	if strings.Contains(body, "content without nul") {
+		t.Errorf("body rendered unsupported content:\n%s", body)
+	}
 }
 
 func TestRepoBlob_servesHistoricalCommit(t *testing.T) {
@@ -200,6 +266,7 @@ func TestGitShowBlob_capsAtMaxBrowserBytes(t *testing.T) {
 	dir := t.TempDir()
 	run := func(args ...string) {
 		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = testutil.GitEnv()
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}
@@ -213,25 +280,141 @@ func TestGitShowBlob_capsAtMaxBrowserBytes(t *testing.T) {
 	}
 	run("add", "big.txt")
 	run("commit", "--quiet", "-m", "big")
-	headOut, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "HEAD")
+	cmd.Env = testutil.GitEnv()
+	headOut, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)
 	}
 	commit := strings.TrimSpace(string(headOut))
 
-	content, binary, truncated, err := gitShowBlob(context.Background(), dir, commit, "big.txt")
+	blob, err := gitShowBlob(context.Background(), dir, commit, "big.txt")
 	if err != nil {
 		t.Fatalf("gitShowBlob: %v", err)
 	}
-	if binary {
-		t.Error("expected non-binary")
+	if !renderableBlob(blob.Detection) {
+		t.Errorf("expected renderable detection, got %+v", blob.Detection)
 	}
-	if !truncated {
+	if !blob.Truncated {
 		t.Error("expected truncated=true")
 	}
-	if len(content) != maxBrowserBytes {
-		t.Errorf("len(content) = %d, want %d", len(content), maxBrowserBytes)
+	if len(blob.Content) != maxBrowserBytes {
+		t.Errorf("len(content) = %d, want %d", len(blob.Content), maxBrowserBytes)
 	}
+}
+
+func TestGitShowBlob_readsWithoutGitOnPath(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	commitBlob(t, dir, "fixture", []byte("content"))
+	commit := headCommit(t, dir)
+	t.Setenv("PATH", t.TempDir())
+
+	blob, err := gitShowBlob(context.Background(), dir, commit, "fixture")
+	if err != nil {
+		t.Fatalf("gitShowBlob: %v", err)
+	}
+	if string(blob.Content) != "content" || blob.Truncated {
+		t.Errorf("blob = (%q, truncated %v), want complete content", blob.Content, blob.Truncated)
+	}
+}
+
+func TestGitShowBlob_classifiesContent(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	tests := []struct {
+		name         string
+		content      []byte
+		wantKind     magic.Kind
+		wantEncoding string
+		wantRender   bool
+	}{
+		{name: "UTF-8", content: []byte("hello, world\n"), wantKind: magic.KindText, wantEncoding: "utf-8", wantRender: true},
+		{name: "empty", content: []byte{}, wantKind: magic.KindText, wantRender: true},
+		{name: "PNG without NUL", content: []byte("\x89PNG\r\n\x1a\npayload"), wantKind: magic.KindBinary},
+		{name: "invalid UTF-8", content: []byte{0xff, 'x'}, wantKind: magic.KindUnknown},
+		{name: "UTF-16LE", content: []byte{0xff, 0xfe, 'h', 0, 'i', 0}, wantKind: magic.KindText, wantEncoding: "utf-16le"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			commitBlob(t, dir, "fixture", tt.content)
+
+			blob, err := gitShowBlob(context.Background(), dir, headCommit(t, dir), "fixture")
+			if err != nil {
+				t.Fatalf("gitShowBlob: %v", err)
+			}
+			if blob.Detection.Kind != tt.wantKind {
+				t.Errorf("Kind = %q, want %q", blob.Detection.Kind, tt.wantKind)
+			}
+			if blob.Detection.Encoding != tt.wantEncoding {
+				t.Errorf("Encoding = %q, want %q", blob.Detection.Encoding, tt.wantEncoding)
+			}
+			if got := renderableBlob(blob.Detection); got != tt.wantRender {
+				t.Errorf("renderableBlob() = %v, want %v", got, tt.wantRender)
+			}
+		})
+	}
+}
+
+func TestGitShowBlob_doesNotRenderSplitUTF8Prefix(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	content := bytes.Repeat([]byte("a"), maxBrowserBytes-1)
+	content = append(content, []byte("éx")...)
+	commitBlob(t, dir, "split.txt", content)
+
+	blob, err := gitShowBlob(context.Background(), dir, headCommit(t, dir), "split.txt")
+	if err != nil {
+		t.Fatalf("gitShowBlob: %v", err)
+	}
+	if !blob.Truncated {
+		t.Fatal("expected truncated=true")
+	}
+	if blob.Detection.Kind != magic.KindUnknown || blob.Detection.Reason != magic.ReasonNeedMore {
+		t.Errorf("Detection = %+v, want unknown needing more bytes", blob.Detection)
+	}
+	if renderableBlob(blob.Detection) {
+		t.Error("expected split UTF-8 prefix not to render")
+	}
+}
+
+func commitBlob(t *testing.T, dir, name string, content []byte) {
+	t.Helper()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = testutil.GitEnv()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init", "--quiet", "-b", "main")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(dir, name), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", name)
+	runGit("commit", "--quiet", "-m", "fixture")
+}
+
+func headCommit(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "HEAD")
+	cmd.Env = testutil.GitEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func TestRepoBlob_rendersMissingNoticeWhenNoCache(t *testing.T) {

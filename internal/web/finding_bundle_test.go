@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -65,10 +66,25 @@ func setUpBundleFinding(t *testing.T, s *Server, withPatch bool) *db.Finding {
 	return &f
 }
 
+func seedBundleDependent(t *testing.T, s *Server, repoID uint) db.Dependent {
+	t.Helper()
+	dep := db.Dependent{
+		RepositoryID:   repoID,
+		Name:           "downstream-app",
+		Ecosystem:      "go",
+		PURL:           "pkg:golang/example.com/downstream-app",
+		RepositoryURL:  "https://github.com/acme/downstream-app",
+		DependentRepos: 10,
+	}
+	s.DB.Create(&dep)
+	return dep
+}
+
 func TestFindingBundle_containsManifestAndExports(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	f := setUpBundleFinding(t, s, true)
+	seedBundleDependent(t, s, f.RepositoryID)
 
 	r := httptest.NewRequest(http.MethodGet,
 		"/findings/"+strconv.Itoa(int(f.ID))+"/bundle.tar.gz", nil)
@@ -109,6 +125,9 @@ func TestFindingBundle_containsManifestAndExports(t *testing.T) {
 	if _, ok := m.Contents["patch.diff"]; !ok {
 		t.Errorf("manifest.contents missing patch.diff: %+v", m.Contents)
 	}
+	if _, ok := m.Contents["csaf.json"]; !ok {
+		t.Errorf("manifest.contents missing csaf.json: %+v", m.Contents)
+	}
 
 	// The per-file exports must equal what the corresponding /findings/{id}/{file}
 	// endpoint serves. The OSV and report endpoints are the strongest check:
@@ -120,6 +139,33 @@ func TestFindingBundle_containsManifestAndExports(t *testing.T) {
 	s.Handler().ServeHTTP(osvRec, osvReq)
 	if !bytes.Equal(files["osv.json"], osvRec.Body.Bytes()) {
 		t.Errorf("bundle osv.json differs from /findings/%d/osv.json", f.ID)
+	}
+}
+
+func TestFindingBundle_omitsCSAFWhenNoDependents(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := setUpBundleFinding(t, s, true)
+
+	r := httptest.NewRequest(http.MethodGet,
+		"/findings/"+strconv.Itoa(int(f.ID))+"/bundle.tar.gz", nil)
+	r.Host = "127.0.0.1:8080"
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	files := readArchive(t, w.Body.Bytes())
+	if _, ok := files["csaf.json"]; ok {
+		t.Errorf("archive should omit csaf.json when repository has no dependents")
+	}
+
+	var m bundleManifest
+	if err := json.Unmarshal(files["manifest.json"], &m); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if _, ok := m.Contents["csaf.json"]; ok {
+		t.Errorf("manifest.contents should omit csaf.json without dependents")
 	}
 }
 
@@ -190,4 +236,22 @@ func keys[V any](m map[string]V) []string {
 var _ = func(s *Server, w http.ResponseWriter, r *http.Request) {
 	s.findingBundleDownload(w, r)
 	_ = strings.TrimSpace("")
+}
+
+func TestFindingBundle_failsOnDependentLookupError(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := setUpBundleFinding(t, s, false)
+	dep := seedBundleDependent(t, s, f.RepositoryID)
+	s.DB.Create(&db.FindingDependent{FindingID: f.ID, DependentID: dep.ID, Status: db.ExposureKnownAffected})
+	failQueries(t, s, dependentRowsQuery, errors.New("database unavailable"))
+
+	r := httptest.NewRequest(http.MethodGet,
+		"/findings/"+strconv.Itoa(int(f.ID))+"/bundle.tar.gz", nil)
+	r.Host = "127.0.0.1:8080"
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "load dependents:") {
+		t.Fatalf("status = %d, want 500 with a dependents error; body=%q", w.Code, w.Body)
+	}
 }

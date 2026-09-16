@@ -22,6 +22,7 @@ func TestFindingPatchDownload_servesGatedColumn(t *testing.T) {
 	f := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "t",
 		Severity: "Low", Location: "x.go:1", SuggestedFix: diff, SuggestedFixCommit: "abc"}
 	s.DB.Create(&f)
+	s.DB.Create(&db.RemediationAttempt{FindingID: f.ID, PatchScanID: scan.ID, Attempt: 1, Patch: diff, BaseCommit: "abc"})
 
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/findings/%d/patch.diff", f.ID)))

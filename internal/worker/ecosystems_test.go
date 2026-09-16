@@ -2,73 +2,101 @@ package worker
 
 import (
 	"context"
-	"io"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
+	"net"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/git-pkgs/enrichment"
 	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
 )
 
-// ecosystemsTestServer serves canned responses for every ecosyste.ms source,
-// routed by path, plus the per-package dependent lists chained off /packages
-// and a two-page /advisories response so pagination is exercised.
-func ecosystemsTestServer(t *testing.T) (*httptest.Server, *int) {
-	t.Helper()
-	hits := 0
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos", func(w http.ResponseWriter, _ *http.Request) {
-		hits++
-		_, _ = io.WriteString(w, `{"full_name":"acme/widget","stars":10}`)
-	})
-	mux.HandleFunc("/packages", func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		base := "http://" + r.Host
-		_, _ = io.WriteString(w, `[`+
-			`{"name":"widget","ecosystem":"npm","dependent_packages_url":"`+base+`/deps/widget"},`+
-			`{"name":"acme","ecosystem":"npm","dependent_packages_url":"`+base+`/deps/acme"}]`)
-	})
-	mux.HandleFunc("/advisories", func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		if r.URL.Query().Get("page") == "2" {
-			_, _ = io.WriteString(w, `[{"id":"GHSA-2"}]`)
-			return
-		}
-		w.Header().Set("Link", `<http://`+r.Host+`/advisories?page=2>; rel="next"`)
-		_, _ = io.WriteString(w, `[{"id":"GHSA-1"}]`)
-	})
-	mux.HandleFunc("/commits", func(w http.ResponseWriter, _ *http.Request) {
-		hits++
-		_, _ = io.WriteString(w, `{"commits":[{"login":"alice"}]}`)
-	})
-	mux.HandleFunc("/issues", func(w http.ResponseWriter, _ *http.Request) {
-		hits++
-		_, _ = io.WriteString(w, `{"issues":[{"login":"bob"}]}`)
-	})
-	mux.HandleFunc("/deps/widget", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `[{"repo":"downstream-1"}]`)
-	})
-	mux.HandleFunc("/deps/acme", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `[{"repo":"downstream-2"}]`)
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv, &hits
+type fakeEcosystemsFetcher struct {
+	payloads map[string][]byte
+	errs     map[string]error
+	hits     map[string]int
 }
 
-func testEndpoints(base string) ecosystemsEndpoints {
-	return ecosystemsEndpoints{
-		repo:       base + "/repos",
-		packages:   base + "/packages",
-		advisories: base + "/advisories",
-		commits:    base + "/commits",
-		issues:     base + "/issues",
+func newFakeEcosystemsFetcher() *fakeEcosystemsFetcher {
+	return &fakeEcosystemsFetcher{
+		payloads: map[string][]byte{
+			"repo":       []byte(`{"full_name":"acme/widget","stars":10}`),
+			"packages":   []byte(`[{"name":"widget","ecosystem":"npm"},{"name":"acme","ecosystem":"npm"}]`),
+			"advisories": []byte(`[{"id":"GHSA-1"},{"id":"GHSA-2"}]`),
+			"commits":    []byte(`{"commits":[{"login":"alice"}]}`),
+			"issues":     []byte(`{"issues":[{"login":"bob"}]}`),
+			"dependents": mustDependentsPayloadForTest(),
+		},
+		errs: map[string]error{},
+		hits: map[string]int{},
 	}
+}
+
+func (f *fakeEcosystemsFetcher) fetchRepository(context.Context, string) ([]byte, error) {
+	return f.fetch("repo")
+}
+
+func (f *fakeEcosystemsFetcher) fetchPackages(context.Context, string) ([]byte, error) {
+	return f.fetch("packages")
+}
+
+func (f *fakeEcosystemsFetcher) fetchAdvisories(context.Context, string) ([]byte, error) {
+	return f.fetch("advisories")
+}
+
+func (f *fakeEcosystemsFetcher) fetchCommits(context.Context, string) ([]byte, error) {
+	return f.fetch("commits")
+}
+
+func (f *fakeEcosystemsFetcher) fetchIssues(context.Context, string) ([]byte, error) {
+	return f.fetch("issues")
+}
+
+func (f *fakeEcosystemsFetcher) fetchDependents(context.Context, string) ([]byte, error) {
+	return f.fetch("dependents")
+}
+
+func (f *fakeEcosystemsFetcher) fetch(key string) ([]byte, error) {
+	f.hits[key]++
+	if err := f.errs[key]; err != nil {
+		return nil, err
+	}
+	return f.payloads[key], nil
+}
+
+func mustDependentsPayloadForTest() []byte {
+	payload := []dependentsEntry{
+		{
+			Package:   "widget",
+			Ecosystem: "npm",
+			PURL:      "pkg:npm/widget",
+			Dependents: []dependentPackage{
+				{Name: "downstream-1", Ecosystem: "npm", PURL: "pkg:npm/downstream-1", RepositoryURL: "https://github.com/acme/downstream-1", DependentReposCount: 2},
+				{Name: "downstream-1b", Ecosystem: "npm", PURL: "pkg:npm/downstream-1b", RepositoryURL: "https://github.com/acme/downstream-1b", DependentReposCount: 3},
+			},
+		},
+		{
+			Package:   "acme",
+			Ecosystem: "npm",
+			PURL:      "pkg:npm/acme",
+			Dependents: []dependentPackage{
+				{Name: "downstream-2", Ecosystem: "npm", PURL: "pkg:npm/downstream-2", RepositoryURL: "https://github.com/acme/downstream-2", DependentReposCount: 4},
+			},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+	return body
 }
 
 func openEcosystemsTestDB(t *testing.T) *gorm.DB {
@@ -81,12 +109,12 @@ func openEcosystemsTestDB(t *testing.T) *gorm.DB {
 }
 
 func TestRefreshEcosystems_populatesAllSources(t *testing.T) {
-	srv, _ := ecosystemsTestServer(t)
+	fetcher := newFakeEcosystemsFetcher()
 	gdb := openEcosystemsTestDB(t)
 	repo := db.Repository{URL: "https://github.com/acme/widget", Name: "widget"}
 	gdb.Create(&repo)
 
-	if err := refreshEcosystems(context.Background(), gdb, repo.ID, false, slog.Default(), testEndpoints(srv.URL)); err != nil {
+	if err := refreshEcosystems(context.Background(), gdb, repo.ID, false, slog.Default(), fetcher); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 
@@ -113,22 +141,24 @@ func TestRefreshEcosystems_populatesAllSources(t *testing.T) {
 		if c.at == nil {
 			t.Errorf("%s fetched_at is nil, want set", c.name)
 		}
+		if fetcher.hits[c.name] != 1 {
+			t.Errorf("%s fetches = %d, want 1", c.name, fetcher.hits[c.name])
+		}
 	}
 
-	// advisories must concatenate both pages; dependents must cover both packages.
-	if !strings.Contains(got.EcosystemsAdvisoriesData, "GHSA-2") {
-		t.Errorf("advisories did not follow pagination: %q", got.EcosystemsAdvisoriesData)
-	}
-	if !strings.Contains(got.EcosystemsDependentsData, "downstream-2") {
-		t.Errorf("dependents missing second package: %q", got.EcosystemsDependentsData)
+	var rows []db.Dependent
+	gdb.Where("repository_id = ?", repo.ID).Order("name").Find(&rows)
+	if len(rows) != 3 {
+		t.Fatalf("dependent rows = %+v, want 3", rows)
 	}
 }
 
 func TestRefreshEcosystems_staleOnlySkipsFresh(t *testing.T) {
-	srv, _ := ecosystemsTestServer(t)
+	fetcher := newFakeEcosystemsFetcher()
 	gdb := openEcosystemsTestDB(t)
 
 	fresh := time.Now()
+	stale := fresh.Add(-8 * 24 * time.Hour)
 	repo := db.Repository{
 		URL:  "https://github.com/acme/widget",
 		Name: "widget",
@@ -137,11 +167,11 @@ func TestRefreshEcosystems_staleOnlySkipsFresh(t *testing.T) {
 		EcosystemsRepoFetchedAt: &fresh,
 		// commits TTL is 7d: backdate 8 days so it is stale and re-fetched.
 		EcosystemsCommitsData:      `{"cached":true}`,
-		EcosystemsCommitsFetchedAt: new(fresh.Add(-8 * 24 * time.Hour)),
+		EcosystemsCommitsFetchedAt: &stale,
 	}
 	gdb.Create(&repo)
 
-	if err := refreshEcosystems(context.Background(), gdb, repo.ID, true, slog.Default(), testEndpoints(srv.URL)); err != nil {
+	if err := refreshEcosystems(context.Background(), gdb, repo.ID, true, slog.Default(), fetcher); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 
@@ -150,27 +180,25 @@ func TestRefreshEcosystems_staleOnlySkipsFresh(t *testing.T) {
 	if got.EcosystemsRepoData != `{"cached":true}` {
 		t.Errorf("fresh repo source was re-fetched: %q", got.EcosystemsRepoData)
 	}
+	if fetcher.hits["repo"] != 0 {
+		t.Errorf("fresh repo source fetched %d times, want 0", fetcher.hits["repo"])
+	}
 	if !strings.Contains(got.EcosystemsCommitsData, "alice") {
 		t.Errorf("stale commits source not refreshed: %q", got.EcosystemsCommitsData)
+	}
+	if fetcher.hits["commits"] != 1 {
+		t.Errorf("stale commits fetches = %d, want 1", fetcher.hits["commits"])
 	}
 }
 
 func TestRefreshEcosystems_fetchErrorIsNonFatal(t *testing.T) {
+	fetcher := newFakeEcosystemsFetcher()
+	fetcher.errs["commits"] = errors.New("temporary failure")
 	gdb := openEcosystemsTestDB(t)
-	// Server 500s on /commits only; every other source succeeds.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"full_name":"a/b"}`) })
-	mux.HandleFunc("/packages", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `[]`) })
-	mux.HandleFunc("/advisories", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `[]`) })
-	mux.HandleFunc("/commits", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
-	mux.HandleFunc("/issues", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"issues":[]}`) })
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
 	repo := db.Repository{URL: "https://github.com/a/b", Name: "b"}
 	gdb.Create(&repo)
 
-	if err := refreshEcosystems(context.Background(), gdb, repo.ID, false, slog.Default(), testEndpoints(srv.URL)); err != nil {
+	if err := refreshEcosystems(context.Background(), gdb, repo.ID, false, slog.Default(), fetcher); err != nil {
 		t.Fatalf("refresh returned error, want nil (best-effort): %v", err)
 	}
 
@@ -187,18 +215,160 @@ func TestRefreshEcosystems_fetchErrorIsNonFatal(t *testing.T) {
 	}
 }
 
+// A denied domain fails identically on every source, so the first transport
+// error abandons the pass instead of paying one timeout per source.
+func TestRefreshEcosystems_transportErrorStopsThePass(t *testing.T) {
+	fetcher := newFakeEcosystemsFetcher()
+	fetcher.errs["repo"] = &net.DNSError{Err: "no such host", Name: "packages.ecosyste.ms", IsNotFound: true}
+	gdb := openEcosystemsTestDB(t)
+	repo := db.Repository{URL: "https://github.com/a/b", Name: "b"}
+	gdb.Create(&repo)
+
+	if err := refreshEcosystems(context.Background(), gdb, repo.ID, false, slog.Default(), fetcher); err != nil {
+		t.Fatalf("refresh returned error, want nil (best-effort): %v", err)
+	}
+
+	if fetcher.hits["repo"] != 1 {
+		t.Errorf("repo fetches = %d, want 1", fetcher.hits["repo"])
+	}
+	for _, key := range []string{"packages", "advisories", "commits", "issues", "dependents"} {
+		if fetcher.hits[key] != 0 {
+			t.Errorf("%s fetches = %d after an unreachable upstream, want 0", key, fetcher.hits[key])
+		}
+	}
+	var got db.Repository
+	gdb.First(&got, repo.ID)
+	if got.EcosystemsPackagesData != "" {
+		t.Errorf("abandoned pass still cached packages: %q", got.EcosystemsPackagesData)
+	}
+}
+
+// An upstream that answers "nothing recorded for this repository" says nothing
+// about the next source, so that one stays per-source.
+func TestRefreshEcosystems_upstreamMissErrorKeepsGoing(t *testing.T) {
+	fetcher := newFakeEcosystemsFetcher()
+	fetcher.errs["repo"] = errors.New("repository not found")
+	gdb := openEcosystemsTestDB(t)
+	repo := db.Repository{URL: "https://github.com/a/b", Name: "b"}
+	gdb.Create(&repo)
+
+	if err := refreshEcosystems(context.Background(), gdb, repo.ID, false, slog.Default(), fetcher); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	for _, key := range []string{"packages", "advisories", "commits", "issues", "dependents"} {
+		if fetcher.hits[key] != 1 {
+			t.Errorf("%s fetches = %d after a per-source miss, want 1", key, fetcher.hits[key])
+		}
+	}
+	var got db.Repository
+	gdb.First(&got, repo.ID)
+	if got.EcosystemsPackagesData == "" {
+		t.Error("sibling source should still be cached after a per-source miss")
+	}
+}
+
+// A cancelled scan abandons the pass too, but as the caller giving up rather
+// than upstream being unreachable. The fetch error is deliberately one that
+// unreachable() rejects, so only the ctx.Err() branch can stop the pass: with
+// that branch removed the loop falls through to `continue` and the assertion
+// below fails.
+func TestRefreshEcosystems_cancelledContextStopsThePass(t *testing.T) {
+	fetcher := newFakeEcosystemsFetcher()
+	fetcher.errs["repo"] = errors.New("repository not found")
+	if unreachable(fetcher.errs["repo"]) {
+		t.Fatal("the seeded error must not be unreachable, or the test proves nothing")
+	}
+	gdb := openEcosystemsTestDB(t)
+	repo := db.Repository{URL: "https://github.com/a/b", Name: "b"}
+	gdb.Create(&repo)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := refreshEcosystems(ctx, gdb, repo.ID, false, slog.Default(), fetcher); err != nil {
+		t.Fatalf("refresh returned error, want nil (best-effort): %v", err)
+	}
+
+	if fetcher.hits["packages"] != 0 {
+		t.Errorf("packages fetches = %d after a cancelled context, want 0", fetcher.hits["packages"])
+	}
+}
+
+// The six sources span five hosts, so one host answering slowly must not
+// abandon the others: a failed fetch never writes its fetched_at, so a pass
+// that gave up here would restart at the same source on every later scan and
+// the ones after it would never refresh again.
+func TestRefreshEcosystems_slowHostDoesNotStarveLaterSources(t *testing.T) {
+	fetcher := newFakeEcosystemsFetcher()
+	fetcher.errs["advisories"] = &url.Error{
+		Op:  "Get",
+		URL: "https://advisories.ecosyste.ms",
+		Err: context.DeadlineExceeded,
+	}
+	gdb := openEcosystemsTestDB(t)
+	repo := db.Repository{URL: "https://github.com/a/b", Name: "b"}
+	gdb.Create(&repo)
+
+	if err := refreshEcosystems(context.Background(), gdb, repo.ID, false, slog.Default(), fetcher); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	for _, key := range []string{"commits", "issues", "dependents"} {
+		if fetcher.hits[key] != 1 {
+			t.Errorf("%s fetches = %d after a slow sibling host, want 1", key, fetcher.hits[key])
+		}
+	}
+	var got db.Repository
+	gdb.First(&got, repo.ID)
+	if got.EcosystemsDependentsData == "" {
+		t.Error("a slow advisories host stopped dependents from ever being cached")
+	}
+	if got.EcosystemsAdvisoriesFetchedAt != nil {
+		t.Error("the timed-out source must stay unstamped so the TTL retries it")
+	}
+}
+
+func TestUnreachable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"dns failure", &net.DNSError{Err: "no such host", IsNotFound: true}, true},
+		{"dial refused", &net.OpError{Op: "dial", Err: errors.New("connection refused")}, true},
+		{"wrapped dial", fmt.Errorf("fetch packages: %w", &net.OpError{Op: "dial", Err: errors.New("i/o timeout")}), true},
+		{"tls interception", &url.Error{Op: "Get", URL: "https://packages.ecosyste.ms", Err: &tls.CertificateVerificationError{Err: errors.New("x509: certificate signed by unknown authority")}}, true},
+		{"not a tls server", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, true},
+		// One host answering slowly says nothing about the other four, so a
+		// response-level timeout stays a per-source failure.
+		{"slow response", &url.Error{Op: "Get", URL: "https://packages.ecosyste.ms", Err: context.DeadlineExceeded}, false},
+		{"deadline exceeded", context.DeadlineExceeded, false},
+		{"cancelled", context.Canceled, false},
+		{"upstream miss", errors.New("repository not found"), false},
+		{"http status", errors.New("unexpected status 404"), false},
+		{"nil", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unreachable(tc.err); got != tc.want {
+				t.Errorf("unreachable(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRefreshEcosystems_skipsLocalRepo(t *testing.T) {
-	srv, hits := ecosystemsTestServer(t)
+	fetcher := newFakeEcosystemsFetcher()
 	gdb := openEcosystemsTestDB(t)
 	repo := db.Repository{URL: "file:///tmp/local", Name: "local"}
 	gdb.Create(&repo)
-	*hits = 0
 
-	if err := refreshEcosystems(context.Background(), gdb, repo.ID, false, slog.Default(), testEndpoints(srv.URL)); err != nil {
+	if err := refreshEcosystems(context.Background(), gdb, repo.ID, false, slog.Default(), fetcher); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	if *hits != 0 {
-		t.Errorf("local repo triggered %d upstream fetches, want 0", *hits)
+	for key, hits := range fetcher.hits {
+		if hits != 0 {
+			t.Errorf("%s fetches = %d, want 0", key, hits)
+		}
 	}
 	var got db.Repository
 	gdb.First(&got, repo.ID)
@@ -209,25 +379,130 @@ func TestRefreshEcosystems_skipsLocalRepo(t *testing.T) {
 
 func TestRefreshEcosystems_missingRepoErrors(t *testing.T) {
 	gdb := openEcosystemsTestDB(t)
-	if err := refreshEcosystems(context.Background(), gdb, 9999, false, slog.Default(), defaultEcosystemsEndpoints); err == nil {
+	if err := refreshEcosystems(context.Background(), gdb, 9999, false, slog.Default(), nil); err == nil {
 		t.Fatal("want error for missing repository, got nil")
 	}
 }
 
-func TestNextLink(t *testing.T) {
-	cases := []struct {
-		header string
-		want   string
-	}{
-		{`<https://x/api?page=2>; rel="next"`, "https://x/api?page=2"},
-		{`<https://x/api?page=3>; rel="last", <https://x/api?page=2>; rel="next"`, "https://x/api?page=2"},
-		{`<https://x/api?page=9>; rel="last"`, ""},
-		{"", ""},
-		{"garbage", ""},
+func TestDependentsPayload_mapsEnrichmentGroups(t *testing.T) {
+	body, err := dependentsPayload([]enrichment.RepositoryDependents{
+		{
+			PackageName: "widget",
+			Ecosystem:   "npm",
+			PURL:        "pkg:npm/widget",
+			Dependents: []enrichment.DependentPackage{
+				{
+					Name:                "app",
+					Ecosystem:           "npm",
+					PURL:                "pkg:npm/app",
+					Repository:          "https://github.com/acme/app",
+					RegistryURL:         "https://npmjs.org/app",
+					LatestVersion:       "1.2.3",
+					Downloads:           42,
+					DependentReposCount: 7,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("dependentsPayload: %v", err)
 	}
-	for _, c := range cases {
-		if got := nextLink(c.header); got != c.want {
-			t.Errorf("nextLink(%q) = %q, want %q", c.header, got, c.want)
-		}
+	var got []dependentsEntry
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if len(got) != 1 || got[0].Package != "widget" || got[0].PURL != "pkg:npm/widget" {
+		t.Fatalf("group = %+v", got)
+	}
+	if len(got[0].Dependents) != 1 {
+		t.Fatalf("dependents = %+v, want 1", got[0].Dependents)
+	}
+	dep := got[0].Dependents[0]
+	if dep.RepositoryURL != "https://github.com/acme/app" ||
+		dep.RegistryURL != "https://npmjs.org/app" ||
+		dep.LatestVersion != "1.2.3" ||
+		dep.Downloads != 42 ||
+		dep.DependentReposCount != 7 {
+		t.Errorf("dependent = %+v", dep)
+	}
+}
+
+func TestUpdateDependentsTable_mapsEnrichmentPayload(t *testing.T) {
+	gdb := openEcosystemsTestDB(t)
+	repo := db.Repository{URL: "https://github.com/acme/widget", Name: "widget"}
+	gdb.Create(&repo)
+	gdb.Create(&db.Dependent{RepositoryID: repo.ID, Name: "stale", Ecosystem: "npm"})
+
+	payload := []dependentsEntry{
+		{
+			Package:   "widget",
+			Ecosystem: "npm",
+			Dependents: []dependentPackage{
+				{
+					Name:                "rails-x",
+					Ecosystem:           "rubygems",
+					PURL:                "pkg:gem/rails-x",
+					RepositoryURL:       "https://github.com/acme/rails-x",
+					Downloads:           5000,
+					DependentReposCount: 200,
+					RegistryURL:         "https://rubygems.org/gems/rails-x",
+					LatestVersion:       "7.0.0",
+				},
+				{
+					Name:                "action-user",
+					Ecosystem:           "github-actions",
+					PURL:                "pkg:githubactions/acme/action-user",
+					RepositoryURL:       "https://github.com/acme/action-user",
+					Downloads:           42,
+					DependentReposCount: 9,
+					LatestVersion:       "v1",
+				},
+			},
+		},
+		{
+			Package:   "widget-extra",
+			Ecosystem: "npm",
+			Dependents: []dependentPackage{
+				{
+					Name:                "rails-x-duplicate",
+					Ecosystem:           "rubygems",
+					PURL:                "pkg:gem/rails-x",
+					RepositoryURL:       "https://github.com/acme/rails-x-duplicate",
+					Downloads:           9999,
+					DependentReposCount: 999,
+					LatestVersion:       "9.9.9",
+				},
+			},
+		},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := updateDependentsTable(gdb, repo.ID, body); err != nil {
+		t.Fatalf("update dependents table: %v", err)
+	}
+
+	var rows []db.Dependent
+	gdb.Where("repository_id = ?", repo.ID).Order("name").Find(&rows)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %+v, want 2", rows)
+	}
+	if rows[0].Name != "action-user" ||
+		rows[0].Ecosystem != "githubactions" ||
+		rows[0].RepositoryURL != "https://github.com/acme/action-user" ||
+		rows[0].DependentRepos != 9 ||
+		rows[0].LatestVersion != "v1" {
+		t.Errorf("action row = %+v", rows[0])
+	}
+	if rows[1].Name != "rails-x" ||
+		rows[1].Ecosystem != "gem" ||
+		rows[1].RepositoryURL != "https://github.com/acme/rails-x" ||
+		rows[1].DependentRepos != 200 ||
+		rows[1].LatestVersion != "7.0.0" ||
+		rows[1].RegistryURL != "https://rubygems.org/gems/rails-x" ||
+		rows[1].Downloads != 5000 {
+		t.Errorf("rails row = %+v", rows[1])
 	}
 }

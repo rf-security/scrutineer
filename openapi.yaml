@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Scrutineer Skill API
-  version: 0.3.0
+  version: 0.4.0
   description: |
     A narrow HTTP surface that claude-code skills use while they run. The
     goal is enough to let a skill orchestrate other skills and read prior
@@ -24,6 +24,81 @@ security:
   - bearerAuth: []
 
 paths:
+  /openapi.yaml:
+    get:
+      summary: Fetch this OpenAPI document
+      description: |
+        Returns the embedded copy of `openapi.yaml`, so a skill or an external
+        tool can read the API surface from a running server without a checkout.
+
+        Two ways in. From localhost it is unauthenticated, because a caller
+        discovering the API has no running scan to take a bearer token from;
+        the host check is the boundary, as on the browser UI. A skill inside
+        the runner container cannot pass that check -- it reaches the server
+        through the egress proxy on the host endpoint `api_base` advertises,
+        which forwards the original `Host` -- so it authenticates with the
+        per-scan bearer token it already holds for the rest of this API.
+        See threatmodel.md.
+      operationId: getOpenAPISpec
+      security:
+        - {}
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The OpenAPI document
+          content:
+            application/yaml:
+              schema:
+                type: string
+        "401":
+          description: |
+            Request came from a non-local host without a bearer token
+            belonging to a currently running scan
+  /claim-check:
+    servers:
+      - url: http://127.0.0.1:8080
+        description: Local scrutineer server root
+    post:
+      summary: Check whether this instance already holds a federated finding claim
+      description: |
+        Accepts a salted finding hash from a federation peer and returns whether
+        this instance already has a claimable matching finding. The request does
+        not reveal the finding; a match discloses only the configured operator
+        contact. Disabled instances, non-POST requests, and instances without a
+        federation salt answer 404 so federation support is not fingerprintable.
+      operationId: claimCheck
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hash]
+              properties:
+                hash:
+                  type: string
+                  pattern: '^[0-9a-f]{64}$'
+      responses:
+        '200':
+          description: Claim-check result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [match]
+                properties:
+                  match: { type: boolean }
+                  contact:
+                    type: string
+                    description: Present only when match is true and federation contact is configured.
+        '400':
+          description: Invalid JSON body or hash value
+        '404':
+          description: Claim check disabled or unsupported method
+        '500':
+          description: Failed to load local findings
+
   /repositories/{id}:
     get:
       summary: Fetch a repository summary
@@ -38,6 +113,45 @@ paths:
               schema: { $ref: '#/components/schemas/Repository' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      summary: Update skill-writable repository fields
+      description: |
+        Allows the authenticated scan to write repository fields that are
+        produced by skills rather than owned by metadata refreshes. Currently
+        only `fork` is accepted.
+      operationId: patchRepository
+      parameters:
+        - $ref: '#/components/parameters/RepositoryID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fork]
+              properties:
+                fork:
+                  type: string
+                  description: Owner/name of the staging fork prepared for patch work.
+      responses:
+        '204':
+          description: Repository updated
+        '400':
+          description: Body is not valid JSON
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: No writable fields were supplied
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: Database update failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /repositories/{id}/scans:
     get:
@@ -49,7 +163,7 @@ paths:
           in: query
           schema:
             type: string
-            enum: [queued, running, done, failed]
+            enum: [queued, running, paused, done, failed, skipped, cancelled]
         - name: skill
           in: query
           schema: { type: string }
@@ -96,6 +210,22 @@ paths:
                 items: { $ref: '#/components/schemas/Package' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
+  /repositories/{id}/alternatives:
+    get:
+      summary: List operator-curated package migration alternatives
+      operationId: listRepositoryAlternatives
+      parameters:
+        - $ref: '#/components/parameters/RepositoryID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PackageAlternative' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   /repositories/{id}/advisories:
     get:
       summary: List published advisories affecting this repository's packages
@@ -118,6 +248,7 @@ paths:
       operationId: listRepositoryDependents
       parameters:
         - $ref: '#/components/parameters/RepositoryID'
+        - $ref: '#/components/parameters/RepositoryReadLimit'
       responses:
         '200':
           description: OK
@@ -126,6 +257,7 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/Dependent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
   /repositories/{id}/ecosystems/{source}/raw:
@@ -134,7 +266,9 @@ paths:
       description: >
         Returns the raw upstream payload pre-fetched and cached server-side.
         A 404 signals nothing is cached, in which case the caller falls
-        back to a direct WebFetch.
+        back to a direct WebFetch. When the operator sets
+        ecosystems_enrichment false, no source is ever cached, so every
+        request answers 404 and the fallback is the only path.
       operationId: getRepositoryEcosystemsRaw
       parameters:
         - $ref: '#/components/parameters/RepositoryID'
@@ -154,10 +288,10 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
-  /repositories/{id}/dependencies:
+  /repositories/{id}/expected:
     get:
-      summary: List dependencies declared by this repository's manifests
-      operationId: listRepositoryDependencies
+      summary: List expected findings for benchmark comparison
+      operationId: listRepositoryExpectedFindings
       parameters:
         - $ref: '#/components/parameters/RepositoryID'
       responses:
@@ -167,7 +301,24 @@ paths:
             application/json:
               schema:
                 type: array
+                items: { $ref: '#/components/schemas/ExpectedFinding' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /repositories/{id}/dependencies:
+    get:
+      summary: List dependencies declared by this repository's manifests
+      operationId: listRepositoryDependencies
+      parameters:
+        - $ref: '#/components/parameters/RepositoryID'
+        - $ref: '#/components/parameters/RepositoryReadLimit'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
                 items: { $ref: '#/components/schemas/Dependency' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
   /repositories/{id}/findings:
@@ -188,6 +339,14 @@ paths:
           in: query
           description: Only return findings produced by scans of this skill (e.g. `semgrep`, `security-deep-dive`).
           schema: { type: string }
+        - name: scan_group
+          in: query
+          description: Only return findings from scans in this parallel batch, so an in-flight audit skill reads only its siblings' findings.
+          schema: { type: string }
+        - name: sub_path
+          in: query
+          description: Only return findings for this monorepo sub-package (e.g. `activesupport`), so a repository can be exported or bundled one sub-package at a time.
+          schema: { type: string }
       responses:
         '200':
           description: OK
@@ -196,6 +355,32 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/FindingSummary' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      summary: Stream one finding into the concurrent-finding log
+      description: >
+        Records a single finding emitted mid-scan so sibling scans in the same
+        `scan_group` can read it before this scan completes. The body is one
+        finding in the same shape it has in the skill's `report.json`; the
+        scan's identity (scan id, repository, commit, sub-path) is stamped from
+        the bearer token, never trusted from the body. The finding still
+        belongs in the final `report.json`, which reconciles against the
+        streamed row by fingerprint rather than duplicating it.
+      operationId: streamRepositoryFinding
+      parameters:
+        - $ref: '#/components/parameters/RepositoryID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FindingInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FindingSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
   /repositories/{id}/dependency-findings:
@@ -250,12 +435,32 @@ paths:
                 ref:
                   type: string
                   description: Git ref to checkout; empty means the repository's default branch.
+                sub_path:
+                  type: string
+                  description: |
+                    Scope this run to a monorepo sub-package (a relative sub-folder, e.g. `activesupport`).
+                    The `triage` skill forwards it to every pipeline child so the whole scan set stays
+                    scoped to the same sub-package. Empty means the whole repository. A `..` segment is rejected.
                 profile:
                   type: string
                   description: |
                     Runner profile name (e.g. `php`). Empty auto-detects from the clone via `brief`;
                     `default` forces the default runner image. Unknown names return 400, as do
                     overrides that conflict with the skill's `requires_profile` constraint.
+                rescan_mode:
+                  type: string
+                  enum: [full, diff]
+                  description: |
+                    `diff` asks Scrutineer to compare the current commit against a compatible baseline
+                    scan and stage `diff.patch` plus `changed_files.json` for diff-aware skills. The
+                    worker falls back to a full scan when no usable baseline exists or the diff exceeds
+                    safety limits.
+                baseline_scan_id:
+                  type: integer
+                  format: int64
+                  description: |
+                    Optional baseline scan to use for `rescan_mode: diff`; omitted lets Scrutineer
+                    choose the latest compatible completed scan.
       responses:
         '201':
           description: Scan enqueued
@@ -263,7 +468,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Scan' }
         '400':
-          description: Bad request (unknown profile or profile mismatch with the skill's `requires_profile`)
+          description: Bad request (unknown profile, profile mismatch with the skill's `requires_profile`, invalid ref, or invalid `rescan_mode`)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -273,21 +478,37 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-
+        '409':
+          description: 'The repository maintainer opted out of federated scanning, so no scan may be enqueued for it.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /findings/{id}:
     parameters:
       - name: id
         in: path
         required: true
         schema: { type: integer, format: int64 }
+    get:
+      summary: Fetch one finding with its six-step prose
+      operationId: getFinding
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FindingDetail' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
     patch:
       summary: Update mutable fields on a finding
       operationId: patchFinding
       description: |
+        The authenticated scan must be finding-scoped to this finding ID.
         Each field value is written through the history-tracked path.
-        Skills write with source=model_suggested; the browser UI (behind
-        its own session) writes with source=analyst. Unknown field names
-        are rejected.
+        Finding-scoped skills write with source=model_suggested; browser
+        form edits use separate routes and write with source=analyst.
+        Unknown field names are rejected.
       requestBody:
         required: true
         content:
@@ -304,9 +525,12 @@ paths:
                   additionalProperties: { type: string }
                   description: |
                     Map of field name to new value. Allowed fields:
-                    title, severity, status, cwe, location, affected,
+                    title, severity, status, cwe, location, affected, reachability, quality_tier,
                     cve_id, ghsa_id, cvss_vector, cvss_v4_vector, fix_version, fix_commit,
-                    resolution, disclosure_draft, assignee.
+                    resolution, disclosure_draft, disclosure_title, suggested_recipients, assignee,
+                    suggested_fix, suggested_fix_commit, breaking_change, breaking_change_rationale,
+                    exploited_in_wild, exploited_in_wild_evidence, mitigation, mitigation_semgrep,
+                    release_tag, release_url, last_revalidate_verdict.
       responses:
         '204': { description: Updated }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -394,38 +618,6 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/FindingReview' }
-    post:
-      summary: Record one structured human verdict on a finding
-      description: |
-        Verdicts mirror the revalidate skill's enum so reviewer agreement
-        with the model is computed by direct string comparison. When
-        automated_outcome is omitted the server snapshots the latest
-        revalidate verdict from the finding's notes; explicit values
-        win to support older notes the operator wants to re-pin.
-      operationId: addFindingReview
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [verdict]
-              properties:
-                verdict:
-                  type: string
-                  enum: [true_positive, false_positive, already_fixed, uncertain]
-                reason: { type: string }
-                reviewer: { type: string }
-                automated_outcome:
-                  type: string
-                  description: Optional override for the automation outcome the human is judging. When empty the server pulls it from the finding's latest revalidate note.
-      responses:
-        '201':
-          description: Created
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/FindingReview' }
-
   /v1/audit/queue:
     get:
       summary: Sample of recently auto-bucketed findings without a recorded review
@@ -568,9 +760,20 @@ paths:
                 labels:
                   type: array
                   items: { type: string }
-                  description: Label names. Missing labels are created on demand.
+                  description: |
+                    Label names, replacing the finding's current set. Missing
+                    labels are created on demand. Blank and whitespace-only
+                    names are trimmed and ignored, so a request whose names are
+                    all blank clears every label just as `[]` does. The field
+                    itself is required: omitting it or sending null is rejected
+                    rather than treated as a clear-all.
       responses:
         '204': { description: Updated }
+        '400':
+          description: Body is not valid JSON, or has no labels array
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /findings/{id}/history:
     get:
@@ -592,13 +795,16 @@ paths:
 
   /findings/{id}/skills/{name}/run:
     post:
-      summary: Enqueue a finding-scoped skill (verify, revalidate, patch, disclose)
+      summary: Enqueue a finding-scoped skill (verify, revalidate, patch, reattack, disclose)
       operationId: runFindingSkill
       description: |
         The authenticated scan's repository must own the finding. The scan
         that gets enqueued has FindingID set so its skill body can read
         `scrutineer.finding_id` from context.json and act on one finding
         specifically.
+        A `reattack` enqueue ignores a caller-supplied ref and pins the scan to
+        the newest immutable gated patch attempt and its base commit. It returns
+        412 when the finding has no gated patch.
       parameters:
         - name: id
           in: path
@@ -628,6 +834,16 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404':
           description: Finding or skill not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: 'The repository maintainer opted out of federated scanning, so no scan may be enqueued for it, or a federation peer already holds this finding and an outreach skill was asked to report it.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '412':
+          description: A re-attack was requested but the finding has no reproducible gated patch attempt.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -697,24 +913,6 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /findings/{id}:
-    get:
-      summary: Fetch one finding with its six-step prose
-      operationId: getFinding
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: { type: integer, format: int64 }
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/FindingDetail' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-
   /skills:
     get:
       summary: List installed skills
@@ -723,6 +921,9 @@ paths:
         - name: active
           in: query
           schema: { type: boolean }
+          description: >
+            Filter by active state. An empty value applies no filter; a value
+            that is not a boolean returns 400.
       responses:
         '200':
           description: OK
@@ -731,6 +932,7 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/SkillSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
 
   /cnas:
     get:
@@ -764,6 +966,54 @@ paths:
                     root:         { type: string }
                     types:        { type: string }
 
+  /v1/repositories:
+    get:
+      summary: Export repositories as JSONL
+      description: |
+        Returns one JSON object per line (`application/x-ndjson`) for the
+        Repositories tab data set. Each line includes selected scalar
+        repository columns, the latest scan summary, and the same curated
+        findings count shown in the UI. Large metadata and ecosystems cache
+        blobs are intentionally omitted to keep the payload suitable for
+        automation. No bearer token; localhost-only.
+      operationId: exportRepositories
+      security: []
+      parameters:
+        - name: format
+          in: query
+          schema: { type: string, enum: [jsonl] }
+      responses:
+        '200':
+          description: JSONL stream of RepositoryExport objects, one per line.
+          content:
+            application/x-ndjson:
+              schema: { $ref: '#/components/schemas/RepositoryExport' }
+        '400':
+          description: Unsupported format query value, or `encrypt`/`scope`/`include` requested (`scope` is only valid on per-repository exports, `encrypt`/`include` on per-repository bundle exports).
+        '403':
+          description: Host header is not localhost
+
+  /v1/repositories/{id}:
+    delete:
+      summary: Delete a repository and its linked data
+      description: |
+        Host-only operator endpoint for local automation. Removes the
+        repository, its scans, findings, repository-scoped rows, chat
+        conversations, and cached clone/workspace artifacts using the same
+        cleanup path as the browser delete action. Not reachable with a
+        per-scan bearer token.
+      operationId: deleteRepository
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RepositoryID'
+      responses:
+        '204': { description: Repository deleted }
+        '400': { description: Invalid repository id }
+        '403': { description: Host header is not localhost }
+        '404': { description: Repository not found }
+        '409': { description: Repository has queued, running, or paused scans }
+        '500': { description: Delete failed }
+
   /v1/repositories/{id}/findings:
     get:
       summary: Export findings for a repository (JSONL, or a shareable bundle)
@@ -772,11 +1022,28 @@ paths:
         (`application/x-ndjson`), each a `FindingExport` carrying the full set
         of `db.Finding` columns. With `format=bundle` returns a single
         self-contained JSON document (the minimal ingest shape) that
-        round-trips through `/v1/import`; the bundle carries only finding
-        substance, not analyst-set triage state (status, CVE/GHSA id, affected,
-        fix_version, references). Adding `encrypt=1` (bundle only) wraps the
-        bundle in armored age, encrypted to every configured recipient. No
-        bearer token; localhost-only.
+        round-trips through `/v1/import`. The default bundle is share-safe: it
+        carries finding substance (the six-step audit narrative, reachability,
+        sinks, VID, provenance) but not the analyst's private workspace or the
+        recipient's triage — status, assignee, resolution, notes, and
+        communications stay out.
+
+        Adding `include=all` (bundle only) promotes the bundle to an archival
+        superset for round-tripping a repo's findings back into your own
+        instance: on top of the default it carries the enrichment and disclosure
+        work product (snippet, affected, fix_version, CVE/GHSA id, CVSS vectors,
+        mitigation, breaking-change verdict, dup-check, disclosure draft,
+        exploited-in-wild, upstream fix commit) and the notes, communications,
+        and references child records. Instance-local lifecycle (status,
+        resolution, assignee), the change history, release-watch, and labels are
+        never carried. It is opt-in because notes/communications are internal and
+        snippet embeds verbatim source, which a cross-party share must not leak.
+
+        Adding `encrypt=1` (bundle only) wraps the bundle in armored age,
+        encrypted to every configured recipient. Adding `scope=findings` (either
+        format) curates the export to the Findings bucket (deep-dive and
+        vuln-scan audits plus operator imports), dropping per-repo scanner
+        noise. No bearer token; localhost-only.
       operationId: exportRepositoryFindings
       security: []
       parameters:
@@ -794,6 +1061,27 @@ paths:
             encrypted to the configured recipients. Requires `format=bundle`
             and at least one configured recipient, else 400.
           schema: { type: string }
+        - name: scope
+          in: query
+          description: |
+            `findings` curates a `jsonl` or `bundle` export to the Findings
+            bucket (deep-dive and vuln-scan audits plus operator imports),
+            excluding per-repo scanner noise. It combines with `severity` and
+            `status`. Any other value, or use on the cross-repo
+            `/v1/repositories`, `/v1/findings` and `/v1/scans` endpoints, gets
+            a 400. Omitted: the export carries every finding.
+          schema: { type: string, enum: [findings] }
+        - name: include
+          in: query
+          description: |
+            `all` promotes a `format=bundle` export to the archival superset —
+            the operator's enrichment and disclosure work product plus the
+            notes/communications/references child records — for lossless
+            round-trip into your own instance. The default bundle omits them so a
+            cross-party share stays lean and leaks no internal workspace.
+            Requires `format=bundle`; any other value, or use on the cross-repo
+            `/v1/findings` and `/v1/scans` endpoints, gets a 400.
+          schema: { type: string, enum: [all] }
         - name: severity
           in: query
           schema: { type: string, enum: [Critical, High, Medium, Low] }
@@ -818,7 +1106,7 @@ paths:
                 type: string
                 description: Armored age ciphertext, starting `-----BEGIN AGE ENCRYPTED FILE-----`.
         '400':
-          description: Unsupported format, `encrypt` without `format=bundle`, or encryption requested with no recipients configured.
+          description: Unsupported `format`, `encrypt`/`include` without `format=bundle`, an unknown `scope`/`include` value, or encryption requested with no recipients configured.
         '403':
           description: Host header is not localhost
         '404':
@@ -852,9 +1140,33 @@ paths:
             application/x-ndjson:
               schema: { $ref: '#/components/schemas/FindingExport' }
         '400':
-          description: Unsupported format query value, or `encrypt` requested (only valid on per-repository bundle exports).
+          description: Unsupported format query value, or `encrypt`/`scope`/`include` requested (`scope` is only valid on per-repository exports, `encrypt`/`include` on per-repository bundle exports).
         '403':
           description: Host header is not localhost
+
+  /v1/findings/{id}:
+    delete:
+      summary: Delete one finding and its linked data
+      description: |
+        Host-only operator endpoint for local automation. Removes the finding,
+        labels join rows, notes, communications, references, history, reviews,
+        exposure rows, and finding-scoped chat conversations. Scans that
+        pointed at the finding are preserved with `finding_id` cleared. Not
+        reachable with a per-scan bearer token.
+      operationId: deleteFinding
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '204': { description: Finding deleted }
+        '400': { description: Invalid finding id }
+        '403': { description: Host header is not localhost }
+        '404': { description: Finding not found }
+        '409': { description: Finding has queued, running, or paused scans }
+        '500': { description: Delete failed }
 
   /v1/scans:
     get:
@@ -872,10 +1184,30 @@ paths:
           schema: { type: string, enum: [jsonl] }
         - name: status
           in: query
-          schema: { type: string, enum: [queued, running, done, failed] }
+          schema: { type: string, enum: [queued, running, paused, done, failed, skipped, cancelled] }
         - name: skill
           in: query
           schema: { type: string }
+        - name: repository_id
+          in: query
+          description: Restrict scans to this repository. A nonexistent ID returns an empty stream.
+          schema: { type: integer, format: int64, minimum: 1 }
+        - name: kind
+          in: query
+          description: |
+            Exact, case-sensitive match against the stored scan kind (for example,
+            `skill`, `exposure`, `import` or `schedule`). Any nonempty string is accepted;
+            unknown values return an empty stream. Empty means no kind filter.
+          schema: { type: string }
+        - name: since
+          in: query
+          description: |
+            Include scans whose `created_at` is greater than or equal to this
+            RFC3339 timestamp. UTC and numeric offsets represent the same instant;
+            fractional seconds are preserved to nanosecond precision. Combine
+            with any other filters using AND. This filters creation time, so it
+            does not include older scans merely because they were updated later.
+          schema: { type: string, format: date-time }
       responses:
         '200':
           description: JSONL stream of ScanExport objects, one per line.
@@ -883,7 +1215,7 @@ paths:
             application/x-ndjson:
               schema: { $ref: '#/components/schemas/ScanExport' }
         '400':
-          description: Unsupported format query value, or `encrypt` requested (only valid on per-repository bundle exports).
+          description: Invalid or empty repository_id or since, unsupported format query value, or `encrypt`/`scope`/`include` requested (`scope` is only valid on per-repository exports, `encrypt`/`include` on per-repository bundle exports). Validation completes before streaming starts.
         '403':
           description: Host header is not localhost
 
@@ -899,12 +1231,18 @@ paths:
         field, the CSV `Repository` column, the markdown location link);
         when absent the caller must pass `?repo=`. Re-importing the same
         report dedupes by fingerprint and bumps `seen_count` rather than
-        inserting duplicates. A body matching no supported format is
+        inserting duplicates. The scanner exports (SARIF, CSV, markdown)
+        are raw rule output and are bounded on the way in: at most 5
+        findings per rule and 50 per result are imported, in input order,
+        with the drop counts reported in the response. Curated input
+        imports whole.
+        A body matching no supported format is
         routed to the `ingest` skill instead when `?repo=` is supplied:
         the raw payload is staged into the skill workspace and a scan is
         queued, returning 202 with the scan id. Age-encrypted bodies (armored
-        or binary) are transparently decrypted first when an identity is
-        configured (`-identity-file`); plaintext bodies pass through untouched.
+        or binary) are transparently decrypted first when an identity file or
+        plugin is configured (`-identity-file` or `-identity-plugin`); plaintext
+        bodies pass through untouched.
         No bearer token; localhost-only. See docs/import.md for the per-format
         field mapping.
       operationId: importFindings
@@ -914,6 +1252,16 @@ paths:
           in: query
           description: Repository URL to attribute findings to. Overrides any provenance in the body.
           schema: { type: string, format: uri }
+        - name: revalidate
+          in: query
+          description: |
+            Whether each newly-imported finding is enqueued for the
+            `revalidate` pre-sort (which chains into `verify` on a confirmed
+            High/Critical). Defaults to true. Pass `false` to import
+            already-audited findings — e.g. a trusted sharing bundle — without
+            priming the funnel. A value that is neither true/false nor 1/0 is a
+            400.
+          schema: { type: boolean, default: true }
       requestBody:
         required: true
         content:
@@ -959,7 +1307,7 @@ paths:
                   skill: { type: string, enum: [ingest] }
                   status: { type: string, enum: [queued] }
         '400':
-          description: Body unreadable or empty
+          description: Body unreadable or empty, or `revalidate` is not a boolean
         '403':
           description: Host header is not localhost
         '413':
@@ -979,6 +1327,11 @@ components:
       in: path
       required: true
       schema: { type: integer, format: int64 }
+    RepositoryReadLimit:
+      name: limit
+      in: query
+      description: Maximum number of rows to return; defaults to 200 and is capped at 1000.
+      schema: { type: integer, minimum: 0, maximum: 1000, default: 200 }
 
   responses:
     NotFound:
@@ -988,6 +1341,11 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     Forbidden:
       description: Token does not grant access to this resource
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Malformed query or request body, or a missing required field
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -1017,6 +1375,47 @@ components:
         fork:           { type: string, description: 'owner/name of the staging fork in fork_org, when one exists.' }
         posture:        { type: string, enum: [ready, partial, unprepared], description: 'Disclosure-readiness tier from the posture skill. Empty when posture has not run.' }
         posture_summary: { type: string }
+        health:            { type: string, enum: [active, stale, abandoned, zombie], description: 'Evidence-based maintenance classification. Empty when evidence is incomplete.' }
+
+    RepositoryExport:
+      description: |
+        Compact repository row used by the unauthenticated JSONL export. This
+        intentionally omits large metadata and ecosystems cache blobs.
+      type: object
+      required: [id, url, name, findings_count, last_scan]
+      properties:
+        id:             { type: integer, format: int64 }
+        url:            { type: string, format: uri }
+        name:           { type: string }
+        full_name:      { type: string }
+        owner:          { type: string }
+        languages:      { type: string, description: Comma-joined language names. }
+        stars:          { type: integer }
+        findings_count: { type: integer, description: Curated open findings count matching the Repositories tab. }
+        created_at:     { type: string, format: date-time }
+        updated_at:     { type: string, format: date-time }
+        last_scan:
+          nullable: true
+          type: object
+          properties:
+            id:          { type: integer, format: int64 }
+            kind:        { type: string }
+            status:      { type: string, enum: [queued, running, paused, done, failed, skipped, cancelled] }
+            skill_name:  { type: string }
+            commit:      { type: string }
+            created_at:  { type: string, format: date-time, nullable: true }
+            finished_at: { type: string, format: date-time, nullable: true }
+
+    ExpectedFinding:
+      type: object
+      required: [id, repository_id, file, cwe]
+      properties:
+        id:            { type: integer, format: int64 }
+        repository_id: { type: integer, format: int64 }
+        file:          { type: string, description: Path relative to the repository root, without line number. }
+        cwe:           { type: string, description: CWE identifier, e.g. CWE-79. }
+        cve:           { type: string }
+        note:          { type: string }
 
     Scan:
       type: object
@@ -1025,14 +1424,61 @@ components:
         id:            { type: integer, format: int64 }
         repository_id: { type: integer, format: int64 }
         kind:          { type: string }
-        status:        { type: string, enum: [queued, running, paused, done, failed, cancelled] }
+        status:        { type: string, enum: [queued, running, paused, done, failed, skipped, cancelled] }
         model:         { type: string }
+        verification_feedback:
+          type: string
+          description: Optional operator guidance snapshotted on a finding-scoped verify scan, limited to 4000 UTF-8 bytes. Preserved on retries; not a verification verdict.
         commit:        { type: string }
-        skill_name:    { type: string }
-        skill_version: { type: integer }
+        ref:           { type: string, description: Branch, tag, or commit requested for this scan. Omitted for the repository default branch. }
+        sub_path:      { type: string, description: Monorepo sub-folder this scan was scoped to. Omitted for a repository-root scan. }
+        rescan_mode:
+          type: string
+          enum: [full, diff]
+          description: Requested or resolved scan mode.
+        triage_scan_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: Triage invocation that requested this pipeline scan.
+        exploration_mode:
+          type: string
+          enum: ['', random-dig]
+          description: Empty or omitted for planned scans. Random-dig scans have no threat-model context and may only validate their own report through the callback API.
+        exploration_path:
+          type: string
+          description: Repository-relative directory selected for a random dig, or dot for root-level source. Empty until the worker selects a target.
+        diff_base_scan_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: Baseline scan used for a diff rescan.
+        diff_base_commit:
+          type: string
+          description: Baseline commit used to generate the staged diff.
+        diff_threat_model_scan_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: Prior threat-model scan staged as `old_threat_model.json`, when available.
+        diff_stats:
+          type: string
+          description: JSON metadata for staged diff inputs, including changed files and size limits.
+        remediation_attempt_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: Immutable gated patch attempt pinned to a re-attack scan at enqueue time.
+        coverage:
+          type: string
+          description: JSON coverage metadata, including diff fallback reasons and threat-model update decisions.
+        skill_name:           { type: string }
+        skill_version:        { type: integer, description: Snapshot of the Skill row version at enqueue time. }
+        skill_schema_version: { type: integer, description: Snapshot of metadata.scrutineer.version at enqueue time. }
         started_at:    { type: string, format: date-time, nullable: true }
         finished_at:   { type: string, format: date-time, nullable: true }
         max_turns_hit: { type: boolean, description: True when the scan completed with partial output after hitting the Claude max-turns cap; retry resumes the saved session when available. }
+        refusal_audit_warning: { type: boolean, description: True when a security-deep-dive refusal audit reports declined or skipped analysis. }
         error:         { type: string }
 
     ScanDetail:
@@ -1041,6 +1487,7 @@ components:
         - type: object
           properties:
             report: { type: string, description: Raw output report (may be JSON text). }
+            refusal_audit: { type: string, description: Structured post-report security-deep-dive refusal audit. }
             log:    { type: string }
 
     Maintainer:
@@ -1068,6 +1515,8 @@ components:
         dependent_repos:    { type: integer }
         registry_url:       { type: string }
         latest_release_at:  { type: string, format: date-time, nullable: true }
+        risk_flags:         { type: array, items: { type: string, enum: [single_maintainer, no_security_policy, native_extension, stale_release, maintainer_domain_expired] }, description: "Supply-chain hygiene warnings from the packages skill. The evidence for each stays in the scan report." }
+        sub_path:           { type: string, description: "Monorepo sub-package this package is attributed to (its subproject path). Omitted for a repo-level package." }
 
     Advisory:
       type: object
@@ -1097,6 +1546,16 @@ components:
         dependent_repos: { type: integer }
         registry_url:    { type: string }
         latest_version:  { type: string }
+
+    PackageAlternative:
+      type: object
+      required: [id, repository_id, purl, kind]
+      properties:
+        id:            { type: integer, format: int64 }
+        repository_id: { type: integer, format: int64 }
+        purl:          { type: string }
+        kind:          { type: string, enum: [fork, successor, equivalent] }
+        note:          { type: string }
 
     Dependency:
       type: object
@@ -1134,6 +1593,23 @@ components:
         trace:                 { type: string }
         boundary:              { type: string }
 
+    FindingInput:
+      type: object
+      description: >
+        One finding as it appears in a skill's report.json, streamed into the
+        concurrent-finding log. Only title, severity and location are required;
+        the other report.json finding fields (cwe, sinks, dup_check, trace, …)
+        are accepted and stored. Scan-owned identity fields are ignored.
+      required: [title, severity, location]
+      additionalProperties: true
+      properties:
+        title:    { type: string }
+        severity: { type: string, enum: [Critical, High, Medium, Low] }
+        location: { type: string }
+        cwe:      { type: string }
+        sinks:    { type: array, items: { type: string } }
+        dup_check: { type: string, description: "One sentence: which siblings under this scan_group you compared against and why this one is distinct." }
+
     FindingSummary:
       type: object
       required: [id, scan_id, repository_id, severity, location]
@@ -1145,6 +1621,8 @@ components:
         sinks:         { type: string, description: Comma-joined sink ids. }
         title:         { type: string }
         severity:      { type: string, enum: [Critical, High, Medium, Low] }
+        severity_caps: { type: array, items: { type: string }, description: "Deterministic reasons that currently cap severity, derived from the latest reconciled verification controls and typed attacker prerequisites." }
+        severity_calibration_incomplete: { type: boolean, description: "True when an unknown severity, unknown or unattempted prerequisite, unavailable control resolution, or unresolved control assessment prevented complete calibration; unknown inputs never lower severity." }
         status:        { type: string }
         cwe:           { type: string }
         location:      { type: string }
@@ -1166,12 +1644,17 @@ components:
         exploited_in_wild_evidence: { type: string }
         mitigation:    { type: string, description: "Markdown body of operational mitigation guidance from the mitigate skill: workarounds, detection, optionally a semgrep rule (see mitigation_semgrep)." }
         mitigation_semgrep: { type: string, description: "Optional YAML semgrep rule from the mitigate skill. Empty when no rule was warranted." }
+        dup_check:     { type: string, description: "Audit agent's one-sentence rationale for why this finding is distinct from the siblings already filed under the same scan_group. Empty for findings from skills that do not emit it." }
+        novelty:       { type: string, enum: [unfixed, fixed, unclear, not_checked, ""], description: "Latest upstream novelty state. A touched file remains unclear until revalidate classifies the staged history." }
+        production_viability: { type: string, enum: [VIABLE, NON_VIABLE, SAMPLE_OR_TEST, CONDITIONAL_VIABLE, ""], description: "Latest critic assessment of whether the finding can affect a real release build. Empty before assessment." }
+        novelty_checked_commit: { type: string, description: "Repository HEAD compared with the finding's scanned commit for novelty." }
+        novelty_checked_at: { type: string, format: date-time, nullable: true }
 
     FindingDetail:
       allOf:
         - $ref: '#/components/schemas/FindingSummary'
         - type: object
-          description: Adds the six-step narrative and disclosure draft text.
+          description: Adds the six-step narrative and the disclosure draft/routing fields.
           properties:
             trace:            { type: string }
             boundary:         { type: string }
@@ -1180,6 +1663,183 @@ components:
             reach:            { type: string }
             rating:           { type: string }
             disclosure_draft: { type: string }
+            disclosure_title: { type: string, description: "The disclose skill's drafted GHSA summary; may differ from the finding's own title." }
+            suggested_recipients: { type: string, description: "File-level owners for the finding's location, from CODEOWNERS or recent non-bot committers." }
+            sub_path:         { type: string, description: "Monorepo sub-folder the producing scan was scoped to. The finding's location is relative to it; empty means the repo root." }
+            verification:
+              allOf:
+                - $ref: '#/components/schemas/FindingVerification'
+              nullable: true
+            attack_path:
+              allOf:
+                - $ref: '#/components/schemas/FindingAttackPath'
+              nullable: true
+            remediation:
+              allOf:
+                - $ref: '#/components/schemas/RemediationAttempt'
+              nullable: true
+
+    FindingVerification:
+      type: object
+      required: [id, scan_id, status, report, created_at]
+      properties:
+        id:         { type: integer, format: int64 }
+        scan_id:    { type: integer, format: int64 }
+        status:     { type: string, enum: [confirmed, fixed, inconclusive, deferred, not_attempted] }
+        score:      { type: number, format: double, minimum: 0, maximum: 1, nullable: true, description: "Fraction of the five fixed verification criteria that passed. Null for legacy reports and reports that remain internally inconsistent after repair." }
+        report:     { $ref: '#/components/schemas/VerificationReport' }
+        created_at: { type: string, format: date-time }
+
+    FindingAttackPath:
+      type: object
+      required: [id, scan_id, production_viability, report, created_at]
+      properties:
+        id:                   { type: integer, format: int64 }
+        scan_id:              { type: integer, format: int64 }
+        production_viability: { type: string, enum: [VIABLE, NON_VIABLE, SAMPLE_OR_TEST, CONDITIONAL_VIABLE] }
+        report:               { $ref: '#/components/schemas/AttackPathReport' }
+        created_at:           { type: string, format: date-time }
+
+    AttackPathReport:
+      type: object
+      required: [production_viability, source_state, reason, counterevidence, attacker_position, preconditions, impact, likelihood, applied_adjustments, facts_that_would_change_the_result]
+      additionalProperties: false
+      properties:
+        production_viability: { type: string, enum: [VIABLE, NON_VIABLE, SAMPLE_OR_TEST, CONDITIONAL_VIABLE] }
+        source_state: { type: string, enum: [PRESENT, MOVED, MISSING, UNKNOWN] }
+        reason: { type: string }
+        counterevidence: { type: array, items: { type: string } }
+        attacker_position: { type: string }
+        preconditions: { type: array, items: { type: string } }
+        impact: { type: string }
+        likelihood: { type: string, enum: [likely, plausible, unlikely, unknown] }
+        applied_adjustments:
+          type: array
+          maxItems: 0
+          description: "Reserved for severity-cap calibration; critic emits an empty array."
+          items:
+            type: object
+            required: [kind, reason, severity_before, severity_after]
+            additionalProperties: false
+            properties:
+              kind: { type: string }
+              reason: { type: string }
+              severity_before: { type: string, enum: [Critical, High, Medium, Low] }
+              severity_after: { type: string, enum: [Critical, High, Medium, Low] }
+        facts_that_would_change_the_result: { type: array, items: { type: string } }
+
+    RemediationAttempt:
+      type: object
+      required: [id, attempt, patch_scan_id, base_commit, status, created_at]
+      properties:
+        id:            { type: integer, format: int64 }
+        attempt:       { type: integer, minimum: 1 }
+        patch_scan_id: { type: integer, format: int64 }
+        base_commit:   { type: string }
+        status:        { type: string, enum: [verification_incomplete, bypassed_patch, verified_secure] }
+        created_at:    { type: string, format: date-time }
+        validation:
+          allOf:
+            - $ref: '#/components/schemas/RemediationValidation'
+          nullable: true
+
+    RemediationValidation:
+      type: object
+      required: [scan_id, outcome, valid_variants, benign_control_passed, bypass_input, created_at]
+      properties:
+        scan_id:               { type: integer, format: int64 }
+        outcome:               { type: string, enum: [failed_to_bypass, bypassed_patch, inconclusive] }
+        valid_variants:        { type: integer, minimum: 0 }
+        benign_control_passed: { type: boolean }
+        bypass_input:          { type: string }
+        created_at:            { type: string, format: date-time }
+
+    VerificationReport:
+      type: object
+      description: "Immutable verify output containing an evidenced attack tree, typed attacker prerequisites, three attempt records, five scored criteria, and a non-scored host-validated control-bypass gate. Historical reports may omit attack_tree, severity_prerequisites, or criteria.control_bypass. See skills/verify/schema.json for the current output contract."
+      required: [status]
+      additionalProperties: true
+      properties:
+        status: { type: string, enum: [confirmed, fixed, inconclusive, deferred, not_attempted] }
+        attack_tree:
+          type: object
+          description: "Claim-specific attack path with a rooted parent-linked node set, per-node evidence, an overall reachable/blocked/unproven/not_attempted verdict, and concrete blockers."
+          additionalProperties: true
+          properties:
+            goal: { type: string }
+            root_id: { type: string }
+            verdict: { type: string, enum: [reachable, blocked, unproven, not_attempted] }
+            nodes:
+              type: array
+              items: { type: object, additionalProperties: true }
+            blockers:
+              type: array
+              items: { type: string }
+        severity_prerequisites:
+          type: object
+          description: "Evidence-backed inputs for deterministic severity caps. Required by the current verify contract; optional here only for historical stored reports. Unknown inputs mark calibration incomplete and never lower severity."
+          required: [attacker_position, user_interaction, outcome_determinism, impact, existing_capability]
+          additionalProperties: false
+          properties:
+            attacker_position:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: { type: string, enum: [remote_unauthenticated, remote_authenticated, internal_authenticated, local, host_shell, long_term_physical, unknown, not_attempted] }
+                evidence: { type: string }
+            user_interaction:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: { type: string, enum: [none, required, unknown, not_attempted] }
+                evidence: { type: string }
+            outcome_determinism:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: { type: string, enum: [deterministic, probabilistic_llm, unknown, not_attempted] }
+                evidence: { type: string }
+            impact:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: { type: string, enum: [code_execution_or_equivalent, privilege_escalation, sensitive_data_access, availability, other, unknown, not_attempted] }
+                evidence: { type: string }
+            existing_capability:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: { type: string, enum: [none, less_than_outcome, support_channel_equivalent, equivalent_or_greater, unknown, not_attempted] }
+                evidence: { type: string }
+        attempts:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items: { type: object, additionalProperties: true }
+        criteria:
+          type: object
+          additionalProperties: true
+          properties:
+            control_bypass:
+              type: object
+              required: [matched_controls, assessments]
+              properties:
+                matched_controls:
+                  type: array
+                  uniqueItems: true
+                  items: { type: string }
+                unavailable_reason:
+                  type: string
+                  description: "Exact host-staged reason control resolution failed; omitted when resolution succeeded or no controls exist."
+                assessments:
+                  type: array
+                  items:
+                    type: object
+                    required: [control_id, disposition, evidence]
+                    properties:
+                      control_id: { type: string }
+                      disposition: { type: string, enum: [bypassed, held, not_applicable, unresolved, not_attempted] }
+                      evidence: { type: string }
 
     FindingExport:
       description: |
@@ -1191,7 +1851,15 @@ components:
         - type: object
           properties:
             commit:            { type: string }
-            sub_path:          { type: string }
+            model:
+              type: string
+              description: |
+                Model id of the scan that first produced the finding,
+                denormalised from that scan. For findings imported from a
+                scrutineer sharing bundle it is the exporting instance's
+                producing model; empty when no model attribution was
+                recorded (deterministic imports, or rows predating model
+                recording).
             fingerprint:       { type: string }
             last_seen_scan_id: { type: integer, format: int64 }
             last_seen_commit:  { type: string }
@@ -1201,8 +1869,13 @@ components:
 
     ImportMinimal:
       description: |
-        Minimal hand-written ingest shape for findings that came from a
-        pentest writeup or a tool with no SARIF emitter.
+        Minimal hand-written ingest shape for findings from a pentest writeup or
+        a tool with no SARIF emitter. It is also the shape scrutineer's own
+        `format=bundle` export emits and `/v1/import` round-trips: the seven base
+        fields, the extended fields every bundle carries, and the archival fields
+        an `include=all` bundle adds. Everything past the base seven is optional;
+        a hand-written report or a bundle produced before a field existed simply
+        omits it.
       type: object
       required: [findings]
       properties:
@@ -1221,6 +1894,71 @@ components:
               cwe:         { type: string }
               location:    { type: string, description: "path[:line[:col]]" }
               patch:       { type: string, description: "unified diff" }
+              # Extended fields every scrutineer bundle carries (six-step audit
+              # prose, provenance, correlation).
+              commit:       { type: string, description: "Per-finding revision; falls back to the top-level commit." }
+              sub_path:     { type: string }
+              locations:    { type: string, description: "Newline-joined file:line hit set." }
+              sinks:        { type: string, description: "Comma-joined sink ids." }
+              vid:          { type: string }
+              reachability: { type: string, enum: [reachable, harness_only, unclear] }
+              quality_tier: { type: string, enum: [high, low] }
+              boundary:     { type: string }
+              validation:   { type: string }
+              prior_art:    { type: string }
+              reach:        { type: string }
+              rating:       { type: string }
+              fix_commit:   { type: string, description: "Base revision the patch applies to." }
+              model:        { type: string, description: "Model id of the scan that produced the finding on the exporting instance; preserved as the finding's model on import. Dropped unless it looks like a model id (leading alphanumeric, id charset, at most 100 chars) — bundle text is externally supplied and this field feeds the reporting CSV." }
+              # Archival fields, emitted only with include=all: the operator's
+              # enrichment, disclosure work product, and child records.
+              snippet:                    { type: string }
+              affected:                   { type: string, description: "Vulnerable version range." }
+              fix_version:                { type: string }
+              cve_id:                     { type: string }
+              ghsa_id:                    { type: string }
+              cvss_vector:                { type: string, description: "v3.x base vector; score recomputed on import." }
+              cvss_v4_vector:             { type: string, description: "v4.0 base vector; score recomputed on import." }
+              mitigation:                 { type: string }
+              mitigation_semgrep:         { type: string }
+              breaking_change:            { type: string, enum: [breaking, non_breaking, unknown] }
+              breaking_change_rationale:  { type: string }
+              dup_check:                  { type: string }
+              disclosure_draft:           { type: string }
+              disclosure_title:           { type: string, description: "The disclose skill's drafted GHSA summary; may differ from the finding's own title." }
+              suggested_recipients:       { type: string, description: "File-level owners for the finding's location, from CODEOWNERS or recent non-bot committers." }
+              exploited_in_wild:          { type: string, enum: [yes, no] }
+              exploited_in_wild_evidence: { type: string }
+              upstream_fix_commit:        { type: string, description: "Real upstream fix commit (distinct from fix_commit)." }
+              notes:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    body:       { type: string }
+                    by:         { type: string }
+                    created_at: { type: string, format: date-time }
+              communications:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    channel:      { type: string, enum: [email, ghsa, issue, pr, direct, registry] }
+                    direction:    { type: string, enum: [outbound, inbound] }
+                    actor:        { type: string }
+                    body:         { type: string }
+                    offered_help: { type: string, enum: [pr, funding, adoption, none] }
+                    at:           { type: string, format: date-time }
+                    created_at:   { type: string, format: date-time }
+              references:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    url:        { type: string, format: uri }
+                    tags:       { type: string, description: "Comma-joined: issue, pr, cve, ghsa, patch, advisory, discussion, article." }
+                    summary:    { type: string }
+                    created_at: { type: string, format: date-time }
 
     ImportResponse:
       type: object
@@ -1237,6 +1975,25 @@ components:
               tool:          { type: string }
               created:       { type: integer }
               observed:      { type: integer }
+              received:
+                type: integer
+                description: Findings the parser produced for this result, before the scanner caps.
+              accepted:
+                type: integer
+                description: |
+                  Findings that survived the scanner caps and were imported.
+                  Equal to `received` for the curated formats. A scanner
+                  export (SARIF, CSV, markdown) is capped at 5 findings per
+                  rule and 50 per result.
+              dropped_per_rule:
+                type: integer
+                description: Findings rejected by the per-rule cap.
+              dropped_total_cap:
+                type: integer
+                description: |
+                  Findings rejected by the per-result cap. A finding both caps
+                  would reject counts against `dropped_per_rule` only, so the
+                  two drop counts sum to `received` minus `accepted`.
               finding_ids:
                 type: array
                 items: { type: integer, format: int64 }

@@ -43,7 +43,7 @@ type Repository struct {
 	FetchedAt     *time.Time
 
 	// Ecosystems* hold raw ecosyste.ms payloads pre-fetched server-side so
-	// the metadata/packages/advisories/maintainers/dependents skills can read
+	// metadata/packages/advisories/maintainers skills can read
 	// a known URL from the API instead of issuing a WebFetch and carrying the
 	// payload across every turn. Each Data column mirrors the Metadata
 	// blob pattern above; the paired FetchedAt drives the per-source TTL
@@ -67,6 +67,19 @@ type Repository struct {
 	// SECURITY.md / CODEOWNERS / registry data; the analyst can overwrite
 	// it from the repo page.
 	DisclosureChannel string
+	// DisclosureChannelAt is when DisclosureChannel last changed. It is the
+	// verified_at of the interchange route record, so it only moves on a
+	// real change: bumping it on every maintainers re-run would rewrite the
+	// record and churn the public feed with no new information.
+	DisclosureChannelAt *time.Time
+
+	// FederationOptOutAt records that this repository's maintainer asked
+	// federated instances to neither scan it nor contact them about it.
+	// Non-null blocks new scans, keeps the repository out of every other
+	// feed record, and publishes an optout record on the public feed.
+	// FederationOptOutReason is the optional reason that travels with it.
+	FederationOptOutAt     *time.Time
+	FederationOptOutReason string
 
 	// Posture is the disclosure-readiness tier assigned by the posture
 	// skill: "ready", "partial", or "unprepared". PostureSummary is the
@@ -74,6 +87,11 @@ type Repository struct {
 	// are overwritten on each posture run.
 	Posture        string `gorm:"index"`
 	PostureSummary string
+
+	// Health is the evidence-based maintenance classification: active, stale,
+	// abandoned, or zombie. Empty means there is not yet enough evidence to
+	// make a classification.
+	Health RepositoryHealth `gorm:"index"`
 
 	// Fork is the full_name (owner/name) of this repository's private
 	// staging repo inside the configured fork_org. Written by the fork
@@ -103,11 +121,34 @@ type Repository struct {
 	// workbench tab; empty means no override.
 	ThreatModel string `gorm:"type:text"`
 
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	// ScanConfig is analyst-authored YAML that narrows and explains the
+	// repository's security review. The worker validates and stages it as
+	// scrutineer.scan_config in every skill workspace.
+	ScanConfig string `gorm:"type:text"`
 
-	Scans       []Scan       `gorm:"constraint:OnDelete:CASCADE"`
-	Maintainers []Maintainer `gorm:"many2many:repository_maintainers"`
+	// ScanSchedule drives recurring scans: "daily", "weekly", or a
+	// cron expression. Empty inherits the global scan_schedule setting;
+	// "off" disables scheduling even when a global default is set.
+	ScanSchedule string
+	// UpstreamURL, when set, names the upstream this repository is a
+	// pushed staging copy of (no forge fork relationship). The scheduler
+	// force-syncs the repository from it (a mirror push that overwrites
+	// local-only commits) before the new-commit check.
+	UpstreamURL string
+	// NextScheduledScanAt is scheduler bookkeeping: when the next
+	// scheduled run is due. Null means "recompute on the next tick";
+	// schedule edits reset it rather than computing inline.
+	NextScheduledScanAt *time.Time `gorm:"index"`
+
+	CreatedAt time.Time
+	// UpdatedAt drives the repository list's default newest-first order. Keep
+	// it indexed so SQLite can find the first page without scanning through
+	// every repository's large cache columns and building a temporary sort.
+	UpdatedAt time.Time `gorm:"index"`
+
+	Scans            []Scan            `gorm:"constraint:OnDelete:CASCADE"`
+	ExpectedFindings []ExpectedFinding `gorm:"constraint:OnDelete:CASCADE"`
+	Maintainers      []Maintainer      `gorm:"many2many:repository_maintainers"`
 }
 
 // IsLocal reports whether this Repository points at a directory on disk
@@ -128,12 +169,22 @@ func (r Repository) LocalPath() string {
 type ScanStatus string
 
 const (
-	ScanQueued    ScanStatus = "queued"
-	ScanRunning   ScanStatus = "running"
-	ScanPaused    ScanStatus = "paused"
-	ScanDone      ScanStatus = "done"
-	ScanFailed    ScanStatus = "failed"
+	ScanQueued  ScanStatus = "queued"
+	ScanRunning ScanStatus = "running"
+	ScanPaused  ScanStatus = "paused"
+	ScanDone    ScanStatus = "done"
+	ScanFailed  ScanStatus = "failed"
+	// ScanSkipped records a scheduled scan the scheduler decided not to run
+	// (remote HEAD unchanged, a scan already in flight, ...). The row never
+	// enters the queue; Error carries the reason so the scans list shows
+	// why nothing ran.
+	ScanSkipped   ScanStatus = "skipped"
 	ScanCancelled ScanStatus = "cancelled"
+)
+
+const (
+	ScanRescanModeFull = "full"
+	ScanRescanModeDiff = "diff"
 )
 
 // Scan is one execution of a job against a repository. Kind names the job
@@ -160,9 +211,10 @@ type Scan struct {
 	// the skill is deleted. APIToken is a random bearer generated per-run
 	// so skills can call back into scrutineer's HTTP API from inside the
 	// workspace; it is cleared when the scan reaches a terminal state.
-	SkillID      *uint `gorm:"index"`
-	SkillVersion int
-	SkillName    string `gorm:"index"`
+	SkillID            *uint `gorm:"index"`
+	SkillVersion       int
+	SkillSchemaVersion int
+	SkillName          string `gorm:"index"`
 	// FindingID is set when a scan is finding-scoped (verify, patch,
 	// disclose). Skills read it from context.json to know which finding
 	// they are acting on.
@@ -179,8 +231,12 @@ type Scan struct {
 	// The pointer both marks the scan as a validation anchor — so the auto
 	// triage funnel skips it — and pins the baseline scan it diffs against.
 	// Nil on every ordinary scan.
-	BaselineScanID *uint  `gorm:"index"`
-	APIToken       string `gorm:"index"`
+	BaselineScanID *uint `gorm:"index"`
+	// RemediationAttemptID pins a re-attack scan to the immutable patch
+	// attempt it validates. Reading Finding.SuggestedFix when the worker starts
+	// would race with a newer patch run and could validate the wrong diff.
+	RemediationAttemptID *uint  `gorm:"index"`
+	APIToken             string `gorm:"index"`
 
 	// StatusPriority is a denormalised sort key so the scans index can use
 	// an index instead of evaluating a CASE on every row. 0 = running,
@@ -200,10 +256,70 @@ type Scan struct {
 
 	// SubPath scopes the scan's code analysis to a sub-folder within the
 	// clone (e.g. airflow-core inside apache/airflow). Empty means the
-	// repo root. Skills that walk files honour this through
-	// scrutineer.scan_subpath in context.json; skills that consult
-	// external APIs (packages/advisories/dependents) ignore it.
+	// repo root. Finding-producing / code-analysis skills honour this through
+	// scrutineer.scan_subpath in context.json; repo-wide projection skills
+	// (those whose output populates repository-level rows, e.g.
+	// packages/advisories/dependencies/maintainers/repo-overview) ignore it and
+	// always describe the whole repository.
 	SubPath string `gorm:"index"`
+
+	// ScopeMode overrides the instance-default subproject staging mode for
+	// this scan: "hard" stages only SubPath's sub-folder into the workspace
+	// (so the agent, build, and findings are confined to the sub-package),
+	// "soft" stages the whole clone with SubPath as an advisory focus hint.
+	// Empty inherits the configured default (config.SubprojectScope).
+	// Persisted so a retry reproduces the mode even if the instance default
+	// changed, and rewritten to "soft" by the automatic whole-tree fallback
+	// when a hard-scoped scan's isolated dependency resolution fails. Ignored
+	// when SubPath is empty (a root scan is neither hard nor soft).
+	ScopeMode string `gorm:"index"`
+
+	// ScanGroup ties together a cohort of deep-dive scans launched as one
+	// parallel batch (Scan-all-subprojects, or a single New-scan run), so an
+	// in-flight audit skill can list its siblings' findings via
+	// /repositories/{id}/findings?scan_group=... and avoid re-filing a bug a
+	// sibling already reported before the dedup judge runs. Empty on
+	// scans that were not launched as part of such a batch.
+	ScanGroup string `gorm:"index"`
+
+	// FocusArea is the normalized JSON focus-area payload for an audit split
+	// out of a repository scan configuration. Empty means the scan covers its
+	// normal repository or subproject scope. It is stored on the scan so queued
+	// work remains reproducible if the repository configuration changes.
+	FocusArea string `gorm:"type:text"`
+
+	// TriageScanID identifies the triage invocation that requested this scan.
+	// ExplorationMode is empty for planned audits; random-dig audits choose
+	// ExplorationPath from the filtered checkout without using the threat model.
+	TriageScanID    *uint `gorm:"index"`
+	ExplorationMode string
+	ExplorationPath string
+
+	// RescanMode records the actual coverage mode for this scan. Empty and
+	// "full" mean ordinary full coverage. "diff" means the worker staged a
+	// baseline diff and skills should not claim coverage over untouched code.
+	// A requested diff scan can fall back to full coverage; Coverage records
+	// why.
+	RescanMode string `gorm:"index"`
+	// DiffBaseScanID/DiffBaseCommit identify the baseline used for a diff
+	// rescan. The commit is denormalized so the scan remains understandable
+	// even if the baseline scan row is later deleted.
+	DiffBaseScanID *uint `gorm:"index"`
+	DiffBaseCommit string
+	// DiffThreatModelScanID points at the prior threat-model report staged as
+	// old_threat_model.json for a diff threat-model scan, when available.
+	DiffThreatModelScanID *uint `gorm:"index"`
+	// DiffStats and Coverage are JSON blobs. DiffStats describes changed
+	// files/counts; Coverage is the internal/coverage.Record describing what
+	// this scan did or did not reach, including automatic fallback reasons.
+	DiffStats string `gorm:"type:text"`
+	Coverage  string `gorm:"type:text"`
+	// Completeness is Coverage's completeness verdict lifted out into its own
+	// indexed column so the scans list can filter on it without decoding the
+	// record. "complete" / "partial" / "unknown"; empty on rows written
+	// before the typed contract. It is derived by the worker from receipt
+	// reconciliation, never copied from a skill's own claim.
+	Completeness string `gorm:"index"`
 
 	// Profile is the runner profile that ran (or was overridden to run)
 	// this scan. Empty means the default runner image; non-empty names
@@ -211,27 +327,68 @@ type Scan struct {
 	// operator's override and the UI can show the chosen ecosystem.
 	Profile string `gorm:"index"`
 
-	// SessionID is the claude-code session this scan's run belongs to,
-	// captured from the stream-json init/result events. It is written as
-	// soon as the init event arrives (before the run finishes) so it
-	// survives a crash, and cleared once the scan reaches ordinary "done"
-	// so a deliberate re-run from the UI starts a fresh conversation. A
-	// retry of a failed or max-turns-hit scan carries this value forward
-	// so the runner can pass `claude -p --resume <id>` and continue from
-	// where it left off instead of restarting from turn 0.
+	// Backend is the harness (agent CLI) that ran this scan — the -backend
+	// value, e.g. "claude" or "codex". Stamped by the worker so a retry
+	// after switching -backend can drop the recorded SessionID rather than
+	// pass one harness's session/thread id to another's resume command.
+	// Empty on rows that predate the column or never reached the runner.
+	Backend string `gorm:"index"`
+	// Provider is the model id prefix selected by OpenCode. RunnerImage is the
+	// provider base image, and RunnerImageDigest is its resolved content digest
+	// or local image id. They make runs reproducible when an image tag moves.
+	Provider          string `gorm:"index"`
+	RunnerImage       string
+	RunnerImageDigest string
+
+	// SessionID is the harness session this scan's run belongs to,
+	// captured from the harness's own event stream. Its meaning depends
+	// on Backend (a claude session id, a codex thread id, ...). It is
+	// written as soon as the session event arrives (before the run
+	// finishes) so it survives a crash, and cleared once the scan reaches
+	// ordinary "done" so a deliberate re-run from the UI starts a fresh
+	// conversation. A retry of a failed or max-turns-hit scan carries
+	// this value forward so the harness can resume the same conversation
+	// instead of restarting from turn 0.
 	SessionID string
 	// MaxTurnsHit marks scans that completed with partial output because
 	// claude-code hit --max-turns. They stay status=done because the
 	// partial report is real output, but keep SessionID so Retry can resume.
 	MaxTurnsHit bool `gorm:"not null;default:false"`
-	// ResumedFromScanID points at the lineage-root scan whose claude session
-	// and workspace a retry reuses. Nil on a fresh scan. claude keys its
-	// session store by working directory, so a resuming run must execute
-	// in the same per-scan workspace path as the original; this pins that
-	// path across the whole retry chain. Always the root of the lineage,
+	// ResumedFromScanID points at the lineage-root scan whose harness
+	// session and workspace a retry reuses. Nil on a fresh scan. Harness
+	// session stores are keyed by working directory, so a resuming run
+	// must execute in the same per-scan workspace path as the original;
+	// this pins that path across the whole retry chain. Always the root of the lineage,
 	// not the immediate parent, so N retries deep still resolve to one
 	// workspace.
 	ResumedFromScanID *uint `gorm:"index"`
+
+	// ParentScanID points at the scan this one was enqueued as a rerun of:
+	// the *immediate* parent, so a chain of reruns can be walked one hop at
+	// a time and each hop's Recipe diffed against its parent's. Nil on a
+	// fresh scan. Deliberately separate from ResumedFromScanID, which is
+	// pinned to the lineage root because it addresses a workspace, and
+	// which is only set when the retry actually resumes a harness session
+	// — a retry of a done or cancelled scan has a parent but no session.
+	ParentScanID *uint `gorm:"index"`
+	// VerificationFeedback is operator guidance snapshotted for this verify run.
+	// It is not a verdict and is never copied into the finding's reproduction.
+	VerificationFeedback string `gorm:"type:text"`
+
+	// Recipe is an immutable JSON snapshot (worker.ScanRecipe) of the
+	// inputs the worker was handed, written once inside the transaction
+	// that claims the scan and never updated. The columns it duplicates are
+	// mutable and some are backfilled later, so they record what the row
+	// looks like now rather than what the worker started from; the recipe
+	// also digests the Repository threat model and scan config in effect at
+	// claim time, which nothing else records. Empty on rows claimed before
+	// the column existed.
+	//
+	// The write-once guarantee is enforced in SQL, not just by writing it
+	// at claim: a paused scan returns to `queued` on the same row (operator
+	// resume, bulk resume, and the account-pause auto-resume), so the claim
+	// itself can run more than once per row.
+	Recipe string `gorm:"type:text"`
 
 	Commit     string
 	StartedAt  *time.Time
@@ -249,8 +406,18 @@ type Scan struct {
 
 	Prompt string
 	Report string
-	Log    string
-	Error  string
+	// RefusalAudit is the structured follow-up from security-deep-dive after
+	// its primary report. It records analysis the agent declined or only
+	// partially completed, without changing the primary report artifact.
+	RefusalAudit string `gorm:"type:text"`
+	// RefusalAuditWarning is denormalized from RefusalAudit so scan lists can
+	// flag incomplete coverage without parsing JSON while rendering.
+	RefusalAuditWarning bool `gorm:"not null;default:false"`
+	Log                 string
+	Error               string
+	// PausedUntil is set for model-account pauses with a known reset time.
+	// Nil means a manual pause or an account pause without a reported reset.
+	PausedUntil *time.Time `gorm:"index"`
 
 	// ImportPayload carries the raw uploaded report for an ingest-skill
 	// run created by the /v1/import fallback. The worker stages it into
@@ -265,11 +432,29 @@ type Scan struct {
 	UpdatedAt time.Time
 }
 
+// Resumable reports whether a retry can reuse this scan's harness session and
+// workspace state. Failed scans and partial successful scans that exhausted
+// their turn budget are resumable only when the harness recorded a session.
+func (s Scan) Resumable() bool {
+	if s.SessionID == "" {
+		return false
+	}
+	return s.Status == ScanFailed || (s.Status == ScanDone && s.MaxTurnsHit)
+}
+
 // Package is one registry entry from packages.ecosyste.ms linked to this repo.
 type Package struct {
 	ID           uint `gorm:"primarykey"`
 	RepositoryID uint `gorm:"index;not null"`
 	Repository   Repository
+
+	// SubprojectID links this published package to the monorepo sub-package
+	// it is built from, matched by manifest name during the attribution
+	// reconcile. Nil means repo-level: a single-package repo, a package that
+	// matched no subproject, or monorepo attribution disabled. Recomputed on
+	// each packages/subprojects run, so it never needs to survive a wholesale
+	// row replace.
+	SubprojectID *uint `gorm:"index"`
 
 	Name                 string
 	Ecosystem            string `gorm:"index"`
@@ -284,8 +469,40 @@ type Package struct {
 	LatestReleaseAt      *time.Time
 	DependentPackagesURL string
 	Metadata             string `gorm:"type:text"`
+	// RiskFlags is the comma-joined set of supply-chain hygiene warnings the
+	// packages skill reported for this package: single_maintainer,
+	// no_security_policy, native_extension, stale_release,
+	// maintainer_domain_expired. The ids are validated and canonically
+	// ordered on write, so a stored value only ever names known flags. Each
+	// flag's evidence sentence stays in the scan report; promoting only the
+	// ids keeps the health summary and the package page free of JSON decoding.
+	RiskFlags string
 
 	CreatedAt time.Time
+}
+
+type PackageAlternativeKind string
+
+const (
+	PackageAlternativeFork       PackageAlternativeKind = "fork"
+	PackageAlternativeSuccessor  PackageAlternativeKind = "successor"
+	PackageAlternativeEquivalent PackageAlternativeKind = "equivalent"
+)
+
+// PackageAlternative records a migration target for a repository's package.
+// It is operator-curated: the source repo may be abandoned or zombie, while
+// the alternative PURL points at a maintained fork, successor, or equivalent.
+type PackageAlternative struct {
+	ID           uint `gorm:"primarykey"`
+	RepositoryID uint `gorm:"index;not null;uniqueIndex:idx_repo_alt_purl_kind"`
+	Repository   Repository
+
+	PURL string                 `gorm:"not null;uniqueIndex:idx_repo_alt_purl_kind"`
+	Kind PackageAlternativeKind `gorm:"index;not null;uniqueIndex:idx_repo_alt_purl_kind"`
+	Note string
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 type MaintainerStatus string
@@ -337,6 +554,15 @@ const (
 	FindingDuplicate    FindingLifecycle = "duplicate"
 )
 
+type FindingNovelty string
+
+const (
+	FindingNoveltyUnfixed    FindingNovelty = "unfixed"
+	FindingNoveltyFixed      FindingNovelty = "fixed"
+	FindingNoveltyUnclear    FindingNovelty = "unclear"
+	FindingNoveltyNotChecked FindingNovelty = "not_checked"
+)
+
 // FindingLifecycles lists every finding status in workflow order. Used to
 // render the Status filter on the findings index.
 var FindingLifecycles = []FindingLifecycle{
@@ -357,10 +583,20 @@ func (s FindingLifecycle) Closed() bool {
 	return slices.Contains(ClosedFindingLifecycles, s)
 }
 
+// SQLStringLiteral renders s as a single-quoted SQL string literal, doubling
+// any embedded single quote. It is for splicing a TRUSTED CONSTANT into a
+// query fragment that cannot take a bind parameter — e.g. a correlated
+// subquery used inside an ORDER BY. It is defence-in-depth against a constant
+// later gaining a quote, NOT a licence to interpolate user input: anything
+// reachable from a request must still go through a `?` placeholder.
+func SQLStringLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
 func ClosedFindingLifecycleSQLValues() string {
 	values := make([]string, 0, len(ClosedFindingLifecycles))
 	for _, status := range ClosedFindingLifecycles {
-		values = append(values, "'"+strings.ReplaceAll(string(status), "'", "''")+"'")
+		values = append(values, SQLStringLiteral(string(status)))
 	}
 	return strings.Join(values, ", ")
 }
@@ -369,6 +605,12 @@ func ClosedFindingLifecycleSQLValues() string {
 type Advisory struct {
 	ID           uint `gorm:"primarykey"`
 	RepositoryID uint `gorm:"index;not null"`
+
+	// SubprojectID links this advisory to the monorepo sub-package it affects,
+	// matched during the attribution reconcile from the advisory's affected
+	// package names. Nil means repo-level (unmatched, single-package repo, or
+	// attribution disabled). Recomputed on each advisories/subprojects run.
+	SubprojectID *uint `gorm:"index"`
 
 	UUID           string
 	URL            string
@@ -384,8 +626,75 @@ type Advisory struct {
 	CreatedAt time.Time
 }
 
+// AdvisoryAuditStatuses is the set of verdicts an advisory fix audit may
+// record: the advertised fix held (fixed), can be circumvented (bypass),
+// left the same bug class open elsewhere (variant), or the original
+// reproduction fires again at the audited commit (regressed).
+var AdvisoryAuditStatuses = map[string]bool{
+	"fixed": true, "bypass": true, "variant": true, "regressed": true,
+}
+
+// AdvisoryAudit is one fix-audit verdict for a published advisory, written by
+// the advisory-deep-dive skill. One row per advisory per run; the newest row
+// per (repository, advisory) is authoritative. Keyed by advisory UUID rather
+// than Advisory.ID because the advisories skill replaces Advisory rows
+// wholesale on each run.
+type AdvisoryAudit struct {
+	ID           uint `gorm:"primarykey"`
+	RepositoryID uint `gorm:"index;not null"`
+	ScanID       uint `gorm:"index"`
+
+	AdvisoryUUID string `gorm:"index"`
+	Status       string // one of AdvisoryAuditStatuses
+	Evidence     string
+	// FindingIDs is the comma-joined list of Finding row ids this audit
+	// opened. Empty when Status is fixed.
+	FindingIDs string
+	// Commit is the audited commit, denormalized from the scan.
+	Commit string
+
+	CreatedAt time.Time
+}
+
+// InterchangeRecord is one federation record imported from a peer feed,
+// stored verbatim so re-validating or re-applying it never depends on how
+// the running version of scrutineer happened to interpret it. Unique per
+// (feed, predicate_type, subject_digest): a peer refreshing a record
+// replaces its own row, while two peers publishing conflicting verdicts
+// for the same subject each keep theirs instead of one silently winning.
+type InterchangeRecord struct {
+	ID uint `gorm:"primarykey"`
+
+	// Feed is the peer feed's git remote, part of the unique key.
+	Feed          string `gorm:"uniqueIndex:idx_interchange_record,priority:1"`
+	PredicateType string `gorm:"uniqueIndex:idx_interchange_record,priority:2"`
+	// SubjectDigest is the record's subject sha256: the salted finding hash
+	// for a claim, sha256 of the canonical repository URL for an opt-out or
+	// route, sha256 of repository plus advisory id for a certificate.
+	SubjectDigest string `gorm:"uniqueIndex:idx_interchange_record,priority:3"`
+	// Record is the raw in-toto statement as published.
+	Record string `gorm:"type:text"`
+	// AppliedAt is when the import last acted on this record, or established
+	// there was nothing local to act on. Null re-opens it on the next pass,
+	// and a changed Record clears it, so a peer's correction is re-applied
+	// and an opt-out published before its repository was imported here still
+	// lands once the repository exists. An unchanged record keeps its stamp,
+	// which is what stops the hourly pass from reinstating what an operator
+	// deliberately cleared.
+	AppliedAt *time.Time
+	// AppliedRepositoryID is the repository row the stamp above was written
+	// against, zero for the kinds that act on nothing local. Deleting that
+	// repository re-opens the record, since the stamp only ever meant "this
+	// row already carries it": without that, an opt-out applied before a
+	// repository was deleted and re-added would leave the new row scannable
+	// while the peer's request is still standing.
+	AppliedRepositoryID uint `gorm:"index"`
+
+	ReceivedAt time.Time
+}
+
 // Dependent is a package that depends on one of this repo's packages.
-// Populated by the dependents job from packages.ecosyste.ms.
+// Populated by the ecosystems dependents prefetch from packages.ecosyste.ms.
 type Dependent struct {
 	ID           uint `gorm:"primarykey"`
 	RepositoryID uint `gorm:"index;not null"`
@@ -422,6 +731,24 @@ type Dependency struct {
 	CreatedAt             time.Time
 }
 
+// ExpectedFinding is an operator-supplied benchmark target for a repository.
+// It records a known vulnerable file/CWE pair that model-backed scans should
+// rediscover. Matching intentionally ignores line numbers because they drift
+// between versions.
+type ExpectedFinding struct {
+	ID           uint `gorm:"primarykey"`
+	RepositoryID uint `gorm:"index;not null;uniqueIndex:idx_expected_repo_file_cwe,priority:1"`
+	Repository   Repository
+
+	File string `gorm:"not null;uniqueIndex:idx_expected_repo_file_cwe,priority:2"`
+	CWE  string `gorm:"not null;uniqueIndex:idx_expected_repo_file_cwe,priority:3"`
+	CVE  string
+	Note string `gorm:"type:text"`
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 // FindingResolution says how a finding got resolved. Set by the analyst
 // once disclosure runs its course.
 type FindingResolution string
@@ -443,6 +770,7 @@ const (
 	SourceTool    FindingSource = "tool"
 	SourceModel   FindingSource = "model_suggested"
 	SourceAnalyst FindingSource = "analyst"
+	SourceSystem  FindingSource = "system"
 )
 
 // Finding is one vulnerability reported by a scan. The Finding row holds
@@ -463,6 +791,20 @@ type Finding struct {
 	RepositoryID uint `gorm:"index;index:idx_findings_repo_fp,priority:1"`
 	Commit       string
 	SubPath      string `gorm:"index"`
+	// Model is the model id of the scan that first produced this finding,
+	// denormalized like Commit so exports and the reporting page can
+	// attribute findings to a model without joining through Scan. Set at
+	// finding-create time from the producing scan and never changed on
+	// re-observation; BackfillFindingRepository fills rows that predate
+	// the column. For findings imported from a scrutineer sharing bundle
+	// it carries the *exporting* instance's producing model when the
+	// bundle recorded one; the deterministic importers (SARIF, CSV,
+	// markdown) run on a synchronous import scan that records no model,
+	// so their findings stay empty, while the queued LLM ingest fallback
+	// stamps its own resolved model like any skill run. ImportedFrom
+	// disambiguates. Also empty when the producing scan predates
+	// Scan.Model.
+	Model string `gorm:"index"`
 
 	// Fingerprint dedupes the same vulnerability reported by repeated
 	// scans; see FingerprintFinding. ScanID/Commit are first-seen;
@@ -474,10 +816,13 @@ type Finding struct {
 	LastSeenCommit string
 	SeenCount      int
 	// MissedCount/LastMissedScanID track the inverse: consecutive
-	// same-skill rescans of this repo+subpath where the fingerprint did
-	// NOT reappear. Reset to zero on the next re-observation. A non-zero
-	// MissedCount is a hint the finding may have been fixed upstream; it
-	// is not proof since model-driven audits are nondeterministic.
+	// same-skill full-repo rescans of this repo+subpath where the
+	// fingerprint did NOT reappear. Reset to zero on the next
+	// re-observation. Focus-area scans never increment it: they are only
+	// in scope for their own slice, so a miss there says nothing. A
+	// non-zero MissedCount is a hint the finding may have been fixed
+	// upstream; it is not proof since model-driven audits are
+	// nondeterministic.
 	MissedCount      int
 	LastMissedScanID uint
 
@@ -492,14 +837,20 @@ type Finding struct {
 	// used for dedup: a VID changes whenever the function's bytes change.
 	VID string `gorm:"column:vid;index"`
 
-	FindingID  string // e.g. F1, F2 within the report
-	Sinks      string // comma-joined sink IDs
-	Title      string
-	Severity   string           `gorm:"index"`
-	Confidence string           `gorm:"index"` // high/medium/low; how certain the audit is
-	Status     FindingLifecycle `gorm:"index;default:new"`
-	CWE        string
-	Location   string
+	FindingID string // e.g. F1, F2 within the report
+	Sinks     string // comma-joined sink IDs
+	Title     string
+	Severity  string `gorm:"index"`
+	// SeverityCaps is the newline-delimited set of deterministic cap reasons
+	// applied by the latest authoritative verification. Unknown calibration
+	// inputs never lower Severity; SeverityCalibrationIncomplete records that
+	// an analyst still needs to resolve them.
+	SeverityCaps                  string `gorm:"type:text"`
+	SeverityCalibrationIncomplete bool
+	Confidence                    string           `gorm:"index"` // high/medium/low; how certain the audit is
+	Status                        FindingLifecycle `gorm:"index;default:new"`
+	CWE                           string
+	Location                      string
 	// Locations is the newline-joined set of file:line positions for
 	// findings that represent one rule firing many times (#191). The
 	// first entry is duplicated in Location for the fingerprint and the
@@ -565,13 +916,48 @@ type Finding struct {
 	ReleaseURL      string
 	Resolution      FindingResolution `gorm:"index"`
 	DisclosureDraft string            `gorm:"type:text"`
-	Assignee        string            `gorm:"index"`
+	// DisclosureTitle is the disclose skill's drafted GHSA summary
+	// (report.json's ghsa.summary), which may differ from Finding.Title:
+	// the finding's own title is set at audit time and preserved across
+	// disclose re-runs, while this is the disclosure-specific headline
+	// meant for the GHSA/VINCE form. Analyst-editable like the rest of
+	// this block.
+	DisclosureTitle string `gorm:"type:text"`
+	// SuggestedRecipients routes the disclosure to the file-level owners
+	// of Location (CODEOWNERS entries or, absent those, recent non-bot
+	// committers) because the repo-level maintainers list is too coarse
+	// on large projects. Comma-joined free text with provenance, usually
+	// produced by the disclose skill but also editable via the finding
+	// form and the PATCH API.
+	SuggestedRecipients string `gorm:"type:text"`
+	// FederationClaimContacts holds the peer contacts returned by the
+	// outbound claim-check that ran when this finding was about to be
+	// reported, comma-joined. Non-empty means at least one federation peer
+	// already holds the same finding and the attempt was refused so the
+	// analyst coordinates first; a recorded claim is also the
+	// acknowledgement, so the next attempt goes through. Any status change
+	// clears it, reported or not, so it cannot stand in for a fresh check
+	// after a reopen.
+	FederationClaimContacts string `gorm:"type:text"`
+	FederationClaimAt       *time.Time
+	Assignee                string `gorm:"index"`
 	// LastRevalidateVerdict caches the latest verdict from the
 	// revalidate skill (true_positive | false_positive | already_fixed
 	// | uncertain; empty when revalidate has not run) so the audit
 	// queue can filter on an indexed column rather than LIKE-scanning
 	// finding_notes for the revalidate header.
 	LastRevalidateVerdict string `gorm:"index"`
+	// ProductionViability caches the newest immutable critic assessment so
+	// finding lists and disclosure gates do not need to parse report JSON or
+	// join the attack-path history. The append-only FindingAttackPath row is
+	// the source of truth; this column is only its current projection.
+	ProductionViability string `gorm:"index"`
+	// Novelty records whether the finding's source location changed between
+	// the scanned commit and the HEAD inspected by revalidate. A touched file
+	// starts as unclear until revalidate classifies the staged diff.
+	Novelty              FindingNovelty `gorm:"index"`
+	NoveltyCheckedCommit string
+	NoveltyCheckedAt     *time.Time
 	// SuggestedFix is a unified diff from the patch skill that has passed
 	// the applicability gate (parses, targets real files, touches a file
 	// named in Location, git apply --check clean). Empty when no patch has
@@ -621,11 +1007,22 @@ type Finding struct {
 	Reach      string `gorm:"type:text"`
 	Rating     string `gorm:"type:text"`
 
-	Labels         []FindingLabel         `gorm:"many2many:finding_labels_join"`
-	Notes          []FindingNote          `gorm:"constraint:OnDelete:CASCADE"`
-	Communications []FindingCommunication `gorm:"constraint:OnDelete:CASCADE"`
-	References     []FindingReference     `gorm:"constraint:OnDelete:CASCADE"`
-	History        []FindingHistory       `gorm:"constraint:OnDelete:CASCADE"`
+	// DupCheck is the audit agent's one-sentence rationale for why this
+	// finding is distinct from the sibling findings already filed under the
+	// same ScanGroup: which ones it compared against and why this is not a
+	// duplicate. The dedup judge weighs it alongside fingerprint matching.
+	// Empty for findings from skills that do not emit it.
+	DupCheck string `gorm:"type:text"`
+
+	Labels                 []FindingLabel          `gorm:"many2many:finding_labels_join"`
+	Notes                  []FindingNote           `gorm:"constraint:OnDelete:CASCADE"`
+	Communications         []FindingCommunication  `gorm:"constraint:OnDelete:CASCADE"`
+	References             []FindingReference      `gorm:"constraint:OnDelete:CASCADE"`
+	History                []FindingHistory        `gorm:"constraint:OnDelete:CASCADE"`
+	Verifications          []FindingVerification   `gorm:"constraint:OnDelete:CASCADE"`
+	AttackPaths            []FindingAttackPath     `gorm:"constraint:OnDelete:CASCADE"`
+	RemediationAttempts    []RemediationAttempt    `gorm:"constraint:OnDelete:CASCADE"`
+	RemediationValidations []RemediationValidation `gorm:"constraint:OnDelete:CASCADE"`
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -656,6 +1053,18 @@ func (f Finding) LocationList() []string {
 		out[i] = strings.TrimSpace(out[i])
 	}
 	return out
+}
+
+// SeverityCapList splits the current deterministic severity-cap projection
+// into display/API entries.
+func (f Finding) SeverityCapList() []string {
+	caps := make([]string, 0)
+	for line := range strings.SplitSeq(f.SeverityCaps, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			caps = append(caps, line)
+		}
+	}
+	return caps
 }
 
 // ExtraLocationCount is the number of grouped match positions beyond the
@@ -712,10 +1121,16 @@ type FindingCommunication struct {
 
 // FindingReference is an external URL related to a finding: the upstream
 // issue/PR, a CVE or GHSA record, a fix commit, a blog post.
+//
+// (FindingID, URL) is unique: one URL is one reference on one finding, and a
+// repeat write enriches that row rather than adding a second. AddFindingReference
+// keeps sequential writers idempotent, but its lookup-then-insert cannot make
+// two concurrent writers atomic on its own, so the index is the backstop. Rows
+// written before it existed are merged by mergeDuplicateFindingReferences.
 type FindingReference struct {
-	ID        uint `gorm:"primarykey"`
-	FindingID uint `gorm:"index;not null"`
-	URL       string
+	ID        uint   `gorm:"primarykey"`
+	FindingID uint   `gorm:"index;not null;uniqueIndex:idx_finding_ref_url,priority:1"`
+	URL       string `gorm:"uniqueIndex:idx_finding_ref_url,priority:2"`
 	// Tags is comma-joined: issue, pr, cve, ghsa, patch, advisory, discussion, article.
 	Tags    string
 	Summary string
@@ -731,6 +1146,35 @@ const (
 	ExposureUnderInvestigation = "under_investigation"
 	ExposureFixed              = "fixed"
 )
+
+// DependentCampaignStatus is the operator-managed outreach state for one
+// finding/dependent pair. It is deliberately separate from exposure status:
+// whether a consumer is affected and whether it has answered a migration
+// campaign are independent facts.
+type DependentCampaignStatus string
+
+const (
+	CampaignNotified DependentCampaignStatus = "notified"
+	CampaignAcked    DependentCampaignStatus = "acked"
+	CampaignMigrated DependentCampaignStatus = "migrated"
+	CampaignDeclined DependentCampaignStatus = "declined"
+	CampaignSilent   DependentCampaignStatus = "silent"
+)
+
+// DependentCampaignStatuses lists campaign states in workflow order.
+var DependentCampaignStatuses = []DependentCampaignStatus{
+	CampaignNotified, CampaignAcked, CampaignMigrated, CampaignDeclined, CampaignSilent,
+}
+
+// ValidDependentCampaignStatus reports whether status is a campaign state
+// the database accepts. Empty clears campaign tracking for the pair.
+func ValidDependentCampaignStatus(status DependentCampaignStatus) bool {
+	switch status {
+	case "", CampaignNotified, CampaignAcked, CampaignMigrated, CampaignDeclined, CampaignSilent:
+		return true
+	}
+	return false
+}
 
 // CSAF 2.0 VEX flag labels. Only valid when Status is known_not_affected.
 const (
@@ -786,6 +1230,10 @@ type FindingDependent struct {
 	ScanID     *uint
 	ScanCommit string
 
+	CampaignStatus    DependentCampaignStatus `gorm:"index"`
+	CampaignNote      string                  `gorm:"type:text"`
+	CampaignUpdatedAt *time.Time
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -803,6 +1251,24 @@ type FindingHistory struct {
 	By        string        // free text, or the skill name for model_suggested writes
 
 	CreatedAt time.Time
+}
+
+// AuditEvent records an append-only event for any auditable entity. It sits
+// alongside FindingHistory, which remains the specialised field-level record
+// for findings. Payload is JSON stored as text so the schema stays portable
+// between SQLite and PostgreSQL.
+type AuditEvent struct {
+	ID uint `gorm:"primarykey"`
+	// Kind identifies the action, for example scan.started or scan.failed.
+	Kind string `gorm:"not null;index:idx_audit_events_kind_created_at,priority:1"`
+	// SubjectType and SubjectID form a polymorphic reference to the entity the
+	// event describes, for example scan/42 or finding/17.
+	SubjectType string `gorm:"not null;index:idx_audit_events_subject,priority:1"`
+	SubjectID   uint   `gorm:"not null;index:idx_audit_events_subject,priority:2"`
+	Actor       string
+	Source      FindingSource `gorm:"not null;index"`
+	Payload     string        `gorm:"type:text;not null"`
+	CreatedAt   time.Time     `gorm:"index:idx_audit_events_kind_created_at,priority:2"`
 }
 
 // FindingReview is a structured human verdict against an automation
@@ -825,6 +1291,82 @@ type FindingReview struct {
 	// outcomes since there is nothing to compare to.
 	AutomatedOutcome string `gorm:"index"`
 	Reviewer         string
+
+	CreatedAt time.Time
+}
+
+// FindingVerification is one immutable grading record produced by a
+// finding-scoped verify scan. Report preserves the complete structured rubric;
+// Status and Score are promoted for cheap display and filtering. Score is nil
+// for legacy reports and rubric reports that remain internally inconsistent
+// after the repair attempt.
+type FindingVerification struct {
+	ID        uint   `gorm:"primarykey"`
+	FindingID uint   `gorm:"index;not null;uniqueIndex:idx_finding_verification_scan,priority:1"`
+	ScanID    uint   `gorm:"not null;uniqueIndex:idx_finding_verification_scan,priority:2"`
+	Status    string `gorm:"index;not null"`
+	Score     *float64
+	Report    string `gorm:"type:text;not null"`
+
+	CreatedAt time.Time
+}
+
+const (
+	ProductionViabilityViable            = "VIABLE"
+	ProductionViabilityNonViable         = "NON_VIABLE"
+	ProductionViabilitySampleOrTest      = "SAMPLE_OR_TEST"
+	ProductionViabilityConditionalViable = "CONDITIONAL_VIABLE"
+)
+
+// FindingAttackPath is one immutable release-viability assessment produced
+// by a finding-scoped critic scan. Report preserves the complete structured
+// attack-path record; ProductionViability is promoted for display and
+// filtering. The same scan cannot be recorded twice when parser work retries.
+type FindingAttackPath struct {
+	ID                  uint   `gorm:"primarykey"`
+	FindingID           uint   `gorm:"index;not null;uniqueIndex:idx_finding_attack_path_scan,priority:1"`
+	ScanID              uint   `gorm:"not null;uniqueIndex:idx_finding_attack_path_scan,priority:2"`
+	ProductionViability string `gorm:"index;not null"`
+	Report              string `gorm:"type:text;not null"`
+
+	CreatedAt time.Time
+}
+
+// RemediationAttempt is one immutable patch that passed the host-side
+// applicability gate. Attempt numbers are scoped to a finding; PatchScanID
+// makes parser retries idempotent. Finding.SuggestedFix remains the convenient
+// projection of the newest attempt, not the source of remediation history.
+type RemediationAttempt struct {
+	ID          uint   `gorm:"primarykey"`
+	FindingID   uint   `gorm:"not null;uniqueIndex:idx_remediation_attempt_number,priority:1"`
+	PatchScanID uint   `gorm:"not null;uniqueIndex"`
+	Attempt     int    `gorm:"not null;uniqueIndex:idx_remediation_attempt_number,priority:2"`
+	Patch       string `gorm:"type:text;not null"`
+	BaseCommit  string `gorm:"not null"`
+
+	CreatedAt time.Time
+}
+
+const (
+	ReattackFailedToBypass = "failed_to_bypass"
+	ReattackBypassedPatch  = "bypassed_patch"
+	ReattackInconclusive   = "inconclusive"
+)
+
+// RemediationValidation is one immutable re-attack result for a patch
+// attempt. Report carries every generated variant and the benign control;
+// promoted fields support fail-closed display and filtering without parsing
+// arbitrary JSON in hot paths.
+type RemediationValidation struct {
+	ID                   uint   `gorm:"primarykey"`
+	FindingID            uint   `gorm:"index;not null"`
+	RemediationAttemptID uint   `gorm:"index;not null;uniqueIndex:idx_remediation_validation_scan,priority:1"`
+	ScanID               uint   `gorm:"not null;uniqueIndex:idx_remediation_validation_scan,priority:2"`
+	RootCauseStatus      string `gorm:"index;not null"`
+	ValidVariants        int
+	BenignControlPassed  bool
+	BypassInput          string `gorm:"type:text"`
+	Report               string `gorm:"type:text;not null"`
 
 	CreatedAt time.Time
 }
@@ -873,6 +1415,8 @@ type Skill struct {
 	// Default false so newly added skills work on local scans unless they
 	// declare otherwise.
 	RequiresRemote bool
+	// RecurseSubmodules initializes shallow Git submodules before the skill runs.
+	RecurseSubmodules bool
 
 	// RequiresProfile constrains the skill to a single registered runner
 	// profile (e.g. "php"). Set via `scrutineer.requires_profile` in the
@@ -896,15 +1440,25 @@ type Skill struct {
 	// worker re-queues a job whose prereqs are not yet satisfied; see
 	// worker.preflightSkill. A prereq that is unregistered, disabled, or
 	// never enqueued for the repo is treated as satisfied so gating
-	// decisions in triage do not deadlock dependents.
+	// decisions in triage do not deadlock dependent skills.
 	Requires string `gorm:"type:text"`
 
-	Source     string // "local" | "remote" | "ui"
-	SourcePath string // directory on disk (local/remote) or empty (ui)
+	Source     string // "bundled" | "local" | "remote" | "ui"
+	SourcePath string // directory on disk (bundled/local/remote) or empty (ui)
 	SourceHash string // sha256 of SKILL.md + schema.json contents
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// RetireDependentsSkill deactivates the removed bundled dependents skill on
+// upgraded instances. LoadDirectory upserts active skills but does not prune
+// directories that disappeared from the bundled set, so the old local row would
+// otherwise stay clickable in the UI.
+func RetireDependentsSkill(gdb *gorm.DB) error {
+	return gdb.Model(&Skill{}).
+		Where("name = ? AND source = ?", "dependents", "local").
+		Update("active", false).Error
 }
 
 func (s Scan) Duration() time.Duration {
@@ -930,24 +1484,11 @@ func (s Scan) CacheHitRatio() float64 {
 	return float64(s.CacheReadTokens) / float64(total)
 }
 
-// HasExportableReport tells the UI whether to offer a "download as
-// markdown" button for this scan. A scan that has produced findings is
-// always worth exporting. Otherwise we parse the report and look for any
-// substantive content: at least one top-level value that isn't an empty
-// string, empty array, empty object, or null. That lets through real
-// reports of any size — a single-package result is just as worth
-// exporting as a 10K-line SBOM — while filtering out structurally
-// empty scans like {"subprojects": []} or {"packages": [], "advisories":
-// []}. For non-JSON-object reports (bare array, plain text, malformed
-// JSON) we accept anything past a small trimmed length so freeform skills
-// emitting non-object output aren't accidentally hidden. The
-// /scans/{id}/report.md route is unaffected and remains reachable by
-// URL regardless of this signal.
+// HasExportableReport reports whether a scan's own result has substantive
+// content for generic Markdown export. Disclosure availability is checked
+// separately against the saved finding draft.
 func (s Scan) HasExportableReport() bool {
-	// nonObjectReportMinLen is the trimmed-length floor below which a
-	// non-JSON-object report (bare array, plain text, malformed JSON) is
-	// treated as too thin to bother exporting. JSON-object reports get
-	// the structural check instead and ignore this.
+	// Non-object reports use a size floor; JSON objects are checked structurally.
 	const nonObjectReportMinLen = 20
 	if s.FindingsCount > 0 {
 		return true
@@ -988,7 +1529,7 @@ func isEmptyJSONValue(v any) bool {
 }
 
 func (s ScanStatus) Terminal() bool {
-	return s == ScanDone || s == ScanFailed || s == ScanCancelled
+	return s == ScanDone || s == ScanFailed || s == ScanCancelled || s == ScanSkipped
 }
 
 const (
@@ -1021,6 +1562,11 @@ func StatusPriorityFor(s ScanStatus) int {
 // stick after one Exec, but setting it here keeps all three together.
 const connectionPragmas = "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 
+// databaseSchemaVersion stops guarded older binaries before AutoMigrate can
+// change a schema written by a newer build. Bump it with incompatible schema
+// changes.
+const databaseSchemaVersion = 1
+
 // withPragmas appends connectionPragmas to dsn, joining with ? or &
 // depending on whether dsn already carries a query string (the in-memory
 // test DSNs do).
@@ -1032,7 +1578,9 @@ func withPragmas(dsn string) string {
 	return dsn + sep + connectionPragmas
 }
 
-func Open(dsn string) (*gorm.DB, error) {
+// Connect opens dsn with the standard pragmas and logger but performs no
+// migration. Open is Connect plus the full migration path.
+func Connect(dsn string) (*gorm.DB, error) {
 	cfg := &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
 	}
@@ -1040,18 +1588,287 @@ func Open(dsn string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	return gdb, nil
+}
+
+func Open(dsn string) (*gorm.DB, error) {
+	gdb, err := Connect(dsn)
+	if err != nil {
+		return nil, err
+	}
+	foundSchemaVersion, err := checkDatabaseSchemaVersion(gdb)
+	if err != nil {
+		return nil, err
+	}
+	if err := preMigrate(gdb); err != nil {
+		return nil, fmt.Errorf("premigrate: %w", err)
+	}
 	if err := gdb.AutoMigrate(
 		&Repository{}, &Scan{},
 		&Finding{}, &FindingLabel{}, &FindingNote{},
-		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{},
-		&Dependency{}, &Package{}, &Dependent{}, &FindingDependent{}, &Advisory{},
+		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{}, &FindingVerification{}, &FindingAttackPath{},
+		&RemediationAttempt{}, &RemediationValidation{}, &AuditEvent{},
+		&Dependency{}, &ExpectedFinding{}, &Package{}, &PackageAlternative{}, &Dependent{}, &FindingDependent{}, &Advisory{}, &AdvisoryAudit{},
 		&Maintainer{}, &Skill{}, &Subproject{},
 		&SBOMUpload{}, &SBOMPackage{}, &CNA{}, &Setting{},
+		&Conversation{}, &ChatMessage{}, &InterchangeRecord{},
 	); err != nil {
 		return nil, fmt.Errorf("automigrate: %w", err)
 	}
 	gdb.Exec(`CREATE INDEX IF NOT EXISTS idx_scans_priority_id ON scans (status_priority, id DESC)`)
+	// Subproject identity is (repository_id, path): the upsert in
+	// parseSubprojectsOutput keys on it so ids stay stable across skill
+	// re-runs (Package/Advisory.SubprojectID reference them). Collapse any
+	// duplicate rows left by the pre-upsert wholesale-replace path — keeping
+	// the lowest id — before adding the unique index so its creation can't
+	// fail on historic data. Gated on the index's absence so this is a true
+	// one-shot migration: once the index exists there can be no duplicates,
+	// and re-running the full-table dedup scan on every boot would be wasted
+	// work.
+	if !gdb.Migrator().HasIndex(&Subproject{}, "idx_subprojects_repo_path") {
+		gdb.Exec(`DELETE FROM subprojects WHERE id NOT IN (SELECT MIN(id) FROM subprojects GROUP BY repository_id, path)`)
+		gdb.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_subprojects_repo_path ON subprojects (repository_id, path)`)
+	}
+	if foundSchemaVersion < databaseSchemaVersion {
+		if err := gdb.Exec(fmt.Sprintf("PRAGMA user_version = %d", databaseSchemaVersion)).Error; err != nil {
+			return nil, fmt.Errorf("record database schema version: %w", err)
+		}
+	}
 	return gdb, nil
+}
+
+func checkDatabaseSchemaVersion(gdb *gorm.DB) (int, error) {
+	var found int
+	if err := gdb.Raw("PRAGMA user_version").Scan(&found).Error; err != nil {
+		return 0, fmt.Errorf("read database schema version: %w", err)
+	}
+	if found > databaseSchemaVersion {
+		return 0, fmt.Errorf("database schema version %d is newer than this build supports (%d)", found, databaseSchemaVersion)
+	}
+	return found, nil
+}
+
+// preMigrate applies structural changes AutoMigrate cannot express, chiefly
+// column renames and the data cleanups a new constraint needs before it can be
+// added. It must run before AutoMigrate so a renamed column is not re-added
+// under its new name alongside the old one, and so AutoMigrate never tries to
+// build a unique index over data that violates it. Each step is guarded so a
+// fresh database and an already-migrated database are both no-ops. A failure is
+// fatal: proceeding would add a new column alongside the old one and strand its
+// data, or leave AutoMigrate to fail on the index it cannot build.
+func preMigrate(gdb *gorm.DB) error {
+	if err := migrateSBOMPackageRepositoryColumn(gdb); err != nil {
+		return err
+	}
+	m := gdb.Migrator()
+	// FindingReference gained a unique (finding_id, url) index. Databases
+	// written before AddFindingReference deduplicated (#519, #865) can hold
+	// several rows for one URL, so the duplicates are collapsed and the index
+	// is created together here, ahead of the AutoMigrate that would otherwise
+	// have built it. Gated on the index's absence so this is a true one-shot
+	// migration: once it exists there can be no duplicates left to find, so
+	// rescanning the table on every boot would be wasted work.
+	if m.HasTable(&FindingReference{}) && !m.HasIndex(&FindingReference{}, findingRefURLIndex) {
+		if err := mergeAndIndexFindingReferences(gdb, findingRefMergeBatch); err != nil {
+			return fmt.Errorf("merge duplicate finding references: %w", err)
+		}
+	}
+	return nil
+}
+
+// SBOMPackage.RepositoryID became SourceRepositoryID when SBOMUpload gained
+// its own RepositoryID pointing in the opposite direction.
+func migrateSBOMPackageRepositoryColumn(gdb *gorm.DB) error {
+	m := gdb.Migrator()
+	if !m.HasTable(&SBOMPackage{}) || !m.HasColumn(&SBOMPackage{}, "repository_id") {
+		return nil
+	}
+	if !m.HasColumn(&SBOMPackage{}, "source_repository_id") {
+		if err := m.RenameColumn(&SBOMPackage{}, "repository_id", "source_repository_id"); err != nil {
+			return fmt.Errorf("rename sbom_packages.repository_id: %w", err)
+		}
+		return nil
+	}
+	return gdb.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec(`UPDATE sbom_packages SET source_repository_id = repository_id WHERE repository_id IS NOT NULL`).Error; err != nil {
+			return fmt.Errorf("merge sbom package repository ids: %w", err)
+		}
+		m := tx.Migrator()
+		if m.HasConstraint(&SBOMPackage{}, "fk_sbom_packages_repository") {
+			if err := m.DropConstraint(&SBOMPackage{}, "fk_sbom_packages_repository"); err != nil {
+				return fmt.Errorf("drop sbom package repository constraint: %w", err)
+			}
+		}
+		if m.HasIndex(&SBOMPackage{}, "idx_sbom_packages_repository_id") {
+			if err := m.DropIndex(&SBOMPackage{}, "idx_sbom_packages_repository_id"); err != nil {
+				return fmt.Errorf("drop sbom package repository index: %w", err)
+			}
+		}
+		if err := m.DropColumn(&SBOMPackage{}, "repository_id"); err != nil {
+			return fmt.Errorf("drop sbom_packages.repository_id: %w", err)
+		}
+		return nil
+	})
+}
+
+// findingRefURLIndex is the unique (finding_id, url) index declared on
+// FindingReference, named here so preMigrate can ask whether it exists yet.
+const findingRefURLIndex = "idx_finding_ref_url"
+
+// findingRefMergeBatch bounds how many findings one merge pass holds in memory
+// and how many ids one delete binds. The work is keyed by finding, so paging on
+// finding_id never splits a group across batches. It is passed in rather than
+// read from here so a test can force the paging a production-sized batch would
+// never reach.
+const findingRefMergeBatch = 500
+
+// mergeAndIndexFindingReferences collapses every (finding_id, url) group in
+// finding_references down to one row then creates the unique index over the
+// result, both in one transaction.
+//
+// The lowest id in a group survives, which keeps the reference a finding page
+// has always shown and makes the merge deterministic: the same database always
+// produces the same rows, whatever order the duplicates were written in. The
+// survivor absorbs any tags and summary it is missing from the rows being
+// removed, oldest first, so metadata a later duplicate carried is not lost with
+// the row that carried it. Values already on the survivor always win; the merge
+// never overwrites one reference's metadata with another's.
+//
+// URLs are trimmed as they are grouped, because AddFindingReference trims
+// before it looks a row up: a stored " https://x " would never match a write of
+// "https://x" and the index would happily keep both, leaving exactly the
+// duplicate this migration exists to remove. Tags and summary are trimmed on
+// the survivor for the same reason, to leave every row in the shape the helper
+// writes today. A row whose URL is blank once trimmed is deleted rather than
+// kept, since it points nowhere and no writer can produce one any more.
+//
+// The merge and the index creation are one unit of work, which is what makes
+// the repair safe to interrupt. Leaving the index to AutoMigrate would commit
+// the deletions first and build the index in a later statement, so a schema
+// step that failed in between would return an error from Open having already
+// dropped rows the operator cannot get back. The index is the only reason those
+// rows were removed: either the table ends up collapsed and constrained, or it
+// ends up untouched. SQLite rolls DDL back with the rest of a transaction, so a
+// CREATE INDEX that fails takes the deletes with it. AutoMigrate then finds the
+// index already present and has nothing left to do for this table.
+func mergeAndIndexFindingReferences(gdb *gorm.DB, batch int) error {
+	return gdb.Transaction(func(tx *gorm.DB) error {
+		if err := mergeFindingReferences(tx, batch); err != nil {
+			return err
+		}
+		if err := tx.Migrator().CreateIndex(&FindingReference{}, findingRefURLIndex); err != nil {
+			return fmt.Errorf("create %s: %w", findingRefURLIndex, err)
+		}
+		return nil
+	})
+}
+
+// mergeFindingReferences pages through the findings that own references and
+// collapses each page. The caller owns the transaction.
+func mergeFindingReferences(tx *gorm.DB, batch int) error {
+	var after uint
+	for {
+		var findingIDs []uint
+		err := tx.Model(&FindingReference{}).
+			Where("finding_id > ?", after).
+			Distinct().Order("finding_id").Limit(batch).
+			Pluck("finding_id", &findingIDs).Error
+		if err != nil {
+			return fmt.Errorf("page finding ids: %w", err)
+		}
+		if len(findingIDs) == 0 {
+			return nil
+		}
+		if err := mergeFindingReferencePage(tx, findingIDs, batch); err != nil {
+			return err
+		}
+		after = findingIDs[len(findingIDs)-1]
+	}
+}
+
+// mergeFindingReferencePage merges the references of one page of findings.
+func mergeFindingReferencePage(tx *gorm.DB, findingIDs []uint, batch int) error {
+	var rows []FindingReference
+	err := tx.Select("id", "finding_id", "url", "tags", "summary").
+		Where("finding_id IN ?", findingIDs).
+		Order("finding_id, id").Find(&rows).Error
+	if err != nil {
+		return fmt.Errorf("load references: %w", err)
+	}
+	survivors, drop := planFindingReferenceMerge(rows)
+	for _, s := range survivors {
+		update := map[string]any{"url": s.URL, "tags": s.Tags, "summary": s.Summary}
+		if err := tx.Model(&FindingReference{}).Where("id = ?", s.ID).Updates(update).Error; err != nil {
+			return fmt.Errorf("update reference %d: %w", s.ID, err)
+		}
+	}
+	for chunk := range slices.Chunk(drop, batch) {
+		if err := tx.Where("id IN ?", chunk).Delete(&FindingReference{}).Error; err != nil {
+			return fmt.Errorf("delete duplicate references: %w", err)
+		}
+	}
+	return nil
+}
+
+// planFindingReferenceMerge decides what one page of references collapses to.
+// It returns the surviving rows whose stored values need rewriting, in their
+// merged form, plus the ids to delete: the duplicates of a URL, plus any row
+// left with no URL at all. A row already in its final shape appears in neither,
+// so an install with nothing to fix issues no writes.
+//
+// rows must be ordered by (finding_id, id) so the lowest id in each group is
+// seen first and the metadata backfill runs oldest to newest.
+func planFindingReferenceMerge(rows []FindingReference) (survivors []FindingReference, drop []uint) {
+	type groupKey struct {
+		findingID uint
+		url       string
+	}
+	type group struct {
+		merged  FindingReference
+		changed bool
+	}
+	groups := make([]*group, 0, len(rows))
+	index := make(map[groupKey]*group, len(rows))
+	for _, row := range rows {
+		url := strings.TrimSpace(row.URL)
+		if url == "" {
+			drop = append(drop, row.ID)
+			continue
+		}
+		key := groupKey{findingID: row.FindingID, url: url}
+		g, seen := index[key]
+		if !seen {
+			merged := FindingReference{
+				ID:        row.ID,
+				FindingID: row.FindingID,
+				URL:       url,
+				Tags:      strings.TrimSpace(row.Tags),
+				Summary:   strings.TrimSpace(row.Summary),
+			}
+			g = &group{
+				merged:  merged,
+				changed: merged.URL != row.URL || merged.Tags != row.Tags || merged.Summary != row.Summary,
+			}
+			groups = append(groups, g)
+			index[key] = g
+			continue
+		}
+		drop = append(drop, row.ID)
+		if tags := strings.TrimSpace(row.Tags); g.merged.Tags == "" && tags != "" {
+			g.merged.Tags = tags
+			g.changed = true
+		}
+		if summary := strings.TrimSpace(row.Summary); g.merged.Summary == "" && summary != "" {
+			g.merged.Summary = summary
+			g.changed = true
+		}
+	}
+	for _, g := range groups {
+		if g.changed {
+			survivors = append(survivors, g.merged)
+		}
+	}
+	return survivors, drop
 }
 
 // Snapshot writes a consistent copy of the SQLite database at src to dest
@@ -1097,9 +1914,16 @@ func Snapshot(src, dest string) error {
 	return nil
 }
 
-// SBOMUpload is one CycloneDX or SPDX document a user uploaded. Packages
-// are replaced wholesale on re-upload (cascade delete) but the resolved
-// Repository rows survive so prior scan results stay attached.
+const (
+	SBOMOriginUploaded  = "uploaded"
+	SBOMOriginGenerated = "generated"
+)
+
+// SBOMUpload is one CycloneDX or SPDX document. Origin distinguishes a
+// document a user uploaded from one the dependencies scan generated for a
+// repository at a specific commit. Packages are replaced wholesale on
+// re-upload (cascade delete) but the resolved Repository rows survive so
+// prior scan results stay attached.
 type SBOMUpload struct {
 	ID uint `gorm:"primarykey"`
 
@@ -1107,18 +1931,43 @@ type SBOMUpload struct {
 	Filename    string
 	Format      string
 	SpecVersion string
-	Raw         []byte
+	// Raw holds the document bytes for uploaded origin so the operator can
+	// re-download exactly what was submitted. Generated snapshots leave it
+	// nil since retaining every historical CycloneDX document per repository
+	// is not worth the storage.
+	Raw []byte
+
+	// Origin is SBOMOriginUploaded or SBOMOriginGenerated. The default keeps
+	// rows created before the column existed classified as uploads.
+	Origin string `gorm:"index;not null;default:uploaded"`
+	// RepositoryID and Commit identify the scanned repository and revision
+	// for a generated snapshot. Nil for uploads.
+	RepositoryID *uint `gorm:"index:idx_sbom_uploads_repo_current"`
+	Repository   *Repository
+	ScanID       *uint `gorm:"index"`
+	Commit       string
+	// Current marks the newest successful generated snapshot for
+	// RepositoryID. Portfolio queries filter on it so they read one row per
+	// repository without a per-repo subquery. The dependencies parser moves
+	// the flag inside the same transaction that writes the new snapshot.
+	Current bool `gorm:"index:idx_sbom_uploads_repo_current"`
 
 	PackageCount int
-	Packages     []SBOMPackage `gorm:"constraint:OnDelete:CASCADE"`
+	// ImportPending is true after a newly parsed upload and until the operator
+	// confirms repository resolution. False preserves the previous behaviour
+	// for uploads created before the confirmation step was introduced.
+	ImportPending bool          `gorm:"not null;default:false"`
+	Packages      []SBOMPackage `gorm:"constraint:OnDelete:CASCADE"`
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
 
-// SBOMPackage is one component listed in an upload. RepositoryID is set
-// asynchronously once the PURL has been resolved to a source repo and the
-// triage scan enqueued; until then it is nil.
+// SBOMPackage is one component listed in an upload. SourceRepositoryID is set
+// asynchronously once the PURL has been resolved to the repository that
+// publishes the package and a triage scan enqueued; until then it is nil.
+// It is distinct from SBOMUpload.RepositoryID, which for a generated
+// snapshot points at the repository whose dependencies were scanned.
 type SBOMPackage struct {
 	ID           uint `gorm:"primarykey"`
 	SBOMUploadID uint `gorm:"index;not null"`
@@ -1134,9 +1983,9 @@ type SBOMPackage struct {
 	// dependency graph to derive it from.
 	Scope string `gorm:"index"`
 
-	RepositoryID *uint `gorm:"index"`
-	Repository   *Repository
-	ResolveError string
+	SourceRepositoryID *uint `gorm:"index"`
+	SourceRepository   *Repository
+	ResolveError       string
 
 	CreatedAt time.Time
 }
@@ -1188,8 +2037,58 @@ type Subproject struct {
 	Kind        string `gorm:"index"`
 	Description string `gorm:"type:text"`
 
+	// DisclosureChannel is the preferred vector for reporting a vulnerability
+	// in this specific sub-package — an email, GHSA URL, registry owner
+	// handle, or SECURITY.md URL. Written by the attribution reconcile /
+	// maintainers skill from this sub-package's registry ownership; the
+	// disclose flow prefers it over Repository.DisclosureChannel for a
+	// finding scoped to this subproject. Empty falls back to the repo channel.
+	DisclosureChannel string
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// EnsureSubproject records a monorepo sub-package an operator submitted
+// directly (repo#sub/dir) so it is a first-class entity immediately, without
+// waiting for the subprojects skill to discover it. Keyed on
+// (repository_id, path): an existing row — e.g. one the skill already
+// enriched — is left untouched; a new row is seeded with a Name derived from
+// the last path segment. Path is trimmed; an empty path is a no-op. The
+// caller is expected to have already validated the path (worker.CleanSubPath).
+func EnsureSubproject(gdb *gorm.DB, repoID uint, subPath string) error {
+	subPath = strings.Trim(subPath, "/ \t\n")
+	if subPath == "" {
+		return nil
+	}
+	name := subPath
+	if i := strings.LastIndex(subPath, "/"); i >= 0 && i+1 < len(subPath) {
+		name = subPath[i+1:]
+	}
+	sub := Subproject{RepositoryID: repoID, Path: subPath}
+	return gdb.Where(Subproject{RepositoryID: repoID, Path: subPath}).
+		Attrs(Subproject{Name: name}).
+		FirstOrCreate(&sub).Error
+}
+
+// EffectiveDisclosureChannel returns the disclosure channel to use for a
+// finding: the finding's sub-package channel when the finding is scoped to a
+// Subproject that has one set, otherwise the repository channel. A monorepo can
+// thus route each sub-package's reports to its own maintainers, while a
+// single-package repo (no sub-path, or no per-subproject channel) behaves
+// exactly as before. Empty when neither is set.
+func EffectiveDisclosureChannel(gdb *gorm.DB, repoID uint, subPath string) string {
+	if subPath != "" {
+		var sub Subproject
+		if err := gdb.Where("repository_id = ? AND path = ?", repoID, subPath).First(&sub).Error; err == nil && sub.DisclosureChannel != "" {
+			return sub.DisclosureChannel
+		}
+	}
+	var repo Repository
+	if err := gdb.Select("disclosure_channel").First(&repo, repoID).Error; err != nil {
+		return ""
+	}
+	return repo.DisclosureChannel
 }
 
 func BackfillStatusPriority(gdb *gorm.DB) {
@@ -1199,9 +2098,12 @@ func BackfillStatusPriority(gdb *gorm.DB) {
 	gdb.Exec(`UPDATE scans SET status_priority = 3 WHERE status NOT IN ('running', 'queued', 'paused') AND (status_priority IS NULL OR status_priority != 3)`)
 }
 
-// BackfillFindingRepository copies Scan.RepositoryID onto Finding rows
-// whose RepositoryID column is still zero. Used on first boot after
-// adding the denormalized column so existing findings pick up their repo.
+// BackfillFindingRepository copies the columns denormalized from Scan
+// (RepositoryID, Commit, Model) onto Finding rows that still have them
+// empty. Used on first boot after adding each denormalized column so
+// existing findings pick up the value from their producing scan. A
+// finding whose producing scan itself predates Scan.Model stays empty:
+// the model genuinely was not recorded.
 func BackfillFindingRepository(gdb *gorm.DB) {
 	gdb.Exec(`
 		UPDATE findings
@@ -1216,6 +2118,16 @@ func BackfillFindingRepository(gdb *gorm.DB) {
 			SELECT "commit" FROM scans WHERE scans.id = findings.scan_id
 		)
 		WHERE "commit" IS NULL OR "commit" = ''
+	`)
+	gdb.Exec(`
+		UPDATE findings
+		SET model = (
+			SELECT model FROM scans WHERE scans.id = findings.scan_id
+		)
+		WHERE (model IS NULL OR model = '')
+		  AND (
+			SELECT model FROM scans WHERE scans.id = findings.scan_id
+		  ) IS NOT NULL
 	`)
 }
 

@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -9,10 +10,29 @@ import (
 	"strings"
 	"testing"
 
+	"gorm.io/gorm"
+
 	"scrutineer/internal/db"
 )
 
 const wantAttackVectorNetwork = "NETWORK"
+
+func TestRepoHasDependentsReturnsCountError(t *testing.T) {
+	gdb, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqldb, err := gdb.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqldb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repoHasDependents(gdb, 1); err == nil {
+		t.Fatal("expected count error after closing database")
+	}
+}
 
 func seedCSAFFinding(t *testing.T, s *Server, mut func(*db.Finding)) db.Finding {
 	t.Helper()
@@ -42,6 +62,8 @@ func seedCSAFFinding(t *testing.T, s *Server, mut func(*db.Finding)) db.Finding 
 		mut(&f)
 	}
 	s.DB.Create(&f)
+	dep := db.Dependent{RepositoryID: repo.ID, Name: "downstream-app", Ecosystem: "npm", RepositoryURL: "https://github.com/example/downstream-app"}
+	s.DB.Create(&dep)
 	return f
 }
 
@@ -102,6 +124,21 @@ func TestFindingCSAF_validatesAgainstOfficialSchema(t *testing.T) {
 	ps := v["product_status"].(map[string]any)
 	if _, ok := ps["known_affected"]; !ok {
 		t.Errorf("product_status missing known_affected: %+v", ps)
+	}
+}
+
+func TestFindingCSAF_noDependentsReturns404(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	f := seedCSAFFinding(t, s, nil)
+	s.DB.Where("repository_id = ?", f.RepositoryID).Delete(&db.Dependent{})
+	w := getCSAF(t, s, f.ID)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status %d, want 404: %s", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), "no recorded dependents") {
+		t.Errorf("body should explain missing dependents: %s", w.Body)
 	}
 }
 
@@ -255,6 +292,64 @@ func TestFindingCSAF_404ForMissingFinding(t *testing.T) {
 	}
 }
 
+// failQueries makes every query matching pred fail with err.
+func failQueries(t *testing.T, s *Server, pred func(*gorm.DB) bool, err error) {
+	t.Helper()
+	if regErr := s.DB.Callback().Query().Before("gorm:query").Register("test:fail_lookup", func(tx *gorm.DB) {
+		if pred(tx) {
+			_ = tx.AddError(err)
+		}
+	}); regErr != nil {
+		t.Fatal(regErr)
+	}
+}
+
+func tableQuery(name string) func(*gorm.DB) bool {
+	return func(tx *gorm.DB) bool { return tx.Statement.Table == name }
+}
+
+// dependentRowsQuery matches the Dependent row load and not the eligibility
+// count, which hits the same table with an *int64 destination.
+func dependentRowsQuery(tx *gorm.DB) bool {
+	_, ok := tx.Statement.Dest.(*[]db.Dependent)
+	return ok
+}
+
+func TestFindingCSAF_handlesLookupErrors(t *testing.T) {
+	dbErr := errors.New("database unavailable")
+	for _, tt := range []struct {
+		name       string
+		pred       func(*gorm.DB) bool
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{name: "finding failure", pred: tableQuery("findings"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load finding"},
+		{name: "repository missing", pred: tableQuery("repositories"), err: gorm.ErrRecordNotFound, wantStatus: http.StatusNotFound, wantBody: "404 page not found"},
+		{name: "repository failure", pred: tableQuery("repositories"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load repository"},
+		{name: "finding_references", pred: tableQuery("finding_references"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load finding references"},
+		{name: "packages", pred: tableQuery("packages"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load repository packages"},
+		{name: "finding_dependents", pred: tableQuery("finding_dependents"), err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load finding dependents"},
+		{name: "dependents", pred: dependentRowsQuery, err: dbErr, wantStatus: http.StatusInternalServerError, wantBody: "failed to load dependents"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+
+			f := seedCSAFFinding(t, s, nil)
+			dep := db.Dependent{RepositoryID: f.RepositoryID, Name: "linked-app", Ecosystem: "npm"}
+			s.DB.Create(&dep)
+			s.DB.Create(&db.FindingDependent{FindingID: f.ID, DependentID: dep.ID, Status: db.ExposureKnownAffected})
+			failQueries(t, s, tt.pred, tt.err)
+
+			w := getCSAF(t, s, f.ID)
+			if body := strings.TrimSpace(w.Body.String()); w.Code != tt.wantStatus || body != tt.wantBody {
+				t.Errorf("status = %d, body = %q; want %d, %q", w.Code, body, tt.wantStatus, tt.wantBody)
+			}
+		})
+	}
+}
+
 // Older rows may carry a populated vector with a stale CVSSScore == 0
 // (the column wasn't kept in sync before #8). Export must still emit a
 // correct score so downstream consumers don't see baseScore: 0 next to
@@ -279,7 +374,7 @@ func TestFindingCSAF_scoreDerivedFromVectorIgnoresStoredScore(t *testing.T) {
 }
 
 // parseCVSSv3Vector tolerates a truncated vector (returns a partial
-// struct) but go-cvss rejects it; the scores block must be omitted
+// struct) but the shared CVSS parser rejects it; the scores block must be omitted
 // rather than emitted with a fabricated baseScore: 0.
 func TestFindingCSAF_partialVectorOmitsScores(t *testing.T) {
 	s, done := newTestServer(t)
@@ -296,7 +391,7 @@ func TestFindingCSAF_partialVectorOmitsScores(t *testing.T) {
 	doc := decodeCSAF(t, w.Body.Bytes())
 	v := doc["vulnerabilities"].([]any)[0].(map[string]any)
 	if _, ok := v["scores"]; ok {
-		t.Errorf("scores must be omitted when vector is unparseable by go-cvss: %+v", v["scores"])
+		t.Errorf("scores must be omitted when vector is unparseable by the shared CVSS parser: %+v", v["scores"])
 	}
 }
 
@@ -701,5 +796,22 @@ func TestParseCVSSv3Vector(t *testing.T) {
 				tc.checks(t, got)
 			}
 		})
+	}
+}
+
+func TestBuildScoreMulti_trimsCVSSVector(t *testing.T) {
+	// CSAF's embedded CVSS schema anchors vectorString, so a stored value
+	// with surrounding whitespace must be trimmed before emission.
+	const want = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+	f := db.Finding{CVSSVector: "  " + want + "\n"}
+	got := buildScoreMulti(f, []string{"pkg:npm/example"})
+	if got == nil || got.CVSSv3 == nil {
+		t.Fatal("buildScoreMulti = nil for padded valid vector")
+	}
+	if got.CVSSv3.VectorString != want {
+		t.Errorf("VectorString = %q, want %q", got.CVSSv3.VectorString, want)
+	}
+	if got.CVSSv3.BaseScore != 9.8 {
+		t.Errorf("BaseScore = %v, want 9.8", got.CVSSv3.BaseScore)
 	}
 }

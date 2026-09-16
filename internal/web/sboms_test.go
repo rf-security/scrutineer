@@ -71,6 +71,15 @@ func TestSBOMUpload_parsesAndStores(t *testing.T) {
 	if up.PackageCount != 2 || len(up.Packages) != 2 {
 		t.Fatalf("packages = %d (%d rows)", up.PackageCount, len(up.Packages))
 	}
+	if !up.ImportPending {
+		t.Error("new upload should wait for import confirmation")
+	}
+	var repos, scans int64
+	s.DB.Model(&db.Repository{}).Count(&repos)
+	s.DB.Model(&db.Scan{}).Count(&scans)
+	if repos != 0 || scans != 0 {
+		t.Errorf("upload created repos=%d scans=%d before confirmation", repos, scans)
+	}
 	var lodash db.SBOMPackage
 	for _, p := range up.Packages {
 		if p.Name == "lodash" {
@@ -130,7 +139,7 @@ func TestSBOMResolveHandler(t *testing.T) {
 
 	var pkg db.SBOMPackage
 	s.DB.Where("sbom_upload_id = ?", up.ID).First(&pkg)
-	if pkg.RepositoryID == nil {
+	if pkg.SourceRepositoryID == nil {
 		t.Errorf("package not linked after resolve handler: %+v", pkg)
 	}
 
@@ -140,6 +149,169 @@ func TestSBOMResolveHandler(t *testing.T) {
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("missing upload: status = %d, want 404", w.Code)
+	}
+}
+
+func TestSBOMResolve_recordsReasonWhenEnrichmentDisabled(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	s.resolveSync = true
+	s.DisableEcosystems()
+	looked := false
+	s.resolvePURL = func(context.Context, string) string {
+		looked = true
+		return "https://github.com/lodash/lodash"
+	}
+	up := db.SBOMUpload{Name: "demo", Packages: []db.SBOMPackage{
+		{Name: "lodash", PURL: "pkg:npm/lodash@4.17.21"},
+		{Name: "mystery"},
+		// Concluded by an earlier run while enrichment was on.
+		{Name: "orphan", PURL: "pkg:npm/orphan@1", ResolveError: "no repository_url for purl"},
+	}}
+	s.DB.Create(&up)
+
+	r := localReq("POST", fmt.Sprintf("/sboms/%d/resolve", up.ID))
+	r.Header.Set("Sec-Fetch-Site", "same-origin")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body=%s", w.Code, w.Body)
+	}
+
+	byName := map[string]db.SBOMPackage{}
+	var pkgs []db.SBOMPackage
+	s.DB.Where("sbom_upload_id = ?", up.ID).Find(&pkgs)
+	for _, p := range pkgs {
+		byName[p.Name] = p
+	}
+	if len(byName) != 3 {
+		t.Fatalf("packages = %d, want 3", len(byName))
+	}
+	if byName["lodash"].SourceRepositoryID != nil {
+		t.Errorf("package linked with enrichment disabled: %+v", byName["lodash"])
+	}
+	if got := byName["lodash"].ResolveError; got != ecosystemsDisabled {
+		t.Errorf("resolve_error = %q, want %q", got, ecosystemsDisabled)
+	}
+	// A package with no PURL was unresolvable regardless of the setting, so
+	// blaming enrichment for it would be wrong.
+	if got := byName["mystery"].ResolveError; got != noPURLError {
+		t.Errorf("no-purl resolve_error = %q, want %q", got, noPURLError)
+	}
+	// Nor may a re-resolve with the setting flipped destroy the more precise
+	// reason an earlier enabled run recorded.
+	if got := byName["orphan"].ResolveError; got != "no repository_url for purl" {
+		t.Errorf("earlier reason overwritten: resolve_error = %q", got)
+	}
+	if looked {
+		t.Error("resolve still called the PURL lookup with enrichment disabled")
+	}
+}
+
+func TestSBOMConfirm_resolvesAfterOperatorConfirmation(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	s.resolveSync = true
+	s.resolvePURL = func(_ context.Context, purl string) string {
+		switch {
+		case strings.Contains(purl, "direct"):
+			return "https://github.com/acme/direct"
+		case strings.Contains(purl, "transitive"):
+			return "https://github.com/acme/transitive"
+		default:
+			return ""
+		}
+	}
+	s.DB.Create(&db.Skill{Name: defaultSkillName, Body: "b", Active: true})
+	up := db.SBOMUpload{Name: "pending", ImportPending: true, Packages: []db.SBOMPackage{
+		{Name: "direct", PURL: "pkg:npm/direct@1", Scope: sbom.ScopeDirect},
+		{Name: "transitive", PURL: "pkg:npm/transitive@1", Scope: sbom.ScopeTransitive},
+	}}
+	s.DB.Create(&up)
+
+	req := localReq("POST", fmt.Sprintf("/sboms/%d/resolve", up.ID))
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("unconfirmed resolve status = %d, want 409", w.Code)
+	}
+	var repos, scans int64
+	s.DB.Model(&db.Repository{}).Count(&repos)
+	s.DB.Model(&db.Scan{}).Count(&scans)
+	if repos != 0 || scans != 0 {
+		t.Fatalf("unconfirmed resolve created repos=%d scans=%d", repos, scans)
+	}
+
+	req = localReq("POST", fmt.Sprintf("/sboms/%d/confirm", up.ID))
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("confirm status = %d: %s", w.Code, w.Body)
+	}
+	var confirmed db.SBOMUpload
+	if err := s.DB.Preload("Packages").First(&confirmed, up.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if confirmed.ImportPending {
+		t.Fatal("confirmation did not clear ImportPending")
+	}
+	for _, p := range confirmed.Packages {
+		if p.SourceRepositoryID == nil {
+			t.Fatalf("package %s was not resolved", p.Name)
+		}
+		var count int64
+		s.DB.Model(&db.Scan{}).Where("repository_id = ?", *p.SourceRepositoryID).Count(&count)
+		want := int64(0)
+		if p.Scope == sbom.ScopeDirect {
+			want = 1
+		}
+		if count != want {
+			t.Errorf("%s scans = %d, want %d", p.Name, count, want)
+		}
+	}
+
+	// A second confirmation must not enqueue another direct-dependency scan.
+	req = localReq("POST", fmt.Sprintf("/sboms/%d/confirm", up.ID))
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("repeat confirm status = %d", w.Code)
+	}
+	s.DB.Model(&db.Scan{}).Count(&scans)
+	if scans != 1 {
+		t.Errorf("repeat confirmation scans = %d, want 1", scans)
+	}
+}
+
+func TestSBOMShow_pendingImportSummary(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	up := db.SBOMUpload{Name: "pending", PackageCount: 3, ImportPending: true, Packages: []db.SBOMPackage{
+		{Name: "direct", Scope: sbom.ScopeDirect},
+		{Name: "transitive", Scope: sbom.ScopeTransitive},
+		{Name: "unknown"},
+	}}
+	s.DB.Create(&up)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/sboms/%d", up.ID)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"Import 3 packages", "This SBOM contains 3 packages", "1 direct dependencies are eligible for triage scans",
+		"1 transitive dependencies will be linked without scans", "Awaiting import confirmation", "awaiting import",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("pending SBOM page missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "Re-resolve") {
+		t.Error("pending SBOM should not render the re-resolve action")
 	}
 }
 
@@ -235,9 +407,9 @@ func TestSBOMResolve_linksRepoAndEnqueuesTriage(t *testing.T) {
 	s.DB.Create(&triage)
 
 	up := db.SBOMUpload{Name: "demo", Packages: []db.SBOMPackage{
-		{Name: "lodash", PURL: "pkg:npm/lodash@4.17.21", Scope: scopeDirect},
+		{Name: "lodash", PURL: "pkg:npm/lodash@4.17.21", Scope: sbom.ScopeDirect},
 		{Name: "flat", PURL: "pkg:npm/flat@1.0.0"},
-		{Name: "transitive", PURL: "pkg:npm/transitive@1.0.0", Scope: scopeTransitive},
+		{Name: "transitive", PURL: "pkg:npm/transitive@1.0.0", Scope: sbom.ScopeTransitive},
 		{Name: "nopurl"},
 		{Name: "noresolve", PURL: "pkg:npm/ghost@1.0.0"},
 	}}
@@ -248,11 +420,11 @@ func TestSBOMResolve_linksRepoAndEnqueuesTriage(t *testing.T) {
 	var pkgs []db.SBOMPackage
 	s.DB.Where("sbom_upload_id = ?", up.ID).Order("id").Find(&pkgs)
 
-	if pkgs[0].RepositoryID == nil {
+	if pkgs[0].SourceRepositoryID == nil {
 		t.Fatalf("lodash not linked: %+v", pkgs[0])
 	}
 	var repo db.Repository
-	s.DB.First(&repo, *pkgs[0].RepositoryID)
+	s.DB.First(&repo, *pkgs[0].SourceRepositoryID)
 	if repo.URL != "https://github.com/lodash/lodash" {
 		t.Errorf("repo url = %q", repo.URL)
 	}
@@ -262,18 +434,18 @@ func TestSBOMResolve_linksRepoAndEnqueuesTriage(t *testing.T) {
 		t.Errorf("triage scan not enqueued for direct dependency, scans = %d", scans)
 	}
 
-	if pkgs[1].RepositoryID == nil {
+	if pkgs[1].SourceRepositoryID == nil {
 		t.Fatalf("flat-scope package not linked: %+v", pkgs[1])
 	}
-	s.DB.Model(&db.Scan{}).Where("repository_id = ?", *pkgs[1].RepositoryID).Count(&scans)
+	s.DB.Model(&db.Scan{}).Where("repository_id = ?", *pkgs[1].SourceRepositoryID).Count(&scans)
 	if scans != 1 {
 		t.Errorf("triage scan not enqueued for flat-scope dependency, scans = %d", scans)
 	}
 
-	if pkgs[2].RepositoryID == nil {
+	if pkgs[2].SourceRepositoryID == nil {
 		t.Fatalf("transitive not linked: %+v", pkgs[2])
 	}
-	s.DB.Model(&db.Scan{}).Where("repository_id = ?", *pkgs[2].RepositoryID).Count(&scans)
+	s.DB.Model(&db.Scan{}).Where("repository_id = ?", *pkgs[2].SourceRepositoryID).Count(&scans)
 	if scans != 0 {
 		t.Errorf("triage scan enqueued for transitive dependency, scans = %d", scans)
 	}
@@ -305,7 +477,7 @@ func TestSBOMShow_aggregatesFindings(t *testing.T) {
 	s.DB.Create(&db.Finding{ScanID: scan.ID, RepositoryID: other.ID, Title: "unrelated", Severity: "High"})
 
 	up := db.SBOMUpload{Name: "demo", PackageCount: 1, Packages: []db.SBOMPackage{
-		{Name: "r-pkg", PURL: "pkg:npm/r", RepositoryID: &repo.ID},
+		{Name: "r-pkg", PURL: "pkg:npm/r", SourceRepositoryID: &repo.ID},
 	}}
 	s.DB.Create(&up)
 
@@ -344,7 +516,7 @@ func TestSBOMShow_findingsSort(t *testing.T) {
 	s.DB.Create(&db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "new-low", Severity: "Low"})
 
 	up := db.SBOMUpload{Name: "demo", PackageCount: 1, Packages: []db.SBOMPackage{
-		{Name: "p", RepositoryID: &repo.ID},
+		{Name: "p", SourceRepositoryID: &repo.ID},
 	}}
 	s.DB.Create(&up)
 
@@ -380,7 +552,7 @@ func TestSBOMShow_listsAdvisories(t *testing.T) {
 	s.DB.Create(&db.Advisory{RepositoryID: repo.ID, Title: "withdrawn-one", WithdrawnAt: new(time.Now())})
 
 	up := db.SBOMUpload{Name: "demo", PackageCount: 1, Packages: []db.SBOMPackage{
-		{Name: "adv-pkg", PURL: "pkg:npm/adv", RepositoryID: &repo.ID},
+		{Name: "adv-pkg", PURL: "pkg:npm/adv", SourceRepositoryID: &repo.ID},
 	}}
 	s.DB.Create(&up)
 
@@ -414,50 +586,33 @@ func TestSBOMList_renders(t *testing.T) {
 	}
 }
 
-func TestClassifyScope(t *testing.T) {
-	t.Run("cyclonedx graph", func(t *testing.T) {
-		// root → a, b; a → c. Root is identified by having no inbound edge.
-		doc := &sbom.SBOM{Relationships: []sbom.Relationship{
-			{SourceID: "root", TargetID: "a", Type: "DEPENDS_ON"},
-			{SourceID: "root", TargetID: "b", Type: "DEPENDS_ON"},
-			{SourceID: "a", TargetID: "c", Type: "DEPENDS_ON"},
-		}}
-		got := classifyScope(doc)
-		want := map[string]string{"a": scopeDirect, "b": scopeDirect, "c": scopeTransitive}
-		for id, s := range want {
-			if got[id] != s {
-				t.Errorf("%s = %q, want %q", id, got[id], s)
-			}
-		}
+func TestSBOMList_excludesGeneratedSnapshots(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	s.DB.Create(&db.SBOMUpload{Name: "user.cdx", Format: "cyclonedx", Origin: db.SBOMOriginUploaded})
+	s.DB.Create(&db.SBOMUpload{
+		Name: "generated-snapshot", Format: "cyclonedx",
+		Origin: db.SBOMOriginGenerated, RepositoryID: &repo.ID, Current: true,
 	})
-	t.Run("spdx with DESCRIBES", func(t *testing.T) {
-		// DOCUMENT --DESCRIBES--> root; root --DEPENDS_ON--> a; a --DEPENDS_ON--> b.
-		doc := &sbom.SBOM{Relationships: []sbom.Relationship{
-			{SourceID: "SPDXRef-DOCUMENT", TargetID: "root", Type: "DESCRIBES"},
-			{SourceID: "root", TargetID: "a", Type: "DEPENDS_ON"},
-			{SourceID: "a", TargetID: "b", Type: "DEPENDS_ON"},
-		}}
-		got := classifyScope(doc)
-		if got["a"] != scopeDirect || got["b"] != scopeTransitive {
-			t.Errorf("got %v", got)
-		}
-	})
-	t.Run("direct wins over transitive", func(t *testing.T) {
-		// root → a, a → b, root → b. b should still be direct.
-		doc := &sbom.SBOM{Relationships: []sbom.Relationship{
-			{SourceID: "root", TargetID: "a", Type: "DEPENDS_ON"},
-			{SourceID: "a", TargetID: "b", Type: "DEPENDS_ON"},
-			{SourceID: "root", TargetID: "b", Type: "DEPENDS_ON"},
-		}}
-		if got := classifyScope(doc); got["b"] != scopeDirect {
-			t.Errorf("b = %q, want direct", got["b"])
-		}
-	})
-	t.Run("no graph", func(t *testing.T) {
-		if got := classifyScope(&sbom.SBOM{}); got != nil {
-			t.Errorf("expected nil for empty relationships, got %v", got)
-		}
-	})
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", "/sboms"))
+	if w.Code != 200 {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "user.cdx") {
+		t.Errorf("uploaded SBOM not listed")
+	}
+	if strings.Contains(body, "generated-snapshot") {
+		t.Errorf("generated snapshot listed on /sboms")
+	}
+	if n := strings.Count(body, `<tr id="sbom-`); n != 1 {
+		t.Errorf("rows = %d, want 1", n)
+	}
 }
 
 func TestSBOMShow_scopeFilter(t *testing.T) {
@@ -474,8 +629,8 @@ func TestSBOMShow_scopeFilter(t *testing.T) {
 	s.DB.Create(&db.Finding{ScanID: scan.ID, RepositoryID: repoB.ID, Title: "trans-dep-finding", Severity: "High"})
 
 	up := db.SBOMUpload{Name: "demo", PackageCount: 2, Packages: []db.SBOMPackage{
-		{Name: "pkg-direct", Scope: scopeDirect, RepositoryID: &repoA.ID},
-		{Name: "pkg-trans", Scope: scopeTransitive, RepositoryID: &repoB.ID},
+		{Name: "pkg-direct", Scope: sbom.ScopeDirect, SourceRepositoryID: &repoA.ID},
+		{Name: "pkg-trans", Scope: sbom.ScopeTransitive, SourceRepositoryID: &repoB.ID},
 	}}
 	s.DB.Create(&up)
 

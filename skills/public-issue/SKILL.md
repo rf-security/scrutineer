@@ -33,6 +33,7 @@ Read `./context.json`, then `GET {api_base}/repositories/{repository_id}` and `G
 - the finding's `status` is `reported`, `acknowledged`, `fixed`, `published`, `rejected`, or `duplicate`
 - the finding's `status` is not `ready`; the analyst must review and mark it ready before public filing
 - the finding's `severity` is `High` or `Critical`; those should stay on the private disclosure path unless the analyst manually overrides outside this skill
+- the finding's `production_viability` is `NON_VIABLE` — refuse with `{"error": "latest critic assessment is NON_VIABLE; disclosure, public issue filing, and upstream reporting are blocked"}`; reassess it if new build or packaging evidence establishes a supported production path
 - the finding already has a reference tagged `public-issue` (`GET {api_base}/findings/{finding_id}/references`)
 - the repository has issues disabled: `gh api repos/{owner}/{repo} --jq '.has_issues'` is not `true`
 

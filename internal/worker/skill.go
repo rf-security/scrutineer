@@ -5,12 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
+	"github.com/alpha-omega-security/harness"
+	"gorm.io/gorm"
+
+	"scrutineer/internal/coverage"
 	"scrutineer/internal/db"
+	"scrutineer/internal/repoconfig"
 	"scrutineer/internal/skills"
+	"scrutineer/internal/verification"
 )
 
 const (
@@ -19,6 +27,13 @@ const (
 	skillSchemaFile           = "schema.json"
 	schemaRepairMaxTurns      = 4
 	schemaRepairReportMaxSize = 4000
+	deepDiveSkillName         = "security-deep-dive"
+	embeddedNativeSkillName   = "embedded-native"
+	refusalAuditSkillName     = deepDiveSkillName
+	refusalAuditOutputFile    = "refusal_audit.json"
+	refusalAuditMaxTurns      = 3
+	threatModelSkillName      = "threat-model"
+	reconSkillName            = "recon"
 )
 
 // skillContext is the JSON document scrutineer writes to ./context.json in
@@ -35,20 +50,31 @@ type skillContext struct {
 }
 
 type skillContextScrutineer struct {
-	APIBase     string `json:"api_base"`               // e.g. http://127.0.0.1:8080/api
-	ScanID      uint   `json:"scan_id"`                // the scan that owns this run
-	Token       string `json:"token"`                  // bearer for api_base
-	RepoID      uint   `json:"repository_id"`          // convenience for URL building
-	SkillID     uint   `json:"skill_id,omitempty"`     // the running skill
-	FindingID   uint   `json:"finding_id,omitempty"`   // set for finding-scoped scans
-	DependentID uint   `json:"dependent_id,omitempty"` // set on exposure scans
+	APIBase              string `json:"api_base"`             // e.g. http://127.0.0.1:8080/api
+	ScanID               uint   `json:"scan_id"`              // the scan that owns this run
+	Token                string `json:"token"`                // bearer for api_base
+	RepoID               uint   `json:"repository_id"`        // convenience for URL building
+	SkillID              uint   `json:"skill_id,omitempty"`   // the running skill
+	FindingID            uint   `json:"finding_id,omitempty"` // set for finding-scoped scans
+	VerificationFeedback string `json:"verification_feedback,omitempty"`
+	DependentID          uint   `json:"dependent_id,omitempty"` // set on exposure scans
 	// ScanRef is the git ref (branch/tag) the clone was checked out to.
 	// Empty means the repository's default branch.
 	ScanRef string `json:"scan_ref,omitempty"`
 	// ScanSubPath scopes code analysis to a sub-folder of ./src (monorepo
-	// support). Empty means the repo root. Skills that walk files honour
-	// this; skills that query external APIs ignore it.
+	// support). Empty means the repo root. Finding-producing / code-analysis
+	// skills honour it, scoping their reads and reported locations to the
+	// sub-folder. Repo-wide projection skills — those whose parser writes
+	// repository-level rows (see worker.repoWideProjectionKinds) — ignore it and
+	// always describe the whole repository; scoping one would overwrite or wipe
+	// repo-level data from a single sub-package's view (that is why repo-overview
+	// runs brief against ./src, not ./src/<subpath>).
 	ScanSubPath string `json:"scan_subpath,omitempty"`
+	// ScanGroup identifies the parallel batch this scan belongs to. An audit
+	// skill passes it to /repositories/{id}/findings?scan_group=... to read
+	// what its siblings have already filed before reporting its own.
+	// Empty when the scan was not launched as part of a batch.
+	ScanGroup string `json:"scan_group,omitempty"`
 	// ForkOrg is the GitHub organisation the fork skill stages scanned
 	// repositories into. Absent when fork_org is unconfigured.
 	ForkOrg string `json:"fork_org,omitempty"`
@@ -56,6 +82,44 @@ type skillContextScrutineer struct {
 	// metadata lives (`.scrutineer/` by default). Always written so
 	// skills can build paths without re-applying the default.
 	MetadataDir string `json:"metadata_dir"`
+	// Rescan is present for diff-based rescans. It names the baseline and
+	// staged files a diff-aware skill should read.
+	Rescan *skillContextRescan `json:"rescan,omitempty"`
+	// ScanConfig is the operator-authored repository guidance. It is omitted
+	// entirely for repositories without a saved configuration.
+	ScanConfig *repoconfig.Config `json:"scan_config,omitempty"`
+	// FocusArea narrows a fan-out security-deep-dive scan to one named
+	// input-processing subsystem from scan_config. Empty means normal scope.
+	FocusArea   *repoconfig.FocusArea    `json:"focus_area,omitempty"`
+	Exploration *skillContextExploration `json:"exploration,omitempty"`
+	// Recon is the latest completed focus-area map. It is staged only for the
+	// threat-model skill, which incorporates it into a complete scan-config
+	// proposal without letting recon overwrite analyst configuration directly.
+	Recon *skillContextRecon `json:"recon,omitempty"`
+	// Novelty is a bounded host-side git history check staged for revalidate.
+	// It keeps deterministic evidence separate from the model's verdict.
+	Novelty *skillContextNovelty `json:"novelty,omitempty"`
+	// Controls are the threat-model controls that claim to protect the
+	// finding's file, resolved host-side and staged for verify. Absent when
+	// the repository's threat model declares no controls.
+	Controls *skillContextControls `json:"controls,omitempty"`
+}
+
+type skillContextRecon struct {
+	FocusAreas []repoconfig.FocusArea `json:"focus_areas"`
+	Notes      []string               `json:"notes"`
+}
+
+type skillContextRescan struct {
+	Mode                string `json:"mode"`
+	BaseScanID          uint   `json:"base_scan_id,omitempty"`
+	BaseCommit          string `json:"base_commit,omitempty"`
+	HeadCommit          string `json:"head_commit,omitempty"`
+	ThreatModelScanID   uint   `json:"threat_model_scan_id,omitempty"`
+	DiffFile            string `json:"diff_file,omitempty"`
+	ChangedFilesFile    string `json:"changed_files_file,omitempty"`
+	OldThreatModelFile  string `json:"old_threat_model_file,omitempty"`
+	CoverageMetadataKey string `json:"coverage_metadata_key,omitempty"`
 }
 
 // DefaultMetadataDir is the value used when scrutineer.yaml does not
@@ -93,16 +157,23 @@ func (w *Worker) doSkill(ctx context.Context, scan *db.Scan, emit func(Event)) (
 	}
 	scan.SkillName = skill.Name
 	scan.SkillVersion = skill.Version
-	w.DB.Model(scan).Updates(map[string]any{
+	// Non-fatal: the in-memory scan already carries both fields and finalizeScan
+	// saves the whole row at the end, so a failure here only leaves the columns
+	// stale for readers watching the table while the scan runs.
+	if err := w.DB.Model(scan).Updates(map[string]any{
 		"skill_name":    skill.Name,
 		"skill_version": skill.Version,
-	})
+	}).Error; err != nil {
+		w.Log.Warn("update scan skill metadata", "scan", scan.ID, "skill", skill.Name, "err", err)
+	}
 
 	// Per-scan workspace keeps concurrent skills on the same repo from
-	// clobbering each other's src/ and report.json. wrap() removes it on
-	// successful completion; failed/cancelled dirs are left so the
-	// operator can inspect what the skill saw. The clone itself lives in
-	// the persistent repo-cache and is copied in by prepareRepoSrc.
+	// clobbering each other's src/ and report.json. wrap() removes it once
+	// the scan reaches a terminal status. A paused scan keeps it and comes
+	// back through here on resume, after the agent has had the run of it, so
+	// staging always starts from an empty directory rather than writing into
+	// one the agent shaped (see resetWorkspace). The clone itself lives in the
+	// persistent repo-cache and is copied in by prepareRepoSrc.
 	workRoot := w.scanWorkRoot(scan)
 	if err := validateSkillPaths(skill.Name, skill.OutputFile); err != nil {
 		return "", err
@@ -110,19 +181,19 @@ func (w *Worker) doSkill(ctx context.Context, scan *db.Scan, emit func(Event)) (
 	if scan.Repository.IsLocal() && skill.RequiresRemote {
 		return "", fmt.Errorf("skill %q requires a remote repository; cannot run on local directory", skill.Name)
 	}
-	if err := os.MkdirAll(workRoot, dirPerm); err != nil {
-		return "", fmt.Errorf("mkdir work: %w", err)
+	if err := resetWorkspace(workRoot); err != nil {
+		return "", fmt.Errorf("reset work: %w", err)
 	}
 	if scan.Repository.IsLocal() {
 		if err := prepareLocalSrc(scan.Repository.LocalPath(), workRoot, emit); err != nil {
 			return "", fmt.Errorf("copy local source: %w", err)
 		}
+		scan.Commit = gitHead(filepath.Join(workRoot, "src"))
 	} else {
-		prepare := w.PrepareRepoSrc
-		if prepare == nil {
-			prepare = w.prepareRepoSrc
-		}
-		cacheCommit, err := prepare(ctx, scan.Repository.URL, scan.Ref, workRoot, emit)
+		w.prepareNoveltyHistory(ctx, scan, &skill)
+		cacheCommit, err := w.prepareSkillRepoSrc(
+			ctx, scan.Repository.URL, scan.Ref, workRoot, skill.RecurseSubmodules, emit,
+		)
 		if err != nil {
 			if report, ok := w.handleCloneError(scan, err, emit); ok {
 				return report, nil
@@ -132,16 +203,25 @@ func (w *Worker) doSkill(ctx context.Context, scan *db.Scan, emit func(Event)) (
 		scan.Commit = cacheCommit
 		w.clearCloneError(scan)
 	}
-	if err := applyPathFilters(workRoot, &skill, emit); err != nil {
-		return "", fmt.Errorf("apply path filters: %w", err)
+	if skill.Name == embeddedNativeSkillName {
+		if err := stageEmbeddedNativeComponents(ctx, workRoot, scan.SubPath); err != nil {
+			return "", err
+		}
 	}
-
-	skillDir := filepath.Join(workRoot, ".claude", "skills", skill.Name)
-	if err := w.stageWorkspace(workRoot, skillDir, scan, &skill); err != nil {
+	hardScope, err := w.prepareSkillSource(ctx, workRoot, scan, &skill, emit)
+	if err != nil {
 		return "", err
 	}
 
-	prompt := buildLoggedPrompt(&skill)
+	skillDir := w.Runner.SkillDir(workRoot, skill.Name)
+	if err := w.prepareExploration(ctx, workRoot, scan); err != nil {
+		return "", err
+	}
+	if err := w.stageWorkspace(ctx, workRoot, skillDir, scan, &skill); err != nil {
+		return "", err
+	}
+
+	prompt := buildLoggedPrompt(&skill, scan.Backend)
 	scan.Prompt = prompt
 	w.DB.Model(scan).Update("prompt", prompt)
 
@@ -163,20 +243,11 @@ func (w *Worker) doSkill(ctx context.Context, scan *db.Scan, emit func(Event)) (
 		RequiresProfile: skill.RequiresProfile,
 	}
 	w.applyResume(scan, &sj, emit)
-	res, err := w.Runner.RunSkill(ctx, sj, emit)
-	if res.SessionID != "" && res.SessionID != scan.SessionID {
-		scan.SessionID = res.SessionID
-	}
-	if res.Commit != "" {
-		scan.Commit = res.Commit
-	}
-	if res.Profile != "" && res.Profile != scan.Profile {
-		scan.Profile = res.Profile
-		w.DB.Model(scan).Update("profile", res.Profile)
-	}
+	res, err := w.runSkillWithFallback(ctx, scan, &skill, sj, workRoot, hardScope, emit)
+	w.applySkillResult(scan, res)
 	if err != nil {
 		if _, ok := errors.AsType[*MaxTurnsReachedError](err); ok && res.Report != "" {
-			w.parsePartialSkillReport(&skill, scan, res.Report, emit)
+			w.parsePartialSkillReport(ctx, &skill, scan, res.Report, emit)
 		}
 		return res.Report, err
 	}
@@ -188,29 +259,110 @@ func (w *Worker) doSkill(ctx context.Context, scan *db.Scan, emit func(Event)) (
 		if err != nil {
 			return report, err
 		}
+		w.auditSkillRefusals(ctx, &skill, scan, sj, emit)
 	}
 	return report, nil
+}
+
+// runSkillWithFallback runs the skill once and, when a hard-scoped sub-package
+// could not resolve its dependencies in isolation — it needs a sibling package
+// that is unpublished or version-skewed — re-stages the whole repository (soft)
+// and runs it again. Only a dependency-resolution signature triggers the retry;
+// an ordinary build or analysis failure is left to stand as a real result. That
+// failure usually surfaces in the agent's streamed narration during the run
+// rather than in the final report.json (which stays valid findings), so the
+// first run watches the emit stream for it as well as the returned report/error.
+func (w *Worker) runSkillWithFallback(ctx context.Context, scan *db.Scan, skill *db.Skill, sj SkillJob, workRoot string, hardScope bool, emit func(Event)) (SkillResult, error) {
+	// Set-once flag; the check stops after the first hit. Guarded because the
+	// runner may emit from more than one goroutine (e.g. the egress sidecar
+	// drain).
+	var depResolveFail atomic.Bool
+	capture := func(e Event) {
+		if e.Text != "" && !depResolveFail.Load() && isDependencyResolutionFailure(e.Text) {
+			depResolveFail.Store(true)
+		}
+		emit(e)
+	}
+	res, err := w.Runner.RunSkill(ctx, sj, capture)
+	if !hardScope || scan.ScopeMode == "soft" || !dependencyResolutionFailed(depResolveFail.Load(), res, err) {
+		return res, err
+	}
+	emit(Event{Kind: KindText, Text: "hard-scope dependency resolution failed; widening to the whole repository (soft) and retrying"})
+	w.DB.Model(scan).Update("scope_mode", "soft")
+	scan.ScopeMode = "soft"
+	if wErr := w.reStageWholeTree(ctx, scan, skill, workRoot, emit); wErr != nil {
+		w.Log.Warn("re-stage whole tree for soft fallback", "scan", scan.ID, "err", wErr)
+		return res, err
+	}
+	return w.Runner.RunSkill(ctx, sj, emit)
+}
+
+// dependencyResolutionFailed reports whether a run failed specifically because
+// its dependencies could not be resolved — detected from the streamed narration
+// (streamed), the final report, or the returned error. It is the one condition
+// the automatic whole-repository retry is meant to rescue.
+func dependencyResolutionFailed(streamed bool, res SkillResult, err error) bool {
+	if streamed || isDependencyResolutionFailure(res.Report) {
+		return true
+	}
+	return err != nil && isDependencyResolutionFailure(err.Error())
+}
+
+// applySkillResult writes back the fields RunSkill reports about the run
+// itself (as opposed to the skill's report) onto the scan row: session id
+// and commit onto the in-memory struct (persisted by wrap()'s closing Save),
+// and Profile/Backend to the DB immediately so a retry sees them even if the
+// scan later fails hard. Provider and runner image provenance use the same
+// immediate path. Called from every RunSkill call site so the fields stay in
+// one place.
+func (w *Worker) applySkillResult(scan *db.Scan, res SkillResult) {
+	if res.SessionID != "" && res.SessionID != scan.SessionID {
+		scan.SessionID = res.SessionID
+	}
+	if res.Commit != "" {
+		scan.Commit = res.Commit
+	}
+	if res.Profile != "" && res.Profile != scan.Profile {
+		scan.Profile = res.Profile
+		w.DB.Model(scan).Update("profile", res.Profile)
+	}
+	if res.Backend != "" && res.Backend != scan.Backend {
+		scan.Backend = res.Backend
+		w.DB.Model(scan).Update("backend", res.Backend)
+	}
+	if res.Provider != "" && res.Provider != scan.Provider {
+		scan.Provider = res.Provider
+		w.DB.Model(scan).Update("provider", res.Provider)
+	}
+	if res.RunnerImage != "" && res.RunnerImage != scan.RunnerImage {
+		scan.RunnerImage = res.RunnerImage
+		w.DB.Model(scan).Update("runner_image", res.RunnerImage)
+	}
+	if res.RunnerImageDigest != "" && res.RunnerImageDigest != scan.RunnerImageDigest {
+		scan.RunnerImageDigest = res.RunnerImageDigest
+		w.DB.Model(scan).Update("runner_image_digest", res.RunnerImageDigest)
+	}
 }
 
 // parsePartialSkillReport runs parseSkillOutput against a max-turns
 // partial and logs on failure. The scan is already returning a
 // MaxTurnsReachedError so the parse error has nowhere useful to
 // propagate; logging keeps a silently-malformed partial from vanishing.
-func (w *Worker) parsePartialSkillReport(skill *db.Skill, scan *db.Scan, report string, emit func(Event)) {
-	if err := w.parseSkillOutput(skill, scan, report, emit); err != nil {
+func (w *Worker) parsePartialSkillReport(ctx context.Context, skill *db.Skill, scan *db.Scan, report string, emit func(Event)) {
+	if err := w.parseSkillOutput(ctx, skill, scan, report, emit); err != nil {
 		w.Log.Warn("parse partial skill output after max turns", "scan", scan.ID, "skill", skill.Name, "err", err)
 	}
 }
 
 func (w *Worker) repairAndParseSkillOutput(ctx context.Context, skill *db.Skill, scan *db.Scan, sj SkillJob, report string, emit func(Event)) (string, error) {
 	if skill.SchemaJSON != "" {
-		if detail := ValidateReportSchema(skill.SchemaJSON, report); detail != "" {
+		if detail := ValidateSkillReport(skill.Name, skill.SchemaJSON, report); detail != "" {
 			if repairedReport, ok := w.repairSchemaReport(ctx, skill, scan, sj, report, detail, emit); ok {
 				report = repairedReport
 			}
 		}
 	}
-	if err := w.parseSkillOutput(skill, scan, report, emit); err != nil {
+	if err := w.parseSkillOutput(ctx, skill, scan, report, emit); err != nil {
 		return report, err
 	}
 	return report, nil
@@ -222,46 +374,37 @@ func (w *Worker) repairSchemaReport(ctx context.Context, skill *db.Skill, scan *
 		return "", false
 	}
 
-	emit(Event{Kind: KindText, Text: fmt.Sprintf("schema: %s failed validation; asking claude to repair it", outputFile)})
+	emit(Event{Kind: KindText, Text: fmt.Sprintf("validation: %s failed validation; asking the agent to repair it", outputFile)})
 	repairJob := sj
 	repairJob.ResumeSessionID = scan.SessionID
 	repairJob.ResumePrompt = buildSchemaRepairPrompt(skill, detail, report)
 	repairJob.MaxTurns = schemaRepairMaxTurns
 	res, err := w.Runner.RunSkill(ctx, repairJob, emit)
-	if res.SessionID != "" && res.SessionID != scan.SessionID {
-		scan.SessionID = res.SessionID
-	}
-	if res.Commit != "" {
-		scan.Commit = res.Commit
-	}
-	if res.Profile != "" && res.Profile != scan.Profile {
-		scan.Profile = res.Profile
-		w.DB.Model(scan).Update("profile", res.Profile)
-	}
+	w.applySkillResult(scan, res)
 	if err != nil {
-		emit(Event{Kind: KindError, Text: fmt.Sprintf("schema: repair attempt for %s failed: %v; parsing original output", outputFile, err)})
+		emit(Event{Kind: KindError, Text: fmt.Sprintf("validation: repair attempt for %s failed: %v; parsing original output", outputFile, err)})
 		return "", false
 	}
 	if res.Report == "" {
-		emit(Event{Kind: KindError, Text: fmt.Sprintf("schema: repair attempt did not produce %s; parsing original output", outputFile)})
+		emit(Event{Kind: KindError, Text: fmt.Sprintf("validation: repair attempt did not produce %s; parsing original output", outputFile)})
 		return "", false
 	}
-	if detail = ValidateReportSchema(skill.SchemaJSON, res.Report); detail == "" {
-		emit(Event{Kind: KindText, Text: fmt.Sprintf("schema: repaired %s validates", outputFile)})
+	if detail = ValidateSkillReport(skill.Name, skill.SchemaJSON, res.Report); detail == "" {
+		emit(Event{Kind: KindText, Text: fmt.Sprintf("validation: repaired %s validates", outputFile)})
 		return res.Report, true
 	}
-	emit(Event{Kind: KindText, Text: fmt.Sprintf("schema: repaired %s still does not validate; parsing original output", outputFile)})
+	emit(Event{Kind: KindText, Text: fmt.Sprintf("validation: repaired %s still does not validate; parsing original output", outputFile)})
 	return "", false
 }
 
 func buildSchemaRepairPrompt(skill *db.Skill, detail, report string) string {
 	outputFile := skillOutputFile(skill)
-	return fmt.Sprintf(`Your previous %q skill run wrote ./%s, but it failed validation against ./%s.
+	return fmt.Sprintf(`Your previous %q skill run wrote ./%s, but it failed Scrutineer report validation against ./%s and any skill-specific report rules.
 
 Validation errors:
 %s
 
-Rewrite only ./%s with JSON that validates against ./%s. Preserve the facts from the previous run, do not restart the analysis, and do not write prose outside the JSON file.
+Rewrite only ./%s with JSON that satisfies every validation requirement above: it must validate against ./%s and comply with any skill-specific report rules. Preserve the facts from the previous run, do not restart the analysis, and do not write prose outside the JSON file.
 
 Previous invalid ./%s:
 %s`, skill.Name, outputFile, skillSchemaFile, detail, outputFile, skillSchemaFile, outputFile, truncateSchemaRepairReport(report))
@@ -274,8 +417,8 @@ func skillOutputFile(skill *db.Skill) string {
 	return defaultSkillOutputFile
 }
 
-func schemaValidationEvent(skill *db.Skill, detail string) Event {
-	return Event{Kind: KindError, Text: fmt.Sprintf("schema: %s does not validate against %s:\n%s", skillOutputFile(skill), skillSchemaFile, detail)}
+func reportValidationEvent(skill *db.Skill, detail string) Event {
+	return Event{Kind: KindError, Text: fmt.Sprintf("validation: %s does not pass Scrutineer report validation:\n%s", skillOutputFile(skill), detail)}
 }
 
 func truncateSchemaRepairReport(report string) string {
@@ -286,15 +429,29 @@ func truncateSchemaRepairReport(report string) string {
 	return report[:schemaRepairReportMaxSize] + "\n... truncated ..."
 }
 
-func (w *Worker) parseSkillOutput(skill *db.Skill, scan *db.Scan, report string, emit func(Event)) error {
+func (w *Worker) parseSkillOutput(ctx context.Context, skill *db.Skill, scan *db.Scan, report string, emit func(Event)) error {
 	if skill.SchemaJSON != "" {
-		if detail := ValidateReportSchema(skill.SchemaJSON, report); detail != "" {
-			emit(schemaValidationEvent(skill, detail))
-			if w.SchemaStrict {
+		if detail, recoverable := reportValidationForParsing(skill, report); detail != "" {
+			emit(reportValidationEvent(skill, detail))
+			if w.SchemaStrict && !recoverable {
 				return &SchemaValidationError{Skill: skill.Name, Detail: detail}
 			}
 		}
 	}
+	if err := w.parseSkillOutputKind(ctx, skill, scan, report, emit); err != nil {
+		return err
+	}
+	if scan.RescanMode != db.ScanRescanModeDiff {
+		return nil
+	}
+	claim, hasClaim, err := extractSkillCoverageClaim(report)
+	if err != nil || !hasClaim {
+		return err
+	}
+	return applySkillCoverageClaim(scan, claim)
+}
+
+func (w *Worker) parseSkillOutputKind(ctx context.Context, skill *db.Skill, scan *db.Scan, report string, emit func(Event)) error {
 	switch skill.OutputKind {
 	case "findings":
 		return w.parseFindingsOutput(skill, scan, report, emit)
@@ -306,8 +463,8 @@ func (w *Worker) parseSkillOutput(skill *db.Skill, scan *db.Scan, report string,
 		return w.parsePackagesOutput(scan, report, emit)
 	case "advisories":
 		return w.parseAdvisoriesOutput(scan, report, emit)
-	case "dependents":
-		return w.parseDependentsOutput(scan, report, emit)
+	case "advisory_audit":
+		return w.parseAdvisoryAuditOutput(skill, scan, report, emit)
 	case "dependencies":
 		return w.parseDependenciesOutput(scan, report, emit)
 	case "finding_dedup":
@@ -316,6 +473,8 @@ func (w *Worker) parseSkillOutput(skill *db.Skill, scan *db.Scan, report string,
 		return w.parseVerifyOutput(scan, report, emit)
 	case "revalidate":
 		return w.parseRevalidateOutput(scan, report, emit)
+	case "critic":
+		return w.parseCriticOutput(scan, report, emit)
 	case "breaking_change":
 		return w.parseBreakingChangeOutput(scan, report, emit)
 	case "mitigation":
@@ -331,7 +490,9 @@ func (w *Worker) parseSkillOutput(skill *db.Skill, scan *db.Scan, report string,
 	case "posture":
 		return w.parsePostureOutput(scan, report, emit)
 	case "patch":
-		return w.parsePatchOutput(scan, report, emit)
+		return w.parsePatchOutput(ctx, scan, report, emit)
+	case "reattack":
+		return w.parseReattackOutput(scan, report, emit)
 	}
 	return nil
 }
@@ -355,17 +516,36 @@ func (w *Worker) clearCloneError(scan *db.Scan) {
 	}
 }
 
+// reportValidationForParsing keeps schema failures strict while allowing the
+// verify parser to preserve a schema-valid but internally inconsistent rubric
+// as ungraded after the repair loop has had its chance to fix it.
+func reportValidationForParsing(skill *db.Skill, report string) (string, bool) {
+	if detail := ValidateReportSchema(skill.SchemaJSON, report); detail != "" {
+		return detail, false
+	}
+	detail := ValidateReportSemantics(skill.Name, report)
+	return detail, detail != "" && skill.Name == verifySkillName
+}
+
 // parseFindingsOutput feeds the existing spec-deep parser so skill-driven
 // audits surface in the Findings tab alongside the legacy claude job.
 // Findings are deduped against prior scans of the same repository by
 // fingerprint: a match bumps last-seen on the existing row instead of
 // creating a duplicate, so analyst triage state survives a rescan (#75).
 func (w *Worker) parseFindingsOutput(skill *db.Skill, scan *db.Scan, report string, emit func(Event)) error {
+	_, err := w.ingestFindings(skill, scan, report, emit)
+	return err
+}
+
+// ingestFindings is the body of parseFindingsOutput, returning the persisted
+// findings with their database IDs set (dedup resolves to the existing row)
+// so callers like parseAdvisoryAuditOutput can map report-local ids to rows.
+func (w *Worker) ingestFindings(skill *db.Skill, scan *db.Scan, report string, emit func(Event)) ([]db.Finding, error) {
 	rep, err := parseReport([]byte(report))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	findings := rep.toFindings(scan.ID, scan.RepositoryID, scan.Commit, scan.SubPath)
+	findings := rep.toFindings(scan.ID, scan.RepositoryID, scan.Commit, scan.SubPath, scan.Model)
 	findings = groupByFingerprint(findings, scan.SkillName)
 
 	if skill.MinConfidence != "" {
@@ -399,39 +579,64 @@ func (w *Worker) parseFindingsOutput(skill *db.Skill, scan *db.Scan, report stri
 		if db.SeverityAtLeast(f.Severity, worst) || worst == "" {
 			worst = f.Severity
 		}
-		f.LastSeenScanID = scan.ID
-		f.LastSeenCommit = scan.Commit
-		f.SeenCount = 1
 		seenThisScan[f.Fingerprint] = true
 
-		var existing db.Finding
-		err := w.DB.Where("repository_id = ? AND fingerprint = ?", scan.RepositoryID, f.Fingerprint).
-			Order("id").First(&existing).Error
-		if err == nil {
-			if uerr := w.reobserveFinding(&existing, f, scan); uerr != nil {
-				return uerr
-			}
+		wasCreated, perr := w.persistFinding(scan, f)
+		if perr != nil {
+			return nil, perr
+		}
+		if wasCreated {
+			created++
+		} else {
 			observed++
-			continue
-		}
-		if cerr := w.DB.Create(f).Error; cerr != nil {
-			return fmt.Errorf("save finding: %w", cerr)
-		}
-		created++
-		if w.OnFindingCreated != nil {
-			w.OnFindingCreated(scan, f)
 		}
 	}
 
-	missed := w.markNotObserved(scan, seenThisScan)
+	missed := 0
+	if scan.RescanMode != db.ScanRescanModeDiff {
+		missed = w.markNotObserved(scan, seenThisScan)
+	}
+	retracted := w.markRetracted(scan, seenThisScan)
 
-	emit(Event{Kind: KindText, Text: fmt.Sprintf("parsed %d finding(s): %d new, %d re-observed, %d not-observed",
-		len(findings), created, observed, missed)})
+	emit(Event{Kind: KindText, Text: fmt.Sprintf("parsed %d finding(s): %d new, %d re-observed, %d not-observed, %d retracted",
+		len(findings), created, observed, missed, retracted)})
 
 	if db.SeverityAtLeast(worst, skill.FailOn) {
-		return &FailOnThresholdError{Worst: worst, Threshold: skill.FailOn}
+		return findings, &FailOnThresholdError{Worst: worst, Threshold: skill.FailOn}
 	}
-	return nil
+	return findings, nil
+}
+
+// persistFinding writes one finding into the repository's finding set using
+// fingerprint dedup: a match re-observes the existing row, otherwise a new row
+// is created and OnFindingCreated fires. Shared by the end-of-scan report
+// ingestion and the streamed concurrent-finding log. On the dedup
+// branch f.ID is set to the existing row so callers can report the live id.
+func (w *Worker) persistFinding(scan *db.Scan, f *db.Finding) (created bool, err error) {
+	f.LastSeenScanID = scan.ID
+	f.LastSeenCommit = scan.Commit
+	f.SeenCount = 1
+
+	var existing db.Finding
+	lookup := w.DB.Where("repository_id = ? AND fingerprint = ?", scan.RepositoryID, f.Fingerprint).
+		Order("id").Limit(1).Find(&existing)
+	if lookup.Error != nil {
+		return false, fmt.Errorf("lookup existing finding: %w", lookup.Error)
+	}
+	if lookup.RowsAffected > 0 {
+		if uerr := w.reobserveFinding(&existing, f, scan); uerr != nil {
+			return false, uerr
+		}
+		f.ID = existing.ID
+		return false, nil
+	}
+	if cerr := w.DB.Create(f).Error; cerr != nil {
+		return false, fmt.Errorf("save finding: %w", cerr)
+	}
+	if w.OnFindingCreated != nil {
+		w.OnFindingCreated(scan, f)
+	}
+	return true, nil
 }
 
 // reobserveFinding handles the dedup branch in parseFindingsOutput:
@@ -440,15 +645,68 @@ func (w *Worker) parseFindingsOutput(skill *db.Skill, scan *db.Scan, report stri
 // Reference and history failures are logged but not fatal; the finding
 // row write itself does propagate so a real DB error stops the scan.
 func (w *Worker) reobserveFinding(existing, f *db.Finding, scan *db.Scan) error {
+	// A finding already last-seen in this same scan was streamed into the
+	// concurrent-finding log earlier in this run. Reconciling it from
+	// the final report must be idempotent: do not bump seen_count or write
+	// another observed-history row, or a streamed finding would count as
+	// seen twice by one scan.
+	sameScan := existing.LastSeenScanID == scan.ID
+
+	seenCount := existing.SeenCount + 1
+	if sameScan {
+		seenCount = existing.SeenCount
+	}
 	updates := map[string]any{
 		"last_seen_scan_id":   scan.ID,
 		"last_seen_commit":    scan.Commit,
-		"seen_count":          existing.SeenCount + 1,
+		"seen_count":          seenCount,
 		"missed_count":        0,
 		"last_missed_scan_id": 0,
 		"location":            f.Location,
 		"locations":           f.Locations,
 	}
+	if sameScan {
+		// The existing row is this run's own streamed preview, which may
+		// carry only the minimal fields the POST endpoint requires. The
+		// final report is the authoritative full version of the same
+		// finding, so parser-owned content is refreshed wholesale.
+		// Cross-scan re-observation deliberately keeps existing content
+		// (TestParseFindingsOutput_dedupesAcrossScans locks that in).
+		maps.Copy(updates, map[string]any{
+			"finding_id":   f.FindingID,
+			"sinks":        f.Sinks,
+			"title":        f.Title,
+			"severity":     f.Severity,
+			"confidence":   f.Confidence,
+			"cwe":          f.CWE,
+			"affected":     f.Affected,
+			"reachability": f.Reachability,
+			"quality_tier": f.QualityTier,
+			"trace":        f.Trace,
+			"boundary":     f.Boundary,
+			"validation":   f.Validation,
+			"prior_art":    f.PriorArt,
+			"reach":        f.Reach,
+			"rating":       f.Rating,
+			"dup_check":    f.DupCheck,
+		})
+	}
+
+	var statusRestore string
+	if existing.Status == db.FindingRejected {
+		var lastStatus db.FindingHistory
+		lastStatusLookup := w.DB.Where("finding_id = ? AND field = ?", existing.ID, "status").
+			Order("id desc").Limit(1).Find(&lastStatus)
+		if lastStatusLookup.Error != nil {
+			w.Log.Warn("lookup finding status history", "finding", existing.ID, "scan", scan.ID, "err", lastStatusLookup.Error)
+		} else if lastStatusLookup.RowsAffected > 0 {
+			if lastStatus.Source == db.SourceSystem {
+				statusRestore = lastStatus.OldValue
+				updates["status"] = statusRestore
+			}
+		}
+	}
+
 	// Refresh the VID and snippet so they track the code as it drifts,
 	// but never wipe a stored one just because this run could not capture
 	// it (vid binary missing, location gone, checkout evicted).
@@ -464,6 +722,9 @@ func (w *Worker) reobserveFinding(existing, f *db.Finding, scan *db.Scan) error 
 	if err := w.upsertFindingReferences(existing.ID, f.References); err != nil {
 		w.Log.Warn("upsert finding references", "finding", existing.ID, "scan", scan.ID, "err", err)
 	}
+	if sameScan {
+		return nil
+	}
 	if err := w.DB.Create(&db.FindingHistory{
 		FindingID: existing.ID,
 		Field:     "observed",
@@ -473,30 +734,28 @@ func (w *Worker) reobserveFinding(existing, f *db.Finding, scan *db.Scan) error 
 	}).Error; err != nil {
 		w.Log.Warn("record observed-again finding history", "finding", existing.ID, "scan", scan.ID, "err", err)
 	}
+
+	if statusRestore != "" {
+		if err := w.DB.Create(&db.FindingHistory{
+			FindingID: existing.ID,
+			Field:     "status",
+			OldValue:  string(db.FindingRejected),
+			NewValue:  statusRestore,
+			Source:    db.SourceSystem,
+			By:        "re-observed in scan",
+		}).Error; err != nil {
+			w.Log.Warn("record finding status reopen history", "finding", existing.ID, "scan", scan.ID, "err", err)
+		}
+	}
+
 	return nil
 }
 
-// upsertFindingReferences inserts any reference URLs not already on the
-// finding. Used in the dedup branch so a re-observed finding picks up new
-// or migration-added references without duplicating ones already present.
+// upsertFindingReferences records skill-emitted references on a re-observed
+// finding. AddFindingReference keeps each URL idempotent and enriches any
+// existing row with non-empty metadata from the new report.
 func (w *Worker) upsertFindingReferences(findingID uint, refs []db.FindingReference) error {
-	if len(refs) == 0 {
-		return nil
-	}
-	var existingURLs []string
-	if err := w.DB.Model(&db.FindingReference{}).
-		Where("finding_id = ?", findingID).
-		Pluck("url", &existingURLs).Error; err != nil {
-		return err
-	}
-	have := make(map[string]bool, len(existingURLs))
-	for _, u := range existingURLs {
-		have[u] = true
-	}
 	for _, r := range refs {
-		if have[r.URL] {
-			continue
-		}
 		if _, err := db.AddFindingReference(w.DB, findingID, r.URL, r.Tags, r.Summary); err != nil {
 			return err
 		}
@@ -567,7 +826,21 @@ func (e *FailOnThresholdError) Error() string {
 // fingerprint did not appear in the scan output. Closed findings (fixed,
 // published, rejected, duplicate) are left alone. Returns the number of
 // rows touched so the scan log can report it.
+//
+// A focus-area scan only looks at its own slice of the repo, so it is not
+// in scope to re-observe findings from sibling areas and never counts as a
+// miss: with N parallel focus-area deep-dives each one would otherwise bump
+// MissedCount on every open finding from the other N-1, which also drives
+// AutoRejectMissedCount below and would auto-reject valid findings. Only
+// full-repo rescans count. Finding denormalizes RepositoryID/Commit/SubPath
+// from Scan but not FocusArea, and a finding can legitimately be observed
+// under more than one area, so scoping the query by focus area instead is
+// not available without joining back through a scan.
 func (w *Worker) markNotObserved(scan *db.Scan, seen map[string]bool) int {
+	if scan.FocusArea != "" {
+		return 0
+	}
+
 	sameSkill := w.DB.Model(&db.Scan{}).Select("id").
 		Where("repository_id = ? AND skill_name = ?", scan.RepositoryID, scan.SkillName)
 	var prior []db.Finding
@@ -582,10 +855,24 @@ func (w *Worker) markNotObserved(scan *db.Scan, seen map[string]bool) int {
 		if seen[f.Fingerprint] {
 			continue
 		}
-		if uerr := w.DB.Model(&db.Finding{}).Where("id = ?", f.ID).Updates(map[string]any{
-			"missed_count":        f.MissedCount + 1,
+
+		missedCount := f.MissedCount + 1
+		updates := map[string]any{
+			"missed_count":        missedCount,
 			"last_missed_scan_id": scan.ID,
-		}).Error; uerr != nil {
+		}
+
+		autoReject := false
+		if w.AutoRejectMissedCount > 0 && missedCount >= w.AutoRejectMissedCount {
+			if f.Status == db.FindingNew || f.Status == db.FindingEnriched || f.Status == db.FindingTriaged || f.Status == db.FindingReady {
+				if !w.hasEverBeenReportedOrAcknowledged(f.ID) {
+					autoReject = true
+					updates["status"] = db.FindingRejected
+				}
+			}
+		}
+
+		if uerr := w.DB.Model(&db.Finding{}).Where("id = ?", f.ID).Updates(updates).Error; uerr != nil {
 			w.Log.Error("mark finding not-observed", "finding", f.ID, "err", uerr)
 			continue
 		}
@@ -596,9 +883,93 @@ func (w *Worker) markNotObserved(scan *db.Scan, seen map[string]bool) int {
 			Source:    db.SourceTool,
 			By:        scan.SkillName,
 		}).Error
+
+		if autoReject {
+			_ = w.DB.Create(&db.FindingHistory{
+				FindingID: f.ID,
+				Field:     "status",
+				OldValue:  string(f.Status),
+				NewValue:  string(db.FindingRejected),
+				Source:    db.SourceSystem,
+				By:        fmt.Sprintf("not observed in %d consecutive rescans", missedCount),
+			}).Error
+		}
+
 		missed++
 	}
 	return missed
+}
+
+// hasEverBeenReportedOrAcknowledged checks if the finding ever reached reported or acknowledged status.
+func (w *Worker) hasEverBeenReportedOrAcknowledged(findingID uint) bool {
+	var count int64
+	w.DB.Model(&db.FindingHistory{}).
+		Where("finding_id = ? AND field = ? AND (new_value = ? OR new_value = ?)",
+			findingID, "status", string(db.FindingReported), string(db.FindingAcknowledged)).
+		Count(&count)
+	return count > 0
+}
+
+// markRetracted flags findings this scan streamed into the concurrent-finding
+// log but then left out of its final report.json. The row is kept — a sibling
+// may have stood down citing it, so deleting would lose the bug from both scans
+// — but a `retracted` history row records that the scan did not confirm it in
+// the end, so it is no longer indistinguishable from a confirmed finding. Only
+// rows this scan both created and last saw are considered; a finding a sibling
+// re-observed since stays live under that sibling.
+func (w *Worker) markRetracted(scan *db.Scan, seen map[string]bool) int {
+	var streamed []db.Finding
+	w.DB.Where("scan_id = ? AND last_seen_scan_id = ?", scan.ID, scan.ID).Find(&streamed)
+
+	retracted := 0
+	for _, f := range streamed {
+		if seen[f.Fingerprint] {
+			continue
+		}
+		if err := w.DB.Create(&db.FindingHistory{
+			FindingID: f.ID,
+			Field:     "retracted",
+			NewValue:  fmt.Sprintf("scan %d @ %s", scan.ID, scan.Commit),
+			Source:    db.SourceTool,
+			By:        scan.SkillName,
+		}).Error; err != nil {
+			w.Log.Error("mark finding retracted", "finding", f.ID, "err", err)
+			continue
+		}
+		retracted++
+	}
+	return retracted
+}
+
+// reportedMaintainer is one entry of a maintainers skill report.
+type reportedMaintainer struct {
+	Login    string `json:"login"`
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Role     string `json:"role"`
+	Status   string `json:"status"`
+	Evidence string `json:"evidence"`
+}
+
+// applyTo copies the fields this report entry refreshes onto the stored row.
+// An absent or unrecognised field leaves the stored value alone, so a partial
+// report never blanks what an earlier scan established.
+func (rm reportedMaintainer) applyTo(m *db.Maintainer) {
+	if rm.Name != "" {
+		m.Name = rm.Name
+	}
+	if validEmail(rm.Email) {
+		m.Email = rm.Email
+	}
+	switch rm.Status {
+	case "active":
+		m.Status = db.MaintainerActive
+	case "inactive":
+		m.Status = db.MaintainerInactive
+	}
+	if rm.Evidence != "" {
+		m.Notes = rm.Role + ": " + rm.Evidence
+	}
 }
 
 // parseMaintainersOutput upserts Maintainer rows and links them to the
@@ -606,15 +977,16 @@ func (w *Worker) markNotObserved(scan *db.Scan, seen map[string]bool) int {
 // maintainers skill and the old Go handler stay interchangeable.
 func (w *Worker) parseMaintainersOutput(scan *db.Scan, report string, emit func(Event)) error {
 	var result struct {
-		Maintainers []struct {
-			Login    string `json:"login"`
-			Name     string `json:"name"`
-			Email    string `json:"email"`
-			Role     string `json:"role"`
-			Status   string `json:"status"`
-			Evidence string `json:"evidence"`
-		} `json:"maintainers"`
-		DisclosureChannel string `json:"disclosure_channel"`
+		Maintainers       []reportedMaintainer `json:"maintainers"`
+		DisclosureChannel string               `json:"disclosure_channel"`
+		// Subprojects optionally carries a per-sub-package disclosure channel
+		// for a monorepo, so a report against one gem in rails/rails routes to
+		// that gem's maintainers rather than the repo-wide channel. Additive:
+		// a report that omits it keeps the pre-monorepo repo-only behaviour.
+		Subprojects []struct {
+			Path              string `json:"path"`
+			DisclosureChannel string `json:"disclosure_channel"`
+		} `json:"subprojects"`
 	}
 	if err := json.Unmarshal([]byte(report), &result); err != nil {
 		return fmt.Errorf("parse maintainers report: %w", err)
@@ -623,39 +995,76 @@ func (w *Worker) parseMaintainersOutput(scan *db.Scan, report string, emit func(
 	if err := w.DB.First(&repo, scan.RepositoryID).Error; err != nil {
 		return err
 	}
-	if strings.TrimSpace(result.DisclosureChannel) != "" {
-		if err := w.DB.Model(&db.Repository{}).Where("id = ?", repo.ID).
-			Update("disclosure_channel", result.DisclosureChannel).Error; err != nil {
+	// A sub-path-scoped run describes one sub-package, so it must never rewrite
+	// repository-wide state: the top-level disclosure channel or the whole
+	// maintainer association set. Today the skill reads repo-root files and
+	// reports the whole repository even when scoped, so this changes nothing —
+	// the guard is what keeps that safe if the skill is ever made sub-path-aware
+	// (the scan_subpath contract at skillContextScrutineer.ScanSubPath invites
+	// it), when a fragmentary report would otherwise clobber every sibling's
+	// attribution through the wholesale Association.Replace below. A scoped run
+	// still records its own sub-package's disclosure channel — that is the point
+	// of running it.
+	repoWide := scan.SubPath == ""
+	if repoWide && strings.TrimSpace(result.DisclosureChannel) != "" {
+		if err := db.SetDisclosureChannel(w.DB, repo.ID, result.DisclosureChannel); err != nil {
 			return fmt.Errorf("update disclosure channel: %w", err)
 		}
 	}
+	if w.MonorepoAttribution {
+		for _, sp := range result.Subprojects {
+			path := strings.Trim(sp.Path, "/ \t\n")
+			ch := strings.TrimSpace(sp.DisclosureChannel)
+			if path == "" || ch == "" {
+				continue
+			}
+			// Best-effort: only touches an existing subproject row, and only
+			// the reconcile/skill-owned channel field.
+			if err := w.DB.Model(&db.Subproject{}).
+				Where("repository_id = ? AND path = ?", scan.RepositoryID, path).
+				Update("disclosure_channel", ch).Error; err != nil {
+				w.Log.Warn("update subproject disclosure channel", "scan", scan.ID, "path", path, "err", err)
+			}
+		}
+	}
 	var linked []db.Maintainer
+	partial := false
 	for _, rm := range result.Maintainers {
 		if rm.Login == "" {
 			continue
 		}
 		var m db.Maintainer
-		w.DB.Where(db.Maintainer{Login: rm.Login}).FirstOrCreate(&m)
-		if rm.Name != "" {
-			m.Name = rm.Name
+		if err := w.DB.Where(db.Maintainer{Login: rm.Login}).FirstOrCreate(&m).Error; err != nil {
+			// m is a zero value here: nothing was found and nothing was
+			// created. Falling through would Save() a record with no primary
+			// key and an empty Login, inserting a second, blank maintainer row
+			// and linking the repository to that instead of the real one.
+			w.Log.Warn("upsert maintainer", "scan", scan.ID, "login", rm.Login, "err", err)
+			partial = true
+			continue
 		}
-		if validEmail(rm.Email) {
-			m.Email = rm.Email
+		rm.applyTo(&m)
+		if err := w.DB.Save(&m).Error; err != nil {
+			// Only the field refresh was lost; m still identifies a row that
+			// exists, so it stays in linked. Dropping it would remove a real
+			// maintainer from the repository via the Replace below, which is a
+			// larger loss than a stale name or note.
+			w.Log.Warn("save maintainer", "scan", scan.ID, "login", rm.Login, "err", err)
 		}
-		switch rm.Status {
-		case "active":
-			m.Status = db.MaintainerActive
-		case "inactive":
-			m.Status = db.MaintainerInactive
-		}
-		if rm.Evidence != "" {
-			m.Notes = rm.Role + ": " + rm.Evidence
-		}
-		w.DB.Save(&m)
 		linked = append(linked, m)
 	}
-	if len(linked) > 0 {
-		_ = w.DB.Model(&repo).Association("Maintainers").Replace(linked)
+	switch {
+	case !repoWide:
+	case partial:
+		// Replace(linked) with a partial set would unlink every maintainer whose
+		// lookup transiently failed. Leave the association as it was; the next
+		// successful run rewrites it.
+		w.Log.Warn("skipping maintainer association replace: set is partial after lookup failure",
+			"scan", scan.ID, "repository", repo.ID, "resolved", len(linked))
+	case len(linked) > 0:
+		if err := w.DB.Model(&repo).Association("Maintainers").Replace(linked); err != nil {
+			w.Log.Warn("replace repository maintainers", "scan", scan.ID, "repository", repo.ID, "err", err)
+		}
 	}
 	emit(Event{Kind: KindText, Text: fmt.Sprintf("identified %d maintainer(s)", len(result.Maintainers))})
 	return nil
@@ -673,8 +1082,61 @@ func (w *Worker) parseMaintainersOutput(scan *db.Scan, report string, emit func(
 // Emits a one-line scan-log entry with the count when at least one file
 // is removed.
 func applyPathFilters(workRoot string, skill *db.Skill, emit func(Event)) error {
+	return applyPathFiltersWithSkips(workRoot, skill, nil, emit)
+}
+
+// applyRepositoryPathFilters layers the repository's configured skip patterns
+// on top of the skill's filters. A repository cannot use this setting to bring
+// files back that a skill or the builtin skip list has excluded.
+func applyRepositoryPathFilters(workRoot string, skill *db.Skill, rawConfig string, emit func(Event)) error {
+	cfg, err := repoconfig.Parse(rawConfig)
+	if err != nil {
+		return fmt.Errorf("parse repository scan config: %w", err)
+	}
+	return applyPathFiltersWithSkips(workRoot, skill, cfg.Skip, emit)
+}
+
+// applyFocusAreaPathFilter narrows a fan-out audit to the paths belonging to
+// its persisted focus area. Repository skip rules have already been applied;
+// this only removes files outside the area and does not reintroduce anything.
+func applyFocusAreaPathFilter(workRoot string, area repoconfig.FocusArea, emit func(Event)) error {
+	return applyPathFiltersWithPatterns(workRoot, area.Paths, nil, emit)
+}
+
+func applyPathFiltersWithSkips(workRoot string, skill *db.Skill, repositorySkips []string, emit func(Event)) error {
 	paths := skills.SplitPatterns(skill.Paths)
 	ignorePaths := skills.SplitPatterns(skill.IgnorePaths)
+	ignorePaths = append(ignorePaths, repositorySkips...)
+	if err := stripWorkspaceAgentDirectives(workRoot, emit); err != nil {
+		return err
+	}
+	return applyPathFiltersWithPatterns(workRoot, paths, ignorePaths, emit)
+}
+
+func stripWorkspaceAgentDirectives(workRoot string, emit func(Event)) error {
+	src := filepath.Join(workRoot, "src")
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	// Unconditional strip of agent-instruction files (CLAUDE.md, AGENTS.md,
+	// .claude/, .cursor/, ...) so a hostile repo cannot inject standing
+	// instructions into the auditing agent. Runs before the paths filter
+	// because scrutineer.paths bypasses BuiltinSkipPaths and must not be
+	// able to opt these back in. See threatmodel.md T5.
+	stripped, err := harness.StripDirectives(src)
+	if err != nil {
+		return fmt.Errorf("strip agent directives: %w", err)
+	}
+	if stripped > 0 {
+		emit(Event{Kind: KindText, Text: fmt.Sprintf("%d agent-directive item(s) stripped from ./src", stripped)})
+	}
+	return nil
+}
+
+func applyPathFiltersWithPatterns(workRoot string, paths, ignorePaths []string, emit func(Event)) error {
 	src := filepath.Join(workRoot, "src")
 	if _, err := os.Stat(src); err != nil {
 		if os.IsNotExist(err) {
@@ -726,6 +1188,17 @@ func applyPathFilters(workRoot string, skill *db.Skill, emit func(Event)) error 
 	return nil
 }
 
+func scanFocusArea(scan *db.Scan) (*repoconfig.FocusArea, error) {
+	if strings.TrimSpace(scan.FocusArea) == "" {
+		return nil, nil
+	}
+	area, err := repoconfig.DecodeFocusAreaJSON(scan.FocusArea)
+	if err != nil {
+		return nil, fmt.Errorf("parse scan focus area: %w", err)
+	}
+	return &area, nil
+}
+
 func removeSubtree(root string) (int, error) {
 	n := 0
 	walkErr := filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
@@ -753,13 +1226,23 @@ func validateSkillPaths(name, outputFile string) error {
 	return nil
 }
 
+// ValidateSkillPaths exposes the same path checks production scans apply before
+// staging a skill. Eval harnesses call this before invoking StageWorkspace.
+func ValidateSkillPaths(name, outputFile string) error {
+	return validateSkillPaths(name, outputFile)
+}
+
 // stageSkill writes the skill's files into dst so claude-code discovers them
-// at ./.claude/skills/{name}. Only SKILL.md and schema.json are reconstructed
-// from the DB; supplementary files (scripts/, references/, assets/) are
-// copied from SourcePath when the skill was loaded from disk.
+// at ./.claude/skills/{name}. SKILL.md and schema.json are reconstructed from
+// the DB; supplementary files (scripts/, references/, assets/) are copied
+// from SourcePath when the skill was loaded from disk.
 //
 // schema.json is also written to workRoot so the `./schema.json` path every
 // SKILL.md references resolves without the model having to glob for it (#221).
+//
+// stageSkill owns dst: it clears the directory before writing, so it must run
+// BEFORE stageContext, which writes context.json into dst as well as workRoot
+// (#499). Running it after would delete that copy.
 func stageSkill(skill *db.Skill, workRoot, dst string) error {
 	if err := os.RemoveAll(dst); err != nil {
 		return err
@@ -812,7 +1295,7 @@ func mirrorScripts(src, workRoot string) error {
 	if err := os.RemoveAll(dst); err != nil {
 		return err
 	}
-	return copyTree(srcScripts, dst)
+	return CopyTree(srcScripts, dst)
 }
 
 // renderSkillMD rebuilds a SKILL.md from the stored fields. The frontmatter
@@ -878,7 +1361,18 @@ func (w *Worker) metadataDir() string {
 	return w.MetadataDir
 }
 
-func stageContext(workRoot, apiBase, forkOrg, metadataDir string, scan *db.Scan, repo *db.Repository) error {
+func stageContext(workRoot, skillDir, apiBase, forkOrg, metadataDir string, scan *db.Scan, repo *db.Repository) error {
+	return stageContextWithInputs(workRoot, skillDir, apiBase, forkOrg, metadataDir, scan, repo, nil, nil, nil)
+}
+
+func stageContextWithInputs(
+	workRoot, skillDir, apiBase, forkOrg, metadataDir string,
+	scan *db.Scan,
+	repo *db.Repository,
+	recon *skillContextRecon,
+	novelty *skillContextNovelty,
+	controls *skillContextControls,
+) error {
 	if err := os.MkdirAll(workRoot, dirPerm); err != nil {
 		return err
 	}
@@ -899,6 +1393,31 @@ func stageContext(workRoot, apiBase, forkOrg, metadataDir string, scan *db.Scan,
 			MetadataDir: metadataDir,
 		},
 	}
+	config, err := repoconfig.Parse(repo.ScanConfig)
+	if err != nil {
+		return fmt.Errorf("parse repository scan config: %w", err)
+	}
+	if !config.Empty() {
+		ctx.Scrutineer.ScanConfig = &config
+	}
+	focusArea, err := scanFocusArea(scan)
+	if err != nil {
+		return fmt.Errorf("parse scan focus area: %w", err)
+	}
+	ctx.Scrutineer.FocusArea = focusArea
+	if scan.ExplorationMode != "" {
+		ctx.Scrutineer.Exploration = &skillContextExploration{Mode: scan.ExplorationMode, Path: scan.ExplorationPath}
+	}
+	ctx.Scrutineer.Recon = recon
+	ctx.Scrutineer.Novelty = novelty
+	ctx.Scrutineer.Controls = controls
+	if scan.SkillName == verifySkillName && scan.FindingID != nil {
+		feedback, err := verification.NormalizeFeedback(scan.VerificationFeedback)
+		if err != nil {
+			return err
+		}
+		ctx.Scrutineer.VerificationFeedback = feedback
+	}
 	if scan.SkillID != nil {
 		ctx.Scrutineer.SkillID = *scan.SkillID
 	}
@@ -914,33 +1433,189 @@ func stageContext(workRoot, apiBase, forkOrg, metadataDir string, scan *db.Scan,
 	if scan.SubPath != "" {
 		ctx.Scrutineer.ScanSubPath = scan.SubPath
 	}
+	if scan.ScanGroup != "" {
+		ctx.Scrutineer.ScanGroup = scan.ScanGroup
+	}
+	if scan.RescanMode == db.ScanRescanModeDiff {
+		rc := &skillContextRescan{
+			Mode:                db.ScanRescanModeDiff,
+			BaseCommit:          scan.DiffBaseCommit,
+			HeadCommit:          scan.Commit,
+			DiffFile:            "diff.patch",
+			ChangedFilesFile:    "changed_files.json",
+			CoverageMetadataKey: coverage.ReportMetadataKey,
+		}
+		if scan.DiffBaseScanID != nil {
+			rc.BaseScanID = *scan.DiffBaseScanID
+		}
+		if scan.DiffThreatModelScanID != nil {
+			rc.ThreatModelScanID = *scan.DiffThreatModelScanID
+			rc.OldThreatModelFile = "old_threat_model.json"
+		}
+		ctx.Scrutineer.Rescan = rc
+	}
 	b, err := json.MarshalIndent(ctx, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(workRoot, "context.json"), b, filePerm)
+	// stageContext owns context.json, so it writes every copy: workRoot for
+	// the workspace-relative path, and the skill directory so ./context.json
+	// resolves from there too. Writing both here is what removes stageSkill's
+	// read-back of workRoot/context.json (#499).
+	for _, dir := range []string{workRoot, skillDir} {
+		if dir == "" {
+			continue
+		}
+		if err := os.MkdirAll(dir, dirPerm); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "context.json"), b, filePerm); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // stageWorkspace writes everything other than ./src into the scan
-// workspace: context.json, the operator's threat-model override, the
-// skill bundle under .claude/skills/{name}/, and any import payload.
+// workspace: context.json, an optional recon context for threat-model, the
+// operator's threat-model override, the skill bundle under .claude/skills/{name}/,
+// and any import payload.
 // Pulled out of doSkill to keep that function under the gocognit
 // threshold; the error wrapping stays here so failures still name the
 // staging step.
-func (w *Worker) stageWorkspace(workRoot, skillDir string, scan *db.Scan, skill *db.Skill) error {
-	if err := stageContext(workRoot, w.APIBase, w.ForkOrg, w.metadataDir(), scan, &scan.Repository); err != nil {
+func (w *Worker) stageWorkspace(ctx context.Context, workRoot, skillDir string, scan *db.Scan, skill *db.Skill) error {
+	recon, err := w.reconContext(scan, skill)
+	if err != nil {
+		return err
+	}
+	novelty, err := w.noveltyContext(ctx, workRoot, scan, skill)
+	if err != nil {
+		return err
+	}
+	controls, err := w.controlsContext(scan, skill)
+	if err != nil {
+		return err
+	}
+	return stageWorkspaceWithInputs(
+		workRoot, skillDir, w.apiBaseFor(skill.Name), w.ForkOrg, w.metadataDir(), scan, skill, recon, novelty, controls,
+	)
+}
+
+// StageWorkspace writes the workspace side files shared by production skill
+// scans and evals: context.json, an optional threat-model override, the
+// rendered skill bundle, and optional import payloads. Production adds recon
+// context for threat-model in Worker.stageWorkspace.
+func StageWorkspace(workRoot, skillDir, apiBase, forkOrg, metadataDir string, scan *db.Scan, skill *db.Skill) error {
+	return stageWorkspaceWithInputs(workRoot, skillDir, apiBase, forkOrg, metadataDir, scan, skill, nil, nil, nil)
+}
+
+func stageWorkspaceWithInputs(
+	workRoot, skillDir, apiBase, forkOrg, metadataDir string,
+	scan *db.Scan,
+	skill *db.Skill,
+	recon *skillContextRecon,
+	novelty *skillContextNovelty,
+	controls *skillContextControls,
+) error {
+	// stageSkill clears skillDir, so it runs before stageContext, which
+	// writes context.json into that directory (#499).
+	if scan.ExplorationMode != "" {
+		return stageExploratoryWorkspace(workRoot, skillDir, apiBase, scan, skill)
+	}
+	if err := stageSkill(skill, workRoot, skillDir); err != nil {
+		return fmt.Errorf("stage skill: %w", err)
+	}
+	if err := stageContextWithInputs(
+		workRoot, skillDir, apiBase, forkOrg, metadataDir, scan, &scan.Repository, recon, novelty, controls,
+	); err != nil {
 		return fmt.Errorf("stage context: %w", err)
 	}
 	if err := stageThreatModel(workRoot, scan.SubPath, scan.Repository.ThreatModel); err != nil {
 		return fmt.Errorf("stage threat model: %w", err)
 	}
-	if err := stageSkill(skill, workRoot, skillDir); err != nil {
-		return fmt.Errorf("stage skill: %w", err)
-	}
 	if err := stageImportPayload(workRoot, scan.ImportPayload); err != nil {
 		return fmt.Errorf("stage import payload: %w", err)
 	}
 	return nil
+}
+
+func (w *Worker) reconContext(scan *db.Scan, skill *db.Skill) (*skillContextRecon, error) {
+	if skill.Name != threatModelSkillName {
+		return nil, nil
+	}
+	if scan.ScanGroup != "" {
+		reconScan, found, err := latestReconScan(w.reconScanQuery(scan).Where("scan_group = ?", scan.ScanGroup))
+		if err != nil {
+			return nil, fmt.Errorf("load grouped recon report: %w", err)
+		}
+		if found {
+			return w.parseReconContext(reconScan)
+		}
+	}
+	reconScan, found, err := latestReconScan(w.reconScanQuery(scan))
+	if err != nil {
+		return nil, fmt.Errorf("load recon report: %w", err)
+	}
+	if !found {
+		return nil, nil
+	}
+	return w.parseReconContext(reconScan)
+}
+
+func (w *Worker) reconScanQuery(scan *db.Scan) *gorm.DB {
+	return w.DB.Select("id, report, skill_id").
+		Where("repository_id = ? AND skill_name = ? AND status = ? AND sub_path = ? AND ref = ? AND report <> ''",
+			scan.RepositoryID, reconSkillName, db.ScanDone, scan.SubPath, scan.Ref)
+}
+
+func latestReconScan(query *gorm.DB) (db.Scan, bool, error) {
+	var scan db.Scan
+	err := query.Order("id DESC").First(&scan).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return db.Scan{}, false, nil
+	}
+	return scan, err == nil, err
+}
+
+func (w *Worker) parseReconContext(reconScan db.Scan) (*skillContextRecon, error) {
+	if reconScan.SkillID == nil {
+		w.Log.Warn("ignore recon report without skill", "scan", reconScan.ID)
+		return nil, nil
+	}
+	var reconSkill db.Skill
+	if err := w.DB.Select("schema_json").First(&reconSkill, *reconScan.SkillID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			w.Log.Warn("ignore recon report for missing skill", "scan", reconScan.ID, "skill", *reconScan.SkillID)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load recon schema: %w", err)
+	}
+	report, err := parseReconReport(reconSkill.Name, reconSkill.SchemaJSON, reconScan.Report)
+	if err != nil {
+		w.Log.Warn("ignore invalid recon report", "scan", reconScan.ID, "err", err)
+		return nil, nil
+	}
+	return report, nil
+}
+
+func parseReconReport(skillName, schema, raw string) (*skillContextRecon, error) {
+	if detail := ValidateSkillReport(skillName, schema, raw); detail != "" {
+		return nil, errors.New(detail)
+	}
+	var report skillContextRecon
+	if err := json.Unmarshal([]byte(raw), &report); err != nil {
+		return nil, err
+	}
+	configRaw, err := json.Marshal(repoconfig.Config{FocusAreas: report.FocusAreas})
+	if err != nil {
+		return nil, err
+	}
+	_, config, err := repoconfig.Normalise(string(configRaw))
+	if err != nil {
+		return nil, err
+	}
+	report.FocusAreas = config.FocusAreas
+	return &report, nil
 }
 
 // stageThreatModel writes the repository's operator-edited threat model to
@@ -972,7 +1647,7 @@ func copyAux(src, dst string) error {
 		if name == "SKILL.md" || name == "schema.json" {
 			continue
 		}
-		if err := copyTree(filepath.Join(src, name), filepath.Join(dst, name)); err != nil {
+		if err := CopyTree(filepath.Join(src, name), filepath.Join(dst, name)); err != nil {
 			return err
 		}
 	}

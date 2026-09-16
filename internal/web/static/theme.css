@@ -373,6 +373,15 @@ pre.log { background: var(--muted); padding: 1rem; border-radius: var(--radius);
           max-height: 60vh; overflow: auto; font-size: 0.8rem; white-space: pre-wrap; }
 .lucide:not([class*="size-"]) { width: 1em; height: 1em; vertical-align: -0.15em; }
 .table tbody tr:has(a) { cursor: pointer; }
+.table th a.th-sort { display: inline-flex; align-items: center; gap: 0.15rem;
+                      white-space: nowrap; color: inherit; }
+.table th a.th-sort:hover { color: var(--foreground); text-decoration: underline;
+                            text-underline-offset: 2px; }
+.th-sort-arrow { width: 0.9em; height: 0.9em; }
+/* Idle (unsorted) columns show a faded double chevron as a sort affordance;
+   it firms up on hover. The active column's solid chevron is full-strength. */
+.th-sort-idle { opacity: 0.4; }
+.table th a.th-sort:hover .th-sort-idle { opacity: 0.75; }
 
 /* ── prose (rendered markdown in finding fields) ── */
 .prose { font-size: 0.875rem; line-height: 1.625; max-width: 80ch; }
@@ -408,6 +417,23 @@ pre.skill-src { background: var(--muted); padding: 0.75rem; border-radius: var(-
                 overflow-x: auto; }
 pre.skill-src code { background: none; padding: 0; }
 
+/* ── chat ── */
+/* The conversation page fits the viewport instead of growing with the
+   transcript: only the message list scrolls, so the composer stays put rather
+   than being pushed below the fold. The subtracted heights mirror the layout
+   wrapper's own padding (p-4 md:p-6 xl:p-12) so the column ends exactly at the
+   viewport edge and the page itself never scrolls. */
+.chat-page { display: flex; flex-direction: column; height: calc(100dvh - 2rem); }
+/* Only the message list absorbs the leftover space; the crumbs, the heading,
+   the live activity and the composer keep their natural height. */
+.chat-page > :not(.chat-messages) { flex: none; }
+.chat-messages { flex: 1; min-height: 0; overflow-y: auto; }
+/* The activity pane shares that fixed part of the column, so it cannot claim
+   the 60vh pre.log takes elsewhere. */
+.chat-page pre.log { max-height: 10rem; }
+@media (min-width: 48rem) { .chat-page { height: calc(100dvh - 3rem); } }
+@media (min-width: 80rem) { .chat-page { height: calc(100dvh - 6rem); } }
+
 /* ── code browser ── */
 #blob { display: block; padding: 0.5rem 0; tab-size: 4; }
 .hl-line { padding-left: 3.5rem; position: relative; }
@@ -427,6 +453,28 @@ pre.skill-src code { background: none; padding: 0; }
   white-space: nowrap;
   border: 0;
 }
+
+/* ── warning alert (e.g. a stale runner image) ── */
+/* basecoat ships only neutral .alert and red .alert-destructive; this amber
+   variant reads as "heads up" without the alarm of destructive red. Use it
+   alongside .alert (class="alert alert-warning") so it inherits basecoat's grid
+   layout and only the colours change. The amber hue is fixed -- the palette has
+   no warning token -- but the surface and border mix toward the active theme so
+   it sits right in both light and dark. theme.css loads after basecoat, so these
+   equal-specificity rules win. */
+.alert-warning {
+  border-color: color-mix(in oklch, oklch(0.75 0.15 75) 55%, var(--border));
+  background-color: color-mix(in oklch, oklch(0.85 0.13 85) 18%, var(--card));
+  color: var(--card-foreground);
+}
+.alert-warning > svg { color: oklch(0.66 0.15 60); }
+
+/* ── copy-to-clipboard button ── */
+/* Holds two stacked lucide icons; app.js sets data-copied for ~1s after a copy,
+   which swaps the clipboard glyph for a green check as transient confirmation. */
+.copy-btn .copied-icon { display: none; }
+.copy-btn[data-copied] .copy-icon { display: none; }
+.copy-btn[data-copied] .copied-icon { display: inline-block; color: oklch(0.62 0.17 150); }
 
 /* ── reduced motion ── */
 @media (prefers-reduced-motion: reduce) {

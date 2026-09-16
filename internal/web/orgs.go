@@ -70,18 +70,20 @@ func (s *Server) orgsList(w http.ResponseWriter, r *http.Request) {
 			N     int
 		}
 		var counts []c
-		// LEFT JOIN scans so the COUNT only includes findings whose scan is
-		// the curated audit. Tool-scanner output (zizmor, semgrep) is shown
-		// per-repo in the Scanners tab, not in cross-org totals.
+		// LEFT JOIN scans so the COUNT only includes the findings the Findings
+		// tab shows — the LLM audits (security-deep-dive, vuln-scan) plus
+		// operator imports, via aliasedFindingsScanFilter. Tool-scanner output
+		// (zizmor, semgrep) is shown per-repo in the Scanners tab, not in
+		// cross-org totals.
 		s.DB.Raw(`
 			SELECT r.owner, COUNT(f.id) AS n
 			FROM repositories r
 			LEFT JOIN findings f ON f.repository_id = r.id
 			LEFT JOIN scans s ON s.id = f.scan_id
 			WHERE r.owner != ''
-			  AND (s.skill_name IS NULL OR s.skill_name = '' OR s.skill_name = ?)
+			  AND ` + aliasedFindingsScanFilter + `
 			GROUP BY r.owner
-		`, deepDiveSkillName).Scan(&counts)
+		`).Scan(&counts)
 		for _, x := range counts {
 			findingCounts[x.Owner] = x.N
 		}
@@ -100,32 +102,28 @@ func (s *Server) orgsList(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, row)
 	}
 
+	// Org rows are aggregated in memory (Repos/FindingsTotal are computed, not
+	// columns), so unlike the SQL indexes this sorts the slice and flips the
+	// comparator for direction via dirLess rather than an ORDER BY.
 	const nameSort = "name"
-	sortBy := r.URL.Query().Get("sort")
-	switch sortBy {
+	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
+	switch sortCol {
 	case "findings":
-		sortSlice(rows, func(a, b orgRow) bool { return a.FindingsTotal > b.FindingsTotal })
+		sortSlice(rows, dirLess(dir, "desc", func(a, b orgRow) bool { return a.FindingsTotal < b.FindingsTotal }))
 	case "repos":
-		sortSlice(rows, func(a, b orgRow) bool { return a.Repos > b.Repos })
-	case defaultSort:
-		sortSlice(rows, func(a, b orgRow) bool {
-			if a.LastActivity == nil {
-				return false
-			}
-			if b.LastActivity == nil {
-				return true
-			}
-			return a.LastActivity.After(*b.LastActivity)
-		})
+		sortSlice(rows, dirLess(dir, "desc", func(a, b orgRow) bool { return a.Repos < b.Repos }))
+	case "newest":
+		sortSlice(rows, dirLess(dir, "desc", orgActivityLess))
+	case nameSort:
+		sortSlice(rows, dirLess(dir, "asc", orgNameLess))
 	default:
-		sortBy = nameSort
-		sortSlice(rows, func(a, b orgRow) bool {
-			return strings.ToLower(a.Owner) < strings.ToLower(b.Owner)
-		})
+		sortCol, dir = nameSort, ""
+		sortSlice(rows, orgNameLess)
 	}
+	sort := joinSort(sortCol, dir)
 
 	s.render(w, r, "orgs.html", map[string]any{
-		"Orgs": rows, "Q": search, "Sort": sortBy,
+		"Orgs": rows, "Q": search, "Sort": sort,
 	})
 }
 
@@ -133,6 +131,34 @@ func (s *Server) orgsList(w http.ResponseWriter, r *http.Request) {
 // less)` without pulling sort.Slice's (i, j int) idiom into each case.
 func sortSlice[T any](s []T, less func(a, b T) bool) {
 	sort.Slice(s, func(i, j int) bool { return less(s[i], s[j]) })
+}
+
+// dirLess adapts an ascending comparator to the requested direction, applying
+// def when dir is unset. It is the in-memory counterpart to dirOr, which does
+// the same job for the SQL indexes' ORDER BY.
+func dirLess[T any](dir, def string, lessAsc func(a, b T) bool) func(a, b T) bool {
+	if dirOr(dir, def) == "desc" {
+		return func(a, b T) bool { return lessAsc(b, a) }
+	}
+	return lessAsc
+}
+
+// orgNameLess orders owners case-insensitively, ascending.
+func orgNameLess(a, b orgRow) bool {
+	return strings.ToLower(a.Owner) < strings.ToLower(b.Owner)
+}
+
+// orgActivityLess orders by last activity ascending (oldest first), with
+// never-active orgs sorting oldest. dirLess flips it to the newest-first
+// default the Last activity column and the "newest" preset show.
+func orgActivityLess(a, b orgRow) bool {
+	if a.LastActivity == nil {
+		return b.LastActivity != nil
+	}
+	if b.LastActivity == nil {
+		return false
+	}
+	return a.LastActivity.Before(*b.LastActivity)
 }
 
 func (s *Server) orgShow(w http.ResponseWriter, r *http.Request) {

@@ -94,6 +94,43 @@ func TestParseMinimal(t *testing.T) {
 	if f.SuggestedFix == "" {
 		t.Error("SuggestedFix empty, want patch")
 	}
+	// Extended bundle fields round-trip through the minimal parser.
+	if f.Commit != "c0ffee1" {
+		t.Errorf("Commit = %q, want c0ffee1", f.Commit)
+	}
+	if f.SubPath != "services/api" {
+		t.Errorf("SubPath = %q, want services/api", f.SubPath)
+	}
+	if f.Locations != "src/handlers/download.js:88\nsrc/handlers/legacy.js:12" {
+		t.Errorf("Locations = %q", f.Locations)
+	}
+	if f.VID != "VID-1111-2222-3333-4444-5555-6666" {
+		t.Errorf("VID = %q", f.VID)
+	}
+	if f.Reachability != "reachable" || f.QualityTier != "high" {
+		t.Errorf("Reachability/QualityTier = %q/%q, want reachable/high", f.Reachability, f.QualityTier)
+	}
+	if f.Boundary == "" || f.Validation == "" || f.PriorArt == "" || f.Reach == "" || f.Rating == "" {
+		t.Errorf("audit prose fields should be populated: %+v", f)
+	}
+	if f.FixCommit != "deadbeef" {
+		t.Errorf("FixCommit = %q, want deadbeef", f.FixCommit)
+	}
+}
+
+func TestParseMinimal_normalisesReachabilityAndTier(t *testing.T) {
+	body := []byte(`{"repository":"https://x/y","findings":[{"title":"t","reachability":"  Harness_Only ","quality_tier":"LOW"}]}`)
+	results, _, err := Parse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := results[0].Findings[0]
+	if f.Reachability != "harness_only" {
+		t.Errorf("Reachability = %q, want harness_only", f.Reachability)
+	}
+	if f.QualityTier != "low" {
+		t.Errorf("QualityTier = %q, want low", f.QualityTier)
+	}
 }
 
 func TestParseMinimalDefaultsTool(t *testing.T) {
@@ -131,6 +168,97 @@ func TestNormaliseSeverity(t *testing.T) {
 		if got := normaliseSeverity(tc.in); got != tc.want {
 			t.Errorf("normaliseSeverity(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestNormaliseModel(t *testing.T) {
+	long := strings.Repeat("a", maxModelLen)
+	cases := []struct{ in, want string }{
+		{"claude-opus-4-1", "claude-opus-4-1"},
+		{"anthropic/claude-sonnet-5", "anthropic/claude-sonnet-5"},
+		{"gpt-5.2", "gpt-5.2"},
+		{"provider@2026-01", "provider@2026-01"},
+		{"llama_3:70b+tuned", "llama_3:70b+tuned"},
+		// Built-in claude ids carry a bracketed context-window suffix.
+		{"claude-fable-5[1m]", "claude-fable-5[1m]"},
+		{"claude-fable-5-1[1m]", "claude-fable-5-1[1m]"},
+		{"[1m]", ""}, // leading bracket is still not an id
+		{" claude-opus-4-1 ", "claude-opus-4-1"},
+		{long, long},
+		{"", ""},
+		// Formula triggers (CWE-1236) and other non-id shapes are dropped,
+		// not stripped: a partial value would be fabricated attribution.
+		{"=1+1", ""},
+		{"+cmd", ""},
+		{"-2+3", ""},
+		{"@SUM(A1)", ""},
+		// Leading whitespace trims away before validation, so what is
+		// stored can never lead with a trigger character either way.
+		{"\tgpt-5", "gpt-5"},
+		{"\r=1+1", ""},
+		{"'quoted'", ""},
+		{"claude opus", ""},
+		{"model;drop", ""},
+		{long + "a", ""},
+	}
+	for _, tc := range cases {
+		if got := normaliseModel(tc.in); got != tc.want {
+			t.Errorf("normaliseModel(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestNormaliseTool(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"CodeQL", "CodeQL"},
+		{"GitHub Code Scanning", "GitHub Code Scanning"},
+		{"manual", "manual"},
+		{" Snyk ", "Snyk"},
+		{"", ""},
+		// Leading formula triggers, control characters, and unbounded
+		// length become "unknown", keeping the import marked as imported
+		// without carrying the hostile text.
+		{"=HYPERLINK(\"x\")", "unknown"},
+		{"+cmd", "unknown"},
+		{"-2+3", "unknown"},
+		{"@SUM(A1)", "unknown"},
+		{"code\tql", "unknown"},
+		{"code\x00ql", "unknown"},
+		{strings.Repeat("a", 101), "unknown"},
+	}
+	for _, tc := range cases {
+		if got := normaliseTool(tc.in); got != tc.want {
+			t.Errorf("normaliseTool(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestParse_guardsHostileTool pins the guard at the Parse choke point, so
+// every format's externally supplied producer name passes through it.
+func TestParse_guardsHostileTool(t *testing.T) {
+	body := []byte(`{"repository":"https://x/y","tool":"=1+1","findings":[{"title":"t","severity":"high"}]}`)
+	results, _, err := Parse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := results[0].Tool; got != "unknown" {
+		t.Errorf("Tool = %q, want unknown", got)
+	}
+}
+
+func TestParseMinimal_dropsInvalidModel(t *testing.T) {
+	body := []byte(`{"repository":"https://x/y","findings":[
+		{"title":"a","severity":"high","model":"=1+1"},
+		{"title":"b","severity":"high","model":"claude-opus-4-1"}]}`)
+	results, _, err := Parse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := results[0].Findings[0].Model; got != "" {
+		t.Errorf("hostile model = %q, want dropped", got)
+	}
+	if got := results[0].Findings[1].Model; got != "claude-opus-4-1" {
+		t.Errorf("valid model = %q, want claude-opus-4-1", got)
 	}
 }
 

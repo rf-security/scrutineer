@@ -39,13 +39,54 @@ The central entity. One row per git URL.
 | ecosystems_issues_fetched_at | datetime | When `ecosystems_issues_data` was last refreshed. TTL 7 days. |
 | ecosystems_dependents_data | text | Cached dependents, chained off the packages lookup (per-package top dependents, capped). |
 | ecosystems_dependents_fetched_at | datetime | When `ecosystems_dependents_data` was last refreshed. TTL 30 days. |
-| disclosure_channel | text | Preferred reporting vector (email, GHSA URL, registry owner handle, SECURITY.md URL). Written by `maintainers`/`cna-match`; analyst-editable. |
+| disclosure_channel | text | Preferred reporting vector (email, GHSA URL, registry owner handle, SECURITY.md URL). Written by `maintainers`/`cna-match`, or by the interchange import job from a peer's `route` record when this instance has none of its own, or when the value stored is that same feed's own unstamped hint and the peer has corrected it (suffixed with the peer feed so the provenance is visible, the way `cna-match` appends the CNA name); analyst-editable. |
+| disclosure_channel_at | datetime | When `disclosure_channel` last changed, and the `verified_at` of the interchange `route` record. Only moves on a real change, so an unchanged `maintainers` re-run does not republish the record. Null for channels written before this column existed, which keeps them off the feed rather than stamping an invented timestamp. |
+| federation_opt_out_at | datetime | Non-null means the maintainer asked federated instances neither to scan this repository nor to contact them. Blocks every scan enqueue, refuses the job at worker dispatch and on the resume paths, stops the scheduler before it makes any network call (no upstream mirror push, no remote HEAD lookup), withdraws the repository from the `route` and `certificate` feed records, and publishes an `optout` record on the public feed. Recording it also cancels the repository's queued, running and paused scans. Set from the repo page or by an `optout` record imported from a peer feed. |
+| federation_opt_out_reason | text | Optional reason the maintainer gave; it travels with the `optout` record. |
 | posture | text | Disclosure-readiness tier from the `posture` skill: `ready`, `partial`, `unprepared`. |
 | posture_summary | text | One-line explanation that goes with `posture`. |
+| health | text | Evidence-based maintenance classification: `active`, `stale`, `abandoned`, or `zombie`. Empty until metadata or maintainer evidence is available. A repository whose newest package release is more than eighteen months old is held at `stale`. |
 | fork | text | `owner/name` of the staging fork inside `-fork-org`. Written by the `fork` skill. |
 | clone_error | text | Last clone/fetch failure message; non-empty means the repo is currently unreachable. Cleared on next successful clone. |
 | disk_bytes | integer | Cached on-disk size of the persistent clone cache, so the repo list renders the disk badge from a column instead of walking each repo's cache per row. Refreshed by the worker after each scan and backfilled once at startup; 0 for local repos and remote repos not scanned since the column was added. |
 | threat_model | text | Operator's working-copy threat-model JSON. When set, the worker writes it to `./threat_model.json` in every skill workspace and `security-deep-dive` loads it instead of fetching the latest `threat-model` scan. Edited via the threat-model workbench tab. Empty = no override. |
+| scan_config | text | Analyst-authored YAML with `focus_areas`, `known_bugs`, `attack_surface`, and `skip` patterns. Validated by the repository editor, staged as `scrutineer.scan_config` in every skill workspace, and its `skip` patterns layer onto each skill's path-filter deny list. Empty = no repository-specific guidance. |
+| scan_schedule | text | Recurring-scan schedule: `daily`, `weekly`, or a cron expression. Empty inherits the global `scan_schedule` setting; `off` disables scheduling even when a global default is set. |
+| upstream_url | text | Upstream this repository is a pushed staging copy of (no forge fork relationship). When set, the scheduler force-syncs the repository from it (a mirror push that overwrites local-only commits) before the new-commit check. Empty for ordinary repos. |
+| next_scheduled_scan_at | datetime | Scheduler bookkeeping: when the next scheduled run is due. Null means "recompute on the next tick"; schedule edits reset it instead of computing inline. |
+| created_at | datetime | |
+| updated_at | datetime | Indexed for the repository list's default newest-first order. |
+
+## audit_events
+
+Append-only audit trail for lifecycle and future operator/system actions. It
+coexists with `finding_histories`, which remains the specialised per-field
+change history for findings. `payload` is JSON stored portably as text.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| kind | text | Event name, for example `scan.started`, `scan.finished`, `scan.failed`, `scan.cancelled`, or `scan.paused`. Indexed with `created_at` for chronological dashboards. |
+| subject_type | text | Polymorphic subject type, currently `scan`. Part of the timeline index with `subject_id`. |
+| subject_id | integer | ID of the subject row, for example `scans.id`. |
+| actor | text | Skill name when available, otherwise the scan kind. |
+| source | text | Existing provenance enum, currently `system` for worker lifecycle events. |
+| payload | text | JSON metadata. Scan events include stable execution metadata and terminal metrics, without duplicating reports or logs. |
+| created_at | datetime | |
+
+## package_alternatives
+
+Operator-curated migration targets for repositories classified as abandoned or
+zombie. The finding migration guide and dependent campaign tracking join on
+this table instead of reparsing notes or reports.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| repository_id | integer FK | Source repository this alternative applies to. |
+| p_url | text | Package URL of the fork, successor, or equivalent package. Unique with `repository_id` and `kind`. |
+| kind | text | One of `fork`, `successor`, or `equivalent`. |
+| note | text | Operator note explaining why this is a credible migration target. |
 | created_at | datetime | |
 | updated_at | datetime | |
 
@@ -57,22 +98,40 @@ One row per skill execution or external import. `skill_name` / `skill_version` p
 |--------|------|-------|
 | id | integer PK | |
 | repository_id | integer FK | References `repositories.id`. Cascade delete. |
-| kind | text | `skill` for native scans, `import` for findings ingested via `POST /api/v1/import`. |
-| status | text | `queued`, `paused`, `running`, `done`, `failed`, `cancelled`. Stale `running` rows are swept to `failed` on startup. |
+| kind | text | `skill` for native scans, `import` for findings ingested via `POST /api/v1/import`, `schedule` for the scheduler's skipped-run trace rows (never queued). |
+| status | text | `queued`, `paused`, `running`, `done`, `failed`, `skipped`, `cancelled`. Stale `running` rows are swept to `failed` on startup. `skipped` rows are written terminal by the scheduler when a due run decides not to enqueue (remote HEAD unchanged, scan in flight, ...); `error` carries the reason. |
 | status_priority | integer | Denormalised sort key for the scans index: 0 running, 1 queued, 2 paused, 3 terminal. |
 | model | text | Claude model ID resolved from the explicit scan model, skill model preference, or skill default model tier at enqueue time. |
 | effort | text | Claude `--effort` level (`low`–`max`) snapshotted from the runtime setting at enqueue. Empty on legacy rows; the runner falls back to its configured default. |
 | skill_id | integer FK | References `skills.id`. Null for legacy non-skill rows. |
 | skill_version | integer | Version of the skill at run time; the skill row's `version` bumps on every edit so older scans stay readable. |
+| skill_schema_version | integer | Snapshot of the skill frontmatter `metadata.scrutineer.version` at enqueue time. Used by the benchmark page to attribute expected-finding results to the report schema/version the skill was asked to emit. |
 | skill_name | text | Denormalised skill name for UI display. |
-| finding_id | integer FK | Set when the scan is finding-scoped (verify/patch/disclose/exposure). References `findings.id`. |
+| finding_id | integer FK | Set when the scan is finding-scoped (verify/critic/patch/disclose/exposure). References `findings.id`. |
 | dependent_id | integer FK | Set on `exposure` scans only. References `dependents.id`; identifies which downstream consumer the skill is auditing for reachability of the upstream finding. |
 | baseline_scan_id | integer FK | Set on a fix-validation scan (`POST /repositories/{id}/validate-fix`). References the baseline `scans.id` the fix ref is diffed against. Marks the scan as a validation anchor (the auto triage funnel skips it) and, when it finalises, drives the fingerprint diff written back to `report`. Null on ordinary scans. |
+| remediation_attempt_id | integer FK | Set on a `reattack` scan and pinned at enqueue time to the exact immutable `remediation_attempts.id` under test. Prevents a newer patch run from changing what an already queued re-attack validates. Null on every other scan. |
 | api_token | text | Per-scan bearer token that the skill presents when calling `/api`. Only valid while the scan is running. |
 | ref | text | Git ref to checkout after cloning. Empty means the default branch. |
 | skills_repo_sha | text | Commit of `-skills-repo` resolved at startup and stamped on every skill scan. Empty when `-skills-repo` is unset or for `import` scans. |
 | sub_path | text | Scopes code analysis to a sub-folder of the clone (monorepo packages). Empty means repo root. |
+| rescan_mode | text | `full` for ordinary scans, `diff` for scans that compare the current commit against a baseline. Requested diff scans can fall back to `full` when no baseline exists or the diff is too large. |
+| verification_feedback | text | Optional operator guidance for one finding-scoped `verify` run, limited to 4000 UTF-8 bytes. Snapshotted at enqueue, included in its recipe, and preserved by single and bulk retries. Not a verdict or a replacement for the finding's reproduction. |
+| diff_base_scan_id | integer FK | Baseline scan chosen for a diff rescan, or the caller-pinned baseline. References `scans.id`. Null for full scans and for diff requests that fall back before a baseline is resolved. |
+| diff_base_commit | text | Baseline commit used to generate `diff.patch` and `changed_files.json`. Empty for full scans. |
+| diff_threat_model_scan_id | integer FK | Prior `threat-model` scan staged as `old_threat_model.json` for a diff-aware run, when one is available. |
+| diff_stats | text | JSON metadata for the generated diff: base/head commits, changed-file count, patch size, file statuses, staged file names, and limits. |
+| coverage | text | JSON coverage metadata. Diff scans record requested versus actual mode and fallback reasons; threat-model scans also record whether the repository working model was updated or skipped for a small diff. |
+| scan_group | text | Groups a cohort of scans launched as one batch (Scan-all-subprojects, a single New-scan run, or a Diff rescan group). Each sibling streams a finding to `POST /repositories/{id}/findings` the moment it confirms it and reads `GET /repositories/{id}/findings?scan_group=...` before reporting, so an in-flight skill sees what a sibling has filed so far — not only after that sibling finishes — and can avoid re-filing it. Empty when not part of a batch. |
+| focus_area | text | Normalized JSON snapshot of the input-processing focus area assigned to a split `security-deep-dive`. It keeps queued work reproducible if repository `scan_config` changes. Empty means the scan is unscoped and covers its normal repository or subproject scope. |
+| triage_scan_id | integer | Nullable ID of the triage scan that requested the pipeline child. Preserved through threat-model fan-out and retries; used to bound automatic exploration to one extra audit per triage invocation. |
+| exploration_mode | text | Empty for ordinary scans; `random-dig` for an independent source audit without threat-model context. Its callback token only permits validating its own report. Exploratory scans cannot serve as diff baselines. |
+| exploration_path | text | Repository-relative source directory chosen after path filtering, or `.` for root-level source. Persisted before the agent starts and preserved on retries. Empty until selection occurs. |
 | profile | text | Runner profile that ran the scan (e.g. `php`). Empty = the default runner image. Set explicitly via `?profile=` or auto-detected from the clone by `brief` before launch; persisted so retries reuse the choice. |
+| backend | text | Agent CLI (`-backend`) that ran the scan: `claude`, `codex`, `opencode`, or `copilot`. Stamped by the worker so a retry after switching `-backend` starts fresh instead of passing one harness's session id to another's resume command. Empty on rows predating the column or that never reached the runner. |
+| provider | text | Provider prefix selected from an OpenCode model id, such as `groq` or `kiro`. Empty for other backends. |
+| runner_image | text | Provider base image selected for the scan, before the language profile is layered on it. |
+| runner_image_digest | text | Locally resolved registry digest, or immutable local image id when the provider image has no registry digest. |
 | commit | text | Git HEAD at scan time. |
 | started_at | datetime | |
 | finished_at | datetime | |
@@ -85,9 +144,26 @@ One row per skill execution or external import. `skill_name` / `skill_version` p
 | max_turns_hit | boolean | True when the scan is `done` with partial output because Claude hit the configured max-turns cap. Such scans keep their session id so Retry can resume. |
 | prompt | text | Activation prompt sent to claude. The skill body lives in the Skill row, not here. |
 | report | text | The skill's primary output. JSON for parsed kinds, freeform for everything else. On a fix-validation anchor (`baseline_scan_id` set) it is replaced, once the scan finalises, by the JSON validation report: the resolved/surviving/new fingerprint diff against the baseline plus the finding-scoped verify verdicts. |
+| refusal_audit | text | Structured post-report `security-deep-dive` follow-up listing analysis the agent declined or skipped. Kept separate from the primary report. |
+| refusal_audit_warning | boolean | Denormalized flag set when `refusal_audit` reports a refusal or one or more skipped paths; used to flag incomplete coverage in scan lists. |
 | log | text | Line-by-line transcript of the scan. Streamed to the UI via SSE. |
 | error | text | Error message if the scan failed. |
 | findings_count | integer | Denormalised count of findings parsed from the report. |
+| created_at | datetime | |
+| updated_at | datetime | |
+
+## expected_findings
+
+Operator-supplied benchmark targets for a repository. Each row is a known file/CWE pair that model-backed scans should rediscover. Matching ignores line numbers, treats CWE case-insensitively, and currently compares Medium+ findings for benchmark metrics.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| repository_id | integer FK | References `repositories.id`. Cascade delete. Part of the unique key with `file` and `cwe`. |
+| file | text | Repository-root-relative path, without line number. Absolute paths and parent-directory traversal are rejected by the write path. Part of the unique key with `repository_id` and `cwe`. |
+| cwe | text | Normalised CWE identifier, e.g. `CWE-79`. Part of the unique key with `repository_id` and `file`. |
+| cve | text | Optional external CVE identifier for operator context. Not used for matching. |
+| note | text | Optional free-text note explaining the expected target. |
 | created_at | datetime | |
 | updated_at | datetime | |
 
@@ -107,15 +183,16 @@ One row per installed skill. Loaded from `skills/` directories on disk or the UI
 | body | text | Markdown body after the frontmatter. The prompt. |
 | schema_json | text | Optional schema.json contents. |
 | output_file | text | Relative path the skill writes to. Promoted from metadata. |
-| output_kind | text | Parser key: `findings`, `maintainers`, `packages`, `advisories`, `dependents`, `dependencies`, `finding_dedup`, `repo_metadata`, `repo_overview`, `subprojects`, `posture`, `verify`, `patch`, `threat_model`, `exposure`, `freeform`. Promoted from metadata. |
+| output_kind | text | Parser key: `findings`, `maintainers`, `packages`, `advisories`, `dependencies`, `finding_dedup`, `repo_metadata`, `repo_overview`, `subprojects`, `posture`, `verify`, `critic`, `patch`, `reattack`, `threat_model`, `exposure`, `freeform`. Promoted from metadata. |
 | version | integer | Bumps on every save. |
 | active | boolean | |
-| requires_remote | boolean | When true, scrutineer refuses to enqueue this skill against a local-directory repository (file:// URL). Set via `scrutineer.requires_remote: true` in SKILL.md frontmatter. Use for skills that depend on a forge URL or remote-only data (advisories, dependents, exposure, fork, maintainers, metadata, packages, report-upstream). |
+| requires_remote | boolean | When true, scrutineer refuses to enqueue this skill against a local-directory repository (file:// URL). Set via `scrutineer.requires_remote: true` in SKILL.md frontmatter. Use for skills that depend on a forge URL or remote-only data (advisories, exposure, fork, maintainers, metadata, packages, report-upstream). |
+| recurse_submodules | boolean | When true, remote scans initialize recursive depth-one Git submodules before the skill runs. Set via `scrutineer.recurse_submodules: true` in SKILL.md frontmatter. |
 | requires_profile | text | Constrains the skill to a single registered runner profile (e.g. `php`). Empty means no constraint. Set via `scrutineer.requires_profile` in SKILL.md frontmatter. Enqueue returns 400 when the requested profile mismatches; the worker fails the scan when auto-detection resolves to a different profile. |
 | paths | text | Newline-joined shell-glob allow-list from `scrutineer.paths`. When non-empty, the skill sees only matching files inside the workspace `src/` and the builtin skip list is bypassed. |
 | ignore_paths | text | Newline-joined shell-glob deny-list from `scrutineer.ignore_paths`. Always layered on top of the active include set. |
-| source | text | `local`, `remote`, or `ui`. |
-| source_path | text | Directory on disk (for local/remote). Empty for UI-created. |
+| source | text | `bundled`, `local`, `remote`, or `ui`. |
+| source_path | text | Directory on disk (for bundled/local/remote). Empty for UI-created. |
 | source_hash | text | sha256 of SKILL.md + schema.json. Used by the loader to detect changes. |
 | created_at | datetime | |
 | updated_at | datetime | |
@@ -131,16 +208,19 @@ One row per vulnerability. Lifecycle columns are mutated through `db.WriteFindin
 | repository_id | integer FK | Denormalised from scan so list queries skip the join. |
 | commit | text | Denormalised from scan. |
 | sub_path | text | Denormalised from scan; sub-folder the finding's `location` is relative to. |
+| model | text | Model that first produced the finding, denormalised from the producing scan. For bundle imports it is the exporting instance's producing model. Deterministic imports (SARIF, CSV, markdown) record no model — their synchronous import scan carries none — while the queued `ingest` skill fallback records its own ingest model. Backfilled on startup; empty when the producing scan recorded no model. |
 | fingerprint | text | Content hash for cross-scan dedupe; `(repository_id, fingerprint)` is indexed. |
 | last_seen_scan_id | integer | Most recent scan that re-observed this fingerprint. |
 | last_seen_commit | text | Commit at re-observation. |
 | seen_count | integer | Total times re-observed across rescans. |
-| missed_count | integer | Consecutive same-skill rescans where the fingerprint did not reappear; reset on next re-observation. Non-zero is a hint the issue may be fixed upstream. |
+| missed_count | integer | Consecutive same-skill full-repo rescans where the fingerprint did not reappear; reset on next re-observation. Focus-area scans never increment it — they only look at their own slice, so a miss there is not evidence of anything. Non-zero is a hint the issue may be fixed upstream. |
 | last_missed_scan_id | integer | Scan where it most recently went missing. |
 | finding_id | text | ID within the originating report, e.g. `F1`. |
 | sinks | text | Comma-joined sink IDs. Links to the threat model tab. |
 | title | text | |
 | severity | text | `Critical`, `High`, `Medium`, `Low`. |
+| severity_caps | text | Newline-delimited deterministic reasons that cap the current severity. Written from host-reconciled verification controls and typed, evidence-backed attacker prerequisites. |
+| severity_calibration_incomplete | boolean | True when an unknown severity, unknown or not-attempted prerequisite, unresolved control assessment, or unavailable control resolution prevented complete calibration. Unknown inputs never lower severity. |
 | confidence | text | `high`, `medium`, `low`; how certain the audit is. |
 | status | text | Lifecycle state: `new`, `enriched`, `triaged`, `ready`, `reported`, `acknowledged`, `fixed`, `published`, `rejected`, `duplicate`. |
 | cwe | text | e.g. `CWE-352`. Tooltips come from the embedded MITRE catalogue. |
@@ -164,6 +244,9 @@ One row per vulnerability. Lifecycle columns are mutated through `db.WriteFindin
 | released_at | datetime | When the release was published upstream. Together with `release_tag` and `release_url`, these close the gap between fix-landed and fix-shipped for the metrics in dora-metrics. |
 | resolution | text | `fix`, `migrate`, `workaround`, `adopt`, `wontfix`. |
 | disclosure_draft | text | Draft advisory text. |
+| suggested_recipients | text | File-level owners for the finding's `location`: CODEOWNERS entries or, absent those, recent non-bot committers. Comma-joined free text with provenance. Usually produced by the `disclose` skill, but also editable via the finding form and the PATCH API. |
+| federation_claim_contacts | text | Peers that answered the outbound claim-check with a match when this finding was about to be reported, comma-joined as `<peer> (<contact>)`. Non-empty means the attempt was refused so the analyst coordinates first, and is itself the acknowledgement: the next attempt goes through. Cleared by any status change, so a claim never outlives the transition it was recorded for. See [interchange.md](interchange.md). |
+| federation_claim_at | datetime | When that claim-check ran. Cleared with `federation_claim_contacts`. |
 | assignee | text | Free-text. |
 | suggested_fix | text | Unified diff from the `patch` skill that passed the applicability gate. Empty when no patch run or the gate rejected it. |
 | suggested_fix_commit | text | Sha the suggested_fix applies cleanly against. |
@@ -173,13 +256,18 @@ One row per vulnerability. Lifecycle columns are mutated through `db.WriteFindin
 | exploited_in_wild_evidence | text | Free-text source note: researcher, ticket link, traffic observation. |
 | mitigation | text | Markdown body from the `mitigate` skill: workarounds consumers can apply before the fix ships, plus detection guidance. |
 | mitigation_semgrep | text | Optional YAML semgrep rule from the same skill that flags the vulnerable pattern. Empty when no rule was warranted. |
+| production_viability | text | Cached latest critic verdict: `VIABLE`, `NON_VIABLE`, `SAMPLE_OR_TEST`, or `CONDITIONAL_VIABLE`. Indexed for finding-list filters. Empty before the first critic assessment; the immutable source record lives in `finding_attack_paths`. |
 | last_revalidate_verdict | text | Cached latest verdict from the `revalidate` skill (`true_positive`, `false_positive`, `already_fixed`, `uncertain`). Indexed so the audit queue can filter without scanning `finding_notes`. Empty when revalidate has not run on this finding. |
+| novelty | text | Upstream novelty state from the bounded host-side history check and revalidate classification: `unfixed`, `fixed`, `unclear`, or `not_checked`. Indexed; empty before a novelty check has run. |
+| novelty_checked_commit | text | Repository HEAD compared with the finding's scanned commit by the latest novelty check. |
+| novelty_checked_at | datetime | When the latest novelty check ran. Null before the first check. |
 | trace | text | Step 1 prose. Markdown. |
 | boundary | text | Step 2. |
 | validation | text | Step 3: reproduction. |
 | prior_art | text | Step 4. |
 | reach | text | Step 5: dependent exposure. |
 | rating | text | Step 6: severity justification. |
+| dup_check | text | The audit agent's one-sentence rationale for why this finding is distinct from siblings already filed under the same `scan_group`: which it compared against and why this is not a duplicate. The dedup judge weighs it alongside fingerprint matching. Empty for skills that do not emit it. |
 | created_at | datetime | |
 | updated_at | datetime | |
 
@@ -212,7 +300,8 @@ Timestamped internal notes on a finding. Replaced the old `findings.notes` colum
 
 Structured human verdicts on a finding, mirroring the revalidate skill's
 enum so reviewer agreement with the model is computable. Populated by the
-`/audit` page and `POST /findings/{id}/reviews`. The audit queue excludes
+`/audit` page and its browser-only `POST /findings/{id}/reviews` form. The
+scan-token API can list reviews but cannot create them. The audit queue excludes
 findings that already have a row here.
 
 | Column | Type | Notes |
@@ -223,6 +312,64 @@ findings that already have a row here.
 | reason | text | Free-text justification. |
 | automated_outcome | text | Snapshot of the automation verdict (typically the latest revalidate verdict) at review time. Empty when no automation has spoken. |
 | reviewer | text | Optional free-text reviewer identity. |
+| created_at | datetime | |
+
+## finding_verifications
+
+Append-only grading records produced by finding-scoped `verify` scans. The complete rubric report remains immutable in `report`; `status` and `score` are promoted for display and filtering. The finding page derives its current verification result from the newest row rather than overwriting prior runs. Current reports also contain a non-scored control-bypass gate whose IDs and optional resolution-failure reason are checked against the context resolved by the host for that finding, plus typed severity prerequisites used by deterministic calibration rules.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| finding_id | integer FK | References `findings.id`; cascade delete. Unique with `scan_id`. |
+| scan_id | integer | The verify scan that produced this record. Unique with `finding_id`. |
+| status | text | `confirmed`, `fixed`, `inconclusive`, `deferred`, or `not_attempted`. |
+| score | real, nullable | Fraction of the five rubric criteria that passed, from `0.0` to `1.0`. Null for legacy pre-rubric reports and reports that remain internally inconsistent after repair. |
+| report | text | Complete structured JSON report, including the attack-tree goal, evidenced path nodes, reachability verdict, concrete blockers, typed severity prerequisites, three attempts, five scored criteria, and per-control bypass assessments. Reports written before attack-tree, control-bypass or prerequisite support remain readable. |
+| created_at | datetime | |
+
+## finding_attack_paths
+
+Append-only release-build assessments produced by finding-scoped `critic` scans. The full attack-path report remains immutable in `report`; the newest row's `production_viability` is projected onto `findings.production_viability` for list filtering and external-reporting gates. An exact `NON_VIABLE` projection blocks the `disclose`, `public-issue`, and `report-upstream` paths, while all other values remain visible for analyst judgment.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| finding_id | integer FK | References `findings.id`; cascade delete. Unique with `scan_id`. |
+| scan_id | integer | The critic scan that produced this record. Unique with `finding_id`. |
+| production_viability | text | `VIABLE`, `NON_VIABLE`, `SAMPLE_OR_TEST`, or `CONDITIONAL_VIABLE`. Moved or missing source cannot by itself justify `NON_VIABLE`. |
+| report | text | Complete structured JSON report, including source state, reason, counterevidence, attacker position, preconditions, impact, likelihood, applied adjustments, and facts that would change the result. |
+| created_at | datetime | |
+
+## remediation_attempts
+
+Append-only patch attempts produced when a finding-scoped `patch` report passes the host-side applicability gate. `findings.suggested_fix` and `suggested_fix_commit` are only convenient projections of the newest row; this table is the remediation history and is never overwritten by a later proposal.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| finding_id | integer FK | References `findings.id`; cascade delete. Unique with `attempt`. |
+| patch_scan_id | integer | Scan whose gated report produced this diff. Unique, making parser retries idempotent. |
+| attempt | integer | Monotonic number scoped to the finding. |
+| patch | text | Exact unified diff that passed the applicability gate. |
+| base_commit | text | Exact Git commit against which the patch applies. |
+| created_at | datetime | |
+
+## remediation_validations
+
+Append-only root-cause re-attack results. A validation belongs to one immutable patch attempt and stores the complete variant/control report. The current patch status is derived from the newest validation for the newest attempt; only `failed_to_bypass` with at least three distinct valid generated variants and a passing benign control derives `verified_secure`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| finding_id | integer FK | References `findings.id`; cascade delete. |
+| remediation_attempt_id | integer FK | Exact `remediation_attempts.id` tested. Unique with `scan_id`. |
+| scan_id | integer | Re-attack scan that produced this record. Unique with `remediation_attempt_id`. |
+| root_cause_status | text | `failed_to_bypass`, `bypassed_patch`, or `inconclusive`. |
+| valid_variants | integer | Number of distinct, valid, newly generated root-cause variants exercised. Prior bypass inputs are replayed but do not satisfy the three-variant minimum. |
+| benign_control_passed | boolean | True only when a benign input reaches the original sink without crashing. |
+| bypass_input | text | Exact first same-class, same-sink bypass input, otherwise empty. Later patch runs receive prior bypasses as regression inputs. |
+| report | text | Complete structured JSON report containing every variant and the benign control. |
 | created_at | datetime | |
 
 ## finding_communications
@@ -243,13 +390,15 @@ External interactions about a finding: emails, GHSA submissions, issue replies, 
 
 ## finding_references
 
-External URLs related to a finding.
+External URLs related to a finding. One URL is one row per finding, enforced by the unique index `idx_finding_ref_url` on `(finding_id, url)`. `AddFindingReference` reuses the existing row for a URL, so a later write carrying non-empty tags or a summary replaces what is stored rather than adding a row. Last non-empty write wins; an empty field on the incoming write leaves the stored one untouched. Whitespace is trimmed off all three fields before the lookup, so the same URL written with stray padding finds the row it already has.
+
+Databases written before the index existed are repaired on the next start: `preMigrate` collapses each `(finding_id, url)` group onto its lowest id, moves any tags and summary that only the removed rows carried onto the survivor, trims stored whitespace, then deletes any row left with no URL at all. It creates the index over what remains in the same transaction, so a failure anywhere in the repair leaves the table exactly as it was rather than short of rows the index was meant to justify removing. The pass is skipped once the index is present.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | integer PK | |
-| finding_id | integer FK | Cascade delete. |
-| url | text | |
+| finding_id | integer FK | Cascade delete. Part of the unique index. |
+| url | text | Part of the unique index. Stored trimmed. |
 | tags | text | Comma-joined: `issue`, `pr`, `cve`, `ghsa`, `patch`, `advisory`, `discussion`, `article`. |
 | summary | text | |
 | created_at | datetime | |
@@ -311,11 +460,12 @@ Registry entries from the `packages` skill. Replaced each run.
 | latest_release_at | datetime | |
 | dependent_packages_url | text | ecosyste.ms API URL for fetching dependents. |
 | metadata | text | Full upstream JSON for this package. |
+| risk_flags | text | Comma-joined supply-chain hygiene flags from the packages skill: `single_maintainer`, `no_security_policy`, `native_extension`, `stale_release`, `maintainer_domain_expired`. Each flag's evidence sentence stays in the scan report. The flags are advisory and do not move `health`. |
 | created_at | datetime | |
 
 ## dependents
 
-Top runtime dependents of this repository's packages. Populated by the `dependents` skill.
+Top runtime dependents of this repository's packages. Populated by the ecosystems dependents prefetch.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -345,6 +495,9 @@ One row per (finding, dependent) pair the `exposure` skill has audited. Status m
 | rationale | text | One-paragraph explanation written by the skill, rendered in the finding page's per-dependent table. |
 | scan_id | integer FK | Exposure scan that wrote this row. |
 | scan_commit | text | HEAD of the dependent's clone when the verdict was made; lets the operator tell whether a later rescan would still apply. |
+| campaign_status | text | Operator-managed migration outreach state: `notified`, `acked`, `migrated`, `declined`, or `silent`. Empty means outreach has not started. |
+| campaign_note | text | Operator note about the downstream migration conversation or outcome. |
+| campaign_updated_at | datetime | When campaign status or note last changed. Null until outreach is recorded. |
 | created_at | datetime | |
 | updated_at | datetime | |
 
@@ -366,6 +519,22 @@ Known security advisories from the `advisories` skill. Replaced each run.
 | packages | text | Comma-joined affected package names. |
 | published_at | datetime | |
 | withdrawn_at | datetime | Non-null if the advisory was withdrawn. |
+| created_at | datetime | |
+
+## advisory_audits
+
+Fix-audit verdicts from the `advisory-deep-dive` skill: for each published advisory, whether its advertised fix still holds at the audited commit. One row per advisory per run; the newest row per `(repository_id, advisory_uuid)` is authoritative. Keyed by advisory UUID rather than `advisories.id` because the `advisories` skill replaces its rows wholesale each run, which would orphan a foreign key.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| repository_id | integer FK | |
+| scan_id | integer FK | The `advisory-deep-dive` scan that produced the verdict. |
+| advisory_uuid | text | The audited advisory's `advisories.uuid`. |
+| status | text | `fixed`, `bypass`, `variant`, or `regressed`. `fixed` backs a public certificate; the others each open one or more findings. |
+| evidence | text | Standalone prose describing what was reproduced (or failed to reproduce) and at which commit. Published verbatim in the certificate for `fixed`. |
+| finding_ids | text | Comma-joined `findings.id` values this verdict opened. Empty for `fixed`. |
+| commit | text | The audited commit, denormalized from the scan. |
 | created_at | datetime | |
 
 ## maintainers
@@ -422,6 +591,7 @@ User-uploaded CycloneDX or SPDX documents. Packages are replaced wholesale on re
 | spec_version | text | e.g. `1.5`. |
 | raw | blob | The original document bytes. |
 | package_count | integer | Denormalised count of components. |
+| import_pending | boolean | True for a newly parsed upload until the operator confirms repository resolution. Legacy and confirmed uploads are false. |
 | created_at | datetime | |
 | updated_at | datetime | |
 
@@ -465,6 +635,51 @@ CVE Numbering Authorities from the public cve.org partner list. Used by the `cna
 | fetched_at | datetime | When the CNA list was last refreshed. |
 | created_at | datetime | |
 | updated_at | datetime | |
+
+## conversations
+
+Persisted chat sessions. Each is a conversation with the agent about a repository or, when `finding_id` is set, one of its findings. The agent runs against a copy of the clone (taken from the shared per-URL cache on the first turn and reused afterwards, so the whole conversation reasons about one revision) plus a snapshot of the repository's findings. It is told to only read and search; on the claude harness that is also enforced with `--allowedTools Read,Grep,Glob`, on codex and opencode the container is the enforcement boundary, exactly as for scans. `session_id`/`backend` let a follow-up turn resume the harness conversation with full history via `--resume`; when that session is gone the turn restarts fresh with the transcript replayed into the prompt. Browser-only surface (chat tabs on the repository and finding pages); not exposed on the scan-token or `/v1` API.
+
+A conversation is deleted from its own page (`POST /conversations/{id}/delete`) or with its repository. Either path drops the `chat_messages` rows explicitly and reclaims the on-disk workspace (the clone copy plus the harness state dir) after the commit. The per-conversation delete is refused while a turn is in flight, since the agent is still reading the clone it would remove.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| repository_id | integer FK | A finding-scoped conversation still carries the finding's repository so repo cleanup reaches it; the repository-delete handler removes the rows explicitly. |
+| finding_id | integer, nullable | Set for a per-finding chat; null for a repo-wide chat. No FK: the row is reached through `repository_id` on cleanup. |
+| title | text | One-line label derived from the first user message. |
+| model | text | Model the turns run under, snapshotted at creation. |
+| backend | text | Harness that owns `session_id` (e.g. `claude`); a turn only reuses the id while the running harness matches. |
+| session_id | text | Harness session the last turn belonged to; the next turn resumes it. Empty until the first turn completes. |
+| created_at | datetime | |
+| updated_at | datetime | Bumped on each new message so recency ordering reflects the latest turn. |
+
+## chat_messages
+
+One turn in a `conversations` row: a user prompt or the assistant's reply.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| conversation_id | integer FK | Cascade delete. |
+| role | text | `user` or `assistant`. |
+| content | text | Rendered message text; for an assistant message, the accumulated streamed response. |
+| created_at | datetime | |
+
+## interchange_records
+
+Federation records imported from peer feeds by the import job, stored verbatim so re-validating or re-applying one never depends on how the running version of scrutineer happened to interpret it. Unique per `(feed, predicate_type, subject_digest)`: a peer refreshing a record replaces its own row, while two peers publishing conflicting verdicts for the same subject each keep theirs instead of one silently winning. Nothing this instance publishes is stored here; the export job derives every outgoing record from `repositories` and `advisory_audits` on each run. See [interchange.md](interchange.md).
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| feed | text | The peer feed's git remote, part of the unique key. |
+| predicate_type | text | The record's in-toto `predicateType`, e.g. `.../interchange/optout/v1`. |
+| subject_digest | text | The record's subject sha256: the salted finding hash for a `claim`, sha256 of the canonical repository URL for an `optout` or `route`, sha256 of repository plus advisory id for a `certificate`. |
+| record | text | The raw in-toto statement as published. |
+| applied_at | datetime | When the import last acted on this record, or established there was nothing local to act on. Null re-opens it on the next pass, and a changed `record` clears it, so a peer's correction is re-applied and an `optout` published before its repository was imported here still lands once that repository exists. An unchanged record keeps its stamp, which is what stops the hourly pass reinstating what an operator deliberately cleared. |
+| applied_repository_id | integer | The `repositories` row `applied_at` was written against, 0 for the kinds that act on nothing local (`certificate`, `claim`). Deleting that repository clears both columns, so a still-standing `optout` lands again on the row a re-added repository gets instead of staying closed against a row that no longer exists. |
+| received_at | datetime | When the import job last read this record. |
 
 ## goqite
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"scrutineer/internal/config"
@@ -86,6 +87,14 @@ func (s *Server) settingsShow(w http.ResponseWriter, r *http.Request) {
 	s.DB.Raw("SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&dbPath)
 
 	meta := s.toolMetadataCached(r.Context())
+	// Overlay the boot-time staleness verdict onto the (separately cached)
+	// version metadata. This is the verdict from the startup check; it is not
+	// re-probed per request, so it reflects the runner image as of boot.
+	if st := s.runnerImageStatus(); st.Stale {
+		meta.Stale = true
+		meta.StaleDays = st.AgeDays
+		meta.PullCommand = st.PullCommand
+	}
 
 	// ConcurrencyInput pre-fills the form with the persisted value when set,
 	// else the value the runner is actually using now. MaxTurns is 0 when
@@ -95,6 +104,7 @@ func (s *Server) settingsShow(w http.ResponseWriter, r *http.Request) {
 	if v := db.SettingInt(s.DB, db.SettingConcurrency); v > 0 {
 		concurrencyInput = v
 	}
+	scanSchedule, _ := db.GetSetting(s.DB, db.SettingScanSchedule)
 
 	s.render(w, r, "settings.html", map[string]any{
 		"Themes":           config.Themes,
@@ -108,32 +118,72 @@ func (s *Server) settingsShow(w http.ResponseWriter, r *http.Request) {
 		"ConcurrencyInput": concurrencyInput,
 		"MaxTurns":         db.SettingInt(s.DB, db.SettingDefaultMaxTurns),
 		"DefaultMaxTurns":  worker.DefaultSkillMaxTurns,
+		"ScanSchedule":     scanSchedule,
 		"Stats":            stats,
 		"DBSize":           dbSizeBytes,
 		"DBPath":           dbPath,
 		"WorkDir":          s.Worker.DataDir,
-		"Commit":           s.Commit,
+		"Version":          s.Version,
 		"Meta":             meta,
 	})
 }
 
 // toolMetadata is the runtime version info shown on the settings page:
-// the scanner tools baked into the runner image plus the host docker
-// daemon and the runner image name itself.
+// the scanner tools baked into the runner image plus the host container
+// runtime version and the runner image name itself.
 type toolMetadata struct {
 	worker.RunnerToolVersions
-	Docker      string
+	// Backend is the active -backend name (e.g. "claude", "codex"), used
+	// as the label for the Harness version row.
+	Backend     string
+	Runtime     string
 	RunnerImage string
+	// Revision is the git commit the runner image was built from (its
+	// org.opencontainers.image.revision label), folded into the displayed image
+	// reference so the settings page names an actual build. "" when the image
+	// carries no such label.
+	Revision string
+	// Staleness of the runner image, from the boot-time check (issue #337).
+	// Overlaid onto the cached metadata per request; the verdict itself is the
+	// one computed at startup and is not refreshed for the process lifetime.
+	Stale       bool
+	StaleDays   int
+	PullCommand string
+}
+
+// shortSHALen is how many leading hex chars of a commit to show -- enough to be
+// unambiguous in practice without spilling the truncated metadata row.
+const shortSHALen = 12
+
+// RunnerImageRef is the runner image annotated with the git commit it was built
+// from, e.g. "ghcr.io/.../scrutineer-runner @ abc123def456", for the settings
+// "Runner image" row. The rolling ":latest" tag says nothing about which build
+// is running, so it's dropped in favour of the commit. Falls back to the bare
+// image reference when the revision label is absent.
+func (m toolMetadata) RunnerImageRef() string {
+	if m.Revision == "" {
+		return m.RunnerImage
+	}
+	rev := m.Revision
+	if len(rev) > shortSHALen {
+		rev = rev[:shortSHALen]
+	}
+	return strings.TrimSuffix(m.RunnerImage, ":latest") + " @ " + rev
 }
 
 // toolMetadataTTL bounds how long a gathered version set is reused. Versions
-// only change when the operator pulls a new image or restarts docker, so a
-// generous TTL keeps the settings page DB-fast without going stale for long.
+// only change when the operator pulls a new image or restarts the runtime, so
+// a generous TTL keeps the settings page DB-fast without going stale for long.
 const toolMetadataTTL = 5 * time.Minute
 
-// toolMetadataTimeout caps the docker shell-outs so a hung or missing daemon
-// degrades to "unavailable" instead of stalling the settings page.
-const toolMetadataTimeout = 5 * time.Second
+// toolMetadataTimeout caps EACH runtime shell-out (not a shared budget across
+// them) so a hung or missing daemon degrades to "unavailable" instead of
+// stalling the settings page. It is generous enough for Apple's container
+// runtime, whose first `container run` cold-starts a VM and can take several
+// seconds: a shorter shared budget let that slow tool-version probe expire the
+// deadline before the fast `container --version` runtime probe even ran, so the
+// whole panel read "unavailable".
+const toolMetadataTimeout = 15 * time.Second
 
 func (s *Server) toolMetadataCached(ctx context.Context) toolMetadata {
 	s.toolMetaMu.Lock()
@@ -141,13 +191,25 @@ func (s *Server) toolMetadataCached(ctx context.Context) toolMetadata {
 	if time.Now().Before(s.toolMetaTTL) {
 		return s.toolMetaCache
 	}
-	ctx, cancel := context.WithTimeout(ctx, toolMetadataTimeout)
-	defer cancel()
+	rt := worker.RuntimeOf(s.Worker.Runner)
 	image := worker.RunnerImageName(s.Worker.Runner)
+	// Each probe gets its own deadline so the slow tool-version `container run`
+	// cannot starve the fast runtime-version `container --version`.
+	toolsCtx, toolsCancel := context.WithTimeout(ctx, toolMetadataTimeout)
+	defer toolsCancel()
+	h, _ := worker.HarnessByName(s.Backend)
+	tools := worker.QueryRunnerToolVersions(toolsCtx, rt, image, h.Binary())
+
+	rtCtx, rtCancel := context.WithTimeout(ctx, toolMetadataTimeout)
+	defer rtCancel()
+	runtimeVer := worker.RuntimeServerVersion(rtCtx, rt)
+
 	meta := toolMetadata{
-		RunnerToolVersions: worker.QueryRunnerToolVersions(ctx, image),
-		Docker:             worker.DockerServerVersion(ctx),
+		RunnerToolVersions: tools,
+		Backend:            s.Backend,
+		Runtime:            runtimeVer,
 		RunnerImage:        image,
+		Revision:           worker.RunnerImageRevision(ctx, rt, image),
 	}
 	s.toolMetaCache = meta
 	s.toolMetaTTL = time.Now().Add(toolMetadataTTL)
@@ -235,8 +297,8 @@ func (s *Server) settingsUpdateConcurrency(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "could not save setting", http.StatusInternalServerError)
 		return
 	}
-	if n == s.Queue.Concurrency() {
-		setFlash(w, Flash{Category: successKey, Title: "Concurrency saved"})
+	if eff := s.Queue.EffectiveConcurrency(n); eff == s.Queue.Concurrency() {
+		setFlash(w, Flash{Category: successKey, Title: "Concurrency saved", Description: cappedConcurrencyNote(n, eff)})
 		s.redirect(w, r, "/settings")
 		return
 	}
@@ -248,7 +310,7 @@ func (s *Server) settingsUpdateConcurrency(w http.ResponseWriter, r *http.Reques
 	s.DB.Model(&db.Scan{}).Where("status = ?", db.ScanRunning).Count(&running)
 	if running == 0 {
 		s.Queue.Reconfigure(n)
-		setFlash(w, Flash{Category: successKey, Title: "Concurrency applied", Description: fmt.Sprintf("Runner now runs %d scans in parallel.", n)})
+		setFlash(w, Flash{Category: successKey, Title: "Concurrency applied", Description: fmt.Sprintf("Runner now runs %d scans in parallel.", s.Queue.Concurrency())})
 		s.redirect(w, r, "/settings")
 		return
 	}
@@ -261,6 +323,16 @@ func (s *Server) settingsUpdateConcurrency(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+// cappedConcurrencyNote explains a saved value the queue will not apply, so a
+// setting that stays inert (Codex account auth pins the runner at one slot)
+// does not read as a silent failure. Empty when nothing was capped.
+func cappedConcurrencyNote(requested, effective int) string {
+	if requested <= effective {
+		return ""
+	}
+	return fmt.Sprintf("Runner stays at %d: a shared backend credential caps parallel scans.", effective)
+}
+
 // settingsRestartRunner rebuilds the runner at the saved concurrency, applying
 // it live. In-flight scans are cancelled by the swap; queued scans survive.
 func (s *Server) settingsRestartRunner(w http.ResponseWriter, r *http.Request) {
@@ -268,8 +340,43 @@ func (s *Server) settingsRestartRunner(w http.ResponseWriter, r *http.Request) {
 	if n <= 0 {
 		n = s.Queue.Concurrency()
 	}
+	if eff := s.Queue.EffectiveConcurrency(n); eff < n && eff == s.Queue.Concurrency() {
+		setFlash(w, Flash{Category: successKey, Title: "Runner unchanged", Description: cappedConcurrencyNote(n, eff)})
+		s.redirect(w, r, "/settings")
+		return
+	}
 	s.Queue.Reconfigure(n)
-	setFlash(w, Flash{Category: successKey, Title: "Runner restarted", Description: fmt.Sprintf("Now running %d scans in parallel; in-flight scans were cancelled.", n)})
+	setFlash(w, Flash{Category: successKey, Title: "Runner restarted", Description: fmt.Sprintf("Now running %d scans in parallel; in-flight scans were cancelled.", s.Queue.Concurrency())})
+	s.redirect(w, r, "/settings")
+}
+
+// settingsUpdateScanSchedule saves the global default scan schedule.
+// "off" normalises to empty: with nothing to inherit from, a disabled
+// global and an unset one are the same thing. Inheriting repositories get
+// their NextScheduledScanAt reset so the next tick recomputes it.
+func (s *Server) settingsUpdateScanSchedule(w http.ResponseWriter, r *http.Request) {
+	schedule := strings.TrimSpace(r.FormValue("scan_schedule"))
+	if schedule == "custom" {
+		schedule = strings.TrimSpace(r.FormValue("scan_schedule_cron"))
+	}
+	if schedule == ScheduleOff {
+		schedule = ""
+	}
+	if schedule != "" {
+		if _, err := ScheduleNext(schedule, time.Now()); err != nil {
+			http.Error(w, "invalid schedule: "+err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+	}
+	if err := db.SetSetting(s.DB, db.SettingScanSchedule, schedule); err != nil {
+		http.Error(w, "could not save setting", http.StatusInternalServerError)
+		return
+	}
+	if err := s.DB.Model(&db.Repository{}).Where("scan_schedule = '' OR scan_schedule IS NULL").
+		UpdateColumn("next_scheduled_scan_at", nil).Error; err != nil {
+		s.Log.Error("reset inherited schedules", "err", err)
+	}
+	setFlash(w, Flash{Category: successKey, Title: "Default scan schedule updated"})
 	s.redirect(w, r, "/settings")
 }
 

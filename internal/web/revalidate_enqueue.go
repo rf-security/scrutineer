@@ -7,9 +7,14 @@ import (
 )
 
 // revalidateSkillName is the cheap finding classifier auto-enqueued for
-// High/Critical findings from security-deep-dive and for every finding
-// created via the /v1/import path. See skills/revalidate/SKILL.md.
+// High/Critical findings from the LLM audits (security-deep-dive, vuln-scan)
+// and for every finding created via the /v1/import path.
+// See skills/revalidate/SKILL.md.
 const revalidateSkillName = "revalidate"
+
+// criticSkillName is the release-build viability assessment chained after a
+// true-positive revalidate verdict.
+const criticSkillName = "critic"
 
 // verifySkillName is shared with server.go: the heavier
 // reproduction-running checker chained after revalidate when a
@@ -17,12 +22,15 @@ const revalidateSkillName = "revalidate"
 
 // autoEnqueueRevalidate is wired onto Worker.OnFindingCreated. The worker
 // calls it after persisting each fresh Finding row from a findings-emitting
-// scan. We only act for High/Critical findings produced by
-// security-deep-dive: smaller scanners (semgrep, zizmor) and finding-scoped
-// re-runs go straight to a human, and lower severities are not worth the
-// model spend at this stage of the funnel. Re-running deep-dive on the same
-// repo bumps the existing finding's seen_count rather than creating a new
-// one, so we never enqueue against an observed-again row.
+// scan. We only act for High/Critical findings produced by the curated LLM
+// audits (security-deep-dive, vuln-scan): smaller scanners (semgrep, zizmor)
+// and finding-scoped re-runs go straight to a human, and lower severities are
+// not worth the model spend at this stage of the funnel. vuln-scan is the
+// high-recall skill, so its High/Critical output needs the cheap revalidate
+// pre-sort most — without it those candidates would sit untriaged in the same
+// queue as triaged deep-dive rows. Re-running an audit on the same repo bumps
+// the existing finding's seen_count rather than creating a new one, so we
+// never enqueue against an observed-again row.
 //
 // Errors are logged and swallowed: failing to enqueue the pre-sort step
 // must never fail the upstream scan.
@@ -34,13 +42,13 @@ func (s *Server) autoEnqueueRevalidate(scan *db.Scan, f *db.Finding) {
 	// ref only to diff fingerprints; feeding its findings back into the
 	// revalidate -> verify funnel would double the spend and race the
 	// finding-scoped verify the pipeline already enqueued against that ref.
-	if scan.SkillName != deepDiveSkillName || scan.BaselineScanID != nil {
+	if !isLLMAuditSkill(scan.SkillName) || scan.BaselineScanID != nil {
 		return
 	}
 	if !db.SeverityAtLeast(f.Severity, "High") {
 		return
 	}
-	s.enqueueRevalidateForFinding(context.Background(), f)
+	s.enqueueRevalidateForFinding(context.Background(), f, scan.Profile)
 }
 
 // enqueueRevalidateForFinding looks up the active revalidate skill and
@@ -49,41 +57,35 @@ func (s *Server) autoEnqueueRevalidate(scan *db.Scan, f *db.Finding) {
 // rather than failing the upstream scan. A revalidate run already queued
 // or in flight for this finding is also a no-op so re-imports and rescans
 // do not pile up duplicate work.
-func (s *Server) enqueueRevalidateForFinding(ctx context.Context, f *db.Finding) {
+//
+// profile carries the parent scan's resolved runner profile onto the derived
+// scan so it skips DetectProfile (a container-spawning `brief` run) and
+// reproduces on the same image the finding came from. Empty means detect
+// fresh — the import path passes "" because there is no parent scan. See #548.
+func (s *Server) enqueueRevalidateForFinding(ctx context.Context, f *db.Finding, profile string) {
 	var skill db.Skill
 	if err := s.DB.Where("name = ? AND active = ?", revalidateSkillName, true).First(&skill).Error; err != nil {
 		return
 	}
-	if s.hasOpenRevalidate(f.ID, skill.ID) {
-		return
-	}
-	fid := f.ID
-	if _, err := s.enqueueSkillWith(ctx, f.RepositoryID, skill.ID, ScanOpts{FindingID: &fid}); err != nil {
+	if err := s.enqueueFindingScopedSkillIfIdle(ctx, f.RepositoryID, f.ID, skill.ID, ScanOpts{Profile: profile}); err != nil {
 		s.Log.Warn("auto-enqueue revalidate",
 			"finding", f.ID, "repo", f.RepositoryID, "skill", revalidateSkillName, "err", err)
 	}
-}
-
-// hasOpenRevalidate returns true when a queued or running revalidate scan
-// already exists for the finding. Avoids piling duplicate work onto the
-// queue when the same finding is observed by both an import and a rescan,
-// or when two findings parsers race in tests.
-func (s *Server) hasOpenRevalidate(findingID, skillID uint) bool {
-	return s.hasOpenFindingScopedScan(findingID, skillID)
 }
 
 func (s *Server) hasOpenFindingScopedScan(findingID, skillID uint) bool {
 	return s.hasOpenScan("finding_id = ? AND skill_id = ?", findingID, skillID)
 }
 
-// hasOpenScan reports whether a queued or running scan matching the given
-// scope predicate already exists. Shared by the finding-scoped and
-// repo-scoped open-scan guards so the "open" definition (queued or running)
-// lives in one place.
+// hasOpenScan reports whether an in-flight scan matching the given scope
+// predicate already exists. Shared by the finding-scoped, repo-scoped and
+// batch-cohort guards so the "open" definition lives in one place, and it is
+// inFlightScanStatuses(): a paused scan has not finished and will resume, so
+// every one of these guards wants to treat it as still open.
 func (s *Server) hasOpenScan(scope string, args ...any) bool {
 	var n int64
 	if err := s.DB.Model(&db.Scan{}).
-		Where("status IN ?", []db.ScanStatus{db.ScanQueued, db.ScanRunning}).
+		Where("status IN ?", inFlightScanStatuses()).
 		Where(scope, args...).
 		Count(&n).Error; err != nil {
 		return false
@@ -92,41 +94,59 @@ func (s *Server) hasOpenScan(scope string, args ...any) bool {
 }
 
 // autoChainVerifyAfterRevalidate is wired onto Worker.OnRevalidateVerdict.
-// The cheap revalidate pass acts as the gate for the expensive verify
-// step: a finding the model has just judged a real bug at High or
-// Critical severity is worth running the reproduction against. Anything
-// revalidate downgraded, called noise, or could not decide stays off the
-// queue. Severity is read post-adjustment so a Critical revalidate marks
-// down to Medium correctly stops the chain.
+// Every true positive gets the static release-viability critic. The expensive
+// reproduction-running verify remains limited to High/Critical findings.
+// These chains are independent: an absent critic does not suppress verify.
 //
 // Errors are logged and swallowed; failing to chain verify must not
 // roll back the revalidate verdict.
-func (s *Server) autoChainVerifyAfterRevalidate(_ *db.Scan, f *db.Finding, verdict, severity string) {
+func (s *Server) autoChainVerifyAfterRevalidate(scan *db.Scan, f *db.Finding, verdict, severity string) {
 	if f == nil {
 		return
 	}
 	if verdict != "true_positive" {
 		return
 	}
-	if !db.SeverityAtLeast(severity, "High") {
+	// Carry the revalidate scan's resolved profile so verify reproduces on the
+	// same image (an ASan crash needs the ruby-ext interpreter, not a
+	// re-detected guess) and skips a redundant DetectProfile container spawn.
+	// scan is never nil in production (the worker passes the revalidate scan);
+	// nil-safe for direct callers. See #548.
+	var profile string
+	if scan != nil {
+		profile = scan.Profile
+	}
+	ctx := context.Background()
+	s.enqueueCriticForFinding(ctx, f, profile)
+	if db.SeverityAtLeast(severity, "High") {
+		s.enqueueVerifyForFinding(ctx, f, profile)
+	}
+}
+
+// enqueueCriticForFinding looks up the active critic skill and enqueues one
+// finding-scoped assessment. Missing or inactive critic installations retain
+// the previous revalidate -> verify behavior.
+func (s *Server) enqueueCriticForFinding(ctx context.Context, f *db.Finding, profile string) {
+	var skill db.Skill
+	if err := s.DB.Where("name = ? AND active = ?", criticSkillName, true).First(&skill).Error; err != nil {
 		return
 	}
-	s.enqueueVerifyForFinding(context.Background(), f)
+	if err := s.enqueueFindingScopedSkillIfIdle(ctx, f.RepositoryID, f.ID, skill.ID, ScanOpts{Profile: profile}); err != nil {
+		s.Log.Warn("auto-chain critic after revalidate",
+			"finding", f.ID, "repo", f.RepositoryID, "skill", criticSkillName, "err", err)
+	}
 }
 
 // enqueueVerifyForFinding looks up the active verify skill and enqueues a
 // finding-scoped run, with the same absent-skill, already-queued, and
-// log-but-do-not-fail behaviour as the revalidate enqueue.
-func (s *Server) enqueueVerifyForFinding(ctx context.Context, f *db.Finding) {
+// log-but-do-not-fail behaviour as the revalidate enqueue. profile carries
+// the parent scan's resolved runner profile; empty means detect fresh.
+func (s *Server) enqueueVerifyForFinding(ctx context.Context, f *db.Finding, profile string) {
 	var skill db.Skill
 	if err := s.DB.Where("name = ? AND active = ?", verifySkillName, true).First(&skill).Error; err != nil {
 		return
 	}
-	if s.hasOpenFindingScopedScan(f.ID, skill.ID) {
-		return
-	}
-	fid := f.ID
-	if _, err := s.enqueueSkillWith(ctx, f.RepositoryID, skill.ID, ScanOpts{FindingID: &fid}); err != nil {
+	if err := s.enqueueFindingScopedSkillIfIdle(ctx, f.RepositoryID, f.ID, skill.ID, ScanOpts{Profile: profile}); err != nil {
 		s.Log.Warn("auto-chain verify after revalidate",
 			"finding", f.ID, "repo", f.RepositoryID, "skill", verifySkillName, "err", err)
 	}

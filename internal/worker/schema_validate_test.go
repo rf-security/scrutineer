@@ -113,6 +113,10 @@ type sequenceRunner struct {
 	jobs    []SkillJob
 }
 
+func (*sequenceRunner) SkillDir(workRoot, name string) string {
+	return ClaudeHarness{}.SkillDir(workRoot, name)
+}
+
 func (r *sequenceRunner) RunSkill(_ context.Context, sj SkillJob, emit func(Event)) (SkillResult, error) {
 	r.jobs = append(r.jobs, sj)
 	emit(Event{Kind: KindText, Text: "running skill " + sj.Name})
@@ -167,14 +171,14 @@ func TestParseSkillOutput_schemaWarnAndContinue(t *testing.T) {
 	// posture parser only decodes tier+summary and ignores unknown keys.
 	report := `{"tier":"ready","summary":"ok","extra":1}`
 	var events []Event
-	err := w.parseSkillOutput(skill, scan, report, func(e Event) { events = append(events, e) })
+	err := w.parseSkillOutput(context.Background(), skill, scan, report, func(e Event) { events = append(events, e) })
 	if err != nil {
 		t.Fatalf("warn mode should not return error: %v", err)
 	}
 
 	var sawSchemaErr, sawParserSuccess bool
 	for _, e := range events {
-		if e.Kind == KindError && strings.Contains(e.Text, "schema:") {
+		if e.Kind == KindError && strings.Contains(e.Text, "validation:") {
 			sawSchemaErr = true
 		}
 		if strings.Contains(e.Text, "posture: ready") {
@@ -244,7 +248,7 @@ func TestDoSkill_schemaMismatchResumesForRepair(t *testing.T) {
 	if got.Report != `{"tier":"ready","summary":"fixed"}` {
 		t.Errorf("Report = %q, want repaired report", got.Report)
 	}
-	if !strings.Contains(got.Log, "report.json failed validation; asking claude to repair it") {
+	if !strings.Contains(got.Log, "report.json failed validation; asking the agent to repair it") {
 		t.Errorf("Log should mention repair attempt, got %q", got.Log)
 	}
 	if got.CostUSD != 1.50 {
@@ -284,14 +288,14 @@ func TestDoSkill_schemaRepairStillInvalidFailsStrict(t *testing.T) {
 	if got.Report != `{"tier":{"x":1}}` {
 		t.Errorf("Report = %q, want original report after invalid repair", got.Report)
 	}
-	if !strings.Contains(got.Error, "schema validation") {
-		t.Errorf("Error = %q, want schema validation error", got.Error)
+	if !strings.Contains(got.Error, "report validation") {
+		t.Errorf("Error = %q, want report validation error", got.Error)
 	}
 	if len(runner.jobs) != 2 {
 		t.Errorf("RunSkill calls = %d, want 2", len(runner.jobs))
 	}
-	if count := strings.Count(got.Log, "does not validate against schema.json"); count != 1 {
-		t.Errorf("schema validation detail logged %d times, want 1; log:\n%s", count, got.Log)
+	if count := strings.Count(got.Log, "does not pass Scrutineer report validation"); count != 1 {
+		t.Errorf("report validation detail logged %d times, want 1; log:\n%s", count, got.Log)
 	}
 }
 
@@ -321,8 +325,8 @@ func TestDoSkill_schemaRepairErrorFallsBackInWarnMode(t *testing.T) {
 	if !strings.Contains(got.Log, "repair attempt for report.json failed: cli flake; parsing original output") {
 		t.Errorf("Log should mention best-effort repair failure, got %q", got.Log)
 	}
-	if count := strings.Count(got.Log, "does not validate against schema.json"); count != 1 {
-		t.Errorf("schema validation detail logged %d times, want 1; log:\n%s", count, got.Log)
+	if count := strings.Count(got.Log, "does not pass Scrutineer report validation"); count != 1 {
+		t.Errorf("report validation detail logged %d times, want 1; log:\n%s", count, got.Log)
 	}
 
 	var repo db.Repository
@@ -337,7 +341,7 @@ func TestParseSkillOutput_schemaStrictFails(t *testing.T) {
 
 	report := `{"tier":{"x":1}}`
 	var events []Event
-	err := w.parseSkillOutput(skill, scan, report, func(e Event) { events = append(events, e) })
+	err := w.parseSkillOutput(context.Background(), skill, scan, report, func(e Event) { events = append(events, e) })
 
 	var sve *SchemaValidationError
 	if !errors.As(err, &sve) {
@@ -362,13 +366,13 @@ func TestParseSkillOutput_schemaMessageUsesOutputFile(t *testing.T) {
 	skill.OutputFile = "custom-output.json"
 
 	var events []Event
-	err := w.parseSkillOutput(skill, scan, `{"tier":"ready","summary":"ok","extra":1}`, func(e Event) { events = append(events, e) })
+	err := w.parseSkillOutput(context.Background(), skill, scan, `{"tier":"ready","summary":"ok","extra":1}`, func(e Event) { events = append(events, e) })
 	if err != nil {
 		t.Fatalf("warn mode should not fail on schema mismatch: %v", err)
 	}
 	for _, e := range events {
-		if e.Kind == KindError && strings.Contains(e.Text, "schema:") {
-			if !strings.Contains(e.Text, "custom-output.json does not validate against schema.json") {
+		if e.Kind == KindError && strings.Contains(e.Text, "validation:") {
+			if !strings.Contains(e.Text, "custom-output.json does not pass Scrutineer report validation") {
 				t.Errorf("schema message should use output file, got %q", e.Text)
 			}
 			return
@@ -381,7 +385,7 @@ func TestParseSkillOutput_schemaStrictPassesThrough(t *testing.T) {
 	w, skill, scan := newSchemaTestWorker(t, true)
 
 	report := `{"tier":"partial","summary":"ok"}`
-	if err := w.parseSkillOutput(skill, scan, report, func(Event) {}); err != nil {
+	if err := w.parseSkillOutput(context.Background(), skill, scan, report, func(Event) {}); err != nil {
 		t.Fatalf("valid report should not error in strict mode: %v", err)
 	}
 	var repo db.Repository
@@ -429,8 +433,8 @@ func TestWrap_schemaStrictKeepsReportOnFailure(t *testing.T) {
 	if got.Report != report {
 		t.Errorf("Report = %q, want preserved %q", got.Report, report)
 	}
-	if !strings.Contains(got.Error, "schema validation") {
-		t.Errorf("Error = %q, want mention of schema validation", got.Error)
+	if !strings.Contains(got.Error, "report validation") {
+		t.Errorf("Error = %q, want mention of report validation", got.Error)
 	}
 }
 
@@ -438,7 +442,7 @@ func TestParseSkillOutput_noSchemaSkipsValidation(t *testing.T) {
 	w, skill, scan := newSchemaTestWorker(t, true)
 	skill.SchemaJSON = ""
 
-	if err := w.parseSkillOutput(skill, scan, `{"tier":"ready"}`, func(Event) {}); err != nil {
+	if err := w.parseSkillOutput(context.Background(), skill, scan, `{"tier":"ready"}`, func(Event) {}); err != nil {
 		t.Fatalf("no schema should skip validation: %v", err)
 	}
 }

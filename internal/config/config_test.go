@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -41,22 +43,39 @@ func TestLoad_explicitMissingPathIsError(t *testing.T) {
 	}
 }
 
+func TestLoad_identityPlugins(t *testing.T) {
+	c, err := Load(write(t, `
+identity_plugins:
+  - 1p
+  - provider-b
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"1p", "provider-b"}
+	if !slices.Equal(c.IdentityPlugins, want) {
+		t.Errorf("identity_plugins = %v, want %v", c.IdentityPlugins, want)
+	}
+}
+
 func TestLoad_parsesFields(t *testing.T) {
 	path := write(t, `
 addr: 0.0.0.0:9000
 data: /var/lib/scrutineer
 effort: medium
-default_model: claude-sonnet-4-6
+default_model: claude-sonnet-5
 models:
-  - name: Sonnet
-    id:   claude-sonnet-4-6
+  - name: Sonnet 5
+    id:   claude-sonnet-5
+    tier: mid
   - name: Opus
-    id:   claude-opus-4-6
+    id:   claude-opus-4-8
 skills:
   - ./skills
   - /srv/skills
 skills_repo: https://github.com/org/skills
-no_docker: true
+backend: codex
+no_container: true
 hardened: true
 runner_image: custom-runner
 egress_allow:
@@ -68,22 +87,34 @@ scan_timeout: 30m
 max_turns: 200
 fork_org: fork-central
 metadata_dir: .ossprey/
+vince:
+  base_url: https://kb.cert.example
+  api_key: secret-token
+  reporter:
+    name: Alice Researcher
+    organization: Example Security
+    email: alice@example.com
+    phone: "+44 20 7946 0958"
+    pgp_key: https://example.com/alice.asc
 `)
 	c, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Addr != "0.0.0.0:9000" || c.DefaultModel != "claude-sonnet-4-6" {
+	if c.Addr != "0.0.0.0:9000" || c.DefaultModel != "claude-sonnet-5" {
 		t.Errorf("flat fields: %+v", c)
 	}
-	if len(c.Models) != 2 || c.Models[0].Name != "Sonnet" {
+	if len(c.Models) != 2 || c.Models[0].Name != "Sonnet 5" || c.Models[0].Tier != "mid" || c.Models[1].Tier != "" {
 		t.Errorf("models: %+v", c.Models)
 	}
 	if len(c.Skills) != 2 {
 		t.Errorf("skills: %+v", c.Skills)
 	}
-	if c.NoDocker == nil || !*c.NoDocker {
-		t.Errorf("no_docker: %v", c.NoDocker)
+	if c.Backend != "codex" {
+		t.Errorf("backend: %q, want codex", c.Backend)
+	}
+	if c.NoContainer == nil || !*c.NoContainer {
+		t.Errorf("no_container: %v", c.NoContainer)
 	}
 	if c.Hardened == nil || !*c.Hardened {
 		t.Errorf("hardened: %v", c.Hardened)
@@ -105,6 +136,265 @@ metadata_dir: .ossprey/
 	}
 	if c.MetadataDir != ".ossprey/" {
 		t.Errorf("metadata_dir=%q, want .ossprey/", c.MetadataDir)
+	}
+	if c.VINCE.BaseURL != "https://kb.cert.example" || c.VINCE.APIKey != "secret-token" {
+		t.Errorf("vince endpoint config: %+v", c.VINCE)
+	}
+	if c.VINCE.Reporter.Name != "Alice Researcher" ||
+		c.VINCE.Reporter.Organization != "Example Security" ||
+		c.VINCE.Reporter.Email != "alice@example.com" ||
+		c.VINCE.Reporter.Phone != "+44 20 7946 0958" ||
+		c.VINCE.Reporter.PGPKey != "https://example.com/alice.asc" {
+		t.Errorf("vince reporter config: %+v", c.VINCE.Reporter)
+	}
+}
+
+func TestLoad_codexAuthFile(t *testing.T) {
+	c, err := Load(write(t, `
+codex:
+  auth_file: /var/lib/scrutineer/codex-rubygems/auth.json
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Codex.AuthFile != "/var/lib/scrutineer/codex-rubygems/auth.json" {
+		t.Errorf("codex.auth_file: %q", c.Codex.AuthFile)
+	}
+}
+
+func TestLoad_parsesOpencodeProviders(t *testing.T) {
+	c, err := Load(write(t, `
+opencode:
+  providers:
+    groq:
+      api_key_env: GROQ_API_KEY
+      egress_allow:
+        - api.groq.com
+    ollama:
+      config_file: ./opencode/ollama.json
+      host_port: 11434
+    kiro:
+      runner_image: registry.example/kiro@sha256:abc
+      config_file: ./opencode/kiro.json
+      pass_env:
+        - KIRO_API_KEY
+      required_binaries:
+        - kiro-cli
+      egress_allow:
+        - q.us-east-1.amazonaws.com
+      state_dir: /var/lib/scrutineer/opencode/kiro
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Opencode.Providers["groq"]; got.APIKeyEnv != "GROQ_API_KEY" || !slices.Equal(got.EgressAllow, []string{"api.groq.com"}) {
+		t.Errorf("opencode groq provider: %+v", got)
+	}
+	if got := c.Opencode.Providers["ollama"]; got.HostPort != 11434 || len(got.EgressAllow) != 0 {
+		t.Errorf("opencode ollama provider: %+v", got)
+	}
+	if got := c.Opencode.Providers["kiro"]; got.RunnerImage == "" || got.ConfigFile != "./opencode/kiro.json" ||
+		!slices.Equal(got.PassEnv, []string{"KIRO_API_KEY"}) || !slices.Equal(got.RequiredBinaries, []string{"kiro-cli"}) || got.StateDir == "" {
+		t.Errorf("opencode kiro provider: %+v", got)
+	}
+}
+
+func TestLoad_rejectsInvalidOpencodeProviders(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "provider id",
+			yaml: "opencode:\n  providers:\n    'bad/provider': {}\n",
+			want: "invalid provider id",
+		},
+		{
+			name: "api key env",
+			yaml: "opencode:\n  providers:\n    groq:\n      api_key_env: 'BAD=VALUE'\n",
+			want: "invalid environment variable",
+		},
+		{
+			name: "reserved env",
+			yaml: "opencode:\n  providers:\n    groq:\n      pass_env: [HTTPS_PROXY]\n",
+			want: "managed by scrutineer",
+		},
+		{
+			name: "harness safety env",
+			yaml: "opencode:\n  providers:\n    groq:\n      pass_env: [OPENCODE_DISABLE_AUTOUPDATE]\n",
+			want: "managed by scrutineer",
+		},
+		{
+			name: "state and inline key",
+			yaml: "opencode:\n  providers:\n    xai:\n      api_key_env: XAI_API_KEY\n      state_dir: ./xai-state\n",
+			want: "cannot be combined",
+		},
+		{
+			name: "egress url",
+			yaml: "opencode:\n  providers:\n    groq:\n      egress_allow: [https://api.groq.com]\n",
+			want: "must be a hostname",
+		},
+		{
+			name: "missing egress",
+			yaml: "opencode:\n  providers:\n    groq:\n      api_key_env: GROQ_API_KEY\n",
+			want: "egress_allow or host_port is required",
+		},
+		{
+			name: "host port range",
+			yaml: "opencode:\n  providers:\n    ollama:\n      host_port: 99999\n",
+			want: "out of range",
+		},
+		{
+			name: "binary path",
+			yaml: "opencode:\n  providers:\n    kiro:\n      required_binaries: [/usr/bin/kiro-cli]\n      egress_allow: [api.example.com]\n",
+			want: "invalid executable name",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(write(t, tc.yaml))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error = %v, want text %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateOpencodeRejectsHarnessSafetyEnvironment(t *testing.T) {
+	for _, name := range []string{
+		"OPENCODE_DISABLE_AUTOUPDATE",
+		"OPENCODE_DISABLE_MODELS_FETCH",
+		"OPENCODE_DISABLE_SHARE",
+		"OPENCODE_PRINT_LOGS",
+		"OPENCODE_LOG_LEVEL",
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateOpencode(Opencode{Providers: map[string]OpencodeProvider{
+				"groq": {PassEnv: []string{name}, EgressAllow: []string{"api.groq.com"}},
+			}})
+			if err == nil || !strings.Contains(err.Error(), "managed by scrutineer") {
+				t.Fatalf("ValidateOpencode error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateOpencodeRejectsManagedProxyEnvironment(t *testing.T) {
+	for _, name := range []string{
+		"HTTPS_PROXY", "https_proxy",
+		"HTTP_PROXY", "http_proxy",
+		"ALL_PROXY", "all_proxy",
+		"NO_PROXY", "no_proxy",
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateOpencode(Opencode{Providers: map[string]OpencodeProvider{
+				"groq": {PassEnv: []string{name}, EgressAllow: []string{"api.groq.com"}},
+			}})
+			if err == nil || !strings.Contains(err.Error(), "managed by scrutineer") {
+				t.Fatalf("ValidateOpencode error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoad_hostSkills(t *testing.T) {
+	c, err := Load(write(t, "host_skills:\n  - verify\n  - critic\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.HostSkills, []string{"verify", "critic"}) {
+		t.Errorf("host_skills: %v", c.HostSkills)
+	}
+	c, err = Load(write(t, "addr: 127.0.0.1:1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.HostSkills) != 0 {
+		t.Errorf("host_skills omitted: %v, want empty", c.HostSkills)
+	}
+}
+
+func TestLoad_noContainerAlias(t *testing.T) {
+	// no_docker is the retained pre-rename alias; Load folds it into NoContainer.
+	aliasOnly, err := Load(write(t, "no_docker: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliasOnly.NoContainer == nil || !*aliasOnly.NoContainer {
+		t.Errorf("no_docker alias did not set NoContainer: %v", aliasOnly.NoContainer)
+	}
+
+	// no_container is canonical and wins when both keys are present.
+	both, err := Load(write(t, "no_container: false\nno_docker: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if both.NoContainer == nil || *both.NoContainer {
+		t.Errorf("no_container should win over no_docker: %v", both.NoContainer)
+	}
+}
+
+func TestLoad_profilesDirDistinguishesOmittedAndEmpty(t *testing.T) {
+	omitted, err := Load(write(t, "addr: 127.0.0.1:8080\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if omitted.ProfilesDir != nil {
+		t.Fatalf("omitted profiles_dir = %q, want nil", *omitted.ProfilesDir)
+	}
+
+	disabled, err := Load(write(t, "profiles_dir: \"\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.ProfilesDir == nil || *disabled.ProfilesDir != "" {
+		t.Fatalf("empty profiles_dir = %v, want pointer to empty string", disabled.ProfilesDir)
+	}
+
+	selected, err := Load(write(t, "profiles_dir: /srv/scrutineer/profiles\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.ProfilesDir == nil || *selected.ProfilesDir != "/srv/scrutineer/profiles" {
+		t.Fatalf("selected profiles_dir = %v", selected.ProfilesDir)
+	}
+}
+
+func TestLoad_ecosystemsEnrichmentDistinguishesOmittedAndFalse(t *testing.T) {
+	omitted, err := Load(write(t, "addr: 127.0.0.1:8080\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if omitted.EcosystemsEnrichment != nil {
+		t.Fatalf("omitted ecosystems_enrichment = %v, want nil so the flag default stands", *omitted.EcosystemsEnrichment)
+	}
+
+	off, err := Load(write(t, "ecosystems_enrichment: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.EcosystemsEnrichment == nil || *off.EcosystemsEnrichment {
+		t.Fatalf("ecosystems_enrichment: false = %v, want pointer to false", off.EcosystemsEnrichment)
+	}
+}
+
+func TestLoad_modelBaseURLAlias(t *testing.T) {
+	// anthropic_base_url is the retained pre-rename alias; Load folds it
+	// into ModelBaseURL.
+	aliasOnly, err := Load(write(t, "anthropic_base_url: https://x.test/v1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliasOnly.ModelBaseURL != "https://x.test/v1" {
+		t.Errorf("anthropic_base_url alias did not set ModelBaseURL: %q", aliasOnly.ModelBaseURL)
+	}
+	// model_base_url is canonical and wins when both keys are present.
+	both, err := Load(write(t, "model_base_url: https://new.test/v1\nanthropic_base_url: https://old.test/v1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if both.ModelBaseURL != "https://new.test/v1" {
+		t.Errorf("model_base_url should win over anthropic_base_url: %q", both.ModelBaseURL)
 	}
 }
 
@@ -147,10 +437,28 @@ func TestLoad_rejectsInvalidClone(t *testing.T) {
 	}
 }
 
+func TestValidateRuntime(t *testing.T) {
+	for _, name := range []string{"", "docker", "podman", "apple"} {
+		if err := ValidateRuntime(name); err != nil {
+			t.Errorf("ValidateRuntime(%q) = %v, want nil", name, err)
+		}
+	}
+	if err := ValidateRuntime("containerd"); err == nil {
+		t.Error("expected error for unknown runtime")
+	}
+}
+
 func TestLoad_rejectsUnparseable(t *testing.T) {
 	path := write(t, "addr: [this is not valid yaml: for a string")
 	if _, err := Load(path); err == nil {
 		t.Error("expected parse error")
+	}
+}
+
+func TestLoad_rejectsInsecureVINCEBaseURL(t *testing.T) {
+	path := write(t, "vince:\n  base_url: http://vince.example\n  api_key: secret\n")
+	if _, err := Load(path); err == nil {
+		t.Error("expected error for non-HTTPS VINCE base URL")
 	}
 }
 

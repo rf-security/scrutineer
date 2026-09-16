@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,11 +9,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"scrutineer/internal/db"
 	"scrutineer/internal/queue"
+	"scrutineer/internal/repoconfig"
 )
 
 func TestStageThreatModel(t *testing.T) {
@@ -44,10 +47,53 @@ func TestStageThreatModel(t *testing.T) {
 	}
 }
 
+func TestApplySkillResultPersistsProviderImageProvenance(t *testing.T) {
+	gdb, err := db.Open(filepath.Join(t.TempDir(), "provider.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "https://example.com/provider", Name: "provider"}
+	if err := gdb.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{RepositoryID: repo.ID, Kind: JobSkill, Status: db.ScanRunning}
+	if err := gdb.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := Worker{DB: gdb}
+	w.applySkillResult(&scan, SkillResult{
+		Backend:           "opencode",
+		Provider:          "kiro",
+		RunnerImage:       "registry.example/kiro:1",
+		RunnerImageDigest: "sha256:abc",
+	})
+	var got db.Scan
+	if err := gdb.First(&got, scan.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider != "kiro" || got.RunnerImage != "registry.example/kiro:1" || got.RunnerImageDigest != "sha256:abc" {
+		t.Errorf("persisted provider provenance = %+v", got)
+	}
+}
+
 const maintainersReport = `{"maintainers":[
   {"login":"alice","name":"Alice","email":"alice@example.com","role":"lead","status":"active","evidence":"80% of past-year commits"},
   {"login":"bob","role":"contributor","status":"inactive","evidence":"last commit 2022"}
 ],"disclosure_channel":"SECURITY.md","notes":""}`
+
+type embeddedNativeCaptureRunner struct {
+	components []byte
+}
+
+func (r *embeddedNativeCaptureRunner) RunSkill(_ context.Context, sj SkillJob, _ func(Event)) (SkillResult, error) {
+	var err error
+	r.components, err = os.ReadFile(filepath.Join(sj.WorkRoot, embeddedNativeComponentsFile))
+	return SkillResult{Commit: "abc", Report: `{"ok":true}`}, err
+}
+
+func (*embeddedNativeCaptureRunner) SkillDir(workRoot, name string) string {
+	return ClaudeHarness{}.SkillDir(workRoot, name)
+}
 
 func TestDoSkill_findingsKind(t *testing.T) {
 	gdb, err := db.Open(filepath.Join(t.TempDir(), "s.db"))
@@ -112,6 +158,123 @@ func TestDoSkill_findingsKind(t *testing.T) {
 	}
 	if !strings.Contains(got.Prompt, "--- SKILL.md ---") || !strings.Contains(got.Prompt, "Do the thing.") {
 		t.Errorf("prompt missing rendered SKILL.md body: %q", got.Prompt)
+	}
+}
+
+func TestDoSkill_passesSubmoduleOptionFromSkill(t *testing.T) {
+	gdb, err := db.Open(filepath.Join(t.TempDir(), "submodules.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "https://example.com/native", Name: "native"}
+	if err := gdb.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	skill := db.Skill{
+		Name: "embedded-native", Description: "Map embedded native code", Body: "Run brief.",
+		OutputFile: "report.json", OutputKind: "freeform", RecurseSubmodules: true,
+		Version: 1, Active: true, Source: "test",
+	}
+	if err := gdb.Create(&skill).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{
+		RepositoryID: repo.ID, Kind: JobSkill, Status: db.ScanQueued,
+		Model: "fake", SkillID: &skill.ID,
+	}
+	if err := gdb.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var recurseSubmodules bool
+	w := &Worker{
+		DB:      gdb,
+		Log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DataDir: t.TempDir(),
+		Runner: fakeRunner{skillRes: SkillResult{
+			Commit: "abc",
+			Report: `{"languages":[{"name":"Rust"},{"name":"C"}]}`,
+		}},
+		PrepareRepoSrcWithOptions: func(
+			_ context.Context,
+			_, _, workRoot string,
+			recurse bool,
+			_ func(Event),
+		) (string, error) {
+			recurseSubmodules = recurse
+			return "abc", os.MkdirAll(filepath.Join(workRoot, "src"), 0o755)
+		},
+	}
+
+	body, err := json.Marshal(queue.Payload{ScanID: scan.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.wrap(w.doSkill)(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+	if !recurseSubmodules {
+		t.Error("doSkill did not request recursive submodule preparation")
+	}
+	var got db.Scan
+	if err := gdb.First(&got, scan.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != db.ScanDone || !strings.Contains(got.Report, `"name":"Rust"`) {
+		t.Errorf("scan = status %s report %q", got.Status, got.Report)
+	}
+}
+
+func TestDoSkillStagesEmbeddedNativeComponentIdentity(t *testing.T) {
+	url := newEmbeddedNativeOrigin(t)
+	gdb, err := db.Open(filepath.Join(t.TempDir(), "embedded-native-components.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: url, Name: "native"}
+	if err := gdb.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	skill := db.Skill{
+		Name: "embedded-native", Description: "Map embedded native code", Body: "Run brief.",
+		OutputFile: "report.json", OutputKind: "freeform", RecurseSubmodules: true,
+		Version: 1, Active: true, Source: "test",
+	}
+	if err := gdb.Create(&skill).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{
+		RepositoryID: repo.ID, Kind: JobSkill, Status: db.ScanQueued,
+		Model: "fake", SkillID: &skill.ID,
+	}
+	if err := gdb.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &embeddedNativeCaptureRunner{}
+	w := &Worker{
+		DB: gdb, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DataDir: t.TempDir(), Runner: runner,
+	}
+	body, err := json.Marshal(queue.Payload{ScanID: scan.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.wrap(w.doSkill)(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+
+	var components []embeddedNativeComponent
+	if err := json.Unmarshal(runner.components, &components); err != nil {
+		t.Fatalf("decode components: %v\n%s", err, runner.components)
+	}
+	if len(components) != 1 {
+		t.Fatalf("components = %+v, want one", components)
+	}
+	component := components[0]
+	if component.Path != "vendor/native" || component.URL != "https://github.com/example/native.git" ||
+		component.PURL == "" || component.Commit == "" || !component.Initialized || component.Status != "initialized" {
+		t.Errorf("component = %+v", component)
 	}
 }
 
@@ -284,7 +447,7 @@ func TestStageContext_writesRepoFacts(t *testing.T) {
 		DefaultBranch: "main",
 	}
 	scan := &db.Scan{ID: 7, RepositoryID: 3, APIToken: "tok"}
-	if err := stageContext(dir, "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -300,6 +463,198 @@ func TestStageContext_writesRepoFacts(t *testing.T) {
 	}
 	if got.Scrutineer.Token != "tok" || got.Scrutineer.APIBase == "" {
 		t.Errorf("scrutineer block: %+v", got.Scrutineer)
+	}
+}
+
+func TestStageContext_includesRepositoryScanConfig(t *testing.T) {
+	dir := t.TempDir()
+	repo := &db.Repository{
+		URL:  "https://example.com/config",
+		Name: "config",
+		ScanConfig: `focus_areas:
+  - name: parser
+    paths: [src/parse/**]
+    surface: accepts arbitrary bytes
+known_bugs: [GHSA-xxxx-yyyy]
+attack_surface: stdin is attacker controlled
+skip: [tests/**]`,
+	}
+	scan := &db.Scan{ID: 7, RepositoryID: 3, APIToken: "tok"}
+	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got skillContext
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Scrutineer.ScanConfig == nil || got.Scrutineer.ScanConfig.FocusAreas[0].Name != "parser" {
+		t.Fatalf("scan_config = %+v", got.Scrutineer.ScanConfig)
+	}
+	if got.Scrutineer.ScanConfig.Skip[0] != "tests/**" || got.Scrutineer.ScanConfig.KnownBugs[0] != "GHSA-xxxx-yyyy" {
+		t.Fatalf("scan_config = %+v", got.Scrutineer.ScanConfig)
+	}
+}
+
+func TestStageContext_includesReconFocusAreas(t *testing.T) {
+	dir := t.TempDir()
+	repo := &db.Repository{URL: "https://example.com/recon", Name: "recon"}
+	scan := &db.Scan{ID: 7, RepositoryID: 3, APIToken: "tok"}
+	recon := &skillContextRecon{
+		FocusAreas: []repoconfig.FocusArea{{
+			Name: "XML parser", Paths: []string{"lib/xml*.c"}, Surface: "XML documents from callers",
+		}},
+		Notes: []string{"Examples excluded."},
+	}
+	if err := stageContextWithInputs(
+		dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo, recon, nil, nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got skillContext
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Scrutineer.Recon == nil || got.Scrutineer.Recon.FocusAreas[0].Name != "XML parser" {
+		t.Fatalf("recon = %+v", got.Scrutineer.Recon)
+	}
+}
+
+func TestStageContext_includesFocusArea(t *testing.T) {
+	dir := t.TempDir()
+	repo := &db.Repository{URL: "https://example.com/focus", Name: "focus"}
+	raw, err := repoconfig.EncodeFocusAreaJSON(repoconfig.FocusArea{
+		Name: "XML parser", Paths: []string{"lib/xml*.c"}, Surface: "untrusted XML",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan := &db.Scan{ID: 7, RepositoryID: 3, APIToken: "tok", FocusArea: raw}
+	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got skillContext
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Scrutineer.FocusArea == nil || got.Scrutineer.FocusArea.Name != "XML parser" {
+		t.Fatalf("focus_area = %+v", got.Scrutineer.FocusArea)
+	}
+}
+
+type reconContextFixture struct {
+	worker      *Worker
+	repository  db.Repository
+	reconSkill  db.Skill
+	threatModel db.Skill
+}
+
+func newReconContextFixture(t *testing.T) reconContextFixture {
+	t.Helper()
+	gdb, err := db.Open(filepath.Join(t.TempDir(), "recon.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "https://example.com/recon", Name: "recon"}
+	if err := gdb.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	schema, err := os.ReadFile("../../skills/recon/schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconSkill := db.Skill{Name: "recon", SchemaJSON: string(schema)}
+	if err := gdb.Create(&reconSkill).Error; err != nil {
+		t.Fatal(err)
+	}
+	return reconContextFixture{
+		worker:      &Worker{DB: gdb, Log: slog.New(slog.NewTextHandler(io.Discard, nil))},
+		repository:  repo,
+		reconSkill:  reconSkill,
+		threatModel: db.Skill{Name: threatModelSkillName},
+	}
+}
+
+func (f reconContextFixture) seedReconScan(t *testing.T, scan db.Scan) db.Scan {
+	t.Helper()
+	scan.RepositoryID = f.repository.ID
+	scan.SkillID = &f.reconSkill.ID
+	scan.SkillName = reconSkillName
+	scan.Status = db.ScanDone
+	if err := f.worker.DB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	return scan
+}
+
+func (f reconContextFixture) context(t *testing.T, scan db.Scan) *skillContextRecon {
+	t.Helper()
+	scan.RepositoryID = f.repository.ID
+	ctx, err := f.worker.reconContext(&scan, &f.threatModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ctx
+}
+
+func requireReconArea(t *testing.T, ctx *skillContextRecon, name string) {
+	t.Helper()
+	if ctx == nil || len(ctx.FocusAreas) != 1 || ctx.FocusAreas[0].Name != name {
+		t.Fatalf("recon context = %+v, want %q", ctx, name)
+	}
+}
+
+func TestReconContextPrefersGroupAndFallsBack(t *testing.T) {
+	f := newReconContextFixture(t)
+	f.seedReconScan(t, db.Scan{ScanGroup: "batch-a", Report: `{"focus_areas":[{"name":"XML parser","paths":["  lib\\xml*.c  "],"surface":"XML documents from callers"}],"notes":["Examples excluded."]}`})
+	f.seedReconScan(t, db.Scan{Report: `{"focus_areas":[{"name":"CLI parser","paths":["cmd/**/*.go"],"surface":"Command-line input from operators"}],"notes":[]}`})
+	// This newer report is the repo-wide fallback but must not replace a
+	// same-group result.
+	f.seedReconScan(t, db.Scan{ScanGroup: "other", Report: `{"focus_areas":[{"name":"fallback parser","paths":["fallback/**"],"surface":"latest compatible recon report"}],"notes":[]}`})
+
+	grouped := f.context(t, db.Scan{ScanGroup: "batch-a"})
+	requireReconArea(t, grouped, "XML parser")
+	if got, want := grouped.FocusAreas[0].Paths, []string{"lib/xml*.c"}; !slices.Equal(got, want) {
+		t.Errorf("paths = %q, want %q", got, want)
+	}
+	requireReconArea(t, f.context(t, db.Scan{}), "fallback parser")
+	requireReconArea(t, f.context(t, db.Scan{ScanGroup: "batch-b"}), "fallback parser")
+}
+
+func TestReconContextFallbackMatchesRefAndSubPath(t *testing.T) {
+	f := newReconContextFixture(t)
+	f.seedReconScan(t, db.Scan{Ref: "topic", Report: `{"focus_areas":[{"name":"topic parser","paths":["topic/**"],"surface":"topic branch input"}],"notes":[]}`})
+	f.seedReconScan(t, db.Scan{SubPath: "cmd", Report: `{"focus_areas":[{"name":"CLI parser","paths":["cmd/**/*.go"],"surface":"command-line input"}],"notes":[]}`})
+
+	requireReconArea(t, f.context(t, db.Scan{Ref: "topic"}), "topic parser")
+	requireReconArea(t, f.context(t, db.Scan{SubPath: "cmd"}), "CLI parser")
+}
+
+func TestReconContextRejectsInvalidReports(t *testing.T) {
+	f := newReconContextFixture(t)
+	recon := f.seedReconScan(t, db.Scan{ScanGroup: "batch-a", Report: `{"focus_areas":[{"name":"XML parser","paths":["lib/xml*.c"],"surface":"XML documents from callers"}],"notes":[]}`})
+	if err := f.worker.DB.Model(&recon).Update("report", `{"focus_areas":[{"name":"bad","paths":["../private/**"],"surface":"bad"}],"notes":[]}`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if ctx := f.context(t, db.Scan{ScanGroup: "batch-a"}); ctx != nil {
+		t.Fatalf("invalid recon context = %+v", ctx)
+	}
+	if err := f.worker.DB.Model(&recon).Update("report", `{"focus_areas":[]}`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if ctx := f.context(t, db.Scan{ScanGroup: "batch-a"}); ctx != nil {
+		t.Fatalf("schema-invalid recon context = %+v", ctx)
 	}
 }
 
@@ -474,11 +829,92 @@ func TestStageSkill_noScriptsDirIsNoop(t *testing.T) {
 	}
 }
 
+func TestStageContext_writesToWorkRootAndSkillDir(t *testing.T) {
+	// stageContext owns context.json, so it writes both copies itself: the
+	// workspace root and the skill directory, where ./context.json must also
+	// resolve. Byte-identical, so the two can never disagree (#499).
+	work := t.TempDir()
+	skillDir := filepath.Join(work, ".claude", "skills", "s")
+	repo := &db.Repository{URL: "https://example.com/r", Name: "r"}
+	scan := &db.Scan{ID: 7, RepositoryID: 1, APIToken: "t"}
+	if err := stageContext(work, skillDir, "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+		t.Fatal(err)
+	}
+	atRoot, err := os.ReadFile(filepath.Join(work, "context.json"))
+	if err != nil {
+		t.Fatalf("context.json missing from workRoot: %v", err)
+	}
+	atSkill, err := os.ReadFile(filepath.Join(skillDir, "context.json"))
+	if err != nil {
+		t.Fatalf("context.json missing from skill dir: %v", err)
+	}
+	if !bytes.Equal(atRoot, atSkill) {
+		t.Errorf("copies differ:\nworkRoot: %s\nskillDir: %s", atRoot, atSkill)
+	}
+	var got skillContext
+	if err := json.Unmarshal(atSkill, &got); err != nil {
+		t.Fatalf("skill dir copy is not valid context.json: %v", err)
+	}
+	if got.Scrutineer.ScanID != 7 {
+		t.Errorf("scan_id = %d, want 7", got.Scrutineer.ScanID)
+	}
+}
+
+func TestStageContext_emptySkillDirWritesWorkRootOnly(t *testing.T) {
+	// Callers that stage no skill (diff rescan, evals) pass an empty skillDir
+	// and must keep the previous single-file behaviour.
+	work := t.TempDir()
+	repo := &db.Repository{URL: "https://example.com/r", Name: "r"}
+	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t"}
+	if err := stageContext(work, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(work, "context.json")); err != nil {
+		t.Fatalf("context.json missing from workRoot: %v", err)
+	}
+	entries, err := os.ReadDir(work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("empty skillDir should write one file, got %d entries", len(entries))
+	}
+}
+
+func TestStageWorkspace_skillStagingDoesNotEatContextJSON(t *testing.T) {
+	// The ordering hazard #499 is about, pinned from the outside. stageSkill
+	// clears skillDir before writing, so staging the skill AFTER the context
+	// deletes the skill-dir copy and ./context.json stops resolving -- with no
+	// error anywhere. Assert through the wrapper so a future reorder fails here
+	// instead of silently in production.
+	work := t.TempDir()
+	skillDir := filepath.Join(work, ".claude", "skills", "s")
+	skill := &db.Skill{Name: "s", Description: "d", Body: "body", Source: "ui"}
+	scan := &db.Scan{
+		ID:           3,
+		RepositoryID: 1,
+		APIToken:     "t",
+		Repository:   db.Repository{URL: "https://example.com/r", Name: "r"},
+	}
+	if err := StageWorkspace(work, skillDir, "http://127.0.0.1:8080/api", "", "", scan, skill); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(skillDir, "context.json")); err != nil {
+		t.Fatalf("./context.json does not resolve from the skill dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(skillDir, "SKILL.md")); err != nil {
+		t.Fatalf("SKILL.md missing, skill bundle was not staged: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(work, "context.json")); err != nil {
+		t.Fatalf("context.json missing from workRoot: %v", err)
+	}
+}
+
 func TestStageContext_includesRef(t *testing.T) {
 	dir := t.TempDir()
 	repo := &db.Repository{URL: "https://example.com/x", Name: "x"}
 	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t", Ref: "2.4.x"}
-	if err := stageContext(dir, "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -498,7 +934,7 @@ func TestStageContext_omitsRefWhenEmpty(t *testing.T) {
 	dir := t.TempDir()
 	repo := &db.Repository{URL: "https://example.com/x", Name: "x"}
 	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t"}
-	if err := stageContext(dir, "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -517,7 +953,7 @@ func TestStageContext_includesForkOrg(t *testing.T) {
 	dir := t.TempDir()
 	repo := &db.Repository{URL: "https://github.com/o/r", Name: "r"}
 	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t"}
-	if err := stageContext(dir, "http://127.0.0.1:8080/api", "fork-central", "", scan, repo); err != nil {
+	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "fork-central", "", scan, repo); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -537,7 +973,7 @@ func TestStageContext_includesMetadataDir(t *testing.T) {
 	dir := t.TempDir()
 	repo := &db.Repository{URL: "https://github.com/o/r", Name: "r"}
 	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t"}
-	if err := stageContext(dir, "http://127.0.0.1:8080/api", "", ".ossprey/", scan, repo); err != nil {
+	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", ".ossprey/", scan, repo); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -619,6 +1055,39 @@ func TestApplyPathFilters_ignorePathsCumulative(t *testing.T) {
 	}
 	assertExists(t, src, "src/foo.go", "src/bar.go")
 	assertGone(t, src, "src/foo_test.go")
+}
+
+func TestApplyRepositoryPathFilters_layersRepositorySkip(t *testing.T) {
+	work := t.TempDir()
+	src := filepath.Join(work, "src")
+	writeFiles(t, src, map[string]string{
+		"src/main.go":    "x",
+		"tests/main.go":  "x",
+		"docs/readme.md": "x",
+	})
+	skill := &db.Skill{Paths: "src/**\ntests/**\ndocs/**"}
+	if err := applyRepositoryPathFilters(work, skill, "skip: [tests/**]", func(Event) {}); err != nil {
+		t.Fatalf("applyRepositoryPathFilters: %v", err)
+	}
+	assertExists(t, src, "src/main.go", "docs/readme.md")
+	assertGone(t, src, "tests/main.go")
+}
+
+func TestApplyFocusAreaPathFilter(t *testing.T) {
+	work := t.TempDir()
+	src := filepath.Join(work, "src")
+	writeFiles(t, src, map[string]string{
+		"lib/xmlparse.c": "x",
+		"lib/xmlrole.c":  "x",
+		"cmd/tool.c":     "x",
+		".git/HEAD":      "ref: refs/heads/main",
+	})
+	area := repoconfig.FocusArea{Name: "XML parser", Paths: []string{"lib/xml*.c"}, Surface: "untrusted XML"}
+	if err := applyFocusAreaPathFilter(work, area, func(Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	assertExists(t, src, "lib/xmlparse.c", "lib/xmlrole.c", ".git/HEAD")
+	assertGone(t, src, "cmd/tool.c")
 }
 
 func TestApplyPathFilters_gitPreserved(t *testing.T) {
@@ -729,4 +1198,85 @@ func hasMatchingEvent(events []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+// workspaceInspectingRunner records what the workspace looked like when the
+// agent was invoked; wrap() removes it once the scan finishes, so the test
+// cannot look afterwards.
+type workspaceInspectingRunner struct {
+	fakeRunner
+	scratchPresent bool
+	contextIsFile  bool
+}
+
+func (r *workspaceInspectingRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Event)) (SkillResult, error) {
+	_, err := os.Lstat(filepath.Join(sj.WorkRoot, "scratch.txt"))
+	r.scratchPresent = err == nil
+	info, err := os.Lstat(filepath.Join(sj.WorkRoot, "context.json"))
+	r.contextIsFile = err == nil && info.Mode().IsRegular()
+	return r.fakeRunner.RunSkill(ctx, sj, emit)
+}
+
+func TestDoSkill_resetsReusedWorkspace(t *testing.T) {
+	gdb, err := db.Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "https://example.com/x", Name: "x"}
+	gdb.Create(&repo)
+	skill := db.Skill{
+		Name:       "spec-deep",
+		Body:       "Do the thing.",
+		OutputFile: "report.json",
+		OutputKind: "findings",
+		Version:    1,
+		Active:     true,
+		Source:     "ui",
+	}
+	gdb.Create(&skill)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: JobSkill, Status: db.ScanQueued, Model: "fake", SkillID: &skill.ID}
+	gdb.Create(&scan)
+
+	dataDir := t.TempDir()
+	runner := &workspaceInspectingRunner{fakeRunner: fakeRunner{skillRes: SkillResult{Commit: "abc", Report: `{"findings":[]}`}}}
+	w := &Worker{
+		DB:             gdb,
+		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DataDir:        dataDir,
+		Runner:         runner,
+		PrepareRepoSrc: stubPrepareRepoSrc,
+	}
+	// A paused scan comes back through doSkill with the workspace its agent
+	// already shaped: context.json, which carries the scan's API token,
+	// replaced by a link to a host path, plus a scratch file of its own.
+	workRoot := w.workRoot(scan.ID)
+	if err := os.MkdirAll(workRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(dataDir, "host-file")
+	if err := os.Symlink("../host-file", filepath.Join(workRoot, "context.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workRoot, "scratch.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(queue.Payload{ScanID: scan.ID})
+	if err := w.wrap(w.doSkill)(context.Background(), body); err != nil {
+		t.Fatal(err)
+	}
+	var got db.Scan
+	gdb.First(&got, scan.ID)
+	if got.Status != db.ScanDone {
+		t.Fatalf("status = %s: %s", got.Status, got.Error)
+	}
+	if _, err := os.Lstat(victim); !os.IsNotExist(err) {
+		t.Errorf("context.json followed the planted link onto the host: lstat err = %v", err)
+	}
+	if !runner.contextIsFile {
+		t.Error("context.json was not staged as a regular file")
+	}
+	if runner.scratchPresent {
+		t.Error("the previous invocation's scratch file survived into the new run")
+	}
 }

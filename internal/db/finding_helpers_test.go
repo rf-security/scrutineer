@@ -2,7 +2,11 @@ package db
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,6 +73,247 @@ func TestSeverityAtLeast(t *testing.T) {
 	}
 }
 
+func TestReconcileFindingSeverityCap(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		severity    string
+		maximum     string
+		want        string
+		wantHistory int64
+	}{
+		{name: "critical is capped", severity: "Critical", maximum: "Medium", want: "Medium", wantHistory: 1},
+		{name: "equal severity is unchanged", severity: "Medium", maximum: "Medium", want: "Medium"},
+		{name: "lower severity is never raised", severity: "Low", maximum: "Medium", want: "Low"},
+		{name: "unknown severity is unchanged", severity: "UNKNOWN", maximum: "Medium", want: "UNKNOWN"},
+		{name: "empty cap only reads", severity: "High", want: "High"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gdb := newTestDB(t)
+			finding := seedFinding(t, gdb)
+			if err := gdb.Model(&Finding{}).Where("id = ?", finding.ID).Update("severity", tc.severity).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := ReconcileFindingSeverityCap(gdb, finding.ID, tc.maximum, SourceSystem, "verify")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("effective severity = %q, want %q", got, tc.want)
+			}
+			var refreshed Finding
+			if err := gdb.First(&refreshed, finding.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if refreshed.Severity != tc.want {
+				t.Fatalf("stored severity = %q, want %q", refreshed.Severity, tc.want)
+			}
+			var historyCount int64
+			if err := gdb.Model(&FindingHistory{}).Where("finding_id = ? AND field = ?", finding.ID, severityField).Count(&historyCount).Error; err != nil {
+				t.Fatal(err)
+			}
+			if historyCount != tc.wantHistory {
+				t.Fatalf("history rows = %d, want %d", historyCount, tc.wantHistory)
+			}
+		})
+	}
+}
+
+func TestReconcileFindingSeverityCapRestoresLatestOwnedWrite(t *testing.T) {
+	gdb := newTestDB(t)
+	finding := seedFinding(t, gdb)
+	if err := gdb.Model(&Finding{}).Where("id = ?", finding.ID).Update("severity", "Critical").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReconcileFindingSeverityCap(gdb, finding.ID, "Medium", SourceSystem, "verify"); err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.Model(&Finding{}).Where("id = ?", finding.ID).Update("severity_caps", "authorization held").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReconcileFindingSeverityCap(gdb, finding.ID, "", SourceSystem, "verify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Critical" {
+		t.Fatalf("effective severity = %q, want Critical", got)
+	}
+	var history []FindingHistory
+	if err := gdb.Where("finding_id = ? AND field = ?", finding.ID, severityField).Order("id").Find(&history).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 2 || history[1].OldValue != "Medium" || history[1].NewValue != "Critical" {
+		t.Fatalf("severity history = %+v", history)
+	}
+}
+
+func TestReconcileFindingSeverityCapRelaxesAcrossOwnedHistory(t *testing.T) {
+	gdb := newTestDB(t)
+	finding := seedFinding(t, gdb)
+	if err := gdb.Model(&Finding{}).Where("id = ?", finding.ID).Update("severity", "Critical").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	steps := []struct {
+		maximum string
+		reason  string
+		want    string
+	}{
+		{maximum: "Low", reason: "host shell", want: "Low"},
+		{maximum: "Medium", reason: "local only", want: "Medium"},
+		{maximum: "High", reason: "user interaction", want: "High"},
+		{maximum: "", reason: "", want: "Critical"},
+	}
+	for _, step := range steps {
+		got, err := ReconcileFindingSeverityCap(gdb, finding.ID, step.maximum, SourceSystem, "verify")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != step.want {
+			t.Fatalf("cap %q produced %q, want %q", step.maximum, got, step.want)
+		}
+		if err := gdb.Model(&Finding{}).Where("id = ?", finding.ID).Update("severity_caps", step.reason).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var history []FindingHistory
+	if err := gdb.Where("finding_id = ? AND field = ?", finding.ID, severityField).Order("id").Find(&history).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 4 || history[0].OldValue != "Critical" || history[3].NewValue != "Critical" {
+		t.Fatalf("severity history = %+v", history)
+	}
+}
+
+func TestReconcileFindingSeverityCapPreservesLaterSeverityWrite(t *testing.T) {
+	gdb := newTestDB(t)
+	finding := seedFinding(t, gdb)
+	if err := gdb.Model(&Finding{}).Where("id = ?", finding.ID).Update("severity", "Critical").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReconcileFindingSeverityCap(gdb, finding.ID, "Medium", SourceSystem, "verify"); err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.Model(&Finding{}).Where("id = ?", finding.ID).Update("severity_caps", "authorization held").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFindingField(gdb, finding.ID, severityField, "Low", SourceAnalyst, "reviewer"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReconcileFindingSeverityCap(gdb, finding.ID, "", SourceSystem, "verify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Low" {
+		t.Fatalf("effective severity = %q, want Low", got)
+	}
+}
+
+func TestReconcileFindingSeverityCapRejectsInvalidMaximum(t *testing.T) {
+	gdb := newTestDB(t)
+	finding := seedFinding(t, gdb)
+	if _, err := ReconcileFindingSeverityCap(gdb, finding.ID, "UNKNOWN", SourceSystem, "verify"); err == nil {
+		t.Fatal("expected invalid severity cap to fail")
+	}
+}
+
+func TestValidDependentCampaignStatus(t *testing.T) {
+	for _, status := range append([]DependentCampaignStatus{""}, DependentCampaignStatuses...) {
+		if !ValidDependentCampaignStatus(status) {
+			t.Errorf("status %q should be valid", status)
+		}
+	}
+	if ValidDependentCampaignStatus("contacted") {
+		t.Error("unknown campaign status should be invalid")
+	}
+}
+
+func TestSetFindingDependentCampaign(t *testing.T) {
+	gdb := newTestDB(t)
+	finding := seedFinding(t, gdb)
+	dependent := Dependent{RepositoryID: finding.RepositoryID, Name: "consumer", PURL: "pkg:npm/consumer"}
+	if err := gdb.Create(&dependent).Error; err != nil {
+		t.Fatal(err)
+	}
+	exposureAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	row := FindingDependent{
+		FindingID:   finding.ID,
+		DependentID: dependent.ID,
+		Status:      ExposureKnownAffected,
+		Rationale:   "reachable",
+		UpdatedAt:   exposureAt,
+	}
+	if err := gdb.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := SetFindingDependentCampaign(gdb, finding.ID, dependent.ID, CampaignNotified, "  opened issue #42  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CampaignStatus != CampaignNotified || got.CampaignNote != "opened issue #42" || got.CampaignUpdatedAt == nil {
+		t.Fatalf("campaign row = %+v", got)
+	}
+	firstCampaignUpdate := *got.CampaignUpdatedAt
+
+	var stored FindingDependent
+	if err := gdb.First(&stored, row.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !stored.UpdatedAt.Equal(exposureAt) {
+		t.Errorf("exposure UpdatedAt = %v, want %v", stored.UpdatedAt, exposureAt)
+	}
+
+	got, err = SetFindingDependentCampaign(gdb, finding.ID, dependent.ID, CampaignNotified, "opened issue #42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CampaignUpdatedAt == nil || !got.CampaignUpdatedAt.Equal(firstCampaignUpdate) {
+		t.Errorf("no-op changed CampaignUpdatedAt: got %v, want %v", got.CampaignUpdatedAt, firstCampaignUpdate)
+	}
+
+	if err := UpsertFindingDependent(gdb, FindingDependent{
+		FindingID:   finding.ID,
+		DependentID: dependent.ID,
+		Status:      ExposureFixed,
+		Rationale:   "fixed upstream",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.First(&stored, row.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.CampaignStatus != CampaignNotified || stored.CampaignNote != "opened issue #42" {
+		t.Errorf("exposure upsert changed campaign fields: %+v", stored)
+	}
+
+	got, err = SetFindingDependentCampaign(gdb, finding.ID, dependent.ID, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CampaignStatus != "" || got.CampaignNote != "" || got.CampaignUpdatedAt != nil {
+		t.Errorf("cleared campaign row = %+v", got)
+	}
+}
+
+func TestSetFindingDependentCampaignRejectsInvalidInput(t *testing.T) {
+	gdb := newTestDB(t)
+	finding := seedFinding(t, gdb)
+
+	if _, err := SetFindingDependentCampaign(gdb, finding.ID, 99, "email-sent", ""); err == nil {
+		t.Fatal("expected invalid campaign status error")
+	}
+	if _, err := SetFindingDependentCampaign(gdb, finding.ID, 99, "", "note without status"); err == nil {
+		t.Fatal("expected note without status error")
+	}
+	if _, err := SetFindingDependentCampaign(gdb, finding.ID, 99, CampaignNotified, ""); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("missing pair error = %v, want record not found", err)
+	}
+}
+
 func TestWriteFindingField_logsHistory(t *testing.T) {
 	gdb := newTestDB(t)
 	f := seedFinding(t, gdb)
@@ -106,11 +351,167 @@ func TestWriteFindingField_noOpWhenUnchanged(t *testing.T) {
 	}
 }
 
+func TestWriteFindingField_blocksNonViableReportingStates(t *testing.T) {
+	gdb := newTestDB(t)
+	f := seedFinding(t, gdb)
+	if err := gdb.Model(&f).Update("production_viability", ProductionViabilityNonViable).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []FindingLifecycle{FindingReady, FindingReported} {
+		t.Run(string(status), func(t *testing.T) {
+			err := WriteFindingField(gdb, f.ID, "status", string(status), SourceAnalyst, "tester")
+			if !errors.Is(err, ErrFindingNonViable) {
+				t.Fatalf("error = %v, want ErrFindingNonViable", err)
+			}
+			var got Finding
+			if err := gdb.First(&got, f.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != FindingNew {
+				t.Fatalf("status = %q, want %q", got.Status, FindingNew)
+			}
+		})
+	}
+}
+
+func TestWriteFindingField_concurrentUpdatesKeepHistoryChain(t *testing.T) {
+	gdb := newTestDB(t)
+	f := seedFinding(t, gdb)
+
+	// Hold both first reads until each writer has loaded the same value.
+	// Release one writer at a time so the second must retry a stale snapshot
+	// after the first commits, without racing the live writer's commit against
+	// the bounded busy-retry backoff.
+	const callbackName = "test:barrier_finding_reads"
+	var reads atomic.Int32
+	arrived := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var writers sync.WaitGroup
+	defer func() {
+		close(release)
+		writers.Wait()
+	}()
+	if err := gdb.Callback().Query().After("gorm:query").Register(callbackName, func(d *gorm.DB) {
+		loaded, ok := d.Statement.Dest.(*Finding)
+		if !ok || loaded.ID != f.ID || d.Error != nil {
+			return
+		}
+		if reads.Add(1) <= 2 {
+			arrived <- struct{}{}
+			<-release
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := gdb.Callback().Query().Remove(callbackName); err != nil {
+			t.Errorf("remove query barrier: %v", err)
+		}
+	})
+
+	errs := make(chan error, 2)
+	writers.Go(func() {
+		errs <- WriteFindingField(gdb, f.ID, severityField, "Critical", SourceAnalyst, "analyst-a")
+	})
+	writers.Go(func() {
+		errs <- WriteFindingField(gdb, f.ID, severityField, "Medium", SourceModel, "worker-b")
+	})
+
+	for range 2 {
+		select {
+		case <-arrived:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for concurrent finding reads")
+		}
+	}
+	for range 2 {
+		select {
+		case release <- struct{}{}:
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out releasing a concurrent finding writer")
+		}
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("concurrent WriteFindingField: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for concurrent finding writes")
+		}
+	}
+	if reads.Load() < 3 {
+		t.Fatal("expected the stale writer to reload the finding on retry")
+	}
+
+	var refreshed Finding
+	if err := gdb.First(&refreshed, f.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var history []FindingHistory
+	if err := gdb.Where("finding_id = ? AND field = ?", f.ID, severityField).Order("id").Find(&history).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history len = %d, want 2: %+v", len(history), history)
+	}
+	if history[0].OldValue != "High" {
+		t.Errorf("first OldValue = %q, want High", history[0].OldValue)
+	}
+	if history[1].OldValue != history[0].NewValue {
+		t.Errorf("history chain is broken: first transition %q -> %q, second %q -> %q",
+			history[0].OldValue, history[0].NewValue, history[1].OldValue, history[1].NewValue)
+	}
+	if refreshed.Severity != history[1].NewValue {
+		t.Errorf("final severity = %q, want last history value %q", refreshed.Severity, history[1].NewValue)
+	}
+	written := map[string]bool{
+		history[0].NewValue: true,
+		history[1].NewValue: true,
+	}
+	if !written["Critical"] || !written["Medium"] {
+		t.Errorf("history transitions = %+v, want both concurrent values", history)
+	}
+}
+
+func TestWriteFindingField_acceptsSuggestedRecipients(t *testing.T) {
+	gdb := newTestDB(t)
+	f := seedFinding(t, gdb)
+
+	if err := WriteFindingField(gdb, f.ID, "suggested_recipients", "@alice (CODEOWNERS: crypto/*)", SourceModel, "disclose"); err != nil {
+		t.Fatal(err)
+	}
+	var refreshed Finding
+	gdb.First(&refreshed, f.ID)
+	if refreshed.SuggestedRecipients != "@alice (CODEOWNERS: crypto/*)" {
+		t.Errorf("suggested_recipients = %q", refreshed.SuggestedRecipients)
+	}
+}
+
 func TestWriteFindingField_rejectsUnknownField(t *testing.T) {
 	gdb := newTestDB(t)
 	f := seedFinding(t, gdb)
 	if err := WriteFindingField(gdb, f.ID, "does_not_exist", "x", SourceAnalyst, ""); err == nil {
 		t.Error("expected error for unknown field")
+	}
+}
+
+func TestWriteFindingField_rejectsUnknownStatus(t *testing.T) {
+	gdb := newTestDB(t)
+	f := seedFinding(t, gdb)
+	for _, bad := range []string{"Rejected", "closed", "REPORTED"} {
+		if err := WriteFindingField(gdb, f.ID, "status", bad, SourceAnalyst, ""); err == nil {
+			t.Errorf("status %q: expected error", bad)
+		}
+	}
+	var got Finding
+	gdb.First(&got, f.ID)
+	if got.Status != FindingNew {
+		t.Errorf("status = %q, want unchanged", got.Status)
+	}
+	for _, ok := range FindingLifecycles {
+		if err := WriteFindingField(gdb, f.ID, "status", string(ok), SourceAnalyst, ""); err != nil {
+			t.Errorf("status %q: %v", ok, err)
+		}
 	}
 }
 
@@ -144,6 +545,39 @@ func TestWriteFindingField_cvssVectorSyncsScore(t *testing.T) {
 	if refreshed.CVSSv4Score != 0 || refreshed.CVSSv4Vector != "" {
 		t.Errorf("v4 columns mutated by v3 write: vec=%q score=%v",
 			refreshed.CVSSv4Vector, refreshed.CVSSv4Score)
+	}
+}
+
+func TestWriteFindingField_cvssSameScoreKeepsScoreHistoryNoOp(t *testing.T) {
+	gdb := newTestDB(t)
+	f := seedFinding(t, gdb)
+	const (
+		oldVector = "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+		newVector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+	)
+	if err := gdb.Model(&Finding{}).Where("id = ?", f.ID).Updates(map[string]any{
+		"cvss_vector": oldVector,
+		"cvss_score":  9.8,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WriteFindingField(gdb, f.ID, "cvss_vector", newVector, SourceAnalyst, "me"); err != nil {
+		t.Fatal(err)
+	}
+	var refreshed Finding
+	if err := gdb.First(&refreshed, f.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.CVSSVector != newVector || refreshed.CVSSScore != 9.8 {
+		t.Fatalf("vector=%q score=%v, want %q and 9.8", refreshed.CVSSVector, refreshed.CVSSScore, newVector)
+	}
+	var history []FindingHistory
+	if err := gdb.Where("finding_id = ?", f.ID).Order("id").Find(&history).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].Field != "cvss_vector" {
+		t.Fatalf("history = %+v, want only the vector transition", history)
 	}
 }
 
@@ -267,6 +701,44 @@ func TestWriteFindingField_rollsBackOnHistoryFailure(t *testing.T) {
 	}
 }
 
+// A caller-owned transaction gets one savepoint-backed helper attempt. Even
+// if that caller handles the error and commits its other work, the finding
+// column cannot escape without its history row.
+func TestWriteFindingField_existingTransactionKeepsFailedWriteAtomic(t *testing.T) {
+	gdb := newTestDB(t)
+	f := seedFinding(t, gdb)
+
+	remove := failCreate(t, gdb, func(d *gorm.DB) bool {
+		return d.Statement.Table == "finding_histories"
+	})
+	var writeErr error
+	if err := gdb.Transaction(func(tx *gorm.DB) error {
+		writeErr = WriteFindingField(tx, f.ID, severityField, "Critical", SourceAnalyst, "me")
+		return nil
+	}); err != nil {
+		t.Fatalf("outer transaction: %v", err)
+	}
+	remove()
+	if writeErr == nil {
+		t.Fatal("expected helper error when the history insert fails")
+	}
+
+	var refreshed Finding
+	if err := gdb.First(&refreshed, f.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Severity != "High" {
+		t.Errorf("severity = %q, want High after helper savepoint rollback", refreshed.Severity)
+	}
+	var count int64
+	if err := gdb.Model(&FindingHistory{}).Where("finding_id = ?", f.ID).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("history rows = %d, want 0", count)
+	}
+}
+
 // A cvss_vector write fans out to three database writes (the vector column +
 // its history row, then the synced score column + its history row). Failing
 // the score history insert — which happens last — must roll back the whole
@@ -338,7 +810,7 @@ var editableFindingFields = []string{
 	"title", "severity", "status", "cwe", "location", "affected",
 	"reachability", "quality_tier", "cve_id", "ghsa_id",
 	"cvss_vector", "cvss_v4_vector", "fix_version", "fix_commit",
-	"resolution", "disclosure_draft", "assignee",
+	"resolution", "disclosure_draft", "disclosure_title", "assignee",
 	"suggested_fix", "suggested_fix_commit",
 	"breaking_change", "breaking_change_rationale",
 	"exploited_in_wild", "exploited_in_wild_evidence",
@@ -352,6 +824,8 @@ func fieldTestValue(field string) string {
 	switch field {
 	case "ghsa_id":
 		return "GHSA-aaaa-bbbb-cccc"
+	case "status":
+		return string(FindingTriaged)
 	case "cvss_vector":
 		return "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
 	case "cvss_v4_vector":
@@ -482,6 +956,25 @@ func TestAddFindingReference(t *testing.T) {
 	if ref.ID == 0 || ref.URL != "https://example.com/advisory" || ref.Tags != "advisory,upstream" {
 		t.Errorf("reference = %+v", ref)
 	}
+	if ref.Summary != "Upstream advisory" {
+		t.Errorf("reference summary = %q, want initial summary", ref.Summary)
+	}
+
+	unchanged, err := AddFindingReference(gdb, f.ID, "  "+ref.URL+"  ", "   ", "   ")
+	if err != nil {
+		t.Fatalf("AddFindingReference unchanged: %v", err)
+	}
+	if unchanged.ID != ref.ID || unchanged.Tags != ref.Tags || unchanged.Summary != ref.Summary {
+		t.Errorf("unchanged reference = %+v, want %+v", unchanged, ref)
+	}
+
+	updated, err := AddFindingReference(gdb, f.ID, ref.URL, " advisory,patch ", " Patch proposal ")
+	if err != nil {
+		t.Fatalf("AddFindingReference update: %v", err)
+	}
+	if updated.ID != ref.ID || updated.Tags != "advisory,patch" || updated.Summary != "Patch proposal" {
+		t.Errorf("updated reference = %+v", updated)
+	}
 
 	if _, err := AddFindingReference(gdb, f.ID, "   ", "", ""); err == nil {
 		t.Error("empty URL should error")
@@ -490,7 +983,7 @@ func TestAddFindingReference(t *testing.T) {
 	var n int64
 	gdb.Model(&FindingReference{}).Where("finding_id = ?", f.ID).Count(&n)
 	if n != 1 {
-		t.Errorf("reference count = %d, want 1 (empty rejected)", n)
+		t.Errorf("reference count = %d, want 1 (duplicates merged; empty rejected)", n)
 	}
 }
 
@@ -539,5 +1032,40 @@ func TestSeedDefaultLabels_idempotent(t *testing.T) {
 	gdb.Model(&FindingLabel{}).Count(&count2)
 	if count1 != count2 {
 		t.Errorf("second seed inserted rows: %d -> %d", count1, count2)
+	}
+}
+
+// SeverityOrderSQL's numbers and SeverityRank's are the same ordering in two
+// forms — one for SQL to sort and filter by, one for Go to build a threshold
+// from. Asserting the two agree by reading the generated CASE ties them
+// together; pinning a couple of literal ranks instead would let a change to
+// the level order or to the unknown slot move one and not the other.
+func TestSeverityOrderSQLIsNumberedBySeverityRank(t *testing.T) {
+	sql := SeverityOrderSQL()
+	for _, level := range SeverityLevels {
+		want, ok := SeverityRank(level)
+		if !ok {
+			t.Fatalf("SeverityRank(%q) reports the level is unknown", level)
+		}
+		clause := fmt.Sprintf(" WHEN '%s' THEN %d", level, want)
+		if !strings.Contains(sql, clause) {
+			t.Errorf("SeverityOrderSQL missing %q\n  got: %s", clause, sql)
+		}
+	}
+	unknown, ok := SeverityRank("not-a-severity")
+	if ok {
+		t.Error("SeverityRank accepted a non-severity")
+	}
+	if clause := fmt.Sprintf(" ELSE %d END", unknown); !strings.HasSuffix(sql, clause) {
+		t.Errorf("SeverityOrderSQL should end %q so unknown severities sort where SeverityRank puts them\n  got: %s", clause, sql)
+	}
+	// Most severe lowest, which is what makes "at least this severe" a <=.
+	critical, _ := SeverityRank("Critical")
+	low, _ := SeverityRank("Low")
+	if critical >= low || critical != 0 {
+		t.Errorf("ranks are not most-severe-lowest: Critical=%d Low=%d", critical, low)
+	}
+	if unknown <= low {
+		t.Errorf("unknown severity ranks %d, must sort below Low at %d", unknown, low)
 	}
 }

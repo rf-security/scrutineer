@@ -1,0 +1,1350 @@
+//go:build evals
+
+package evals
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/alpha-omega-security/harness/llm"
+
+	"scrutineer/internal/worker"
+)
+
+func TestLoadScenarios(t *testing.T) {
+	scenarios, err := LoadScenarios("../../evals")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scenarios) < 3 {
+		t.Fatalf("scenarios = %d, want at least 3", len(scenarios))
+	}
+	for _, sc := range scenarios {
+		if sc.Skill == "" || sc.Fixture == "" {
+			t.Fatalf("invalid scenario: %+v", sc)
+		}
+		if _, err := os.Stat(filepath.Join("../../evals", sc.Fixture)); err != nil {
+			t.Fatalf("%s fixture %q missing: %v", sc.Path, sc.Fixture, err)
+		}
+	}
+}
+
+func TestAuthOmissionScenario(t *testing.T) {
+	sc, err := LoadScenario("../../evals/security-deep-dive-auth-omission.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := `{"findings":[{"title":"Session omission bypass","severity":"High","cwe":"CWE-306","location":"app.py:18","trace":"session_cookie skips validation before serve_account_data."}]}`
+	results, err := (HeuristicJudge{}).Judge(sc, report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || !results[0].Matched || !results[1].Matched {
+		t.Fatalf("scenario results = %+v, want passing positive and negative assertions", results)
+	}
+}
+
+func TestLoadScenarioDefaultsRequiredButAllowsOptional(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "scenario.yaml")
+	if err := os.WriteFile(path, []byte(`given: optional case
+fixture: fixtures/x
+skill: security-deep-dive
+schema_skill: security-deep-dive
+should_find:
+  - finding: required by default
+    evidence_contains:
+      - buildQuery
+  - finding: optional miss
+    required: false
+must_not_contain:
+  - Rails::ActiveRecord
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sc, err := LoadScenario(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sc.ShouldFind[0].Required {
+		t.Fatal("first should_find should default to required")
+	}
+	if sc.ShouldFind[1].Required {
+		t.Fatal("explicit required:false should stay optional")
+	}
+	if got := sc.ShouldFind[0].Evidence; len(got) != 1 || got[0] != "buildQuery" {
+		t.Fatalf("evidence_contains = %#v, want [buildQuery]", got)
+	}
+	if got := sc.MustNotContain; len(got) != 1 || got[0] != "Rails::ActiveRecord" {
+		t.Fatalf("must_not_contain = %#v, want [Rails::ActiveRecord]", got)
+	}
+	if sc.SchemaSkill != "security-deep-dive" {
+		t.Fatalf("schema_skill = %q, want security-deep-dive", sc.SchemaSkill)
+	}
+}
+
+func TestLoadScenarioRejectsUnknownAssertionField(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "scenario.yaml")
+	if err := os.WriteFile(path, []byte(`given: typo case
+fixture: fixtures/x
+skill: security-deep-dive
+should_find:
+  - finding: typo
+    severty: High
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadScenario(path)
+	if err == nil || !strings.Contains(err.Error(), "severty") {
+		t.Fatalf("LoadScenario error = %v, want unknown severty field", err)
+	}
+}
+
+func TestValidateExperimentPairs(t *testing.T) {
+	paired := []Scenario{
+		{
+			Path:       "a.yaml",
+			Given:      "same fixture and rubric",
+			Fixture:    "fixtures/a",
+			Experiment: "prompt",
+			Variant:    "production",
+			ShouldFind: []Assertion{
+				{Finding: "SQL injection", Required: true},
+				{Finding: "command injection", Required: true},
+			},
+			ShouldNotFind: []Assertion{
+				{Finding: "unused import"},
+				{Finding: "dead code"},
+			},
+		},
+		{
+			Path:       "a-short.yaml",
+			Given:      "same fixture and rubric",
+			Fixture:    "fixtures/a",
+			Experiment: "prompt",
+			Variant:    "candidate",
+			ShouldFind: []Assertion{
+				{Finding: "command injection", Required: true, requiredSet: true},
+				{Finding: "SQL injection", Required: true, requiredSet: true},
+			},
+			ShouldNotFind: []Assertion{
+				{Finding: "dead code"},
+				{Finding: "unused import"},
+			},
+		},
+	}
+	if err := validateExperimentPairs(paired); err != nil {
+		t.Fatalf("validateExperimentPairs() = %v, want nil", err)
+	}
+
+	tests := []struct {
+		name      string
+		scenarios []Scenario
+		want      string
+	}{
+		{
+			name: "one variant",
+			scenarios: []Scenario{
+				{Path: "a.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "production"},
+			},
+			want: "at least 2",
+		},
+		{
+			name: "different fixtures",
+			scenarios: []Scenario{
+				{Path: "a.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "production"},
+				{Path: "b.yaml", Fixture: "fixtures/b", Experiment: "prompt", Variant: "candidate"},
+			},
+			want: "different fixtures",
+		},
+		{
+			name: "duplicate fixture",
+			scenarios: []Scenario{
+				{Path: "a.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "production"},
+				{Path: "again.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "production"},
+				{Path: "candidate.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "candidate"},
+			},
+			want: "repeats fixture",
+		},
+		{
+			name: "different given",
+			scenarios: []Scenario{
+				{
+					Path:       "a.yaml",
+					Given:      "SQL injection reaches the database",
+					Fixture:    "fixtures/a",
+					Experiment: "prompt",
+					Variant:    "production",
+					ShouldFind: []Assertion{{Finding: "SQL injection"}},
+				},
+				{
+					Path:       "candidate.yaml",
+					Given:      "An injection reaches the database",
+					Fixture:    "fixtures/a",
+					Experiment: "prompt",
+					Variant:    "candidate",
+					ShouldFind: []Assertion{{Finding: "SQL injection"}},
+				},
+			},
+			want: "different given text",
+		},
+		{
+			name: "different assertions",
+			scenarios: []Scenario{
+				{
+					Path:       "a.yaml",
+					Fixture:    "fixtures/a",
+					Experiment: "prompt",
+					Variant:    "production",
+					ShouldFind: []Assertion{{Finding: "SQL injection"}},
+				},
+				{
+					Path:       "candidate.yaml",
+					Fixture:    "fixtures/a",
+					Experiment: "prompt",
+					Variant:    "candidate",
+					ShouldFind: []Assertion{{Finding: "command injection"}},
+				},
+			},
+			want: "different assertions",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateExperimentPairs(tc.scenarios)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateExperimentPairs() = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestScenarioValidate(t *testing.T) {
+	tests := []struct {
+		name string
+		sc   Scenario
+	}{
+		{
+			name: "missing fixture",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Skill:      "security-deep-dive",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
+		{
+			name: "no assertions",
+			sc: Scenario{
+				Path:    "case.yaml",
+				Given:   "x",
+				Fixture: "fixtures/x",
+				Skill:   "security-deep-dive",
+			},
+		},
+		{
+			name: "blank should_find",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "security-deep-dive",
+				ShouldFind: []Assertion{{}},
+			},
+		},
+		{
+			name: "blank should_not_find",
+			sc: Scenario{
+				Path:          "case.yaml",
+				Given:         "x",
+				Fixture:       "fixtures/x",
+				Skill:         "security-deep-dive",
+				ShouldNotFind: []Assertion{{}},
+			},
+		},
+		{
+			name: "blank evidence term",
+			sc: Scenario{
+				Path:    "case.yaml",
+				Given:   "x",
+				Fixture: "fixtures/x",
+				Skill:   "security-deep-dive",
+				ShouldFind: []Assertion{{
+					Finding:  "x",
+					Evidence: []string{""},
+				}},
+			},
+		},
+		{
+			name: "blank must_not_contain term",
+			sc: Scenario{
+				Path:           "case.yaml",
+				Given:          "x",
+				Fixture:        "fixtures/x",
+				Skill:          "security-deep-dive",
+				ShouldFind:     []Assertion{{Finding: "x"}},
+				MustNotContain: []string{""},
+			},
+		},
+		{
+			name: "invalid skill path",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "../security-deep-dive",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
+		{
+			name: "invalid schema skill path",
+			sc: Scenario{
+				Path:        "case.yaml",
+				Given:       "x",
+				Fixture:     "fixtures/x",
+				Skill:       "security-deep-dive",
+				SchemaSkill: "/security-deep-dive",
+				ShouldFind:  []Assertion{{Finding: "x"}},
+			},
+		},
+		{
+			name: "experiment without variant",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "security-deep-dive",
+				Experiment: "prompt-test",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
+		{
+			name: "invalid variant identifier",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "security-deep-dive",
+				Experiment: "prompt-test",
+				Variant:    "candidate/one",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
+		{
+			name: "experiment surrounding whitespace",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "security-deep-dive",
+				Experiment: " prompt-test",
+				Variant:    "candidate",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
+		{
+			name: "variant surrounding whitespace",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "security-deep-dive",
+				Experiment: "prompt-test",
+				Variant:    "candidate ",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.sc.validate(); err == nil {
+				t.Fatal("validate succeeded, want error")
+			}
+		})
+	}
+}
+
+func TestScenarioValidateAllowsMustNotContainOnly(t *testing.T) {
+	sc := Scenario{
+		Path:           "case.yaml",
+		Given:          "x",
+		Fixture:        "fixtures/x",
+		Skill:          "security-deep-dive",
+		MustNotContain: []string{"Rails::ActiveRecord"},
+	}
+	if err := sc.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+}
+
+func TestScenarioValidateNamesInvalidAssertion(t *testing.T) {
+	sc := Scenario{
+		Path:    "case.yaml",
+		Given:   "x",
+		Fixture: "fixtures/x",
+		Skill:   "security-deep-dive",
+		ShouldFind: []Assertion{{
+			Finding:  "SQL injection",
+			Evidence: []string{""},
+		}},
+	}
+	err := sc.validate()
+	if err == nil || !strings.Contains(err.Error(), "should_find[0] (SQL injection)") {
+		t.Fatalf("validate() = %v, want assertion index and label", err)
+	}
+}
+
+func TestHeuristicJudge(t *testing.T) {
+	sc := Scenario{
+		ShouldFind: []Assertion{{
+			Finding:  "SQL injection",
+			Severity: "High",
+			CWE:      "CWE-89",
+			Path:     "app.py",
+			Evidence: []string{"buildQuery", "username parameter"},
+			Required: true,
+		}},
+		ShouldNotFind: []Assertion{{Finding: "unused import"}},
+	}
+	report := `{"findings":[{"title":"SQL injection in buildQuery","severity":"High","cwe":"CWE-89","location":"app.py:8","trace":"The username parameter reaches buildQuery."}]}`
+	got, err := (HeuristicJudge{}).Judge(sc, report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("results = %d, want 2", len(got))
+	}
+	for _, r := range got {
+		if !r.Matched {
+			t.Fatalf("assertion did not pass: %+v", r)
+		}
+	}
+}
+
+func TestAssertionMatchesFinding(t *testing.T) {
+	baseFinding := Finding{Sinks: []string{"S1"}, Title: "SQL injection in buildQuery", Severity: "high", CWE: "cwe-89", Location: "app.py:12:3"}
+	classes := map[string]string{"S1": "Template or interpolation"}
+	tests := []struct {
+		name string
+		a    Assertion
+		f    Finding
+		want bool
+	}{
+		{name: "full match", a: Assertion{Finding: "sql injection", Severity: "High", CWE: "CWE-89", Path: "app.py"}, want: true},
+		{name: "title mismatch", a: Assertion{Finding: "command injection"}, want: false},
+		{name: "severity mismatch", a: Assertion{Severity: "Low"}, want: false},
+		{name: "cwe mismatch", a: Assertion{CWE: "CWE-78"}, want: false},
+		{name: "path mismatch", a: Assertion{Path: "other.py"}, want: false},
+		{name: "evidence match", a: Assertion{Evidence: []string{"buildQuery"}}, want: true},
+		{name: "evidence mismatch", a: Assertion{Evidence: []string{"missing function"}}, want: false},
+		{name: "CWE is not evidence", a: Assertion{Evidence: []string{"CWE-89"}}, want: false},
+		{
+			name: "path avoids file prefix false positive",
+			a:    Assertion{Path: "app.py"},
+			f:    Finding{Title: "backup", Location: "app.py.bak:1"},
+			want: false,
+		},
+		{
+			name: "directory prefix match",
+			a:    Assertion{Path: "pkg"},
+			f:    Finding{Title: "nested", Location: "pkg/app.py:1"},
+			want: true,
+		},
+		{name: "sink class match", a: Assertion{SinkClass: "template or interpolation"}, want: true},
+		{name: "sink class mismatch", a: Assertion{SinkClass: "API misuse"}, want: false},
+		{
+			name: "sink class needs an inventory entry",
+			a:    Assertion{SinkClass: "Template or interpolation"},
+			f:    Finding{Sinks: []string{"S9"}, Title: "uninventoried", Location: "app.py:1"},
+			want: false,
+		},
+		{
+			name: "sink class needs a cited sink",
+			a:    Assertion{SinkClass: "Template or interpolation"},
+			f:    Finding{Title: "sinkless", Location: "app.py:1"},
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := tc.f
+			if f.Title == "" && f.Location == "" {
+				f = baseFinding
+			}
+			if got := assertionMatchesFinding(tc.a, f, classes); got != tc.want {
+				t.Fatalf("assertionMatchesFinding() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHeuristicJudgeMustNotContain(t *testing.T) {
+	sc := Scenario{MustNotContain: []string{"Rails::ActiveRecord", "ghost.py"}}
+	passingReport := `{"findings":[{"title":"SQL injection","location":"app.py:7"}]}`
+	got, err := (HeuristicJudge{}).Judge(sc, passingReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !got[0].Matched || !got[1].Matched {
+		t.Fatalf("must_not_contain should pass: %+v", got)
+	}
+
+	failingReport := `{"findings":[],"summary":"Rails::ActiveRecord is in scope"}`
+	got, err = (HeuristicJudge{}).Judge(sc, failingReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Matched || !strings.Contains(got[0].Reason, "unexpectedly contains") {
+		t.Fatalf("must_not_contain should fail: %+v", got[0])
+	}
+}
+
+func TestHeuristicJudgeFailures(t *testing.T) {
+	sc := Scenario{
+		ShouldFind:    []Assertion{{Finding: "SQL injection", Required: true}},
+		ShouldNotFind: []Assertion{{Finding: "debug endpoint"}},
+	}
+	report := `{"findings":[{"title":"debug endpoint exposed","severity":"Medium","location":"debug.py:1"}]}`
+	got, err := (HeuristicJudge{}).Judge(sc, report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("results = %d, want 2", len(got))
+	}
+	if got[0].Matched {
+		t.Fatalf("should_find unexpectedly matched: %+v", got[0])
+	}
+	if got[1].Matched {
+		t.Fatalf("should_not_find hit should fail the assertion: %+v", got[1])
+	}
+}
+
+func TestRunnerLoadsEvalSkillWithProductionSchema(t *testing.T) {
+	sc := mustLoadScenario(t, "../../evals/security-deep-dive-short-sqli.yaml")
+	r := Runner{
+		Runner:     fakeSkillRunner{report: validDeepDiveReport()},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+		Model:      "test-model",
+	}
+	skill, err := r.loadSkill(sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if skill.Name != "security-deep-dive-short" {
+		t.Fatalf("skill name = %q, want security-deep-dive-short", skill.Name)
+	}
+	if skill.SchemaJSON == "" {
+		t.Fatal("eval skill did not inherit production schema")
+	}
+	res, err := r.RunScenario(context.Background(), sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.FailedRequired != 0 || res.Unexpected != 0 {
+		t.Fatalf("unexpected failures: %+v", res)
+	}
+}
+
+func TestRunnerStagesEvalSkillReferences(t *testing.T) {
+	sc := mustLoadScenario(t, "../../evals/security-deep-dive-short-sqli.yaml")
+	inspected := false
+	r := Runner{
+		Runner: fakeSkillRunner{
+			report: validDeepDiveReport(),
+			inspect: func(sj worker.SkillJob) error {
+				inspected = true
+				for _, name := range []string{"sink-taxonomy.md", "report-contract.md"} {
+					if _, err := os.Stat(filepath.Join(sj.SkillDir, "references", name)); err != nil {
+						return fmt.Errorf("staged reference %s: %w", name, err)
+					}
+				}
+				return nil
+			},
+		},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+	}
+	if _, err := r.RunScenario(context.Background(), sc); err != nil {
+		t.Fatal(err)
+	}
+	if !inspected {
+		t.Fatal("skill runner did not inspect staged references")
+	}
+}
+
+func TestRunnerEvalSkillFileOnlyFallsBackWhenAbsent(t *testing.T) {
+	evalsRoot := t.TempDir()
+	productionRoot := t.TempDir()
+	evalSkill := filepath.Join(evalsRoot, "skills", "variant", "SKILL.md")
+	if err := os.MkdirAll(filepath.Dir(evalSkill), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(evalsRoot, "missing.md"), evalSkill); err != nil {
+		t.Fatal(err)
+	}
+	writeProductionSkill(t, productionRoot, "variant", "variant")
+
+	r := Runner{EvalsRoot: evalsRoot, SkillsRoot: productionRoot}
+	if got := r.skillFile("variant"); got != evalSkill {
+		t.Fatalf("skillFile = %q, want broken eval skill path %q", got, evalSkill)
+	}
+	_, err := r.loadSkill(Scenario{Path: "case.yaml", Skill: "variant"})
+	if err == nil {
+		t.Fatal("loadSkill succeeded through production fallback, want eval skill parse error")
+	}
+}
+
+func TestRunnerRejectsSkillNameMismatch(t *testing.T) {
+	evalsRoot := t.TempDir()
+	writeEvalSkill(t, evalsRoot, "expected", "actual")
+
+	r := Runner{EvalsRoot: evalsRoot, SkillsRoot: t.TempDir()}
+	_, err := r.loadSkill(Scenario{Path: "case.yaml", Skill: "expected"})
+	if err == nil || !strings.Contains(err.Error(), `skill "expected" loaded SKILL.md with name "actual"`) {
+		t.Fatalf("loadSkill error = %v, want skill name mismatch", err)
+	}
+}
+
+func TestRunnerRejectsSchemaSkillNameMismatch(t *testing.T) {
+	evalsRoot := t.TempDir()
+	skillsRoot := t.TempDir()
+	writeEvalSkill(t, evalsRoot, "variant", "variant")
+	writeProductionSkill(t, skillsRoot, "schema-source", "wrong-schema")
+
+	r := Runner{EvalsRoot: evalsRoot, SkillsRoot: skillsRoot}
+	_, err := r.loadSkill(Scenario{Path: "case.yaml", Skill: "variant", SchemaSkill: "schema-source"})
+	if err == nil || !strings.Contains(err.Error(), `schema_skill "schema-source" loaded SKILL.md with name "wrong-schema"`) {
+		t.Fatalf("loadSkill error = %v, want schema skill name mismatch", err)
+	}
+}
+
+func TestRunnerStagesSkillAndScoresReport(t *testing.T) {
+	sc, err := LoadScenario("../../evals/security-deep-dive-sqli.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Runner{
+		Runner:     fakeSkillRunner{report: validDeepDiveReport()},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+		Model:      "test-model",
+	}
+	res, err := r.RunScenario(context.Background(), sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.FailedRequired != 0 || res.Unexpected != 0 {
+		t.Fatalf("unexpected failures: %+v", res)
+	}
+	if res.Cost.USD != 0.01 || res.Cost.Turns != 1 || res.Cost.InputTokens != 10 {
+		t.Fatalf("cost not accumulated: %+v", res.Cost)
+	}
+}
+
+func TestRunnerAddsUsageJudgeCost(t *testing.T) {
+	sc := mustLoadScenario(t, "../../evals/security-deep-dive-sqli.yaml")
+	r := Runner{
+		Runner:     fakeSkillRunner{report: validDeepDiveReport()},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+		Judge: usageJudgeStub{
+			matches: []AssertionResult{{Kind: assertionShouldFind, Matched: true, Required: true}},
+			cost:    Cost{USD: 0.02, Turns: 1, InputTokens: 20, OutputTokens: 5},
+		},
+	}
+	res, err := r.RunScenario(context.Background(), sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Cost.USD != 0.03 || res.Cost.Turns != 2 || res.Cost.InputTokens != 30 || res.Cost.OutputTokens != 7 {
+		t.Fatalf("cost = %+v, want skill and judge usage combined", res.Cost)
+	}
+}
+
+func TestModelJudgeReturnsOrderedVerdictsAndUsage(t *testing.T) {
+	server := modelJudgeServer(t, `{"verdicts":[{"index":1,"passed":false,"reason":"prohibited finding is present"},{"index":0,"passed":true,"reason":"finding has the required evidence"}]}`)
+	defer server.Close()
+
+	judge := ModelJudge{Options: llm.Options{
+		Endpoint:  server.URL + "/v1/messages",
+		APIKey:    "test-key",
+		Model:     "claude-haiku-4-5",
+		MaxTokens: 64,
+	}}
+	sc := Scenario{
+		Given:         "a test scenario",
+		Skill:         "security-deep-dive",
+		ShouldFind:    []Assertion{{Finding: "SQL injection", Required: true}},
+		ShouldNotFind: []Assertion{{Finding: "debug endpoint"}},
+	}
+	matches, cost, err := judge.JudgeWithUsage(context.Background(), sc, `{"findings":[]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 2 || !matches[0].Matched || matches[1].Matched {
+		t.Fatalf("matches = %+v, want ordered model verdicts", matches)
+	}
+	if cost.Turns != 1 || cost.InputTokens != 10 || cost.OutputTokens != 4 || cost.CacheReadTokens != 3 || cost.CacheWriteTokens != 2 || cost.USD <= 0 {
+		t.Fatalf("cost = %+v, want model usage and priced cost", cost)
+	}
+}
+
+func TestModelJudgeRejectsIncompleteVerdicts(t *testing.T) {
+	server := modelJudgeServer(t, `{"verdicts":[{"index":0,"passed":true,"reason":"one"}]}`)
+	defer server.Close()
+	judge := ModelJudge{Options: llm.Options{
+		Endpoint:  server.URL + "/v1/messages",
+		APIKey:    "test-key",
+		Model:     "claude-haiku-4-5",
+		MaxTokens: 64,
+	}}
+	_, _, err := judge.JudgeWithUsage(context.Background(), Scenario{
+		Given:         "test",
+		Skill:         "security-deep-dive",
+		ShouldFind:    []Assertion{{Finding: "one"}},
+		ShouldNotFind: []Assertion{{Finding: "two"}},
+	}, `{"findings":[]}`)
+	if err == nil || !strings.Contains(err.Error(), "verdicts, want 2") {
+		t.Fatalf("JudgeWithUsage() error = %v, want incomplete-verdict error", err)
+	}
+}
+
+func TestRunnerRejectsSchemaInvalidReport(t *testing.T) {
+	sc, err := LoadScenario("../../evals/security-deep-dive-sqli.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Runner{
+		Runner:     fakeSkillRunner{report: `{"findings":[{"title":"SQL injection in buildQuery","severity":"High","cwe":"CWE-89","location":"app.py:7"}]}`},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+	}
+	_, err = r.RunScenario(context.Background(), sc)
+	if err == nil || !strings.Contains(err.Error(), "failed report validation") {
+		t.Fatalf("RunScenario error = %v, want report validation failure", err)
+	}
+}
+
+func TestRunnerRejectsIncompleteDeepDiveInventory(t *testing.T) {
+	sc, err := LoadScenario("../../evals/security-deep-dive-sqli.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Runner{
+		Runner:     fakeSkillRunner{report: incompleteDeepDiveReport()},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+	}
+	_, err = r.RunScenario(context.Background(), sc)
+	if err == nil || !strings.Contains(err.Error(), "inventory sink S1 has no disposition") {
+		t.Fatalf("RunScenario error = %v, want unresolved inventory failure", err)
+	}
+}
+
+func TestMassAssignmentScenario(t *testing.T) {
+	sc := mustLoadScenario(t, "../../evals/security-deep-dive-mass-assignment.yaml")
+	report := `{"findings":[{
+  "title":"Mass assignment in update_account",
+  "cwe":"CWE-915",
+  "location":"account.py:10",
+  "trace":"request.get_json() supplies body, and account.update(body) copies role without an allow-list."
+}]}`
+	got, err := (HeuristicJudge{}).Judge(sc, report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("results = %d, want 2", len(got))
+	}
+	for _, result := range got {
+		if !result.Matched {
+			t.Fatalf("mass-assignment assertion did not pass: %+v", result)
+		}
+	}
+
+	safeReport := `{"findings":[{
+  "title":"Mass assignment in update_profile",
+  "cwe":"CWE-915",
+  "location":"profile.py:14",
+  "trace":"update_profile uses account.update(editable) and overwrites owner_id."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, safeReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("safe results = %d, want 2", len(got))
+	}
+	if got[1].Kind != assertionShouldNotFind {
+		t.Fatalf("safe result kind = %q, want %q", got[1].Kind, assertionShouldNotFind)
+	}
+	if got[1].Matched {
+		t.Fatalf("allow-listed endpoint unexpectedly passed should_not_find: %+v", got[1])
+	}
+}
+
+func TestAPIMisuseScenario(t *testing.T) {
+	sc := mustLoadScenario(t, "../../evals/security-deep-dive-api-misuse.yaml")
+	// The scenario asserts the class the run put on the sink it cites, not just
+	// the prose, so the inventory entry is what carries `API misuse` here.
+	report := `{
+  "inventory":[{"id":"S1","location":"client.py:5","class":"API misuse","boundary":"caller of the fetch helper","consumes":"the verify argument default"}],
+  "findings":[{
+  "sinks":["S1"],
+  "title":"TLS verification disabled by default in fetch",
+  "cwe":"CWE-295",
+  "location":"client.py:5",
+  "trace":"fetch(url, verify=False) leaves context.verify_mode at ssl.CERT_NONE for a caller who passes nothing."
+}]}`
+	got, err := (HeuristicJudge{}).Judge(sc, report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("results = %d, want 3", len(got))
+	}
+	for _, result := range got {
+		if !result.Matched {
+			t.Fatalf("api-misuse assertion did not pass: %+v", result)
+		}
+	}
+
+	// The two helpers have identical bodies, so a run that reports the one
+	// whose default is safe is reacting to the opt-out rather than to the
+	// default. That is what the negative assertion exists to catch. Each
+	// helper owns a file, so both assertions turn on the path: this title
+	// never says fetch_pinned yet the report is still caught, while the
+	// evidence that carries the real finding no longer buys it the positive.
+	safeReport := `{
+  "inventory":[{"id":"S1","location":"pinned_client.py:5","class":"API misuse","boundary":"caller of the fetch helper","consumes":"the verify argument default"}],
+  "findings":[{
+  "sinks":["S1"],
+  "title":"Certificate validation can be disabled in the pinned helper",
+  "cwe":"CWE-295",
+  "location":"pinned_client.py:5",
+  "trace":"fetch_pinned(url, verify=False) reaches ssl.CERT_NONE, although its default keeps certificate checking on."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, safeReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("safe results = %d, want 3", len(got))
+	}
+	if got[0].Matched {
+		t.Errorf("report naming only the safe helper passed the required positive: %+v", got[0])
+	}
+	if got[2].Kind != assertionShouldNotFind {
+		t.Fatalf("safe result kind = %q, want %q", got[2].Kind, assertionShouldNotFind)
+	}
+	if got[2].Matched {
+		t.Fatalf("safely defaulted helper unexpectedly passed should_not_find: %+v", got[2])
+	}
+
+	// The skill steers a write-up toward contrasting the two defaults, so a
+	// correct finding may well name the safe helper. It stays in client.py,
+	// which is what keeps the negative off it.
+	contrastReport := `{
+  "inventory":[{"id":"S1","location":"client.py:5","class":"API misuse","boundary":"caller of the fetch helper","consumes":"the verify argument default"}],
+  "findings":[{
+  "sinks":["S1"],
+  "title":"fetch defaults verify off while fetch_pinned is the safe counterpart",
+  "cwe":"CWE-295",
+  "location":"client.py:5",
+  "trace":"fetch(url, verify=False) leaves context.verify_mode at ssl.CERT_NONE for a caller who passes nothing."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, contrastReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("contrast results = %d, want 3", len(got))
+	}
+	for _, result := range got {
+		if !result.Matched {
+			t.Errorf("write-up contrasting the two helpers failed an assertion: %+v", result)
+		}
+	}
+
+	// The same finding filed as a plain TLS bug at the call site. Everything the
+	// prose assertions look at is unchanged, so the class on the cited sink is
+	// the only thing standing between this and the required positive: the
+	// scenario is about reaching the API definition, not about noticing that
+	// urlopen can run without certificate checks.
+	networkReport := `{
+  "inventory":[{"id":"S1","location":"client.py:11","class":"Network","boundary":"caller of the fetch helper","consumes":"the url argument"}],
+  "findings":[{
+  "sinks":["S1"],
+  "title":"TLS verification disabled by default in fetch",
+  "cwe":"CWE-295",
+  "location":"client.py:11",
+  "trace":"fetch(url, verify=False) leaves context.verify_mode at ssl.CERT_NONE for a caller who passes nothing."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, networkReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("network-class results = %d, want 3", len(got))
+	}
+	if got[0].Matched {
+		t.Errorf("finding whose sink is not classified API misuse passed the required positive: %+v", got[0])
+	}
+}
+
+func TestConventionPrevalenceScenario(t *testing.T) {
+	sc := mustLoadScenario(t, "../../evals/security-deep-dive-convention.yaml")
+	// One finding for the reachable site, with the other eight named as the
+	// convention in prior_art. Citing them there must not read as reporting
+	// them, which is what keeps the convention write-up from tripping the
+	// negative assertion.
+	report := `{"findings":[{
+  "title":"SQL injection in search",
+  "cwe":"CWE-89",
+  "location":"search.py:11",
+  "trace":"flask.request.args supplies q, which reaches SELECT id FROM items through store.query.",
+  "prior_art":"grep -rn 'query(\"SELECT' finds 9 hits; the 8 in reports.py interpolate module constants."
+}]}`
+	got, err := (HeuristicJudge{}).Judge(sc, report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("results = %d, want 2", len(got))
+	}
+	for _, result := range got {
+		if !result.Matched {
+			t.Fatalf("convention assertion did not pass: %+v", result)
+		}
+	}
+
+	// The reachable site is written up correctly here. What the negative catches
+	// is the eight house-idiom sites filed alongside it, so the search finding
+	// keeps its prior art to leave the count out of the verdict.
+	conventionReport := `{"findings":[{
+  "title":"SQL injection in search",
+  "cwe":"CWE-89",
+  "location":"search.py:11",
+  "trace":"flask.request.args supplies q, which reaches SELECT id FROM items through store.query.",
+  "prior_art":"grep -rn 'query(\"SELECT' finds 9 hits; the 8 in reports.py interpolate module constants."
+},{
+  "title":"SQL injection in active_accounts",
+  "cwe":"CWE-89",
+  "location":"reports.py:5",
+  "trace":"STATUS_ACTIVE is interpolated into the accounts query."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, conventionReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("convention results = %d, want 2", len(got))
+	}
+	if got[1].Kind != assertionShouldNotFind {
+		t.Fatalf("convention result kind = %q, want %q", got[1].Kind, assertionShouldNotFind)
+	}
+	if got[1].Matched {
+		t.Fatalf("house-idiom site unexpectedly passed should_not_find: %+v", got[1])
+	}
+
+	// The same sweep cited without its count. Everything else the assertion asks
+	// for is here, the grep command included, so the count is the only thing
+	// missing: prevalence is what tells this site apart from the eight the run
+	// is meant to leave alone, so a write-up that never counted them has not
+	// done that work. The rating and the handler location are what a real report
+	// carries; each holds a 9 that a bare "9" evidence term would have taken for
+	// the count.
+	uncountedReport := `{"findings":[{
+  "title":"SQL injection in search",
+  "cwe":"CWE-89",
+  "location":"search.py:11",
+  "locations":["search.py:9","search.py:11"],
+  "rating":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H, 9.8 critical",
+  "trace":"flask.request.args supplies q, which reaches SELECT id FROM items through store.query.",
+  "prior_art":"grep -rn 'query(\"SELECT' shows the same idiom across the reports module."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, uncountedReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("uncounted results = %d, want 2", len(got))
+	}
+	if got[0].Matched {
+		t.Errorf("sweep cited with no hit count passed the required positive: %+v", got[0])
+	}
+}
+
+func TestRunnerCountsMustNotContainFailure(t *testing.T) {
+	sc, err := LoadScenario("../../evals/security-deep-dive-sqli.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc.MustNotContain = []string{"username parameter"}
+	r := Runner{
+		Runner:     fakeSkillRunner{report: validDeepDiveReport()},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+	}
+	res, err := r.RunScenario(context.Background(), sc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Unexpected != 1 {
+		t.Fatalf("unexpected = %d, want 1: %+v", res.Unexpected, res.Matches)
+	}
+}
+
+func TestRunFixtures(t *testing.T) {
+	if os.Getenv("SCRUTINEER_RUN_EVALS") != "1" {
+		t.Skip("set SCRUTINEER_RUN_EVALS=1 to execute model-backed skill evals")
+	}
+	scenarios, err := LoadScenarios("../../evals")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Runner{
+		Runner:     worker.LocalClaude{},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+		Model:      os.Getenv("SCRUTINEER_EVAL_MODEL"),
+	}
+	if os.Getenv("SCRUTINEER_EVAL_JUDGE") == "model" {
+		judgeModel := os.Getenv("SCRUTINEER_EVAL_JUDGE_MODEL")
+		if judgeModel == "" {
+			judgeModel = r.Model
+		}
+		r.Judge = ModelJudge{Options: llm.Options{
+			APIKey:    os.Getenv("ANTHROPIC_API_KEY"),
+			Model:     judgeModel,
+			MaxTokens: modelJudgeMaxTokens,
+		}}
+	}
+	results, err := r.RunAll(context.Background(), scenarios)
+	for _, res := range results {
+		t.Logf("%s: assertions=%d required_misses=%d optional_misses=%d unexpected=%d cost=$%.4f turns=%d",
+			res.Scenario.Path, res.AssertionTotal, res.FailedRequired, res.OptionalMisses, res.Unexpected, res.Cost.USD, res.Cost.Turns)
+		if res.FailedRequired > 0 || res.Unexpected > 0 {
+			t.Fail()
+		}
+	}
+	for _, summary := range SummarizeExperiments(results) {
+		t.Logf("experiment=%s variant=%s scenarios=%d passed=%d errors=%d assertions=%d required_misses=%d optional_misses=%d unexpected=%d cost=$%.4f turns=%d input_tokens=%d output_tokens=%d cache_read_tokens=%d cache_write_tokens=%d",
+			summary.Experiment, summary.Variant, summary.ScenarioTotal, summary.Passed, summary.Errors,
+			summary.AssertionTotal, summary.FailedRequired, summary.OptionalMisses, summary.Unexpected,
+			summary.Cost.USD, summary.Cost.Turns, summary.Cost.InputTokens, summary.Cost.OutputTokens,
+			summary.Cost.CacheReadTokens, summary.Cost.CacheWriteTokens)
+	}
+	if err != nil {
+		t.Errorf("run scenarios: %v", err)
+	}
+}
+
+type usageJudgeStub struct {
+	matches []AssertionResult
+	cost    Cost
+}
+
+func (j usageJudgeStub) Judge(Scenario, string) ([]AssertionResult, error) {
+	return j.matches, nil
+}
+
+func (j usageJudgeStub) JudgeWithUsage(context.Context, Scenario, string) ([]AssertionResult, Cost, error) {
+	return j.matches, j.cost, nil
+}
+
+func modelJudgeServer(t *testing.T, verdicts string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
+			t.Fatalf("request = %s %s, want POST /v1/messages", r.Method, r.URL.Path)
+		}
+		var request struct {
+			OutputConfig struct {
+				Format struct {
+					Type   string          `json:"type"`
+					Schema json.RawMessage `json:"schema"`
+				} `json:"format"`
+			} `json:"output_config"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.OutputConfig.Format.Type != "json_schema" || !json.Valid(request.OutputConfig.Format.Schema) {
+			t.Fatalf("structured output = %+v, want valid JSON schema", request.OutputConfig.Format)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"content":[{"type":"text","text":%q}],"usage":{"input_tokens":10,"output_tokens":4,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}`, verdicts)
+	}))
+}
+
+func TestRunnerRejectsFixtureTraversal(t *testing.T) {
+	r := Runner{EvalsRoot: "../../evals"}
+	for _, fixture := range []string{"../outside", "/tmp/repo", "C:/repo"} {
+		_, err := r.fixturePath(Scenario{Path: "case.yaml", Fixture: fixture})
+		if err == nil {
+			t.Fatalf("fixturePath(%q) succeeded, want error", fixture)
+		}
+	}
+}
+
+func TestRunAllContinuesAfterScenarioError(t *testing.T) {
+	scenarios := []Scenario{
+		{Path: "bad.yaml", Fixture: "../bad", Skill: "security-deep-dive"},
+		mustLoadScenario(t, "../../evals/security-deep-dive-sqli.yaml"),
+	}
+	r := Runner{
+		Runner:     fakeSkillRunner{report: validDeepDiveReport()},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+	}
+	results, err := r.RunAll(context.Background(), scenarios)
+	if err == nil {
+		t.Fatal("RunAll error = nil, want joined error")
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %d, want 2", len(results))
+	}
+	if results[0].Error == "" {
+		t.Fatalf("first result missing error: %+v", results[0])
+	}
+	if results[1].Error != "" || results[1].FailedRequired != 0 {
+		t.Fatalf("second scenario should still run successfully: %+v", results[1])
+	}
+}
+
+func TestSummarizeExperiments(t *testing.T) {
+	results := []Result{
+		{
+			Scenario:       Scenario{Experiment: "prompt", Variant: "production"},
+			AssertionTotal: 2,
+			Cost:           Cost{USD: 0.03, Turns: 2, InputTokens: 30},
+		},
+		{
+			Scenario:       Scenario{Experiment: "prompt", Variant: "production"},
+			AssertionTotal: 3,
+			FailedRequired: 1,
+			OptionalMisses: 1,
+			Cost:           Cost{USD: 0.04, Turns: 3, InputTokens: 40},
+		},
+		{
+			Scenario:       Scenario{Experiment: "prompt", Variant: "reference-driven"},
+			AssertionTotal: 2,
+			Unexpected:     1,
+			Cost:           Cost{USD: 0.02, Turns: 1, InputTokens: 20},
+		},
+		{
+			Scenario: Scenario{Experiment: "prompt", Variant: "reference-driven"},
+			Error:    "runner failed",
+		},
+		{Scenario: Scenario{Skill: "unpaired"}, AssertionTotal: 99},
+	}
+
+	got := SummarizeExperiments(results)
+	if len(got) != 2 {
+		t.Fatalf("summaries = %d, want 2: %+v", len(got), got)
+	}
+	if got[0].Variant != "production" || got[0].ScenarioTotal != 2 || got[0].Passed != 1 ||
+		got[0].AssertionTotal != 5 || got[0].FailedRequired != 1 || got[0].OptionalMisses != 1 ||
+		got[0].Cost.USD < 0.0699 || got[0].Cost.USD > 0.0701 || got[0].Cost.Turns != 5 || got[0].Cost.InputTokens != 70 {
+		t.Fatalf("production summary = %+v", got[0])
+	}
+	if got[1].Variant != "reference-driven" || got[1].ScenarioTotal != 2 || got[1].Passed != 0 ||
+		got[1].Errors != 1 || got[1].Unexpected != 1 || got[1].AssertionTotal != 2 {
+		t.Fatalf("reference-driven summary = %+v", got[1])
+	}
+}
+
+func mustLoadScenario(t *testing.T, path string) Scenario {
+	t.Helper()
+	sc, err := LoadScenario(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sc
+}
+
+func writeEvalSkill(t *testing.T, root, dirName, skillName string) {
+	t.Helper()
+	writeSkillFile(t, filepath.Join(root, "skills", dirName), skillName)
+}
+
+func writeProductionSkill(t *testing.T, root, dirName, skillName string) {
+	t.Helper()
+	writeSkillFile(t, filepath.Join(root, dirName), skillName)
+}
+
+func writeSkillFile(t *testing.T, dir, skillName string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`---
+name: %s
+description: eval test skill
+license: MIT
+metadata:
+  scrutineer.output_file: report.json
+  scrutineer.output_kind: freeform
+---
+
+# %s
+
+Write report.json.
+`, skillName, skillName)
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func validDeepDiveReport() string {
+	return `{
+  "repository": "https://example.com/eval",
+  "commit": "abcdef1",
+  "spec_version": 14,
+  "model": "test-model",
+  "date": "2026-07-09",
+  "languages": ["Python"],
+  "boundaries": [{
+    "actor": "HTTP client",
+    "trusted": "no",
+    "controls": "No input validation before query construction",
+    "source": "app.py"
+  }],
+  "method": {
+    "scope": "./src",
+    "grep_patterns": [],
+    "inventory_count": 2,
+    "ruled_out_count": 1,
+    "unresolved_count": 0,
+    "notes": ["Python fixture: no memory-unsafe primitives to enumerate."]
+  },
+  "inventory": [{
+    "id": "S1",
+    "location": "app.py:7",
+    "class": "Validation",
+    "boundary": "HTTP client",
+    "consumes": "username query parameter"
+  }, {
+    "id": "S2",
+    "location": "app.py:1",
+    "class": "Validation",
+    "boundary": "HTTP client",
+    "consumes": "unused import"
+  }],
+  "findings": [{
+    "id": "F1",
+    "sinks": ["S1"],
+    "title": "SQL injection in buildQuery",
+    "severity": "High",
+    "cwe": "CWE-89",
+    "location": "app.py:7",
+    "reachability": "reachable",
+    "quality_tier": "high",
+    "trace": "The username parameter is concatenated into SQL.",
+    "boundary": "Untrusted HTTP input crosses into SQL execution.",
+    "validation": "Manual review of app.py shows string concatenation in buildQuery.",
+    "rating": "High impact and directly reachable."
+  }],
+  "ruled_out": [{
+    "sinks": ["S2"],
+    "step": 6,
+    "reason": "No additional sinks were present in the fixture."
+  }]
+}`
+}
+
+func incompleteDeepDiveReport() string {
+	return `{
+  "repository": "https://example.com/eval",
+  "commit": "abcdef1",
+  "spec_version": 14,
+  "model": "test-model",
+  "date": "2026-07-09",
+  "languages": ["Python"],
+  "boundaries": [{
+    "actor": "HTTP client",
+    "trusted": "no",
+    "controls": "No input validation before query construction",
+    "source": "app.py"
+  }],
+  "method": {
+    "scope": "./src",
+    "grep_patterns": [],
+    "inventory_count": 1,
+    "ruled_out_count": 0,
+    "unresolved_count": 0,
+    "notes": ["Python fixture: no memory-unsafe primitives to enumerate."]
+  },
+  "inventory": [{
+    "id": "S1",
+    "location": "app.py:7",
+    "class": "Validation",
+    "boundary": "HTTP client",
+    "consumes": "username query parameter"
+  }],
+  "findings": [],
+  "ruled_out": []
+}`
+}
+
+type fakeSkillRunner struct {
+	report  string
+	err     error
+	inspect func(worker.SkillJob) error
+}
+
+func (f fakeSkillRunner) RunSkill(ctx context.Context, sj worker.SkillJob, emit func(worker.Event)) (worker.SkillResult, error) {
+	if f.err != nil {
+		return worker.SkillResult{}, f.err
+	}
+	if f.inspect != nil {
+		if err := f.inspect(sj); err != nil {
+			return worker.SkillResult{}, err
+		}
+	}
+	if sj.Name == "" || sj.SkillDir == "" || sj.OutputFile == "" {
+		return worker.SkillResult{}, os.ErrInvalid
+	}
+	if _, err := os.Stat(filepath.Join(sj.WorkRoot, "src")); err != nil {
+		return worker.SkillResult{}, err
+	}
+	if _, err := os.Stat(filepath.Join(sj.SkillDir, "SKILL.md")); err != nil {
+		return worker.SkillResult{}, err
+	}
+	if err := runGit(ctx, filepath.Join(sj.WorkRoot, "src"), "rev-parse", "--verify", "HEAD"); err != nil {
+		return worker.SkillResult{}, err
+	}
+	emit(worker.Event{
+		Kind:    worker.KindResult,
+		CostUSD: 0.01,
+		Turns:   1,
+		Usage:   worker.Usage{InputTokens: 10, OutputTokens: 2},
+	})
+	return worker.SkillResult{Commit: "abc", Report: f.report}, nil
+}
+
+func (fakeSkillRunner) SkillDir(workRoot, name string) string {
+	return filepath.Join(workRoot, ".claude", "skills", name)
+}
+
+var _ worker.SkillRunner = fakeSkillRunner{}

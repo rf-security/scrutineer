@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
 )
@@ -84,11 +86,26 @@ func (s *Server) findingCSAF(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.PathValue("id"))
 	var f db.Finding
 	if err := s.DB.First(&f, id).Error; err != nil {
-		http.NotFound(w, r)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		s.Log.Error("csaf finding", "finding", id, "err", err)
+		http.Error(w, "failed to load finding", http.StatusInternalServerError)
 		return
 	}
 	if f.Status == db.FindingDuplicate {
 		http.Error(w, "finding is a duplicate; export not available", http.StatusGone)
+		return
+	}
+	hasDependents, err := repoHasDependents(s.DB, f.RepositoryID)
+	if err != nil {
+		s.Log.Error("count dependents", "repo", f.RepositoryID, "err", err)
+		http.Error(w, "failed to count repository dependents", http.StatusInternalServerError)
+		return
+	}
+	if !hasDependents {
+		http.Error(w, "CSAF VEX export is unavailable because this repository has no recorded dependents", http.StatusNotFound)
 		return
 	}
 	schema, err := getCSAFSchema()
@@ -98,14 +115,39 @@ func (s *Server) findingCSAF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var repo db.Repository
-	s.DB.First(&repo, f.RepositoryID)
+	if err := s.DB.First(&repo, f.RepositoryID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		s.Log.Error("csaf repository", "finding", f.ID, "repository", f.RepositoryID, "err", err)
+		http.Error(w, "failed to load repository", http.StatusInternalServerError)
+		return
+	}
 	var refs []db.FindingReference
-	s.DB.Where("finding_id = ?", f.ID).Order("id desc").Find(&refs)
+	if err := s.DB.Where("finding_id = ?", f.ID).Order("id desc").Find(&refs).Error; err != nil {
+		s.Log.Error("csaf references", "finding", f.ID, "err", err)
+		http.Error(w, "failed to load finding references", http.StatusInternalServerError)
+		return
+	}
 	var pkgs []db.Package
-	s.DB.Where("repository_id = ?", f.RepositoryID).Find(&pkgs)
+	if err := s.DB.Where("repository_id = ?", f.RepositoryID).Find(&pkgs).Error; err != nil {
+		s.Log.Error("csaf packages", "finding", f.ID, "repository", f.RepositoryID, "err", err)
+		http.Error(w, "failed to load repository packages", http.StatusInternalServerError)
+		return
+	}
 	var fdRows []db.FindingDependent
-	s.DB.Where("finding_id = ?", f.ID).Find(&fdRows)
-	deps := loadFindingDependents(s, fdRows)
+	if err := s.DB.Where("finding_id = ?", f.ID).Find(&fdRows).Error; err != nil {
+		s.Log.Error("csaf finding dependents", "finding", f.ID, "err", err)
+		http.Error(w, "failed to load finding dependents", http.StatusInternalServerError)
+		return
+	}
+	deps, err := loadFindingDependents(s, fdRows)
+	if err != nil {
+		s.Log.Error("csaf dependents", "finding", f.ID, "err", err)
+		http.Error(w, "failed to load dependents", http.StatusInternalServerError)
+		return
+	}
 
 	raw, err := json.MarshalIndent(buildCSAF(f, repo, refs, pkgs, fdRows, deps), "", "  ")
 	if err != nil {
@@ -278,21 +320,31 @@ type csafReference struct {
 
 // loadFindingDependents fetches the Dependent rows referenced by the
 // given exposure rows, keyed by ID for cheap lookup in buildCSAF.
-func loadFindingDependents(s *Server, rows []db.FindingDependent) map[uint]db.Dependent {
+func loadFindingDependents(s *Server, rows []db.FindingDependent) (map[uint]db.Dependent, error) {
 	if len(rows) == 0 {
-		return nil
+		return nil, nil
 	}
 	ids := make([]uint, len(rows))
 	for i, r := range rows {
 		ids[i] = r.DependentID
 	}
 	var deps []db.Dependent
-	s.DB.Where("id IN ?", ids).Find(&deps)
+	if err := s.DB.Where("id IN ?", ids).Find(&deps).Error; err != nil {
+		return nil, err
+	}
 	out := make(map[uint]db.Dependent, len(deps))
 	for _, d := range deps {
 		out[d.ID] = d
 	}
-	return out
+	return out, nil
+}
+
+func repoHasDependents(gdb *gorm.DB, repoID uint) (bool, error) {
+	var dependentCount int64
+	if err := gdb.Model(&db.Dependent{}).Where("repository_id = ?", repoID).Count(&dependentCount).Error; err != nil {
+		return false, err
+	}
+	return dependentCount > 0, nil
 }
 
 func dependentProductID(d db.Dependent) string {
@@ -510,17 +562,18 @@ func buildProductStatusMulti(f db.Finding, productIDs []string, fdRows []db.Find
 // otherwise emit baseScore: 0 / baseSeverity: NONE next to a populated
 // vector, which is worse than no score at all.
 func buildScoreMulti(f db.Finding, productIDs []string) *csafScore {
-	cvss := parseCVSSv3Vector(f.CVSSVector)
+	vector := strings.TrimSpace(f.CVSSVector)
+	cvss := parseCVSSv3Vector(vector)
 	if cvss == nil {
 		return nil
 	}
-	score, ok := db.BaseScoreFromVector(f.CVSSVector)
+	parsed, ok := parseCVSSVersion(vector, cvssVersion30, cvssVersion31)
 	if !ok {
 		return nil
 	}
-	cvss.BaseScore = score
-	cvss.BaseSeverity = severityLabel(score)
-	cvss.VectorString = f.CVSSVector
+	cvss.BaseScore = parsed.Score
+	cvss.BaseSeverity = severityLabel(parsed.Score)
+	cvss.VectorString = vector
 	return &csafScore{Products: productIDs, CVSSv3: cvss}
 }
 

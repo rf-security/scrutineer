@@ -1,13 +1,15 @@
 {{template "head" .}}
 
-<div class="flex items-center justify-between gap-4 mb-6">
+<div class="flex flex-wrap items-center justify-between gap-4 mb-6">
   <h2 class="text-2xl font-semibold flex items-center gap-2">
     <i data-lucide="bug"></i> Findings
+    <span class="text-base font-normal text-muted-foreground">({{.Page.Total}})</span>
   </h2>
-  <div class="flex items-center gap-2">
+  <div class="flex flex-wrap items-center justify-end gap-2">
     {{$mp := ""}}{{if .Missed}}{{$mp = "1"}}{{end}}
     {{$sc := ""}}{{if .Scanners}}{{$sc = "1"}}{{end}}
     {{$st := .Status}}
+    {{$pv := .Viability}}
     <form method="get" action="/findings" class="inline-flex">
       <input class="input" type="search" name="q" value="{{.Q}}" placeholder="Search findings"
              autocomplete="off" spellcheck="false">
@@ -15,18 +17,19 @@
       <input type="hidden" name="status" value="{{.Status}}">
       <input type="hidden" name="category" value="{{.Category}}">
       <input type="hidden" name="sort" value="{{.Sort}}">
+      <input type="hidden" name="viability" value="{{$pv}}">
       {{if .Missed}}<input type="hidden" name="missed" value="1">{{end}}
       {{if .Scanners}}<input type="hidden" name="scanners" value="1">{{end}}
     </form>
     {{if gt .ScannerTotal 0}}
       {{if .Scanners}}
         <a class="btn-outline" aria-pressed="true"
-           href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}">
+           href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&viability={{$pv}}">
           <i data-lucide="scan-search"></i> Include scanners ({{.ScannerTotal}})
         </a>
       {{else}}
         <a class="btn-outline"
-           href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners=1">
+           href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners=1&viability={{$pv}}">
           <i data-lucide="scan-search"></i> Include scanners ({{.ScannerTotal}})
         </a>
       {{end}}
@@ -34,12 +37,12 @@
     {{if gt .MissedTotal 0}}
       {{if .Missed}}
         <a class="btn-outline" aria-pressed="true"
-           href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&scanners={{$sc}}">
+           href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&scanners={{$sc}}&viability={{$pv}}">
           <i data-lucide="eye-off"></i> Not seen on rescan ({{.MissedTotal}})
         </a>
       {{else}}
         <a class="btn-outline"
-           href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed=1&scanners={{$sc}}">
+           href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed=1&scanners={{$sc}}&viability={{$pv}}">
           <i data-lucide="eye-off"></i> Not seen on rescan ({{.MissedTotal}})
         </a>
       {{end}}
@@ -52,9 +55,9 @@
       </button>
       <div data-popover aria-hidden="true" data-align="end">
         <div role="menu">
-          <a role="menuitem" href="/findings?q={{.Q}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}">All severities</a>
+          <a role="menuitem" href="/findings?q={{.Q}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability={{$pv}}">All severities</a>
           {{range (list "Critical" "High" "Medium" "Low")}}
-            <a role="menuitem" href="/findings?q={{$.Q}}&severity={{.}}&status={{$st}}&category={{$.Category}}&sort={{$.Sort}}&missed={{$mp}}&scanners={{$sc}}"
+            <a role="menuitem" href="/findings?q={{$.Q}}&severity={{.}}&status={{$st}}&category={{$.Category}}&sort={{$.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability={{$pv}}"
                {{if eq . $.Severity}}aria-current="true"{{end}}>{{.}}</a>
           {{end}}
         </div>
@@ -68,12 +71,12 @@
       </button>
       <div data-popover aria-hidden="true" data-align="end">
         <div role="menu">
-          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}"
+          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability={{$pv}}"
              {{if not .Status}}aria-current="true"{{end}}>Open</a>
-          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&status=all&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}"
+          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&status=all&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability={{$pv}}"
              {{if eq .Status "all"}}aria-current="true"{{end}}>All statuses</a>
           {{range .Statuses}}
-            <a role="menuitem" href="/findings?q={{$.Q}}&severity={{$.Severity}}&status={{.}}&category={{$.Category}}&sort={{$.Sort}}&missed={{$mp}}&scanners={{$sc}}"
+            <a role="menuitem" href="/findings?q={{$.Q}}&severity={{$.Severity}}&status={{.}}&category={{$.Category}}&sort={{$.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability={{$pv}}"
                {{if eq (printf "%s" .) $.Status}}aria-current="true"{{end}}>{{.}}</a>
           {{end}}
         </div>
@@ -87,27 +90,45 @@
       </button>
       <div data-popover aria-hidden="true" data-align="end">
         <div role="menu">
-          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}">All categories</a>
+          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability={{$pv}}">All categories</a>
           {{range .Categories}}
-            <a role="menuitem" href="/findings?q={{$.Q}}&severity={{$.Severity}}&status={{$st}}&category={{.}}&sort={{$.Sort}}&missed={{$mp}}&scanners={{$sc}}"
+            <a role="menuitem" href="/findings?q={{$.Q}}&severity={{$.Severity}}&status={{$st}}&category={{.}}&sort={{$.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability={{$pv}}"
                {{if eq . $.Category}}aria-current="true"{{end}}>{{catlabel .}}</a>
           {{end}}
-          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Uncategorized}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}"
+          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Uncategorized}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability={{$pv}}"
              {{if eq .Uncategorized .Category}}aria-current="true"{{end}}>{{.Uncategorized}}</a>
         </div>
       </div>
     </div>
     <div class="dropdown-menu">
-      <button type="button" class="btn-outline" aria-hashpopup="menu" aria-expanded="false">
+      <button type="button" class="btn-outline" aria-haspopup="menu" aria-expanded="false">
+        <i data-lucide="route"></i>
+        {{if eq $pv "unassessed"}}Unassessed{{else if $pv}}{{$pv}}{{else}}Viability{{end}}
+        <i data-lucide="chevron-down"></i>
+      </button>
+      <div data-popover aria-hidden="true" data-align="end">
+        <div role="menu">
+          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}">All viability</a>
+          {{range (list "VIABLE" "NON_VIABLE" "SAMPLE_OR_TEST" "CONDITIONAL_VIABLE")}}
+            <a role="menuitem" href="/findings?q={{$.Q}}&severity={{$.Severity}}&status={{$st}}&category={{$.Category}}&sort={{$.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability={{.}}"
+               {{if eq . $pv}}aria-current="true"{{end}}>{{.}}</a>
+          {{end}}
+          <a role="menuitem" href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&scanners={{$sc}}&viability=unassessed"
+             {{if eq $pv "unassessed"}}aria-current="true"{{end}}>Unassessed</a>
+        </div>
+      </div>
+    </div>
+    <div class="dropdown-menu">
+      <button type="button" class="btn-outline" aria-haspopup="menu" aria-expanded="false">
         <i data-lucide="arrow-down-wide-narrow"></i>
-        {{if eq .Sort "severity"}}Severity{{else if eq .Sort "repository"}}Repository{{else}}Newest{{end}}
+        {{if eq (sortkey .Sort) "severity"}}Severity{{else if eq (sortkey .Sort) "repository"}}Repository{{else}}Newest{{end}}
         <i data-lucide="chevron-down"></i>
       </button>
       <div data-popover aria-hidden="true" data-align="end">
         <div role="menu">
           {{range (list "newest" "severity" "repository")}}
-            <a role="menuitem" href="/findings?q={{$.Q}}&severity={{$.Severity}}&status={{$st}}&category={{$.Category}}&sort={{.}}&missed={{$mp}}&scanners={{$sc}}"
-               {{if eq . $.Sort}}aria-current="true"{{end}}>{{.}}</a>
+            <a role="menuitem" href="/findings?q={{$.Q}}&severity={{$.Severity}}&status={{$st}}&category={{$.Category}}&sort={{.}}&missed={{$mp}}&scanners={{$sc}}&viability={{$pv}}"
+               {{if eq . (sortkey $.Sort)}}aria-current="true"{{end}}>{{.}}</a>
           {{end}}
         </div>
       </div>
@@ -118,24 +139,31 @@
 {{if .Findings}}
   <table class="table table-fixed w-full">
     <thead><tr>
-      <th class="w-24">Severity</th><th>Title</th><th class="w-24">Status</th>
-      <th class="w-32">Repository</th>
+      {{template "th-sort" (dict "Sorter" .Sorter "Key" "severity" "Def" "desc" "Label" "Severity" "Class" "w-24")}}
+      {{template "th-sort" (dict "Sorter" .Sorter "Key" "title" "Def" "asc" "Label" "Title" "Class" "")}}
+      {{template "th-sort" (dict "Sorter" .Sorter "Key" "status" "Def" "asc" "Label" "Status" "Class" "w-24")}}
+      {{template "th-sort" (dict "Sorter" .Sorter "Key" "repository" "Def" "asc" "Label" "Repository" "Class" "w-32")}}
+      {{template "th-sort" (dict "Sorter" .Sorter "Key" "repo_id" "Def" "asc" "Label" "Repo ID" "Class" "w-20")}}
       {{if .AnySubPath}}<th class="w-32">Sub-path</th>{{end}}
-      <th class="w-44">CWE</th>
-      <th class="w-56">Location</th><th class="w-16">Scan</th>
+      {{template "th-sort" (dict "Sorter" .Sorter "Key" "cwe" "Def" "asc" "Label" "CWE" "Class" "w-44")}}
+      <th class="w-56">Location</th>
+      {{if .AnyModel}}{{template "th-sort" (dict "Sorter" .Sorter "Key" "model" "Def" "asc" "Label" "Model" "Class" "w-28")}}{{end}}
+      {{template "th-sort" (dict "Sorter" .Sorter "Key" "scan" "Def" "desc" "Label" "Scan" "Class" "w-16")}}
     </tr></thead>
     <tbody>
     {{$repos := .Repos}}
     {{$showSub := .AnySubPath}}
+    {{$showModel := .AnyModel}}
     {{range .Findings}}
       {{$repo := index $repos .RepositoryID}}
       <tr id="finding-{{.ID}}">
         <td>{{template "severity-badge" .Severity}}</td>
         <td class="min-w-0 whitespace-normal">
           <a href="/findings/{{.ID}}" class="font-medium">{{.Title}}</a>
+          {{if .ProductionViability}}<span class="badge-outline text-xs">{{.ProductionViability}}</span>{{end}}
           {{if gt .MissedCount 0}}
             <span class="badge-outline text-xs"
-                  data-tooltip="Not observed in the last {{.MissedCount}} rescan(s) of this repository">
+                  data-tooltip="Not observed in the last {{.MissedCount}} full-repo rescan(s) of this repository">
               not seen {{.MissedCount}}x
             </span>
           {{end}}
@@ -143,6 +171,7 @@
         </td>
         <td>{{template "finding-status" (fstatus .Status)}}</td>
         <td class="truncate">{{$repo.Name}}</td>
+        <td class="text-muted-foreground">{{$repo.ID}}</td>
         {{if $showSub}}
           <td class="text-muted-foreground text-xs">{{if .SubPath}}<code>{{.SubPath}}</code>{{else}}<span class="text-muted-foreground">root</span>{{end}}</td>
         {{end}}
@@ -150,6 +179,9 @@
           {{if .CWE}}<span data-tooltip="{{cwename .CWE}}">{{with cwecatid .CWE}}<span class="text-muted-foreground">{{.}} ›</span> {{end}}{{.CWE}}</span>{{end}}
         </td>
         <td class="whitespace-normal">{{template "loc-link" (dict "RepoID" $repo.ID "Commit" .Commit "Location" .Location "Extra" .ExtraLocationCount)}}</td>
+        {{if $showModel}}
+          <td class="text-muted-foreground text-xs truncate">{{if .Model}}{{.Model}}{{else}}-{{end}}</td>
+        {{end}}
         <td class="text-muted-foreground">#{{.ScanID}}</td>
       </tr>
     {{end}}

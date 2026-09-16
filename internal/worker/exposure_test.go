@@ -3,6 +3,7 @@ package worker
 import (
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	"scrutineer/internal/db"
@@ -107,16 +108,41 @@ func TestParseExposureOutput_invalidJSON(t *testing.T) {
 	}
 }
 
+func TestParseExposureOutputReportsGenericValidationFailure(t *testing.T) {
+	w := newExposureWorker(t)
+	scan, skill, dep := seedExposureFixtures(t, w)
+	skill.SchemaJSON = `{"type":"object","required":["status"]}`
+	var events []Event
+	if err := w.parseExposureOutput(&skill, &scan, dep.ID, `{}`, func(event Event) {
+		events = append(events, event)
+	}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, event := range events {
+		if strings.Contains(event.Text, "validation: report.json does not pass Scrutineer report validation") {
+			return
+		}
+	}
+	t.Fatalf("validation event missing from %#v", events)
+}
+
 func TestParseExposureOutput_upsertsExistingRow(t *testing.T) {
 	w := newExposureWorker(t)
 	scan, skill, dep := seedExposureFixtures(t, w)
 
-	first := `{"status":"under_investigation","spec_version":1}`
-	if err := w.parseExposureOutput(&skill, &scan, dep.ID, first, func(Event) {}); err != nil {
-		t.Fatal(err)
+	if err := w.DB.Create(&db.FindingDependent{
+		FindingID:     *scan.FindingID,
+		DependentID:   dep.ID,
+		Status:        db.ExposureUnderInvestigation,
+		Justification: "old justification",
+		Rationale:     "old rationale",
+		ScanCommit:    "old-commit",
+	}).Error; err != nil {
+		t.Fatalf("seed finding dependent: %v", err)
 	}
-	second := `{"status":"known_affected","spec_version":1}`
-	if err := w.parseExposureOutput(&skill, &scan, dep.ID, second, func(Event) {}); err != nil {
+	scan.Commit = "new-commit"
+	report := `{"status":"known_not_affected","justification":"vulnerable_code_not_in_execute_path","rationale":"new rationale","spec_version":1}`
+	if err := w.parseExposureOutput(&skill, &scan, dep.ID, report, func(Event) {}); err != nil {
 		t.Fatal(err)
 	}
 	var rows []db.FindingDependent
@@ -124,19 +150,14 @@ func TestParseExposureOutput_upsertsExistingRow(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("expected upsert, got %d rows", len(rows))
 	}
-	if rows[0].Status != db.ExposureKnownAffected {
-		t.Errorf("status = %q", rows[0].Status)
+	row := rows[0]
+	if row.Status != db.ExposureKnownNotAffected {
+		t.Errorf("status = %q", row.Status)
 	}
-}
-
-func TestDependentCacheRoot_keyedByURL(t *testing.T) {
-	a := dependentCacheRoot("/data", "https://github.com/a/b")
-	b := dependentCacheRoot("/data", "https://github.com/a/b")
-	c := dependentCacheRoot("/data", "https://github.com/c/d")
-	if a != b {
-		t.Errorf("same URL must yield same path: %s vs %s", a, b)
+	if row.Justification != db.JustifVulnerableCodeNotInPath || row.Rationale != "new rationale" {
+		t.Errorf("verdict fields = %+v", row)
 	}
-	if a == c {
-		t.Errorf("different URLs must yield different paths")
+	if row.ScanID == nil || *row.ScanID != scan.ID || row.ScanCommit != scan.Commit {
+		t.Errorf("scan fields = %+v", row)
 	}
 }

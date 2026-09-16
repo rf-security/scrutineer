@@ -11,6 +11,7 @@
     "date",
     "languages",
     "boundaries",
+    "method",
     "inventory",
     "findings",
     "ruled_out"
@@ -34,11 +35,13 @@
       "propertyNames": { "$ref": "#/$defs/sink_class" },
       "additionalProperties": { "type": "array", "items": { "type": "string" } }
     },
+    "method": { "$ref": "#/$defs/inventory_method" },
     "inventory":        { "type": "array", "items": { "$ref": "#/$defs/sink" } },
     "inventory_notes":  { "$ref": "#/$defs/markdown" },
 
     "findings":  { "type": "array", "items": { "$ref": "#/$defs/finding" } },
     "ruled_out": { "type": "array", "items": { "$ref": "#/$defs/ruled_out_entry" } },
+    "coverage": { "$ref": "#/$defs/coverage_claim" },
 
     "prior_art": { "$ref": "#/$defs/markdown" },
     "reach":     { "$ref": "#/$defs/markdown" }
@@ -57,6 +60,62 @@
       "type": "string",
       "enum": ["high", "medium", "low"]
     },
+    "coverage_disposition": {
+      "type": "string",
+      "enum": ["reviewed_clean", "reviewed_findings", "supporting", "deferred", "excluded", "failed", "cost_capped"]
+    },
+    "coverage_claim": {
+      "type": "object",
+      "required": ["receipts"],
+      "additionalProperties": false,
+      "properties": {
+        "receipts": { "type": "array", "items": { "$ref": "#/$defs/coverage_receipt" } },
+        "surfaces": { "type": "array", "items": { "$ref": "#/$defs/coverage_surface" } },
+        "open_questions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "dropped_findings": { "type": "array", "items": { "$ref": "#/$defs/coverage_dropped_finding" } }
+      }
+    },
+    "coverage_receipt": {
+      "type": "object",
+      "required": ["path", "disposition"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "disposition": { "$ref": "#/$defs/coverage_disposition" },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "disposition": { "enum": ["deferred", "excluded", "failed", "cost_capped"] } }, "required": ["disposition"] },
+          "then": { "required": ["reason"] }
+        }
+      ]
+    },
+    "coverage_surface": {
+      "type": "object",
+      "required": ["name", "disposition", "evidence_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "disposition": { "$ref": "#/$defs/coverage_disposition" },
+        "evidence_ref": { "type": "string", "minLength": 1 }
+      }
+    },
+    "coverage_dropped_finding": {
+      "type": "object",
+      "required": ["reason"],
+      "additionalProperties": false,
+      "properties": {
+        "fingerprint": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string" }
+      },
+      "anyOf": [
+        { "required": ["fingerprint"] },
+        { "required": ["path"] }
+      ]
+    },
     "sink_class": {
       "type": "string",
       "enum": [
@@ -66,7 +125,8 @@
         "Path handling",
         "Archive extraction",
         "Deserialisation",
-        "Template",
+        "Parsing / format readers",
+        "Template or interpolation",
         "Network",
         "Validation",
         "Cryptography",
@@ -74,9 +134,12 @@
         "Shared mutable state",
         "Concurrency",
         "Resource consumption",
-        "Reflection",
+        "Reflection or metaprogramming",
         "Round-trip integrity",
-        "Agentic"
+        "Authorization and access control",
+        "Temporary files",
+        "Agentic",
+        "API misuse"
       ]
     },
     "sink_id":    { "type": "string", "pattern": "^S[0-9]+$" },
@@ -107,14 +170,54 @@
 
     "sink": {
       "type": "object",
-      "required": ["id", "location", "class", "consumes"],
+      "required": ["id", "location", "class", "boundary", "consumes"],
       "additionalProperties": false,
       "properties": {
         "id":        { "$ref": "#/$defs/sink_id" },
         "location":  { "type": "string" },
         "class":     { "$ref": "#/$defs/sink_class" },
+        "boundary":  { "type": "string", "minLength": 1, "description": "Trust-boundary label from the report's boundaries array." },
         "primitive": { "type": "string" },
         "consumes":  { "type": "string" }
+      }
+    },
+
+    "inventory_method": {
+      "type": "object",
+      "required": ["scope", "grep_patterns", "inventory_count", "ruled_out_count", "unresolved_count"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "type": "string", "minLength": 1, "description": "Source-tree scope searched for this inventory." },
+        "grep_patterns": { "type": "array", "items": { "$ref": "#/$defs/grep_pattern" } },
+        "inventory_count": { "type": "integer", "minimum": 0 },
+        "ruled_out_count": { "type": "integer", "minimum": 0 },
+        "unresolved_count": { "type": "integer", "minimum": 0 },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "grep_pattern": {
+      "type": "object",
+      "required": ["class", "primitive", "command", "hit_count", "inventory_sinks", "excluded_hits"],
+      "additionalProperties": false,
+      "properties": {
+        "class": { "$ref": "#/$defs/sink_class" },
+        "primitive": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "hit_count": { "type": "integer", "minimum": 0, "description": "Number of unique source-hit locations returned by command. A single source hit is counted once even when it produces multiple boundary-specific inventory sink IDs." },
+        "inventory_sinks": { "type": "array", "items": { "$ref": "#/$defs/sink_id" }, "uniqueItems": true, "description": "All inventory IDs produced by this command. Multiple IDs may refer to one raw source hit when its inventory entries share a location but have different boundary labels; map each ID to the hit through inventory[].location." },
+        "excluded_hits": { "type": "array", "items": { "$ref": "#/$defs/excluded_hit" } }
+      }
+    },
+
+    "excluded_hit": {
+      "type": "object",
+      "required": ["location", "category", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "location": { "type": "string", "minLength": 1 },
+        "category": { "type": "string", "enum": ["comment", "test", "vendored", "generated", "other"] },
+        "reason": { "type": "string", "minLength": 1 }
       }
     },
 
@@ -155,8 +258,10 @@
         "boundary":   { "$ref": "#/$defs/markdown" },
         "validation": { "$ref": "#/$defs/markdown", "description": "The reproduction: the script or commands you ran, verbatim and in full, followed by their output. The script content is mandatory, not a description of it — output alone, without the thing that produced it, cannot be re-run or acted on by a later verify pass." },
         "prior_art":  { "$ref": "#/$defs/markdown" },
+        "discovered_via": { "type": "string", "enum": ["source", "issue-tracker", "advisory", "documentation"], "description": "How this finding was first identified. source = found by reading code. issue-tracker = an open or closed issue described it. advisory = a prior CVE/GHSA on this or a sibling project pointed at it. documentation = the project's own docs describe the weakness. Folded into prior_art on ingest so disclose can vary its opening line; not a separate database column." },
         "reach":      { "$ref": "#/$defs/markdown" },
-        "rating":     { "$ref": "#/$defs/markdown" }
+        "rating":     { "$ref": "#/$defs/markdown" },
+        "dup_check":  { "$ref": "#/$defs/markdown", "description": "One sentence: which findings already filed under this scan_group you compared this against, and why this one is distinct. Empty list of siblings is fine; say so. Lets the dedup judge weigh your reasoning before merging." }
       }
     }
   }

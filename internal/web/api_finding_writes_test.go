@@ -45,11 +45,48 @@ func apiReq(t *testing.T, s *Server, method, path, token, body string) *httptest
 	return w
 }
 
+// seedEarlierFindingForAPI creates a finding from a completed scan and a
+// separate running scan on the same repository. The running scan starts
+// repository-scoped; individual tests may bind it to the finding explicitly.
+func seedEarlierFindingForAPI(t *testing.T, s *Server) (db.Finding, db.Scan) {
+	t.Helper()
+	repo, running := seedRunningScan(t, s)
+	prior := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone}
+	if err := s.DB.Create(&prior).Error; err != nil {
+		t.Fatal(err)
+	}
+	f := db.Finding{ScanID: prior.ID, RepositoryID: repo.ID, Title: "earlier finding",
+		Severity: "High", Status: db.FindingNew}
+	if err := s.DB.Create(&f).Error; err != nil {
+		t.Fatal(err)
+	}
+	return f, running
+}
+
+func scopeAPITokenToFinding(t *testing.T, s *Server, token string, findingID uint) {
+	t.Helper()
+	if err := s.DB.Model(&db.Scan{}).Where("api_token = ?", token).
+		Update("finding_id", findingID).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedSiblingFindingForAPI(t *testing.T, s *Server, f db.Finding) db.Finding {
+	t.Helper()
+	sibling := db.Finding{ScanID: f.ScanID, RepositoryID: f.RepositoryID,
+		Title: "sibling finding", Severity: "High", Status: db.FindingNew}
+	if err := s.DB.Create(&sibling).Error; err != nil {
+		t.Fatal(err)
+	}
+	return sibling
+}
+
 func TestAPIPatchFinding(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	f, tok, otherTok := seedFindingForAPI(t, s)
 	path := fmt.Sprintf("/api/findings/%d", f.ID)
+	scopeAPITokenToFinding(t, s, tok, f.ID)
 
 	w := apiReq(t, s, "PATCH", path, tok,
 		`{"fields":{"severity":"Critical","cve_id":"CVE-2026-12345"},"by":"disclose"}`)
@@ -95,6 +132,196 @@ func TestAPIPatchFinding(t *testing.T) {
 	w = apiReq(t, s, "PATCH", "/api/findings/999999", tok, `{"fields":{"severity":"Low"}}`)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("missing finding: status = %d, want 404", w.Code)
+	}
+}
+
+func TestApiPatchFinding_refusesForeignFindingStatus(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f, scan := seedEarlierFindingForAPI(t, s)
+
+	w := apiReq(t, s, http.MethodPatch, fmt.Sprintf("/api/findings/%d", f.ID),
+		scan.APIToken, `{"fields":{"status":"reported"}}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), "scoped finding") {
+		t.Errorf("body does not name the finding-scope constraint: %s", w.Body)
+	}
+	var got db.Finding
+	if err := s.DB.First(&got, f.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != db.FindingNew {
+		t.Fatalf("finding status = %q, want unchanged %q", got.Status, db.FindingNew)
+	}
+}
+
+func TestApiPatchFinding_refusesForeignFindingSeverity(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f, scan := seedEarlierFindingForAPI(t, s)
+	sibling := seedSiblingFindingForAPI(t, s, f)
+	scopeAPITokenToFinding(t, s, scan.APIToken, sibling.ID)
+
+	w := apiReq(t, s, http.MethodPatch, fmt.Sprintf("/api/findings/%d", f.ID),
+		scan.APIToken, `{"fields":{"severity":"Low"}}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), "scoped finding") {
+		t.Errorf("body does not name the finding-scope constraint: %s", w.Body)
+	}
+	var got db.Finding
+	if err := s.DB.First(&got, f.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Severity != "High" {
+		t.Fatalf("finding severity = %q, want unchanged High", got.Severity)
+	}
+	var historyCount int64
+	if err := s.DB.Model(&db.FindingHistory{}).Where("finding_id = ?", f.ID).
+		Count(&historyCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if historyCount != 0 {
+		t.Fatalf("history rows = %d, want 0", historyCount)
+	}
+}
+
+func TestApiPatchFinding_allowsOwnFindingScopedStatus(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f, scan := seedEarlierFindingForAPI(t, s)
+	if err := s.DB.Model(&scan).Update("finding_id", f.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	w := apiReq(t, s, http.MethodPatch, fmt.Sprintf("/api/findings/%d", f.ID),
+		scan.APIToken, `{"fields":{"status":"reported"},"by":"report-upstream"}`)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body)
+	}
+	var got db.Finding
+	if err := s.DB.First(&got, f.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != db.FindingReported {
+		t.Fatalf("finding status = %q, want %q", got.Status, db.FindingReported)
+	}
+}
+
+func TestApiPatchFinding_refusesSuppressiveStatus(t *testing.T) {
+	for _, status := range []db.FindingLifecycle{db.FindingRejected, db.FindingDuplicate} {
+		for _, scope := range []string{"matching", "missing", "wrong"} {
+			t.Run(string(status)+"/"+scope, func(t *testing.T) {
+				s, done := newTestServer(t)
+				defer done()
+				f, scan := seedEarlierFindingForAPI(t, s)
+				switch scope {
+				case "matching":
+					scopeAPITokenToFinding(t, s, scan.APIToken, f.ID)
+				case "wrong":
+					sibling := seedSiblingFindingForAPI(t, s, f)
+					scopeAPITokenToFinding(t, s, scan.APIToken, sibling.ID)
+				}
+
+				body := fmt.Sprintf(`{"fields":{"status":%q}}`, status)
+				w := apiReq(t, s, http.MethodPatch, fmt.Sprintf("/api/findings/%d", f.ID),
+					scan.APIToken, body)
+				if w.Code != http.StatusForbidden {
+					t.Fatalf("status = %d, want 403; body=%s", w.Code, w.Body)
+				}
+				if !strings.Contains(w.Body.String(), "rejected") ||
+					!strings.Contains(w.Body.String(), "duplicate") {
+					t.Errorf("body does not name the suppressive-status constraint: %s", w.Body)
+				}
+				var got db.Finding
+				if err := s.DB.First(&got, f.ID).Error; err != nil {
+					t.Fatal(err)
+				}
+				if got.Status != db.FindingNew {
+					t.Fatalf("finding status = %q, want unchanged %q", got.Status, db.FindingNew)
+				}
+			})
+		}
+	}
+}
+
+func TestApiPatchFinding_allowsRepoScopedReferences(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f, scan := seedEarlierFindingForAPI(t, s)
+
+	w := apiReq(t, s, http.MethodPost,
+		fmt.Sprintf("/api/findings/%d/references", f.ID), scan.APIToken,
+		`{"url":"https://example.com/staging/1","tags":"staging-issue"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", w.Code, w.Body)
+	}
+	var count int64
+	if err := s.DB.Model(&db.FindingReference{}).Where("finding_id = ?", f.ID).
+		Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("reference rows = %d, want 1", count)
+	}
+}
+
+func TestAPIPatchFindingAtomicRollback(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f, tok, _ := seedFindingForAPI(t, s)
+	path := fmt.Sprintf("/api/findings/%d", f.ID)
+	scopeAPITokenToFinding(t, s, tok, f.ID)
+
+	w := apiReq(t, s, "PATCH", path, tok,
+		`{"fields":{"cve_id":"CVE-2026-12345","ghsa_id":"not-a-ghsa"},"by":"disclose"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body)
+	}
+
+	var got db.Finding
+	s.DB.First(&got, f.ID)
+	if got.CVEID != "" || got.GHSAID != "" {
+		t.Fatalf("finding fields committed despite failed patch: cve=%q ghsa=%q", got.CVEID, got.GHSAID)
+	}
+	var hist []db.FindingHistory
+	s.DB.Where("finding_id = ?", f.ID).Find(&hist)
+	if len(hist) != 0 {
+		t.Fatalf("history rows = %d, want 0 after rollback: %+v", len(hist), hist)
+	}
+}
+
+func TestAPIPatchFindingCVSSSyncsInsideTransaction(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f, tok, _ := seedFindingForAPI(t, s)
+	path := fmt.Sprintf("/api/findings/%d", f.ID)
+	scopeAPITokenToFinding(t, s, tok, f.ID)
+	const vec = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+
+	w := apiReq(t, s, "PATCH", path, tok,
+		`{"fields":{"cvss_vector":"`+vec+`","severity":"Critical"},"by":"disclose"}`)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body)
+	}
+
+	var got db.Finding
+	s.DB.First(&got, f.ID)
+	if got.CVSSVector != vec || got.CVSSScore != 9.8 || got.Severity != "Critical" {
+		t.Fatalf("finding after patch: vector=%q score=%v severity=%q", got.CVSSVector, got.CVSSScore, got.Severity)
+	}
+	var hist []db.FindingHistory
+	s.DB.Where("finding_id = ?", f.ID).Order("field").Find(&hist)
+	fields := make([]string, 0, len(hist))
+	for _, h := range hist {
+		fields = append(fields, h.Field)
+	}
+	want := []string{"cvss_score", "cvss_vector", "severity"}
+	if fmt.Sprint(fields) != fmt.Sprint(want) {
+		t.Fatalf("history fields = %v, want %v", fields, want)
 	}
 }
 
@@ -206,6 +433,88 @@ func TestAPISetFindingLabels(t *testing.T) {
 
 	if w := apiReq(t, s, "PUT", path, tok, `not json`); w.Code != http.StatusBadRequest {
 		t.Errorf("bad json: status = %d, want 400", w.Code)
+	}
+}
+
+// A body that omits labels, or sends null, must not be read as "replace with
+// the empty set": that let a malformed request silently wipe analyst-set
+// labels and still answer 204 (#710). A present array still clears.
+func TestAPISetFindingLabels_rejectsMissingLabelsArray(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f, tok, _ := seedFindingForAPI(t, s)
+	path := fmt.Sprintf("/api/findings/%d/labels", f.ID)
+
+	if w := apiReq(t, s, "PUT", path, tok, `{"labels":["wontfix","needs-info"]}`); w.Code != http.StatusNoContent {
+		t.Fatalf("seed labels: status = %d, want 204; body=%s", w.Code, w.Body)
+	}
+
+	for _, body := range []string{`{}`, `{"labels":null}`, `{"other":"field"}`} {
+		w := apiReq(t, s, "PUT", path, tok, body)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("PUT %s: status = %d, want 400", body, w.Code)
+		}
+		var got db.Finding
+		s.DB.Preload("Labels").First(&got, f.ID)
+		if len(got.Labels) != 2 {
+			t.Errorf("PUT %s cleared labels: have %d, want the 2 already set", body, len(got.Labels))
+		}
+	}
+
+	// The explicit clear-all still works, so the fix does not cost the caller
+	// the one way it had to empty the set.
+	if w := apiReq(t, s, "PUT", path, tok, `{"labels":[]}`); w.Code != http.StatusNoContent {
+		t.Fatalf("explicit clear: status = %d, want 204; body=%s", w.Code, w.Body)
+	}
+	var got db.Finding
+	s.DB.Preload("Labels").First(&got, f.ID)
+	if len(got.Labels) != 0 {
+		t.Errorf("labels after explicit clear = %+v, want 0", got.Labels)
+	}
+}
+
+// Blank and whitespace-only names are trimmed and skipped by
+// db.SetFindingLabels, so an array of nothing but blanks reaches the
+// association layer as the empty set and clears the finding. That is existing
+// behaviour and #710 deliberately leaves it alone; it is pinned here so the
+// handler comment and the OpenAPI description cannot drift away from what the
+// code actually does.
+func TestAPISetFindingLabels_blankNamesAreIgnored(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f, tok, _ := seedFindingForAPI(t, s)
+	path := fmt.Sprintf("/api/findings/%d/labels", f.ID)
+
+	seed := func(t *testing.T) {
+		t.Helper()
+		if w := apiReq(t, s, "PUT", path, tok, `{"labels":["wontfix","needs-info"]}`); w.Code != http.StatusNoContent {
+			t.Fatalf("seed labels: status = %d, want 204; body=%s", w.Code, w.Body)
+		}
+	}
+
+	for _, body := range []string{`{"labels":[""]}`, `{"labels":[" "]}`, `{"labels":["  ","\t"]}`} {
+		seed(t)
+		w := apiReq(t, s, "PUT", path, tok, body)
+		if w.Code != http.StatusNoContent {
+			t.Errorf("PUT %s: status = %d, want 204", body, w.Code)
+		}
+		var got db.Finding
+		s.DB.Preload("Labels").First(&got, f.ID)
+		if len(got.Labels) != 0 {
+			t.Errorf("PUT %s: labels = %+v, want the blank names ignored and the set cleared", body, got.Labels)
+		}
+	}
+
+	// A blank name alongside a real one is dropped without taking the real
+	// one with it, so this is a trim-and-skip rule and not "any blank clears".
+	seed(t)
+	if w := apiReq(t, s, "PUT", path, tok, `{"labels":[" ","triage"]}`); w.Code != http.StatusNoContent {
+		t.Fatalf("mixed blank and real: status = %d, want 204; body=%s", w.Code, w.Body)
+	}
+	var got db.Finding
+	s.DB.Preload("Labels").First(&got, f.ID)
+	if len(got.Labels) != 1 || got.Labels[0].Name != "triage" {
+		t.Errorf("labels = %+v, want only triage", got.Labels)
 	}
 }
 

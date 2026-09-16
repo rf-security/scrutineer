@@ -3,21 +3,51 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	mavenpom "github.com/git-pkgs/pom"
+	"github.com/git-pkgs/sbom"
 	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/verification"
 )
 
 const insertBatchSize = 50
 
-const findingDedupSkill = "finding-dedup"
+const (
+	findingDedupSkill = "finding-dedup"
+	verifySkillName   = "verify"
+	criticSkillName   = "critic"
+)
+
+type verifyOutput struct {
+	Status     string                   `json:"status"`
+	AttackTree *verification.AttackTree `json:"attack_tree"`
+	Preflight  struct {
+		Classification string `json:"classification"`
+		Justification  string `json:"justification"`
+	} `json:"preflight"`
+	Reproducer string `json:"reproducer"`
+	Evidence   string `json:"evidence"`
+	Notes      string `json:"notes"`
+}
+
+type criticOutput struct {
+	ProductionViability string `json:"production_viability"`
+	SourceState         string `json:"source_state"`
+	Reason              string `json:"reason"`
+	AttackerPosition    string `json:"attacker_position"`
+	Impact              string `json:"impact"`
+	Likelihood          string `json:"likelihood"`
+	AppliedAdjustments  *[]any `json:"applied_adjustments"`
+}
 
 // parseRepoMetadataOutput updates the Repository columns that previously
 // came from the metadata Go handler. Shape matches the subset of
@@ -116,6 +146,13 @@ func (w *Worker) parsePackagesOutput(scan *db.Scan, report string, emit func(Eve
 			LatestReleaseAt      string `json:"latest_release_at"`
 			DependentPackagesURL string `json:"dependent_packages_url"`
 			Metadata             any    `json:"metadata"`
+			RiskFlags            []struct {
+				ID string `json:"id"`
+				// Evidence is not stored on the row; it stays in scan.Report
+				// so the analyst sees why a flag was raised without a second
+				// JSON column to keep in sync.
+				Evidence string `json:"evidence"`
+			} `json:"risk_flags"`
 		} `json:"packages"`
 	}
 	if err := json.Unmarshal([]byte(report), &result); err != nil {
@@ -145,6 +182,11 @@ func (w *Worker) parsePackagesOutput(scan *db.Scan, report string, emit func(Eve
 				row.Metadata = string(b)
 			}
 		}
+		flagIDs := make([]string, 0, len(p.RiskFlags))
+		for _, f := range p.RiskFlags {
+			flagIDs = append(flagIDs, f.ID)
+		}
+		row.RiskFlags = joinPackageRiskFlags(emit, p.Name, row.Ecosystem, flagIDs)
 		rows = append(rows, row)
 	}
 	// Replace the prior row set atomically: a failed insert after the
@@ -164,7 +206,24 @@ func (w *Worker) parsePackagesOutput(scan *db.Scan, report string, emit func(Eve
 		return err
 	}
 	emit(Event{Kind: KindText, Text: fmt.Sprintf("saved %d package(s)", len(rows))})
+	w.reconcileSubprojectLinksIfEnabled(scan.RepositoryID)
 	return nil
+}
+
+// joinPackageRiskFlags validates the risk-flag ids the skill reported for one
+// package and returns them in the comma-joined form Package.RiskFlags stores.
+// It is the write side of db.PackageRiskFlags, which splits the column back
+// into ids on read.
+//
+// An unknown id is dropped with a warning rather than failing the scan: the
+// rest of the package row is still accurate, while a model inventing a
+// sixth flag name should not cost the repository its whole package set.
+func joinPackageRiskFlags(emit func(Event), name, ecosystem string, ids []string) string {
+	kept, dropped := db.NormalisePackageRiskFlags(ids)
+	if len(dropped) > 0 {
+		emit(Event{Kind: KindText, Text: fmt.Sprintf("packages: dropping unknown risk flag(s) %s for %s (%s)", strings.Join(dropped, ", "), name, ecosystem)})
+	}
+	return strings.Join(kept, ",")
 }
 
 // parseAdvisoriesOutput replaces Advisory rows for the scan's repository.
@@ -223,107 +282,295 @@ func (w *Worker) parseAdvisoriesOutput(scan *db.Scan, report string, emit func(E
 		return err
 	}
 	emit(Event{Kind: KindText, Text: fmt.Sprintf("saved %d advisor(ies)", len(rows))})
+	w.reconcileSubprojectLinksIfEnabled(scan.RepositoryID)
 	return nil
 }
 
-// parseDependentsOutput replaces Dependent rows for the scan's repository.
-func (w *Worker) parseDependentsOutput(scan *db.Scan, report string, emit func(Event)) error {
+// parseAdvisoryAuditOutput ingests an advisory-deep-dive report: the findings
+// pass first, with the exact semantics of output_kind=findings, then one
+// AdvisoryAudit row per per-advisory verdict, resolving report-local finding
+// ids ("F001") to the created or re-observed Finding rows. Ids dropped by the
+// min_confidence/report_on filters resolve to nothing and are skipped, so an
+// audit keeps its verdict even when its supporting finding was filtered.
+func (w *Worker) parseAdvisoryAuditOutput(skill *db.Skill, scan *db.Scan, report string, emit func(Event)) error {
 	var result struct {
-		Dependents []struct {
-			Name           string `json:"name"`
-			Ecosystem      string `json:"ecosystem"`
-			PURL           string `json:"purl"`
-			RepositoryURL  string `json:"repository_url"`
-			Downloads      int64  `json:"downloads"`
-			DependentRepos int    `json:"dependent_repos"`
-			RegistryURL    string `json:"registry_url"`
-			LatestVersion  string `json:"latest_version"`
-		} `json:"dependents"`
+		Audits []struct {
+			AdvisoryUUID string   `json:"advisory_uuid"`
+			Status       string   `json:"status"`
+			Evidence     string   `json:"evidence"`
+			FindingIDs   []string `json:"finding_ids"`
+		} `json:"audits"`
 	}
 	if err := json.Unmarshal([]byte(report), &result); err != nil {
-		return fmt.Errorf("parse dependents: %w", err)
+		return fmt.Errorf("parse advisory audits: %w", err)
 	}
-	rows := make([]db.Dependent, 0, len(result.Dependents))
-	for _, d := range result.Dependents {
-		rows = append(rows, db.Dependent{
-			RepositoryID:   scan.RepositoryID,
-			Name:           d.Name,
-			Ecosystem:      db.EcosystemType(d.PURL, d.Ecosystem),
-			PURL:           d.PURL,
-			RepositoryURL:  d.RepositoryURL,
-			Downloads:      d.Downloads,
-			DependentRepos: d.DependentRepos,
-			RegistryURL:    d.RegistryURL,
-			LatestVersion:  d.LatestVersion,
+	seen := make(map[string]bool, len(result.Audits))
+	for _, a := range result.Audits {
+		uuid := strings.TrimSpace(a.AdvisoryUUID)
+		if uuid == "" {
+			return fmt.Errorf("advisory audit with empty advisory_uuid")
+		}
+		if !db.AdvisoryAuditStatuses[a.Status] {
+			return fmt.Errorf("unknown advisory audit status %q for %s", a.Status, a.AdvisoryUUID)
+		}
+		// Downstream readers keep the newest row per advisory, so a report
+		// carrying two verdicts for one advisory would silently pick one.
+		if seen[uuid] {
+			return fmt.Errorf("duplicate advisory audit for %s", uuid)
+		}
+		seen[uuid] = true
+	}
+
+	// ingestFindings persists the findings before reporting fail_on, and the
+	// pipeline treats that error as "finalized with findings committed" (see
+	// maybeFireScanFinalized). The audit rows must land on that path too,
+	// otherwise exactly the runs that find a threshold-severity bypass lose
+	// their verdicts.
+	findings, ingestErr := w.ingestFindings(skill, scan, report, emit)
+	if ingestErr != nil {
+		if _, failOn := errors.AsType[*FailOnThresholdError](ingestErr); !failOn {
+			return ingestErr
+		}
+	}
+	idByReportID := make(map[string]uint, len(findings))
+	for _, f := range findings {
+		idByReportID[f.FindingID] = f.ID
+	}
+
+	rows := make([]db.AdvisoryAudit, 0, len(result.Audits))
+	for _, a := range result.Audits {
+		var ids []string
+		for _, rid := range a.FindingIDs {
+			if dbID, ok := idByReportID[rid]; ok {
+				ids = append(ids, strconv.FormatUint(uint64(dbID), 10))
+			}
+		}
+		rows = append(rows, db.AdvisoryAudit{
+			RepositoryID: scan.RepositoryID,
+			ScanID:       scan.ID,
+			AdvisoryUUID: strings.TrimSpace(a.AdvisoryUUID),
+			Status:       a.Status,
+			Evidence:     a.Evidence,
+			FindingIDs:   strings.Join(ids, ","),
+			Commit:       scan.Commit,
 		})
 	}
-	// Replace the prior row set atomically so a failed insert can't leave
-	// the repository with zero dependents.
-	if err := w.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("repository_id = ?", scan.RepositoryID).Delete(&db.Dependent{}).Error; err != nil {
-			return fmt.Errorf("delete old dependents: %w", err)
+	if len(rows) > 0 {
+		if err := w.DB.CreateInBatches(&rows, insertBatchSize).Error; err != nil {
+			return fmt.Errorf("save advisory audits: %w", err)
 		}
-		if len(rows) > 0 {
-			if err := tx.CreateInBatches(&rows, insertBatchSize).Error; err != nil {
-				return fmt.Errorf("save dependents: %w", err)
+	}
+	emit(Event{Kind: KindText, Text: fmt.Sprintf("recorded %d advisory audit verdict(s)", len(rows))})
+	return ingestErr
+}
+
+// parseDependenciesOutput consumes the versioned envelope emitted by
+// skills/dependencies/scripts/index.sh. The inventory section replaces
+// Dependency rows for the scan's repository; the sbom section becomes a
+// generated SBOMUpload snapshot with Current moved to it. Per-package
+// registry lookups (licences, vulnerabilities, latest-version, deprecation)
+// are not part of the envelope; scrutineer performs those once per package
+// outside the scan.
+func (w *Worker) parseDependenciesOutput(scan *db.Scan, report string, emit func(Event)) error {
+	var env dependencyEnvelope
+	if err := json.Unmarshal([]byte(report), &env); err != nil {
+		return fmt.Errorf("parse dependencies: %w", err)
+	}
+
+	// Dependency rows and the Current snapshot are whole-repo projections; a
+	// sub-path-scoped scan sees only one sub-package's manifests and would
+	// otherwise wipe the full-repo set and mark a partial SBOM as current.
+	// scanScopeHard keeps this skill whole-tree (repoWideProjectionKinds) so
+	// SubPath is normally empty here; this guard is the parseMaintainersOutput-
+	// style belt-and-braces for a scan that reaches the parser scoped anyway.
+	// Per-sub-package snapshots are deferred until SBOMUpload/Dependency are
+	// keyed on sub-path.
+	if scan.SubPath != "" {
+		emit(Event{Kind: KindText, Text: "sub-path scan: repo-level dependency rows and SBOM snapshot unchanged"})
+		return nil
+	}
+
+	inv := env.Analyses.Inventory
+	replaceInventory := inv.Status == analysisOK
+	if !replaceInventory {
+		// The prior row set stays: an errored, or entirely missing, inventory
+		// section says nothing about what the repository depends on, so
+		// replacing it with an empty set would be data loss. Missing arises
+		// from the SKILL.md fallback shape for a wholesale script failure,
+		// {"schema_version":1,"analyses":{},"error":...}. Mirrors the sbom
+		// section, where up == nil leaves the previous Current snapshot in
+		// place. The sbom section is still applied below since it reports
+		// its own status independently.
+		reason := inv.Error
+		if inv.Status == "" {
+			reason = "no inventory section in report"
+		}
+		emit(Event{Kind: KindText, Text: "inventory failed, prior dependency rows kept: " + reason})
+	}
+	w.resolveMavenDependencyRequirements(scan, inv.Result, emit)
+	rows := dependencyRows(scan.RepositoryID, inv.Result)
+
+	up, sbomErr := buildGeneratedSBOM(scan, env)
+	if sbomErr != nil {
+		// A malformed sbom section should not discard a valid inventory.
+		emit(Event{Kind: KindText, Text: "sbom section skipped: " + sbomErr.Error()})
+	}
+
+	// Replace the prior row set and move the Current flag atomically so a
+	// failed insert can't leave the repository with zero dependencies or
+	// two current snapshots.
+	if err := w.DB.Transaction(func(tx *gorm.DB) error {
+		if replaceInventory {
+			if err := tx.Where("repository_id = ?", scan.RepositoryID).Delete(&db.Dependency{}).Error; err != nil {
+				return fmt.Errorf("delete old dependencies: %w", err)
+			}
+			if len(rows) > 0 {
+				if err := tx.CreateInBatches(&rows, insertBatchSize).Error; err != nil {
+					return fmt.Errorf("save dependencies: %w", err)
+				}
+			}
+		}
+		if up != nil {
+			if err := tx.Model(&db.SBOMUpload{}).
+				Where("repository_id = ? AND origin = ? AND current = ?",
+					scan.RepositoryID, db.SBOMOriginGenerated, true).
+				Update("current", false).Error; err != nil {
+				return fmt.Errorf("clear current snapshot: %w", err)
+			}
+			if err := tx.Create(up).Error; err != nil {
+				return fmt.Errorf("save generated sbom: %w", err)
 			}
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
-	emit(Event{Kind: KindText, Text: fmt.Sprintf("saved %d dependent(s)", len(rows))})
+
+	summary := "prior dependency rows kept"
+	if replaceInventory {
+		summary = fmt.Sprintf("saved %d dependenc(ies)", len(rows))
+	}
+	if up != nil {
+		summary += fmt.Sprintf(", %d resolved component(s) at %s", up.PackageCount, shortCommit(up.Commit))
+	}
+	emit(Event{Kind: KindText, Text: summary})
 	return nil
 }
 
-// parseDependenciesOutput replaces Dependency rows for the scan's repository.
-// Dependencies come from a git-pkgs-style manifest scan: one row per
-// (name, ecosystem, manifest_path) tuple.
-func (w *Worker) parseDependenciesOutput(scan *db.Scan, report string, emit func(Event)) error {
-	var result struct {
-		Dependencies []dependencyReportRow `json:"dependencies"`
-	}
-	if err := json.Unmarshal([]byte(report), &result); err != nil {
-		return fmt.Errorf("parse dependencies: %w", err)
-	}
-	w.resolveMavenDependencyRequirements(scan, result.Dependencies, emit)
-	rows := make([]db.Dependency, 0, len(result.Dependencies))
-	for _, d := range result.Dependencies {
+// dependencyRows maps the inventory section's report rows to Dependency
+// records for repoID, folding the type/dependency_type alias and normalising
+// the phase.
+func dependencyRows(repoID uint, in []dependencyReportRow) []db.Dependency {
+	rows := make([]db.Dependency, 0, len(in))
+	for _, d := range in {
 		depType := d.Type
 		if depType == "" {
 			depType = d.DependencyType
 		}
-		depType = db.NormalizeDependencyType(depType)
 		rows = append(rows, db.Dependency{
-			RepositoryID:          scan.RepositoryID,
+			RepositoryID:          repoID,
 			Name:                  d.Name,
 			Ecosystem:             db.EcosystemType(d.PURL, d.Ecosystem),
 			PURL:                  d.PURL,
 			Requirement:           d.Requirement,
 			RequirementUnresolved: d.RequirementUnresolved,
 			RequirementResolution: d.RequirementResolution,
-			DependencyType:        depType,
+			DependencyType:        db.NormalizeDependencyType(depType),
 			ManifestPath:          d.ManifestPath,
 			ManifestKind:          d.ManifestKind,
 		})
 	}
-	// Replace the prior row set atomically so a failed insert can't leave
-	// the repository with zero dependencies.
-	if err := w.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("repository_id = ?", scan.RepositoryID).Delete(&db.Dependency{}).Error; err != nil {
-			return fmt.Errorf("delete old dependencies: %w", err)
+	return rows
+}
+
+const (
+	analysisOK    = "ok"
+	analysisError = "error"
+)
+
+type dependencyEnvelope struct {
+	SchemaVersion  int    `json:"schema_version"`
+	Commit         string `json:"commit"`
+	GeneratedAt    string `json:"generated_at"`
+	GitPkgsVersion string `json:"git_pkgs_version"`
+	Analyses       struct {
+		Inventory struct {
+			analysisSection
+			Result []dependencyReportRow `json:"result"`
+		} `json:"inventory"`
+		SBOM struct {
+			analysisSection
+			Result json.RawMessage `json:"result"`
+		} `json:"sbom"`
+	} `json:"analyses"`
+}
+
+type analysisSection struct {
+	Status   string   `json:"status"`
+	Error    string   `json:"error"`
+	Warnings []string `json:"warnings"`
+}
+
+// buildGeneratedSBOM parses the envelope's sbom section into an SBOMUpload
+// snapshot for the scan's repository. A missing or empty section returns
+// (nil, nil); a section that reported an error, or a document that fails to
+// parse, returns that error for the caller to log. Either way the caller
+// writes inventory rows without a snapshot.
+func buildGeneratedSBOM(scan *db.Scan, env dependencyEnvelope) (*db.SBOMUpload, error) {
+	sec := env.Analyses.SBOM
+	if sec.Status != analysisOK {
+		if sec.Error != "" {
+			return nil, errors.New(sec.Error)
 		}
-		if len(rows) > 0 {
-			if err := tx.CreateInBatches(&rows, insertBatchSize).Error; err != nil {
-				return fmt.Errorf("save dependencies: %w", err)
-			}
-		}
-		return nil
-	}); err != nil {
-		return err
+		return nil, nil
 	}
-	emit(Event{Kind: KindText, Text: fmt.Sprintf("saved %d dependenc(ies)", len(rows))})
-	return nil
+	if len(sec.Result) == 0 || string(sec.Result) == "{}" || string(sec.Result) == "null" {
+		return nil, nil
+	}
+	doc, err := sbom.Parse(sec.Result)
+	if err != nil {
+		return nil, fmt.Errorf("parse cyclonedx: %w", err)
+	}
+	commit := env.Commit
+	if commit == "" {
+		commit = scan.Commit
+	}
+	up := db.SBOMUpload{
+		Name:         doc.Document.Name,
+		Format:       string(doc.Type),
+		SpecVersion:  doc.SpecVersion,
+		Origin:       db.SBOMOriginGenerated,
+		RepositoryID: &scan.RepositoryID,
+		ScanID:       &scan.ID,
+		Commit:       commit,
+		Current:      true,
+		PackageCount: len(doc.Packages),
+	}
+	scope := doc.ClassifyScope()
+	for _, p := range doc.Packages {
+		purl := p.PURL()
+		lic := p.LicenseDeclared
+		if lic == "" {
+			lic = p.LicenseConcluded
+		}
+		up.Packages = append(up.Packages, db.SBOMPackage{
+			Name:      p.Name,
+			Version:   p.Version,
+			PURL:      purl,
+			Ecosystem: db.EcosystemType(purl, ""),
+			License:   lic,
+			Scope:     scope[p.ID],
+		})
+	}
+	return &up, nil
+}
+
+func shortCommit(s string) string {
+	const n = 12
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
 
 type dependencyReportRow struct {
@@ -389,7 +636,7 @@ func resolveLocalPOMDependencies(pomPath, srcRoot string, emit func(Event)) map[
 	if !localPOMParentsStayUnderRoot(pomPath, srcRoot) {
 		return nil
 	}
-	ep, err := mavenpom.ResolveLocal(context.Background(), pomPath, mavenpom.Options{})
+	ep, err := mavenpom.ResolveLocal(context.Background(), pomPath, srcRoot, mavenpom.Options{})
 	if err != nil {
 		emit(Event{Kind: KindText, Text: "maven pom resolver skipped " + pomPath + ": " + err.Error()})
 		return nil
@@ -530,15 +777,52 @@ func (w *Worker) parseSubprojectsOutput(scan *db.Scan, report string, emit func(
 			Description:  sp.Description,
 		})
 	}
-	// Replace the prior row set atomically so a failed insert can't leave
-	// the repository with zero subprojects.
+	// Upsert keyed on (repository_id, path) so a surviving subproject keeps
+	// its id across re-runs — Package/Advisory.SubprojectID reference it, and
+	// a re-pointed link is cheaper to keep than to rebuild. Rows for paths the
+	// skill no longer reports are pruned; a later attribution reconcile moves
+	// any package/advisory that pointed at a pruned row back to repo-level.
+	// The whole set is rewritten in one transaction so a mid-way failure can't
+	// leave a half-updated projection.
 	if err := w.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("repository_id = ?", scan.RepositoryID).Delete(&db.Subproject{}).Error; err != nil {
-			return fmt.Errorf("delete old subprojects: %w", err)
+		keep := make([]string, 0, len(rows))
+		for i := range rows {
+			row := rows[i]
+			keep = append(keep, row.Path)
+			var existing db.Subproject
+			err := tx.Where("repository_id = ? AND path = ?", row.RepositoryID, row.Path).First(&existing).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				if err := tx.Create(&row).Error; err != nil {
+					return fmt.Errorf("create subproject: %w", err)
+				}
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("load subproject: %w", err)
+			}
+			// Update the skill-owned fields only; leave DisclosureChannel,
+			// which the attribution reconcile / maintainers skill owns.
+			existing.Name = row.Name
+			existing.Kind = row.Kind
+			existing.Description = row.Description
+			if err := tx.Save(&existing).Error; err != nil {
+				return fmt.Errorf("update subproject: %w", err)
+			}
 		}
-		if len(rows) > 0 {
-			if err := tx.CreateInBatches(&rows, insertBatchSize).Error; err != nil {
-				return fmt.Errorf("save subprojects: %w", err)
+		// Only a whole-repository run may prune. A sub-path-scoped run saw at
+		// most a fragment of the tree (a slipped hard scope, or a soft run the
+		// agent nonetheless narrowed), so its enumeration is not authoritative
+		// for the repo; pruning against it would delete every sibling's row.
+		// scanScopeHard already keeps subprojects whole-tree, so a scoped run
+		// reaching here means it was mis-scoped some other way — this backstop
+		// turns that into a harmless upsert-only pass instead of a table wipe.
+		if scan.SubPath == "" {
+			prune := tx.Where("repository_id = ?", scan.RepositoryID)
+			if len(keep) > 0 {
+				prune = prune.Where("path NOT IN ?", keep)
+			}
+			if err := prune.Delete(&db.Subproject{}).Error; err != nil {
+				return fmt.Errorf("prune subprojects: %w", err)
 			}
 		}
 		return nil
@@ -546,6 +830,7 @@ func (w *Worker) parseSubprojectsOutput(scan *db.Scan, report string, emit func(
 		return err
 	}
 	emit(Event{Kind: KindText, Text: fmt.Sprintf("saved %d subproject(s)", len(rows))})
+	w.reconcileSubprojectLinksIfEnabled(scan.RepositoryID)
 	return nil
 }
 
@@ -637,57 +922,253 @@ func (w *Worker) parsePostureOutput(scan *db.Scan, report string, emit func(Even
 	return nil
 }
 
-// parseVerifyOutput records the outcome of a finding-scoped verification
-// run. Reproducer, evidence and notes become a FindingNote; the status
-// transition is written via WriteFindingField with source=model_suggested so
-// the audit trail on the finding page shows the skill as the author.
+// parseVerifyOutput records the outcome of a finding-scoped verification run.
+// Each scan gets an immutable rubric row, while the human-readable summary and
+// any lifecycle transition retain their existing finding audit trail entries.
 func (w *Worker) parseVerifyOutput(scan *db.Scan, report string, emit func(Event)) error {
 	if scan.FindingID == nil {
 		return fmt.Errorf("verify scan has no finding_id")
 	}
-	var result struct {
-		Status     string `json:"status"`
-		Reproducer string `json:"reproducer"`
-		Evidence   string `json:"evidence"`
-		Notes      string `json:"notes"`
-	}
-	if err := json.Unmarshal([]byte(report), &result); err != nil {
-		return fmt.Errorf("parse verify report: %w", err)
+	result, rubric, score, gradingError, err := decodeVerifyOutput(report)
+	if err != nil {
+		return err
 	}
 	var f db.Finding
 	if err := w.DB.First(&f, *scan.FindingID).Error; err != nil {
 		return fmt.Errorf("load finding %d: %w", *scan.FindingID, err)
 	}
+	calibration := findingSeverityCalibration{}
+	if rubric != nil {
+		var controls *skillContextControls
+		var expectedControlIDs []string
+		var unavailableReason string
+		if controls = resolveFindingControls(scan.Repository.ThreatModel, f); controls != nil {
+			expectedControlIDs = controls.IDs
+			unavailableReason = controls.UnavailableWhy
+		}
+		if err := rubric.ValidateControlContext(expectedControlIDs, unavailableReason); err != nil {
+			gradingError = err.Error()
+			rubric = nil
+			score = nil
+		} else {
+			calibration = calibrateFindingSeverity(controls, rubric.Criteria.ControlBypass, rubric.SeverityPrerequisites)
+		}
+	}
+	nextStatus, err := verifyNextStatus(f, scan, result, gradingError)
+	if err != nil {
+		return err
+	}
+	if err := w.recordVerifyOutput(scan, f, verifyRecord{
+		result:       result,
+		report:       report,
+		rubric:       rubric,
+		score:        score,
+		gradingError: gradingError,
+		nextStatus:   nextStatus,
+		calibration:  calibration,
+	}); err != nil {
+		return err
+	}
 
-	var nextStatus db.FindingLifecycle
+	emit(Event{Kind: KindText, Text: "finding " + fmt.Sprint(f.ID) + " -> " + result.Status})
+	return nil
+}
+
+// parseCriticOutput records an immutable release-viability assessment and
+// updates the finding's indexed latest projection. The raw report remains the
+// source of truth for preconditions, counterevidence, adjustments, and facts
+// that could change the result.
+func (w *Worker) parseCriticOutput(scan *db.Scan, report string, emit func(Event)) error {
+	if scan.FindingID == nil {
+		return errors.New("critic scan has no finding_id")
+	}
+	var result criticOutput
+	if err := json.Unmarshal([]byte(report), &result); err != nil {
+		return fmt.Errorf("parse critic report: %w", err)
+	}
+	if err := validateCriticOutput(result); err != nil {
+		return err
+	}
+
+	err := w.DB.Transaction(func(tx *gorm.DB) error {
+		var f db.Finding
+		if err := tx.First(&f, *scan.FindingID).Error; err != nil {
+			return fmt.Errorf("load finding %d: %w", *scan.FindingID, err)
+		}
+		var existing db.FindingAttackPath
+		lookup := tx.Where("finding_id = ? AND scan_id = ?", f.ID, scan.ID).Limit(1).Find(&existing)
+		if lookup.Error != nil {
+			return fmt.Errorf("check existing critic record: %w", lookup.Error)
+		}
+		if lookup.RowsAffected > 0 {
+			return nil
+		}
+		row := db.FindingAttackPath{
+			FindingID:           f.ID,
+			ScanID:              scan.ID,
+			ProductionViability: result.ProductionViability,
+			Report:              report,
+		}
+		if err := tx.Create(&row).Error; err != nil {
+			return fmt.Errorf("record critic assessment: %w", err)
+		}
+		if err := tx.Model(&db.Finding{}).Where("id = ?", f.ID).
+			Update("production_viability", result.ProductionViability).Error; err != nil {
+			return fmt.Errorf("update production viability: %w", err)
+		}
+		note := fmt.Sprintf("critic: %s\nsource state: %s\nlikelihood: %s\nseverity: %s\n\n%s\n",
+			result.ProductionViability, result.SourceState, result.Likelihood, f.Severity,
+			strings.TrimSpace(result.Reason))
+		if _, err := db.AddFindingNote(tx, f.ID, note, criticSkillName); err != nil {
+			return fmt.Errorf("record critic note: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	emit(Event{Kind: KindText, Text: fmt.Sprintf("finding %d production viability -> %s", *scan.FindingID, result.ProductionViability)})
+	return nil
+}
+
+func validateCriticOutput(result criticOutput) error {
+	switch result.ProductionViability {
+	case db.ProductionViabilityViable, db.ProductionViabilityNonViable,
+		db.ProductionViabilitySampleOrTest, db.ProductionViabilityConditionalViable:
+	default:
+		return fmt.Errorf("critic production_viability %q is not one of VIABLE|NON_VIABLE|SAMPLE_OR_TEST|CONDITIONAL_VIABLE", result.ProductionViability)
+	}
+	switch result.SourceState {
+	case "PRESENT", "MOVED", "MISSING", "UNKNOWN":
+	default:
+		return fmt.Errorf("critic source_state %q is not one of PRESENT|MOVED|MISSING|UNKNOWN", result.SourceState)
+	}
+	if (result.SourceState == "MOVED" || result.SourceState == "MISSING") &&
+		result.ProductionViability == db.ProductionViabilityNonViable {
+		return fmt.Errorf("critic must not classify source_state %s as NON_VIABLE", result.SourceState)
+	}
+	switch result.Likelihood {
+	case "likely", "plausible", "unlikely", "unknown":
+	default:
+		return fmt.Errorf("critic likelihood %q is not one of likely|plausible|unlikely|unknown", result.Likelihood)
+	}
+	if strings.TrimSpace(result.Reason) == "" || strings.TrimSpace(result.AttackerPosition) == "" || strings.TrimSpace(result.Impact) == "" {
+		return errors.New("critic reason, attacker_position, and impact must be non-empty")
+	}
+	if result.AppliedAdjustments == nil {
+		return errors.New("critic applied_adjustments must be present as an empty array")
+	}
+	if len(*result.AppliedAdjustments) != 0 {
+		return errors.New("critic applied_adjustments must be empty")
+	}
+	return nil
+}
+
+func decodeVerifyOutput(report string) (verifyOutput, *verification.Report, *float64, string, error) {
+	var result verifyOutput
+	if err := json.Unmarshal([]byte(report), &result); err != nil {
+		return verifyOutput{}, nil, nil, "", fmt.Errorf("parse verify report: %w", err)
+	}
+	if result.AttackTree == nil {
+		return verifyOutput{}, nil, nil, "", errors.New("verify report requires attack_tree")
+	}
+	rubric, err := verification.Parse(report)
+	if errors.Is(err, verification.ErrMissingRubric) {
+		return verifyOutput{}, nil, nil, "", err
+	}
+	if err != nil {
+		return result, nil, nil, err.Error(), nil
+	}
+	if rubric.SeverityPrerequisites == nil {
+		return result, nil, nil, "verify report requires severity_prerequisites", nil
+	}
+	score := rubric.Score()
+	return result, &rubric, &score, "", nil
+}
+
+func verifyNextStatus(f db.Finding, scan *db.Scan, result verifyOutput, gradingError string) (db.FindingLifecycle, error) {
+	if !verifyStatusValid(result.Status) {
+		return "", fmt.Errorf("verify status %q is not one of confirmed|fixed|inconclusive|deferred|not_attempted", result.Status)
+	}
+	if gradingError != "" {
+		return "", nil
+	}
 	switch result.Status {
 	case "confirmed":
 		if f.Status == db.FindingNew {
-			nextStatus = db.FindingEnriched
+			return db.FindingEnriched, nil
 		}
 	case "fixed":
-		// Only a verify against the default branch (empty Ref) moves the
-		// finding to fixed. A "fixed" verdict on an explicit fix ref — the
-		// validate-fix pipeline points verify at a candidate ref, often an
-		// unmerged PR branch — means the fix works there, not that a release
-		// carries it; the note below and the fix-validation report still
-		// capture the per-ref verdict.
+		// An explicit ref may be an unmerged fix branch. Only the default
+		// branch proves that the finding itself has moved to fixed.
 		if scan.Ref == "" {
-			nextStatus = db.FindingFixed
+			return db.FindingFixed, nil
 		}
-	case "inconclusive":
-		// Leave status alone.
-	default:
-		return fmt.Errorf("verify status %q is not one of confirmed|fixed|inconclusive", result.Status)
-	}
-	if nextStatus != "" {
-		if err := db.WriteFindingField(w.DB, f.ID, "status", string(nextStatus), db.SourceModel, "verify"); err != nil {
-			return fmt.Errorf("update status: %w", err)
+	case "inconclusive", "not_attempted":
+	case "deferred":
+		if result.Preflight.Classification == "" || strings.TrimSpace(result.Preflight.Justification) == "" {
+			return "", fmt.Errorf("verify status \"deferred\" requires preflight.classification and preflight.justification")
 		}
 	}
+	return "", nil
+}
 
+func verifyStatusValid(status string) bool {
+	switch status {
+	case "confirmed", "fixed", "inconclusive", "deferred", "not_attempted":
+		return true
+	default:
+		return false
+	}
+}
+
+func verifyNote(
+	result verifyOutput,
+	rubric *verification.Report,
+	score *float64,
+	gradingError string,
+	calibration findingSeverityCalibration,
+) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "verify: %s\n", result.Status)
+	if gradingError != "" {
+		fmt.Fprintf(&b, "grading: ungraded\nrubric validation: %s\n", gradingError)
+	}
+	if rubric != nil && score != nil {
+		fmt.Fprintf(&b, "score: %.2f\n", *score)
+		if rubric.AttackTree != nil {
+			fmt.Fprintf(&b, "attack tree: %s\n", rubric.AttackTree.Verdict)
+			for _, blocker := range rubric.AttackTree.Blockers {
+				fmt.Fprintf(&b, "attack blocker: %s\n", blocker)
+			}
+		}
+		writeSeverityPrerequisites(&b, rubric.SeverityPrerequisites)
+		for _, named := range rubric.Criteria.List() {
+			fmt.Fprintf(&b, "criterion: %s = %s\n", named.Name, named.Criterion.Verdict)
+		}
+		gate := rubric.Criteria.ControlBypass
+		if len(gate.MatchedControls) > 0 || gate.UnavailableReason != "" {
+			fmt.Fprintf(&b, "control bypass: %d matched\n", len(gate.MatchedControls))
+			if gate.UnavailableReason != "" {
+				fmt.Fprintf(&b, "control resolution unavailable: %s\n", gate.UnavailableReason)
+			}
+			for _, assessment := range gate.Assessments {
+				fmt.Fprintf(&b, "control: %s = %s: %s\n", assessment.ControlID, assessment.Disposition, assessment.Evidence)
+			}
+		}
+		for _, capReason := range calibration.Caps {
+			fmt.Fprintf(&b, "severity cap: %s\n", capReason)
+		}
+		if calibration.Incomplete {
+			b.WriteString("severity calibration: incomplete\n")
+		}
+	}
+	if result.Preflight.Classification != "" {
+		fmt.Fprintf(&b, "preflight: %s\n", result.Preflight.Classification)
+		if j := strings.TrimSpace(result.Preflight.Justification); j != "" {
+			fmt.Fprintf(&b, "\n%s\n", j)
+		}
+	}
 	if result.Reproducer != "" {
 		fmt.Fprintf(&b, "\n%s\n", strings.TrimSpace(result.Reproducer))
 	}
@@ -697,12 +1178,81 @@ func (w *Worker) parseVerifyOutput(scan *db.Scan, report string, emit func(Event
 	if result.Notes != "" {
 		fmt.Fprintf(&b, "\n%s\n", strings.TrimSpace(result.Notes))
 	}
-	if _, err := db.AddFindingNote(w.DB, f.ID, b.String(), "verify"); err != nil {
-		return fmt.Errorf("record verify note: %w", err)
-	}
+	return b.String()
+}
 
-	emit(Event{Kind: KindText, Text: "finding " + fmt.Sprint(f.ID) + " -> " + result.Status})
-	return nil
+func writeSeverityPrerequisites(b *strings.Builder, prerequisites *verification.SeverityPrerequisites) {
+	if prerequisites == nil {
+		return
+	}
+	for _, prerequisite := range prerequisites.List() {
+		fmt.Fprintf(b, "severity prerequisite: %s = %s: %s\n", prerequisite.Name,
+			prerequisite.Assessment.Value, prerequisite.Assessment.Evidence)
+	}
+}
+
+type verifyRecord struct {
+	result       verifyOutput
+	report       string
+	rubric       *verification.Report
+	score        *float64
+	gradingError string
+	nextStatus   db.FindingLifecycle
+	calibration  findingSeverityCalibration
+}
+
+func (w *Worker) recordVerifyOutput(scan *db.Scan, f db.Finding, record verifyRecord) error {
+	return db.FindingWriteTransaction(w.DB, f.ID, func(tx *gorm.DB) error {
+		calibration := record.calibration
+		var existing db.FindingVerification
+		lookup := tx.Where("finding_id = ? AND scan_id = ?", f.ID, scan.ID).Limit(1).Find(&existing)
+		if lookup.Error != nil {
+			return fmt.Errorf("check existing verify record: %w", lookup.Error)
+		}
+		if lookup.RowsAffected > 0 {
+			return nil
+		}
+		if record.nextStatus != "" {
+			if err := db.WriteFindingField(tx, f.ID, "status", string(record.nextStatus), db.SourceModel, "verify"); err != nil {
+				return fmt.Errorf("update status: %w", err)
+			}
+		}
+		if calibration.Evaluated {
+			effectiveSeverity, err := db.ReconcileFindingSeverityCap(
+				tx, f.ID, calibration.Maximum, db.SourceSystem, verifySkillName,
+			)
+			if err != nil {
+				return fmt.Errorf("reconcile severity cap: %w", err)
+			}
+			if !db.SeverityAtLeast(effectiveSeverity, "Low") {
+				calibration.Incomplete = true
+				calibration.Caps = nil
+			} else if calibration.Maximum != "" && !db.SeverityAtLeast(effectiveSeverity, calibration.Maximum) {
+				calibration.Caps = nil
+			}
+			if err := tx.Model(&db.Finding{}).Where("id = ?", f.ID).Updates(map[string]any{
+				"severity_caps":                   strings.Join(calibration.Caps, "\n"),
+				"severity_calibration_incomplete": calibration.Incomplete,
+			}).Error; err != nil {
+				return fmt.Errorf("record severity calibration: %w", err)
+			}
+		}
+		row := db.FindingVerification{
+			FindingID: f.ID,
+			ScanID:    scan.ID,
+			Status:    record.result.Status,
+			Score:     record.score,
+			Report:    record.report,
+		}
+		if err := tx.Create(&row).Error; err != nil {
+			return fmt.Errorf("record verification: %w", err)
+		}
+		note := verifyNote(record.result, record.rubric, record.score, record.gradingError, calibration)
+		if _, err := db.AddFindingNote(tx, f.ID, note, "verify"); err != nil {
+			return fmt.Errorf("record verify note: %w", err)
+		}
+		return nil
+	})
 }
 
 // parseBreakingChangeOutput records the breaking-change verdict on a
@@ -812,12 +1362,17 @@ func (w *Worker) parseMitigationOutput(scan *db.Scan, report string, emit func(E
 	return nil
 }
 
-// parseDiscloseOutput posts a FindingNote summarising a disclose run so the
-// finding's Notes panel records that a draft was prepared, alongside the
-// verify/revalidate/patch entries (#482). The draft itself is on
-// Finding.DisclosureDraft (PATCHed by the skill via the API); this note is
-// the audit trail pointing at it: the GHSA summary, which fields were
-// patched/preserved, references added, and the report's notes prose. An
+// parseDiscloseOutput records the drafted GHSA summary on
+// Finding.DisclosureTitle and posts a FindingNote summarising the run so
+// the finding's Notes panel records that a draft was prepared, alongside
+// the verify/revalidate/patch entries (#482). DisclosureTitle is distinct
+// from Finding.Title: the skill's own PATCH only touches Title when it
+// was empty, so a re-run against a finding with an existing title would
+// otherwise lose the freshly drafted summary entirely. The disclosure
+// draft body itself is on Finding.DisclosureDraft (PATCHed by the skill
+// via the API); this note is the audit trail pointing at it: the GHSA
+// summary, which fields were patched/preserved, the suggested
+// recipients, references added, and the report's notes prose. An
 // error-only report records why the skill refused to draft.
 func (w *Worker) parseDiscloseOutput(scan *db.Scan, report string, emit func(Event)) error {
 	if scan.FindingID == nil {
@@ -827,12 +1382,13 @@ func (w *Worker) parseDiscloseOutput(scan *db.Scan, report string, emit func(Eve
 		GHSA struct {
 			Summary string `json:"summary"`
 		} `json:"ghsa"`
-		Patched           []string `json:"patched"`
-		Preserved         []string `json:"preserved"`
-		ReferencesAdded   int      `json:"references_added"`
-		ReferencesSkipped int      `json:"references_skipped"`
-		Notes             string   `json:"notes"`
-		Error             string   `json:"error"`
+		Patched             []string `json:"patched"`
+		Preserved           []string `json:"preserved"`
+		SuggestedRecipients string   `json:"suggested_recipients"`
+		ReferencesAdded     int      `json:"references_added"`
+		ReferencesSkipped   int      `json:"references_skipped"`
+		Notes               string   `json:"notes"`
+		Error               string   `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(report), &result); err != nil {
 		return fmt.Errorf("parse disclose report: %w", err)
@@ -842,6 +1398,11 @@ func (w *Worker) parseDiscloseOutput(scan *db.Scan, report string, emit func(Eve
 	if result.Error != "" {
 		fmt.Fprintf(&b, "disclose: refused\n\n%s\n", strings.TrimSpace(result.Error))
 	} else {
+		if summary := strings.TrimSpace(result.GHSA.Summary); summary != "" {
+			if err := db.WriteFindingField(w.DB, *scan.FindingID, "disclosure_title", summary, db.SourceModel, "disclose"); err != nil {
+				return fmt.Errorf("update disclosure_title: %w", err)
+			}
+		}
 		b.WriteString("disclose: drafted")
 		if result.GHSA.Summary != "" {
 			fmt.Fprintf(&b, " %q", result.GHSA.Summary)
@@ -852,6 +1413,9 @@ func (w *Worker) parseDiscloseOutput(scan *db.Scan, report string, emit func(Eve
 		}
 		if len(result.Preserved) > 0 {
 			fmt.Fprintf(&b, "Preserved: %s\n", strings.Join(result.Preserved, ", "))
+		}
+		if r := strings.TrimSpace(result.SuggestedRecipients); r != "" {
+			fmt.Fprintf(&b, "Suggested recipients: %s\n", r)
 		}
 		if result.ReferencesAdded > 0 || result.ReferencesSkipped > 0 {
 			fmt.Fprintf(&b, "References: %d added, %d skipped\n",
@@ -955,9 +1519,10 @@ func (w *Worker) parseReleaseWatchOutput(scan *db.Scan, report string, emit func
 // parseRevalidateOutput records the cheap classifier verdict for a
 // finding. The verdict and reason become a FindingNote; an adjusted
 // severity overwrites the finding's severity (with the change recorded
-// in finding history via WriteFindingField); status transitions
-// new -> enriched only on true_positive. Rejection of false positives
-// stays a human act, so false_positive does not transition status.
+// in finding history via WriteFindingField); true_positive promotes
+// new -> enriched, and already_fixed closes active findings as fixed.
+// Rejection of false positives stays a human act, so false_positive
+// does not transition status.
 func (w *Worker) parseRevalidateOutput(scan *db.Scan, report string, emit func(Event)) error {
 	if scan.FindingID == nil {
 		return fmt.Errorf("revalidate scan has no finding_id")
@@ -965,6 +1530,7 @@ func (w *Worker) parseRevalidateOutput(scan *db.Scan, report string, emit func(E
 	var result struct {
 		Verdict                string `json:"verdict"`
 		Reason                 string `json:"reason"`
+		PrivilegeRequired      string `json:"privilege_required"`
 		AdjustedSeverity       string `json:"adjusted_severity"`
 		AdjustedSeverityReason string `json:"adjusted_severity_reason"`
 	}
@@ -975,6 +1541,11 @@ func (w *Worker) parseRevalidateOutput(scan *db.Scan, report string, emit func(E
 	case "true_positive", "false_positive", "already_fixed", "uncertain":
 	default:
 		return fmt.Errorf("revalidate verdict %q is not one of true_positive|false_positive|already_fixed|uncertain", result.Verdict)
+	}
+	switch result.PrivilegeRequired {
+	case "", "none", "authenticated", "admin", "maintainer", "local-root":
+	default:
+		return fmt.Errorf("revalidate privilege_required %q is not one of none|authenticated|admin|maintainer|local-root", result.PrivilegeRequired)
 	}
 	var f db.Finding
 	if err := w.DB.First(&f, *scan.FindingID).Error; err != nil {
@@ -999,11 +1570,24 @@ func (w *Worker) parseRevalidateOutput(scan *db.Scan, report string, emit func(E
 	if err := db.WriteFindingField(w.DB, f.ID, "last_revalidate_verdict", result.Verdict, db.SourceModel, "revalidate"); err != nil {
 		return fmt.Errorf("update last_revalidate_verdict: %w", err)
 	}
+	if novelty, ok := revalidateNovelty(f.Novelty, result.Verdict); ok {
+		if err := w.DB.Model(&db.Finding{}).Where("id = ?", f.ID).
+			Update("novelty", novelty).Error; err != nil {
+			return fmt.Errorf("update novelty: %w", err)
+		}
+	}
 
-	// Status transition: only true_positive promotes new -> enriched.
+	// Status transitions: true_positive promotes new -> enriched;
+	// already_fixed auto-closes active findings because the cheap git-history
+	// check found an upstream change that addressed the trace (#112).
 	// false_positive does not auto-reject; the analyst owns rejection.
-	if result.Verdict == "true_positive" && f.Status == db.FindingNew {
+	switch {
+	case result.Verdict == "true_positive" && f.Status == db.FindingNew:
 		if err := db.WriteFindingField(w.DB, f.ID, "status", string(db.FindingEnriched), db.SourceModel, "revalidate"); err != nil {
+			return fmt.Errorf("update status: %w", err)
+		}
+	case result.Verdict == "already_fixed":
+		if err := db.WriteFindingField(w.DB, f.ID, "status", string(db.FindingFixed), db.SourceModel, "revalidate"); err != nil {
 			return fmt.Errorf("update status: %w", err)
 		}
 	}
@@ -1024,6 +1608,9 @@ func (w *Worker) parseRevalidateOutput(scan *db.Scan, report string, emit func(E
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "revalidate: %s\n", result.Verdict)
+	if result.PrivilegeRequired != "" {
+		fmt.Fprintf(&b, "privilege: %s\n", result.PrivilegeRequired)
+	}
 	if reason := strings.TrimSpace(result.Reason); reason != "" {
 		fmt.Fprintf(&b, "\n%s\n", reason)
 	}
@@ -1054,6 +1641,32 @@ func (w *Worker) parseRevalidateOutput(scan *db.Scan, report string, emit func(E
 	return nil
 }
 
+func revalidateNovelty(current db.FindingNovelty, verdict string) (db.FindingNovelty, bool) {
+	// A failed deterministic check remains not_checked. The model is told to
+	// return uncertain in this case; it cannot manufacture missing history.
+	if current == "" || current == db.FindingNoveltyNotChecked {
+		return "", false
+	}
+	switch verdict {
+	case "true_positive":
+		return db.FindingNoveltyUnfixed, current != db.FindingNoveltyUnfixed
+	case "already_fixed":
+		return db.FindingNoveltyFixed, current != db.FindingNoveltyFixed
+	default:
+		return "", false
+	}
+}
+
+// dedupGroup is one head-plus-members relation from a finding-dedup report.
+// Duplicates and subsumed both fit this shape (canonical/parent + children);
+// chains have no head, so HeadID is 0 there and applyDedupChains reads
+// MemberIDs only.
+type dedupGroup struct {
+	HeadID    uint
+	MemberIDs []uint
+	Reason    string
+}
+
 func (w *Worker) parseFindingDedupOutput(scan *db.Scan, report string, emit func(Event)) error {
 	var result struct {
 		Duplicates []struct {
@@ -1061,44 +1674,151 @@ func (w *Worker) parseFindingDedupOutput(scan *db.Scan, report string, emit func
 			DuplicateIDs []uint `json:"duplicate_ids"`
 			Reason       string `json:"reason"`
 		} `json:"duplicates"`
+		Subsumed []struct {
+			ParentID    uint   `json:"parent_id"`
+			SubsumedIDs []uint `json:"subsumed_ids"`
+			Reason      string `json:"reason"`
+		} `json:"subsumed"`
+		Chains []struct {
+			FindingIDs []uint `json:"finding_ids"`
+			Reason     string `json:"reason"`
+		} `json:"chains"`
 	}
 	if err := json.Unmarshal([]byte(report), &result); err != nil {
 		return fmt.Errorf("parse finding_dedup report: %w", err)
 	}
-	if len(result.Duplicates) == 0 {
-		emit(Event{Kind: KindText, Text: "finding-dedup: no duplicates reported"})
+	if len(result.Duplicates)+len(result.Subsumed)+len(result.Chains) == 0 {
+		emit(Event{Kind: KindText, Text: "finding-dedup: no relations reported"})
 		return nil
 	}
 
-	marked, skipped := 0, 0
-	for _, group := range result.Duplicates {
-		canonical, ok := w.dedupFinding(scan.RepositoryID, group.CanonicalID)
-		if !ok || !dedupCandidateOpen(canonical.Status) {
-			skipped += len(group.DuplicateIDs)
-			continue
-		}
-		for _, duplicateID := range group.DuplicateIDs {
-			if duplicateID == 0 || duplicateID == canonical.ID {
-				skipped++
-				continue
-			}
-			duplicate, ok := w.dedupFinding(scan.RepositoryID, duplicateID)
-			if !ok || !dedupCandidateOpen(duplicate.Status) {
-				skipped++
-				continue
-			}
-			if err := db.WriteFindingField(w.DB, duplicate.ID, "status", string(db.FindingDuplicate), db.SourceModel, findingDedupSkill); err != nil {
-				return fmt.Errorf("mark finding %d duplicate: %w", duplicate.ID, err)
-			}
-			if err := w.addDedupNote(duplicate.ID, canonical.ID, group.Reason); err != nil {
-				return err
-			}
-			marked++
-		}
+	skipped := 0
+	marked, err := w.applyDedupHeaded(scan.RepositoryID, dedupHeaderDuplicate, true,
+		mapDedupGroups(result.Duplicates, func(g struct {
+			CanonicalID  uint   `json:"canonical_id"`
+			DuplicateIDs []uint `json:"duplicate_ids"`
+			Reason       string `json:"reason"`
+		}) dedupGroup {
+			return dedupGroup{HeadID: g.CanonicalID, MemberIDs: g.DuplicateIDs, Reason: g.Reason}
+		}), &skipped)
+	if err != nil {
+		return err
 	}
 
-	emit(Event{Kind: KindText, Text: fmt.Sprintf("finding-dedup: marked %d duplicate(s), skipped %d", marked, skipped)})
+	// Subsumed findings do not change status: the bug is real and stays in
+	// the database, but disclose and report-upstream read the note marker
+	// and refuse to file it separately (the parent is what the maintainer
+	// should see). Same repo-and-open guards as duplicates apply.
+	subsumed, err := w.applyDedupHeaded(scan.RepositoryID, dedupHeaderSubsumed, false,
+		mapDedupGroups(result.Subsumed, func(g struct {
+			ParentID    uint   `json:"parent_id"`
+			SubsumedIDs []uint `json:"subsumed_ids"`
+			Reason      string `json:"reason"`
+		}) dedupGroup {
+			return dedupGroup{HeadID: g.ParentID, MemberIDs: g.SubsumedIDs, Reason: g.Reason}
+		}), &skipped)
+	if err != nil {
+		return err
+	}
+
+	chained, err := w.applyDedupChains(scan.RepositoryID,
+		mapDedupGroups(result.Chains, func(g struct {
+			FindingIDs []uint `json:"finding_ids"`
+			Reason     string `json:"reason"`
+		}) dedupGroup {
+			return dedupGroup{MemberIDs: g.FindingIDs, Reason: g.Reason}
+		}), &skipped)
+	if err != nil {
+		return err
+	}
+
+	emit(Event{Kind: KindText, Text: fmt.Sprintf(
+		"finding-dedup: marked %d duplicate(s), noted %d subsumed, noted %d chain member(s), skipped %d",
+		marked, subsumed, chained, skipped)})
 	return nil
+}
+
+func mapDedupGroups[T any](in []T, f func(T) dedupGroup) []dedupGroup {
+	out := make([]dedupGroup, len(in))
+	for i, g := range in {
+		out[i] = f(g)
+	}
+	return out
+}
+
+// applyDedupHeaded handles the duplicate and subsumed shapes: one head
+// (canonical or parent) plus a list of members that each get a note
+// pointing at the head. When flipStatus is set the member's lifecycle
+// moves to duplicate; otherwise (subsumed) only the note lands.
+func (w *Worker) applyDedupHeaded(repoID uint, verb string, flipStatus bool, groups []dedupGroup, skipped *int) (int, error) {
+	n := 0
+	for _, g := range groups {
+		head, ok := w.dedupFinding(repoID, g.HeadID)
+		if !ok || !dedupCandidateOpen(head.Status) {
+			*skipped += len(g.MemberIDs)
+			continue
+		}
+		for _, id := range g.MemberIDs {
+			if id == 0 || id == head.ID {
+				*skipped++
+				continue
+			}
+			member, ok := w.dedupFinding(repoID, id)
+			if !ok || !dedupCandidateOpen(member.Status) {
+				*skipped++
+				continue
+			}
+			if flipStatus {
+				if err := db.WriteFindingField(w.DB, member.ID, "status", string(db.FindingDuplicate), db.SourceModel, findingDedupSkill); err != nil {
+					return n, fmt.Errorf("mark finding %d duplicate: %w", member.ID, err)
+				}
+			}
+			if err := w.addRelationNote(member.ID, verb, []uint{head.ID}, g.Reason); err != nil {
+				return n, err
+			}
+			n++
+		}
+	}
+	return n, nil
+}
+
+// minChainMembers is the smallest chain worth recording after the
+// repo-and-open filter has run: a chain with one surviving member has
+// nothing to compose with.
+const minChainMembers = 2
+
+// applyDedupChains handles the chain shape: every member stays open and
+// each gets a note listing the OTHER members so disclose on any one of
+// them can fetch exactly the ids it needs to compose.
+func (w *Worker) applyDedupChains(repoID uint, groups []dedupGroup, skipped *int) (int, error) {
+	n := 0
+	for _, g := range groups {
+		var members []uint
+		for _, id := range g.MemberIDs {
+			f, ok := w.dedupFinding(repoID, id)
+			if !ok || !dedupCandidateOpen(f.Status) {
+				*skipped++
+				continue
+			}
+			members = append(members, f.ID)
+		}
+		if len(members) < minChainMembers {
+			continue
+		}
+		for _, m := range members {
+			others := make([]uint, 0, len(members)-1)
+			for _, o := range members {
+				if o != m {
+					others = append(others, o)
+				}
+			}
+			if err := w.addRelationNote(m, dedupHeaderChains, others, g.Reason); err != nil {
+				return n, err
+			}
+			n++
+		}
+	}
+	return n, nil
 }
 
 func (w *Worker) dedupFinding(repoID, findingID uint) (db.Finding, bool) {
@@ -1122,14 +1842,36 @@ func dedupCandidateOpen(status db.FindingLifecycle) bool {
 	return !status.Closed()
 }
 
-func (w *Worker) addDedupNote(duplicateID, canonicalID uint, reason string) error {
+// dedupHeader* are the fixed first-line markers written to FindingNote by
+// finding-dedup, in the form "finding-dedup: <verb> finding #N[, #M...]".
+// disclose and report-upstream fetch GET /findings/{id}/notes and match on
+// these prefixes, so changing them is a coordinated change with those two
+// skills. The values are the human-readable verb, not an enum; the "#N"
+// suffix is what the reader parses.
+const (
+	dedupHeaderDuplicate = "duplicates"
+	dedupHeaderSubsumed  = "subsumed by"
+	dedupHeaderChains    = "chains with"
+)
+
+// addRelationNote records a finding-dedup relation on findingID as a note
+// whose first line is a fixed marker (see dedupHeader* above) followed by
+// the related ids, then a blank line and the reason. The marker line is
+// what downstream skills grep for; the reason is for the analyst.
+func (w *Worker) addRelationNote(findingID uint, verb string, relatedIDs []uint, reason string) error {
 	var b strings.Builder
-	fmt.Fprintf(&b, "finding-dedup: duplicates finding #%d", canonicalID)
-	if strings.TrimSpace(reason) != "" {
-		fmt.Fprintf(&b, "\n\n%s", strings.TrimSpace(reason))
+	fmt.Fprintf(&b, "finding-dedup: %s finding ", verb)
+	for i, id := range relatedIDs {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "#%d", id)
 	}
-	if _, err := db.AddFindingNote(w.DB, duplicateID, b.String(), findingDedupSkill); err != nil {
-		return fmt.Errorf("record dedup note for finding %d: %w", duplicateID, err)
+	if r := strings.TrimSpace(reason); r != "" {
+		fmt.Fprintf(&b, "\n\n%s", r)
+	}
+	if _, err := db.AddFindingNote(w.DB, findingID, b.String(), findingDedupSkill); err != nil {
+		return fmt.Errorf("record %s note for finding %d: %w", verb, findingID, err)
 	}
 	return nil
 }

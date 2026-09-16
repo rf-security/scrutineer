@@ -19,7 +19,7 @@ func TestToFindings_carriesReachabilityAndQualityTier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := rep.toFindings(1, 1, "abc", "")
+	got := rep.toFindings(1, 1, "abc", "", "model-x")
 	if len(got) != 1 {
 		t.Fatalf("got %d findings, want 1", len(got))
 	}
@@ -28,6 +28,83 @@ func TestToFindings_carriesReachabilityAndQualityTier(t *testing.T) {
 	}
 	if got[0].QualityTier != "high" {
 		t.Errorf("QualityTier = %q, want high", got[0].QualityTier)
+	}
+	if got[0].Model != "model-x" {
+		t.Errorf("Model = %q, want model-x", got[0].Model)
+	}
+}
+
+func TestFoldDiscoveredVia(t *testing.T) {
+	cases := []struct {
+		via, priorArt, want string
+	}{
+		{"", "existing prose", "existing prose"},
+		{"", "", ""},
+		{"source", "", "Discovered via source."},
+		{" source ", "existing prose", "Discovered via source. existing prose"},
+		{"issue-tracker", "See issue #42.", "Discovered via issue-tracker. See issue #42."},
+		{"advisory", "  GHSA-xxxx cited.  ", "Discovered via advisory. GHSA-xxxx cited."},
+		{"not-an-enum", "existing prose", "existing prose"},
+		{"   ", "existing prose", "existing prose"},
+	}
+	for _, tc := range cases {
+		if got := foldDiscoveredVia(tc.via, tc.priorArt); got != tc.want {
+			t.Errorf("foldDiscoveredVia(%q, %q) = %q, want %q", tc.via, tc.priorArt, got, tc.want)
+		}
+	}
+}
+
+func TestToFindings_foldsDiscoveredViaIntoPriorArt(t *testing.T) {
+	raw := []byte(`{
+	  "findings": [
+	    {"id": "F1", "title": "x", "severity": "High", "location": "a.go:1",
+	     "discovered_via": "issue-tracker", "prior_art": "issue #42 describes this"},
+	    {"id": "F2", "title": "y", "severity": "High", "location": "b.go:1",
+	     "prior_art": "no via set"},
+	    {"id": "F3", "title": "z", "severity": "High", "location": "c.go:1",
+	     "discovered_via": "source"}
+	  ]
+	}`)
+	rep, err := parseReport(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := rep.toFindings(1, 1, "abc", "", "")
+	if len(got) != 3 {
+		t.Fatalf("got %d findings, want 3", len(got))
+	}
+	if got[0].PriorArt != "Discovered via issue-tracker. issue #42 describes this" {
+		t.Errorf("F1 PriorArt = %q, want prefix folded ahead of existing prose", got[0].PriorArt)
+	}
+	if got[1].PriorArt != "no via set" {
+		t.Errorf("F2 PriorArt = %q, want unchanged when discovered_via absent", got[1].PriorArt)
+	}
+	if got[2].PriorArt != "Discovered via source." {
+		t.Errorf("F3 PriorArt = %q, want bare prefix when prior_art empty", got[2].PriorArt)
+	}
+}
+
+func TestToFindings_carriesDupCheck(t *testing.T) {
+	raw := []byte(`{
+	  "findings": [
+	    {"id": "F1", "title": "with note", "severity": "Low", "location": "a.go:1",
+	     "dup_check": "compared against F0 (same file); distinct sink, different CWE"},
+	    {"id": "F2", "title": "without note", "severity": "Low", "location": "b.go:1"}
+	  ]
+	}`)
+	rep, err := parseReport(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := rep.toFindings(1, 1, "abc", "", "")
+	if len(got) != 2 {
+		t.Fatalf("got %d findings, want 2", len(got))
+	}
+	if got[0].DupCheck != "compared against F0 (same file); distinct sink, different CWE" {
+		t.Errorf("DupCheck = %q, want the emitted sentence", got[0].DupCheck)
+	}
+	if got[1].DupCheck != "" {
+		t.Errorf("DupCheck = %q, want empty when the field is absent", got[1].DupCheck)
 	}
 }
 
@@ -47,7 +124,7 @@ func TestToFindings_carriesReferences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := rep.toFindings(1, 1, "abc", "")
+	got := rep.toFindings(1, 1, "abc", "", "")
 	if len(got) != 1 {
 		t.Fatalf("got %d findings, want 1", len(got))
 	}
@@ -60,6 +137,38 @@ func TestToFindings_carriesReferences(t *testing.T) {
 	}
 	if refs[1].URL != "https://example.com/" || refs[1].Summary != "trimmed" {
 		t.Errorf("second reference whitespace not trimmed: %+v", refs[1])
+	}
+}
+
+func TestToFindings_dedupesReferencesByURL(t *testing.T) {
+	// (finding_id, url) is unique, so a report naming one URL twice describes
+	// one reference. Passing both through would fail the insert that creates
+	// the finding, taking the whole scan's findings with it.
+	raw := []byte(`{
+	  "findings": [{
+	    "id": "F1", "title": "artipacked", "severity": "Medium",
+	    "location": ".github/workflows/x.yml:18",
+	    "references": [
+	      {"url": "https://example.com/advisory", "tags": "advisory"},
+	      {"url": " https://example.com/advisory ", "tags": "cve", "summary": "same link"},
+	      {"url": "https://example.com/pull/42", "tags": "pr"}
+	    ]
+	  }]
+	}`)
+	rep, err := parseReport(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := rep.toFindings(1, 1, "abc", "", "")[0].References
+	if len(refs) != 2 {
+		t.Fatalf("references = %d, want 2: %+v", len(refs), refs)
+	}
+	// First mention wins, so the metadata is not rewritten by a later repeat.
+	if refs[0].Tags != "advisory" || refs[0].Summary != "" {
+		t.Errorf("first reference = %+v, want the first mention kept", refs[0])
+	}
+	if refs[1].URL != "https://example.com/pull/42" {
+		t.Errorf("second reference = %+v, want the distinct URL", refs[1])
 	}
 }
 

@@ -80,11 +80,17 @@ func seedPrereqSkill(t *testing.T, w *Worker, prereq string, active bool) *db.Sk
 
 func seedPrereqScan(t *testing.T, w *Worker, s *db.Skill, repoID uint, status db.ScanStatus) {
 	t.Helper()
+	seedPrereqScanInGroup(t, w, s, repoID, status, "")
+}
+
+func seedPrereqScanInGroup(t *testing.T, w *Worker, s *db.Skill, repoID uint, status db.ScanStatus, group string) {
+	t.Helper()
 	scan := db.Scan{
 		RepositoryID: repoID,
 		Kind:         JobSkill,
 		Status:       status,
 		SkillName:    s.Name,
+		ScanGroup:    group,
 	}
 	scan.SkillID = &s.ID
 	if err := w.DB.Create(&scan).Error; err != nil {
@@ -123,6 +129,63 @@ func TestPreflightSkill_allSatisfied(t *testing.T) {
 	}
 	if deferred {
 		t.Error("all prereqs satisfied; scan should dispatch")
+	}
+}
+
+func TestPreflightSkill_scanGroupWaitsOnSiblingPrereqs(t *testing.T) {
+	w := newPreflightWorker(t)
+	scan := seedPreflightFixtures(t, w, "threat-model")
+	scan.ScanGroup = "grp-1"
+	if err := w.DB.Save(scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	tm := seedPrereqSkill(t, w, "threat-model", true)
+	seedPrereqScan(t, w, tm, scan.RepositoryID, db.ScanDone)
+	seedPrereqScanInGroup(t, w, tm, scan.RepositoryID, db.ScanQueued, scan.ScanGroup)
+
+	deferred, err := w.preflightSkill(context.Background(), scan, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deferred {
+		t.Error("same-group queued prereq should block even when an older prereq scan is done")
+	}
+}
+
+func TestPreflightSkill_scanGroupSatisfiedBySiblingPrereq(t *testing.T) {
+	w := newPreflightWorker(t)
+	scan := seedPreflightFixtures(t, w, "threat-model")
+	scan.ScanGroup = "grp-1"
+	if err := w.DB.Save(scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	tm := seedPrereqSkill(t, w, "threat-model", true)
+	seedPrereqScanInGroup(t, w, tm, scan.RepositoryID, db.ScanDone, scan.ScanGroup)
+
+	deferred, err := w.preflightSkill(context.Background(), scan, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deferred {
+		t.Error("same-group done prereq should satisfy the gate")
+	}
+}
+
+func TestPreflightSkill_scanGroupFallsBackWhenNoSiblingPrereq(t *testing.T) {
+	w := newPreflightWorker(t)
+	scan := seedPreflightFixtures(t, w, "threat-model")
+	scan.ScanGroup = "grp-1"
+	if err := w.DB.Save(scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	seedPrereqSkillAndDoneScan(t, w, scan.RepositoryID, "threat-model")
+
+	deferred, err := w.preflightSkill(context.Background(), scan, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deferred {
+		t.Error("grouped scan with no sibling prereq rows should use historical prereq behavior")
 	}
 }
 
@@ -169,12 +232,12 @@ func TestPreflightSkill_unknownPrereqTreatedSatisfied(t *testing.T) {
 
 func TestPreflightSkill_neverEnqueuedPrereqTreatedSatisfied(t *testing.T) {
 	// Bundled skills are always registered, so a prereq that triage
-	// decided to skip (e.g. dependents on a no-packages repo) shows up
+	// decided to skip (e.g. zizmor on a no-workflows repo) shows up
 	// as registered with zero scan rows on the repo. That must count as
 	// satisfied or every such repo deadlocks its deep-dive.
 	w := newPreflightWorker(t)
-	scan := seedPreflightFixtures(t, w, "dependents")
-	seedPrereqSkill(t, w, "dependents", true)
+	scan := seedPreflightFixtures(t, w, "zizmor")
+	seedPrereqSkill(t, w, "zizmor", true)
 
 	deferred, err := w.preflightSkill(context.Background(), scan, 0)
 	if err != nil {
@@ -320,145 +383,5 @@ func TestPreflightSkill_failedPrereqWithRetryInFlightDefers(t *testing.T) {
 	}
 	if loaded.Status != db.ScanQueued {
 		t.Errorf("scan status = %q, want queued (defer while retry is in flight)", loaded.Status)
-	}
-}
-
-// seedDependentsScan seeds a queued scan for a skill literally named
-// "dependents" that requires "packages" — the name-keyed content gate in
-// preflightSkill only fires for this skill.
-func seedDependentsScan(t *testing.T, w *Worker) *db.Scan {
-	t.Helper()
-	repo := db.Repository{URL: "https://example.com/repo", Name: "repo"}
-	if err := w.DB.Create(&repo).Error; err != nil {
-		t.Fatal(err)
-	}
-	skill := db.Skill{Name: "dependents", Body: "x", Requires: "packages"}
-	if err := w.DB.Create(&skill).Error; err != nil {
-		t.Fatal(err)
-	}
-	scan := db.Scan{
-		RepositoryID: repo.ID,
-		Kind:         JobSkill,
-		Status:       db.ScanQueued,
-		SkillName:    skill.Name,
-	}
-	scan.SkillID = &skill.ID
-	if err := w.DB.Create(&scan).Error; err != nil {
-		t.Fatal(err)
-	}
-	return &scan
-}
-
-func TestPreflightSkill_dependentsSkippedWhenPackagesEmpty(t *testing.T) {
-	// packages ran (done) but found no published package, so dependents
-	// has nothing to do: mark it a no-op done rather than dispatch.
-	w := newPreflightWorker(t)
-	scan := seedDependentsScan(t, w)
-	seedPrereqSkillAndDoneScan(t, w, scan.RepositoryID, "packages")
-
-	deferred, err := w.preflightSkill(context.Background(), scan, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !deferred {
-		t.Fatal("dependents on a no-packages repo should be skipped, not dispatched")
-	}
-
-	var loaded db.Scan
-	if err := w.DB.First(&loaded, scan.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Status != db.ScanDone {
-		t.Errorf("scan status = %q, want done (no-op skip)", loaded.Status)
-	}
-	// A skip is a successful no-op, not a failure. Error must stay empty so
-	// the UI does not render the done scan as a destructive alert; the reason
-	// lives in the worker log instead.
-	if loaded.Error != "" {
-		t.Errorf("skipped scan should leave Error empty, got %q", loaded.Error)
-	}
-}
-
-func TestPreflightSkill_dependentsDispatchesWhenPackagesFound(t *testing.T) {
-	// packages ran and found a published package, so dependents has work
-	// to do and must dispatch as before.
-	w := newPreflightWorker(t)
-	scan := seedDependentsScan(t, w)
-	seedPrereqSkillAndDoneScan(t, w, scan.RepositoryID, "packages")
-	pkg := db.Package{RepositoryID: scan.RepositoryID, Name: "lib", Ecosystem: "rubygems"}
-	if err := w.DB.Create(&pkg).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	deferred, err := w.preflightSkill(context.Background(), scan, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if deferred {
-		t.Fatal("dependents must dispatch when the repo publishes packages")
-	}
-
-	var loaded db.Scan
-	if err := w.DB.First(&loaded, scan.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Status != db.ScanQueued {
-		t.Errorf("scan status = %q, want queued (dispatch leaves it for the handler)", loaded.Status)
-	}
-}
-
-func TestPreflightSkill_dependentsDeferredWhenPackagesRescanInFlight(t *testing.T) {
-	// Re-scan window: an earlier commit's packages scan is done (satisfying
-	// the prereq) while the current commit's packages run is in flight. The
-	// parser deletes-then-recreates Package rows non-transactionally, so a
-	// zero row count here is "mid-parse", not "no packages". The gate must
-	// defer — not skip and not dispatch — until the re-scan settles.
-	w := newPreflightWorker(t)
-	scan := seedDependentsScan(t, w)
-	pkgSkill := seedPrereqSkill(t, w, "packages", true)
-	seedPrereqScan(t, w, pkgSkill, scan.RepositoryID, db.ScanDone)    // prior commit
-	seedPrereqScan(t, w, pkgSkill, scan.RepositoryID, db.ScanRunning) // current commit, mid-flight
-	// Zero Package rows: the running re-scan has deleted the old rows and not
-	// yet committed the new ones.
-
-	deferred, err := w.preflightSkill(context.Background(), scan, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !deferred {
-		t.Fatal("dependents must defer (not dispatch or skip) while a packages re-scan is in flight")
-	}
-
-	var loaded db.Scan
-	if err := w.DB.First(&loaded, scan.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Status != db.ScanQueued {
-		t.Errorf("scan status = %q, want queued (deferred, not skipped to done)", loaded.Status)
-	}
-}
-
-func TestPreflightSkill_dependentsDispatchesWhenPackagesNeverRan(t *testing.T) {
-	// packages was never enqueued for this repo. Zero Package rows here
-	// means "not yet known", not "no packages", so the gate must NOT skip:
-	// dispatch and let dependents self-gate as it does today.
-	w := newPreflightWorker(t)
-	scan := seedDependentsScan(t, w)
-	seedPrereqSkill(t, w, "packages", true) // registered, but no scan rows
-
-	deferred, err := w.preflightSkill(context.Background(), scan, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if deferred {
-		t.Fatal("dependents must dispatch when packages has not run (no false skip)")
-	}
-
-	var loaded db.Scan
-	if err := w.DB.First(&loaded, scan.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Status != db.ScanQueued {
-		t.Errorf("scan status = %q, want queued", loaded.Status)
 	}
 }

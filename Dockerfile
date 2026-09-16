@@ -1,4 +1,4 @@
-FROM golang:1.26.4-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS build
+FROM golang:1.27.1-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -10,29 +10,37 @@ COPY . .
 ARG COMMIT=""
 RUN CGO_ENABLED=0 go build -ldflags "-X main.commit=${COMMIT}" -o /scrutineer ./cmd/scrutineer
 
-FROM node:26-alpine@sha256:a2dc166a387cc6ca1e62d0c8e265e49ca985d6e60abc9fe6e6c3d6ce8e63f606 AS claude
-RUN npm install -g @anthropic-ai/claude-code@2.1.173
+FROM node:26-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS claude
 
-FROM python:3.15.0b2-alpine@sha256:05458e2cf3a3b7a158d3c2e11940de557c626c064f41311f874a2c08ede01074 AS python-tools
-RUN pip install --no-cache-dir semgrep==1.167.0 "setuptools<81"
+RUN npm install -g @anthropic-ai/claude-code@2.1.266
 
-FROM golang:1.26.4-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS go-tools
+FROM python:3.14-alpine@sha256:c6ead215bfd31f1e433d968853b7a769989117115b728874824e6c0a27cb96fc AS python-tools
+
+ARG SEMGREP_VERSION=1.176.1
+
+ARG BANDIT_VERSION=1.9.4
+
+RUN pip install --no-cache-dir "semgrep==${SEMGREP_VERSION}" "setuptools<81" "bandit==${BANDIT_VERSION}"
+
+FROM golang:1.27.1-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS go-tools
 RUN apk add --no-cache git
-RUN GOBIN=/out go install github.com/git-pkgs/git-pkgs@v0.15.3 && \
-    GOBIN=/out go install github.com/git-pkgs/brief/cmd/brief@v0.6.0
+RUN GOBIN=/out go install github.com/git-pkgs/git-pkgs@v0.20.0
+
+RUN GOBIN=/out go install github.com/git-pkgs/brief/cmd/brief@v0.13.0
 
 # vid links tree-sitter grammars (C), so unlike the main binary it needs
 # cgo; build-base provides gcc and musl headers, matching the musl-based
 # final image.
-FROM golang:1.26.4-alpine@sha256:3ad57304ad93bbec8548a0437ad9e06a455660655d9af011d58b993f6f615648 AS vid-build
+FROM golang:1.27.1-alpine@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS vid-build
 RUN apk add --no-cache build-base git
 RUN GOBIN=/out CGO_ENABLED=1 go install github.com/andrew/VID/cmd/vid@v0.1.0
 
-FROM rust:1.96-alpine@sha256:f87aa870663e2b57ec8c69de82c7eedf7383bee987eef7612c0359635eaadb41 AS zizmor-build
+FROM rust:1.98-alpine@sha256:1716b3aa042d735f4566d14dc54e8037de9d69556e2d5dd58131d93a613d173d AS zizmor-build
 RUN apk add --no-cache build-base linux-headers
-RUN cargo install --locked --root /out zizmor@1.26.1
+RUN cargo install --locked --root /out zizmor@1.30.1
 
-FROM python:3.15.0b2-alpine@sha256:05458e2cf3a3b7a158d3c2e11940de557c626c064f41311f874a2c08ede01074
+FROM python:3.15.0rc2-alpine@sha256:c847d755a8927c714eec064075b1f10549730b3233c758c51a403e60b53b9100
+FROM python:3.14-alpine@sha256:c6ead215bfd31f1e433d968853b7a769989117115b728874824e6c0a27cb96fc
 RUN apk add --no-cache git ca-certificates bash nodejs coreutils && \
     rm -f /usr/local/bin/pip* /usr/local/bin/idle* /usr/local/bin/pydoc*
 
@@ -43,10 +51,12 @@ COPY --from=build /scrutineer /usr/local/bin/scrutineer
 COPY --from=claude /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=claude /usr/local/bin/claude /usr/local/bin/claude
 
-# semgrep
+# semgrep and bandit (both installed into the python-tools stage above, so
+# the shared site-packages copy covers their libraries)
 COPY --from=python-tools /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 COPY --from=python-tools /usr/local/bin/semgrep* /usr/local/bin/
 COPY --from=python-tools /usr/local/bin/pysemgrep /usr/local/bin/
+COPY --from=python-tools /usr/local/bin/bandit* /usr/local/bin/
 
 # go tools
 COPY --from=go-tools /out/* /usr/local/bin/

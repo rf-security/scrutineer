@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/base64"
@@ -15,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,10 +24,14 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/git-pkgs/cwe"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
 	"scrutineer/internal/queue"
+	"scrutineer/internal/repoconfig"
+	"scrutineer/internal/vince"
 	"scrutineer/internal/worker"
 )
 
@@ -41,11 +47,33 @@ var ErrSkillRequiresRemote = errors.New("skill requires a remote repository")
 // instead of a ghost scan failing on the worker.
 var ErrSkillProfileMismatch = errors.New("skill requires a different runner profile")
 
+// ErrRepoFederationOptOut is returned by enqueueSkillWith for a repository
+// whose maintainer asked federated instances not to scan it. The gate sits
+// on the single enqueue choke point rather than on each caller, so an
+// opt-out imported from a peer feed also stops the scheduler, triage
+// fan-out and every button on the repo page.
+var ErrRepoFederationOptOut = errors.New("repository maintainer opted out of federated scanning")
+
+// ErrFederationClaimPending is returned by enqueueSkillWith when an
+// outreach skill is asked to run on a finding a federation peer also holds.
+// See refuseClaimedOutreach for why the check sits at enqueue.
+var ErrFederationClaimPending = errors.New("a federation peer already holds this finding; coordinate before reporting")
+
+// outreachSkills contact someone outside this instance about a finding and
+// mark it reported themselves, so they are the automated half of what the
+// outbound claim-check exists to deduplicate.
+var outreachSkills = map[string]bool{reportUpstreamSkillName: true, publicIssueSkillName: true}
+
 // ErrInvalidRef is returned by enqueueSkillWith when opts.Ref fails the
 // shared ref-charset validation. Mirrors ErrSkillProfileMismatch so the
 // API path rejects a bad ref at the boundary (400) instead of enqueueing
 // a scan that will fail later at git-clone time.
 var ErrInvalidRef = errors.New("invalid git ref")
+
+// ErrInvalidRescanMode is returned by enqueueSkillWith when opts.RescanMode is
+// not one of the persisted scan modes. API callers control this value, so the
+// API layer maps it to a 400 instead of reporting an internal server failure.
+var ErrInvalidRescanMode = errors.New("invalid rescan mode")
 
 //go:embed templates/*.html
 var tmplFS embed.FS
@@ -68,17 +96,54 @@ type Server struct {
 	// is not configured.
 	SkillsRepoSHA string
 
-	// Commit is the git SHA scrutineer itself was built from, shown on the
-	// settings page. Set once by main; empty when the build carries no VCS
-	// stamp (e.g. an ldflags-less build outside a git checkout).
-	Commit string
+	// Version is the Scrutineer release version shown on the settings page.
+	// Release builds inject CalVer at link time; development builds use "dev".
+	Version string
+
+	// MonorepoAttribution mirrors worker.Worker.MonorepoAttribution on the
+	// web side so handlers can gate per-subproject attribution (packages,
+	// advisories, maintainers, disclosure channel) without reaching through
+	// a possibly-nil Worker. Set once by main; default off in tests.
+	MonorepoAttribution bool
+
+	// Backend is the canonical -backend value the runner was started with
+	// (worker.HarnessName). Set once by main. resumeOpts compares it to
+	// Scan.Backend so a retry after switching backends starts fresh instead
+	// of passing one harness's session id to another's resume command.
+	Backend string
 
 	// EncRecipients is the parsed recipients file; nil disables encrypted
 	// export. Supports age X25519 and SSH public keys.
 	EncRecipients []age.Recipient
-	// EncIdentities decrypts encrypted imports. Multiple entries support
-	// key rotation (old + new). nil disables encrypted import.
+	// EncIdentities decrypts encrypted imports and federation members feeds.
+	// Multiple entries support migration and fallback. nil disables decryption.
 	EncIdentities []age.Identity
+
+	// FederationSalt is the shared federation secret mixed into
+	// interchange finding hashes; empty disables the claim-check
+	// endpoint. FederationContact is returned by claim-check on a match;
+	// startup refuses a salt without a contact. claimIndex caches the
+	// salted hash set claim-check consults; see claimHashSet.
+	FederationSalt    string
+	FederationContact string
+	claimIndex        claimCheckIndex
+
+	// VINCE holds the config-file-only API credential and reporter defaults
+	// for native CERT/CC submissions. vinceHTTPClient is injectable so tests
+	// can use httptest without changing the credential-bearing config shape.
+	VINCE           vince.Config
+	vinceHTTPClient *http.Client
+	vinceSubmitMu   sync.Mutex
+	// FederationPublicFeed and FederationMembersFeed are the git remotes
+	// the export job pushes each tier to; FederationImportFeeds are the
+	// peer remotes the import job pulls; all three empty leaves the
+	// federation job dormant. FederationPeers are peer base URLs asked over
+	// POST /claim-check before this instance reports a finding. See
+	// docs/interchange.md.
+	FederationPublicFeed  string
+	FederationMembersFeed string
+	FederationImportFeeds []string
+	FederationPeers       []string
 
 	// resolvePURL maps a Package URL to its source repository URL via
 	// packages.ecosyste.ms. Field rather than direct call so tests can
@@ -96,11 +161,27 @@ type Server struct {
 	// the network lookup, mirroring resolvePURL and listBranches.
 	fetchOrgRepos func(ctx context.Context, org string) ([]OrgRepo, error)
 
+	// resolveRemoteHead returns the commit SHA a repository's HEAD points
+	// at, for the scheduler's new-commit check. Field rather than a direct
+	// worker call so tests can stub the network lookup.
+	resolveRemoteHead func(ctx context.Context, repo db.Repository) (string, error)
+
+	// syncUpstream force-syncs a staging repository from its configured
+	// upstream before the scheduler's new-commit check. Field rather than
+	// a direct worker call so tests can stub the git traffic.
+	syncUpstream func(ctx context.Context, repoURL, upstreamURL string, headTimeout time.Duration) error
+
 	// prefetchEcosystems warms the per-repository ecosyste.ms cache
 	// when a new repo is added, in parallel with the triage enqueue. Field
 	// rather than a direct call so tests can stub the network fan-out,
 	// mirroring resolvePURL and friends.
 	prefetchEcosystems func(repoID uint)
+
+	// ecosystemsEnrichment reports whether outbound ecosyste.ms lookups are
+	// allowed, so the handlers can say why an import refused. New defaults it
+	// on; DisableEcosystems is the only writer. Immutable once serving starts,
+	// unlike the settings-page defaults above, so it needs no lock.
+	ecosystemsEnrichment bool
 
 	// Runtime defaults a new scan inherits when the caller pins none.
 	// Both are seeded at startup from config/flags and mutable via the
@@ -116,12 +197,66 @@ type Server struct {
 	skillNamesCache []string
 	skillNamesTTL   time.Time
 
-	// toolMeta caches the scanner-tool and docker versions shown on the
-	// settings page. Gathering them shells out to docker, so it is cached
-	// behind a TTL to keep the page DB-fast on repeat loads.
+	// toolMeta caches the scanner-tool and container runtime versions shown on
+	// the settings page. Gathering them shells out to the runtime, so it is
+	// cached behind a TTL to keep the page DB-fast on repeat loads.
 	toolMetaMu    sync.Mutex
 	toolMetaCache toolMetadata
 	toolMetaTTL   time.Time
+
+	// agentEnqueueMu makes check-then-enqueue flows atomic within this server
+	// process, including scan-token API deduplication and automatic fan-out.
+	agentEnqueueMu sync.Mutex
+
+	// repoFederationLocks serialises, per repository, recording a federation
+	// opt-out against the scheduler firing that repository. See
+	// lockRepoFederation. repoFederationMu guards the map itself, not the
+	// sections.
+	repoFederationMu    sync.Mutex
+	repoFederationLocks map[uint]*sync.Mutex
+
+	// runnerStatus is the result of the boot-time runner-image staleness check
+	// (issue #337), set once by main shortly after startup and read by the
+	// settings page to render the stale-image banner. The zero value renders
+	// nothing, so reads before the check completes are safe.
+	runnerStatusMu sync.Mutex
+	runnerStatus   worker.RunnerImageStatus
+
+	// chatRunner executes one chat turn. Constructed in New from the worker's
+	// runner; nil when no runner is configured, in which case the
+	// chat handlers refuse gracefully. Tests substitute a stub.
+	chatRunner chatTurnRunner
+	// chatActive guards against two concurrent turns on the same conversation:
+	// each would --resume the same session at once and interleave replies. A
+	// conversation id is present while its turn runs.
+	chatMu     sync.Mutex
+	chatActive map[uint]struct{}
+	// chatSlots bounds concurrent chat turns across all conversations: each
+	// spawns its own agent container, and the per-conversation lock alone
+	// would let one analyst's open tabs outnumber the whole scan pipeline.
+	// Sized at construction from half the queue's concurrency, so a later
+	// Reconfigure does not move the chat ceiling.
+	chatSlots chan struct{}
+	// spawnTurn runs a chat turn in the background. Field rather than a direct
+	// `go s.runChatTurn(...)` so tests can run it synchronously.
+	spawnTurn func(convID uint, message string)
+}
+
+// SetRunnerImageStatus records the boot-time runner-image staleness result so
+// the settings page can surface it. Called once from main after the background
+// check finishes.
+func (s *Server) SetRunnerImageStatus(st worker.RunnerImageStatus) {
+	s.runnerStatusMu.Lock()
+	defer s.runnerStatusMu.Unlock()
+	s.runnerStatus = st
+}
+
+// runnerImageStatus returns the last recorded staleness result, or the zero
+// value (Stale=false) when the check has not run or found nothing to report.
+func (s *Server) runnerImageStatus() worker.RunnerImageStatus {
+	s.runnerStatusMu.Lock()
+	defer s.runnerStatusMu.Unlock()
+	return s.runnerStatus
 }
 
 // displaySeverity maps any known casing of a severity string to its
@@ -142,25 +277,71 @@ func displaySeverity(s string) string {
 	return s
 }
 
+// tmplSince renders a timestamp as "<duration> ago", accepting a time.Time
+// or *time.Time and yielding "" for nil/zero values.
+//
+// The elapsed time is baked in at render time, so a running scan's row would
+// otherwise read "0s ago" for its whole run. Carrying the instant itself in a
+// <time datetime> lets static/app.js recount it every second, which is what
+// makes the value climb without a request. Both halves are generated (RFC 3339
+// and humanDuration's digits), so neither can inject markup.
+func tmplSince(v any) template.HTML {
+	var t time.Time
+	switch x := v.(type) {
+	case time.Time:
+		t = x
+	case *time.Time:
+		if x == nil {
+			return ""
+		}
+		t = *x
+	default:
+		return ""
+	}
+	if t.IsZero() {
+		return ""
+	}
+	// data-elapsed is what app.js keys on, so it only ever recounts values that
+	// mean "this long ago" and leaves any other <time> alone.
+	return template.HTML(fmt.Sprintf(`<time datetime="%s" data-elapsed>%s ago</time>`,
+		t.UTC().Format(time.RFC3339), humanDuration(time.Since(t))))
+}
+
+// tmplBytes renders a byte count with a binary unit suffix (B, KB, MB, ...).
+func tmplBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// defaultResolveRemoteHead is the production resolveRemoteHead: it resolves a
+// repository's remote HEAD, using the local path for file-backed repos.
+func defaultResolveRemoteHead(ctx context.Context, repo db.Repository) (string, error) {
+	url := repo.URL
+	if repo.IsLocal() {
+		url = repo.LocalPath()
+	}
+	return worker.ResolveRemoteHead(ctx, url)
+}
+
 func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *worker.Worker) (*Server, error) {
 	funcs := template.FuncMap{
-		"since": func(v any) string {
-			var t time.Time
-			switch x := v.(type) {
-			case time.Time:
-				t = x
-			case *time.Time:
-				if x == nil {
-					return ""
-				}
-				t = *x
-			default:
+		"since": tmplSince,
+		"until": func(t *time.Time) string {
+			if t == nil || t.IsZero() {
 				return ""
 			}
-			if t.IsZero() {
-				return ""
+			if d := time.Until(*t); d > 0 {
+				return "in " + humanDuration(d)
 			}
-			return humanDuration(time.Since(t)) + " ago"
+			return "due"
 		},
 		"dur":      humanDuration,
 		"usd":      formatUSD,
@@ -175,8 +356,12 @@ func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *work
 			}
 			return m
 		},
-		"list":  func(xs ...string) []string { return xs },
-		"len64": tmplLen64,
+		"list":      func(xs ...string) []string { return xs },
+		"contains":  slices.Contains[[]string, string],
+		"len64":     tmplLen64,
+		"sortkey":   sortKey,
+		"riskflags": db.PackageRiskFlags,
+		"risklabel": db.PackageRiskFlagLabel,
 		"cwename": func(id string) string {
 			if _, c, ok := LookupCWE(id); ok {
 				return c.Name
@@ -239,17 +424,18 @@ func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *work
 			}
 			return s
 		},
-		"bytes": func(b int64) string {
-			const unit = 1024
-			if b < unit {
-				return fmt.Sprintf("%d B", b)
-			}
-			div, exp := int64(unit), 0
-			for n := b / unit; n >= unit; n /= unit {
-				div *= unit
-				exp++
-			}
-			return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+		"bytes": tmplBytes,
+		"repoReportFilename": func(repo db.Repository, upstream bool) string {
+			return repoReportFilename(&repo, upstream)
+		},
+		"scanReportFilename": func(scan db.Scan) string {
+			return scanReportFilename(&scan)
+		},
+		"findingReportFilename": func(repo db.Repository, f db.Finding) string {
+			return findingReportFilename(&repo, &f)
+		},
+		"findingDisclosureMarkdownFilename": func(repo db.Repository, f db.Finding) string {
+			return findingDisclosureMarkdownFilename(&repo, &f)
 		},
 	}
 	t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, "templates/*.html")
@@ -261,14 +447,40 @@ func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *work
 	}
 	s := &Server{DB: gdb, Queue: q, Log: log, Broker: broker, Worker: w, tmpl: t,
 		resolvePURL: resolvePURLRepo, listBranches: worker.ListRemoteBranches,
-		fetchOrgRepos: fetchGitHubOrgRepos}
+		fetchOrgRepos:     fetchGitHubOrgRepos,
+		resolveRemoteHead: defaultResolveRemoteHead,
+		syncUpstream:      w.SyncUpstream}
 	s.prefetchEcosystems = s.ecosystemsPrefetch
+	s.ecosystemsEnrichment = true
+	s.chatActive = map[uint]struct{}{}
+	s.chatSlots = make(chan struct{}, chatTurnSlots(q))
+	s.spawnTurn = func(convID uint, message string) { go s.runChatTurn(convID, message) }
 	if w != nil {
 		w.OnFindingCreated = s.autoEnqueueRevalidate
 		w.OnRevalidateVerdict = s.autoChainVerifyAfterRevalidate
 		w.OnScanFinalized = s.onScanFinalized
+		// Only the dedup pass, not the whole onScanFinalized fan-out: a scan
+		// that timed out or was cancelled has no committed analysis to update
+		// a threat model or seed a config from. Dedup is the one consumer
+		// that cares purely about the cohort having drained.
+		w.OnScanGroupSettled = s.autoEnqueueFindingDedup
+		w.OnScanFailed = s.autoEnqueueFocusAreaDeepDives
+		if w.Runner != nil {
+			s.chatRunner = &worker.ChatRunner{Runner: w.Runner, DB: gdb, DataDir: w.DataDir, PrepareSrc: w.PrepareSrc}
+		}
 	}
 	return s, nil
+}
+
+// DisableEcosystems turns off every outbound ecosyste.ms lookup this layer
+// makes. It neuters the two seams that reach the network as well as recording
+// the flag the handlers report on, so a future caller that reaches a seam
+// without repeating the handler-level check still cannot make a request the
+// operator opted out of.
+func (s *Server) DisableEcosystems() {
+	s.ecosystemsEnrichment = false
+	s.prefetchEcosystems = nil
+	s.resolvePURL = func(context.Context, string) string { return "" }
 }
 
 // ecosystemsPrefetch warms the ecosyste.ms cache for a freshly added repo in a
@@ -296,6 +508,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /repositories/bulk", s.repoBulkCreate)
 	mux.HandleFunc("POST /repositories/org", s.repoOrgImport)
 	mux.HandleFunc("GET /repositories/{id}", s.repoShow)
+	mux.HandleFunc("GET /repositories/{id}/scans", s.repoScansFragment)
+	mux.HandleFunc("POST /repositories/{id}/alternatives", s.repoPackageAlternativeCreate)
+	mux.HandleFunc("POST /repositories/{id}/alternatives/{alternative_id}/delete", s.repoPackageAlternativeDelete)
+	mux.HandleFunc("POST /repositories/{id}/expected", s.repoExpectedFindingCreate)
+	mux.HandleFunc("POST /repositories/{id}/expected/{expected_id}/delete", s.repoExpectedFindingDelete)
 	mux.HandleFunc("GET /repositories/{id}/blob/{commit}/{path...}", s.repoBlob)
 	mux.HandleFunc("GET /repositories/{id}/report.md", s.repoReport)
 	mux.HandleFunc("POST /repositories/{id}/scan", s.repoScan)
@@ -303,9 +520,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /repositories/{id}/validate-fix", s.validateFix)
 	mux.HandleFunc("POST /repositories/{id}/delete", s.repoDelete)
 	mux.HandleFunc("POST /repositories/{id}/disclosure-channel", s.repoDisclosureChannel)
+	mux.HandleFunc("GET /repositories/{id}/subprojects/{sub}", s.subprojectShow)
+	mux.HandleFunc("POST /repositories/{id}/subprojects/{sub}/disclosure-channel", s.subprojectDisclosureChannel)
+	mux.HandleFunc("POST /repositories/{id}/federation-opt-out", s.repoFederationOptOut)
+	mux.HandleFunc("POST /repositories/{id}/schedule", s.repoScheduleUpdate)
 	mux.HandleFunc("POST /repositories/{id}/threat-model", s.repoThreatModelSave)
 	mux.HandleFunc("POST /repositories/{id}/threat-model/run", s.repoThreatModelRun)
 	mux.HandleFunc("POST /repositories/{id}/threat-model/clear", s.repoThreatModelClear)
+	mux.HandleFunc("POST /repositories/{id}/scan-config", s.repoScanConfigSave)
+	mux.HandleFunc("POST /repositories/{id}/scan-config/ignored-paths", s.repoIgnoredPathAdd)
+	mux.HandleFunc("POST /repositories/{id}/scan-config/ignored-paths/delete", s.repoIgnoredPathDelete)
+	mux.HandleFunc("POST /repositories/{id}/scan-config/clear", s.repoScanConfigClear)
 	mux.HandleFunc("GET /scans", s.jobs)
 	mux.HandleFunc("GET /orgs", s.orgsList)
 	mux.HandleFunc("GET /orgs/{login}", s.orgShow)
@@ -315,33 +540,53 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /maintainers/{id}", s.maintainerShow)
 	mux.HandleFunc("POST /maintainers/{id}/do-not-contact", s.maintainerDoNotContact)
 	mux.HandleFunc("GET /findings", s.findings)
+	mux.HandleFunc("GET /benchmark", s.benchmark)
 	mux.HandleFunc("GET /audit", s.auditPage)
 	mux.HandleFunc("POST /findings/{id}/reviews", s.findingReviewCreate)
 	mux.HandleFunc("GET /findings/{id}", s.findingShow)
 	mux.HandleFunc("GET /findings/{id}/report.md", s.findingReport)
+	mux.HandleFunc("GET /findings/{id}/disclosure.md", s.findingDisclosureMarkdown)
 	mux.HandleFunc("GET /findings/{id}/csaf.json", s.findingCSAF)
 	mux.HandleFunc("GET /findings/{id}/osv.json", s.findingOSV)
+	mux.HandleFunc("GET /findings/{id}/disclosure.html", s.findingDisclosureHTML)
+	mux.HandleFunc("GET /findings/{id}/vince", s.findingVINCEPreview)
+	mux.HandleFunc("POST /findings/{id}/vince", s.findingVINCESubmit)
 	mux.HandleFunc("POST /findings/{id}/status", s.findingStatus)
 	mux.HandleFunc("POST /findings/{id}/exploited-in-wild", s.findingExploitedInWild)
 	mux.HandleFunc("POST /findings/{id}/verify", s.findingVerify)
+	mux.HandleFunc("POST /findings/{id}/critic", s.findingCritic)
 	mux.HandleFunc("POST /repositories/{id}/verify-all", s.repoVerifyAll)
 	mux.HandleFunc("POST /findings/{id}/disclose", s.findingDisclose)
 	mux.HandleFunc("POST /findings/{id}/public-issue", s.findingPublicIssue)
 	mux.HandleFunc("POST /findings/{id}/mitigate", s.findingMitigate)
 	mux.HandleFunc("POST /findings/{id}/patch", s.findingPatchRun)
+	mux.HandleFunc("POST /findings/{id}/reattack", s.findingReattackRun)
 	mux.HandleFunc("POST /findings/{id}/exposure", s.findingExposureRun)
+	mux.HandleFunc("POST /findings/{id}/dependents/{dependent_id}/campaign", s.findingDependentCampaignUpdate)
 	mux.HandleFunc("GET /findings/{id}/patch.diff", s.findingPatchDownload)
 	mux.HandleFunc("GET /findings/{id}/bundle.tar.gz", s.findingBundleDownload)
 	mux.HandleFunc("POST /findings/{id}/notes", s.findingNotes)
 	mux.HandleFunc("POST /findings/{id}/fields", s.findingFields)
+	mux.HandleFunc("POST /findings/{id}/disclosure-draft", s.findingDisclosureDraftSave)
 	mux.HandleFunc("POST /findings/{id}/communications", s.findingCommunications)
 	mux.HandleFunc("POST /findings/{id}/references", s.findingReferences)
 	mux.HandleFunc("POST /findings/{id}/labels", s.findingLabels)
 	mux.HandleFunc("POST /dependencies/{id}/scan", s.depScan)
 	mux.HandleFunc("POST /dependents/{id}/scan", s.dependentScan)
+
+	mux.HandleFunc("POST /repositories/{id}/conversations", s.conversationCreateRepo)
+	mux.HandleFunc("POST /findings/{id}/conversations", s.conversationCreateFinding)
+	mux.HandleFunc("GET /conversations/{id}", s.conversationShow)
+	mux.HandleFunc("POST /conversations/{id}/messages", s.conversationMessage)
+	mux.HandleFunc("POST /conversations/{id}/delete", s.conversationDelete)
 	mux.HandleFunc("GET /packages", s.packages)
 	mux.HandleFunc("GET /packages/{id}", s.packageShow)
 	mux.HandleFunc("GET /advisories", s.advisoriesList)
+	mux.HandleFunc("GET /advisories/{id}/certificate.json", s.advisoryCertificateDownload)
+	// No method in the pattern: the handler 404s non-POST itself so a
+	// federation-capable build cannot be fingerprinted by the 405 the
+	// mux would otherwise answer.
+	mux.HandleFunc("/claim-check", s.claimCheck)
 	mux.HandleFunc("GET /scans/{id}", s.scanShow)
 	mux.HandleFunc("GET /scans/{id}/report.md", s.scanReport)
 	mux.HandleFunc("POST /scans/{id}/retry", s.scanRetry)
@@ -353,6 +598,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /scans/{id}/cancel", s.scanCancel)
 	mux.HandleFunc("GET /scans/{id}/log", s.scanLog)
 	mux.HandleFunc("GET /usage", s.usage)
+	mux.HandleFunc("GET /reporting", s.reporting)
+	mux.HandleFunc("GET /reporting/report.csv", s.reportingCSV)
+	mux.HandleFunc("GET /reporting/report.json", s.reportingJSON)
 	s.registerSBOMRoutes(mux)
 	mux.HandleFunc("GET /skills", s.skillsList)
 	mux.HandleFunc("GET /skills/new", s.skillNew)
@@ -369,6 +617,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /settings/concurrency", s.settingsUpdateConcurrency)
 	mux.HandleFunc("POST /settings/runner/restart", s.settingsRestartRunner)
 	mux.HandleFunc("POST /settings/max-turns", s.settingsUpdateMaxTurns)
+	mux.HandleFunc("POST /settings/scan-schedule", s.settingsUpdateScanSchedule)
 
 	// API routes get bearer-auth middleware and skip the browser CSRF checks;
 	// skills call these from inside a scan workspace, not from a browser.
@@ -376,6 +625,10 @@ func (s *Server) Handler() http.Handler {
 	// browser's host-only boundary; see threatmodel.md.
 	root := http.NewServeMux()
 	root.Handle("/api/v1/", securityHeaders(http.StripPrefix(exportPrefix, s.exportHandler())))
+	// More specific than "/api/", so it wins the mux match and gets its own
+	// access rule rather than the scan-token auth apiHandler applies; see
+	// openAPISpecHandler.
+	root.Handle("GET /api/openapi.yaml", s.openAPISpecHandler())
 	root.Handle("/api/", s.apiHandler())
 	root.Handle("/", securityHeaders(mux))
 	return logRequests(s.Log, root)
@@ -388,13 +641,65 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 	data["Nav"] = navKey(r.URL.Path)
 	data["Theme"] = resolveTheme(r)
 	data["ColorScheme"] = resolveColorScheme(r)
-	data["Flash"] = popFlash(w, r)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
+	// The request URI a live page re-requests to refresh its own list fragment,
+	// filters, sort and page included.
+	data["SelfURL"] = r.URL.RequestURI()
+	// Only a full page render pops the flash. The list fragments served to htmx
+	// carry no #toaster, so consuming it there would swallow the message the
+	// full render that a POST is redirecting to is about to show.
+	if !isHX(r) {
+		data["Flash"] = popFlash(w, r)
+	}
+	// Seed the sorter with the handler's EFFECTIVE sort (data["Sort"]) rather
+	// than the raw ?sort param. That token is already the sanitized, defaulted
+	// sort the ORDER BY actually used, so folding it in makes a default or
+	// sanitized sort mark its column active (aria-sort + arrow) and makes the
+	// first header click flip direction instead of silently repeating the
+	// default. When ?sort is a valid explicit token the two agree, so this is a
+	// no-op there; non-index pages set no "Sort" and keep the raw query.
+	sorterQuery := r.URL.Query()
+	if eff, ok := data["Sort"].(string); ok && eff != "" {
+		sorterQuery.Set("sort", eff)
+	}
+	data["Sorter"] = sortCtx{path: r.URL.Path, query: sorterQuery}
+	// Render into a buffer first. ExecuteTemplate writes incrementally, so
+	// executing straight into the ResponseWriter commits a 200 and part of the
+	// page before a mid-template error is known; the http.Error below then
+	// cannot change the status and only appends plain text to half-rendered
+	// HTML. Buffering keeps the failure path able to send a clean 500.
+	buf := renderBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		// One outsized page (a long findings list) would otherwise pin its
+		// capacity in the pool for the process lifetime, so oversized buffers
+		// are dropped instead of recycled.
+		if buf.Cap() <= maxPooledRenderBuf {
+			renderBufPool.Put(buf)
+		}
+	}()
+
+	if err := s.tmpl.ExecuteTemplate(buf, name, data); err != nil {
 		s.Log.Error("render", "tmpl", name, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	if _, err := buf.WriteTo(w); err != nil {
+		// Headers and status are already sent, so this can only be logged:
+		// the client hung up or the connection broke mid-write.
+		s.Log.Error("render write", "tmpl", name, "err", err)
 	}
 }
+
+// render() runs on every page load, so the buffers are pooled rather than
+// allocated per request.
+var renderBufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// Buffers larger than this are dropped rather than returned to the pool.
+const maxPooledRenderBuf = 1 << 20
 
 // Flash is a one-shot message carried across a redirect via the "flash"
 // cookie and rendered server-side into #toaster on the next page load.
@@ -439,9 +744,9 @@ func popFlash(w http.ResponseWriter, r *http.Request) *Flash {
 // index, which is also the home page.
 func navKey(path string) string {
 	for _, p := range []struct{ prefix, key string }{
-		{"/settings", "settings"}, {"/usage", "usage"}, {"/skills", "skills"}, {"/maintainers", "maintainers"},
+		{"/settings", "settings"}, {"/usage", "usage"}, {"/reporting", "reporting"}, {"/skills", "skills"}, {"/maintainers", "maintainers"},
 		{"/orgs", "orgs"}, {"/packages", "packages"}, {"/advisories", "advisories"},
-		{"/findings", "findings"}, {"/scans", "scans"}, {"/sboms", "sboms"}, {"/audit", "audit"},
+		{"/findings", "findings"}, {"/benchmark", "benchmark"}, {"/scans", "scans"}, {"/sboms", "sboms"}, {"/audit", "audit"},
 	} {
 		if strings.HasPrefix(path, p.prefix) {
 			return p.key
@@ -530,11 +835,25 @@ func paginate(r *http.Request, total int64) Page {
 	return Page{N: n, Pages: pages, Total: total, Path: r.URL.Path, Query: r.URL.Query()}
 }
 
+// repoListFields is the complete Repository surface rendered by
+// repo_list.html. Querying into this narrow type makes GORM derive the SELECT
+// list from the template's data contract while keeping the potentially large
+// Repository cache fields out. A template reference to an unlisted field then
+// fails loudly instead of silently rendering an unhydrated zero value.
+type repoListFields struct {
+	ID         uint
+	URL        string
+	Languages  string
+	Health     db.RepositoryHealth
+	CloneError string
+	DiskBytes  int64
+}
+
 type repoRow struct {
-	db.Repository
+	repoListFields
 	LastScan      *db.Scan
+	StatusScan    *db.Scan
 	FindingsTotal int
-	DiskBytes     int64
 	// Branches lists the distinct non-default refs this repo has been
 	// scanned on, for the branch tags next to its name. Empty when every
 	// scan ran on the default branch.
@@ -607,32 +926,48 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	sort := r.URL.Query().Get("sort")
+	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
 	const nameSort = "name"
-	switch sort {
+	switch sortCol {
 	case nameSort:
-		q = q.Order(nameSort)
+		q = q.Order(orderByExpr(nameSort, dir, false))
 	case "stars":
-		q = q.Order("stars desc")
+		q = q.Order(orderByExpr("stars", dir, true))
 	case "language":
-		q = q.Order("languages, name")
+		q = q.Order(orderByExpr("languages", dir, false)).Order("name")
+	case "size":
+		q = q.Order(orderByExpr("disk_bytes", dir, true)).Order("updated_at desc")
 	case "findings":
 		// Correlated subquery keeps the existing Count/Find chain intact
 		// (a JOIN+GROUP BY would change what Count(&total) returns). Low-
 		// thousands of repos so the per-row subselect is fine on sqlite.
 		// Scanner-skill findings (zizmor, semgrep, …) are excluded so the
 		// list reflects curated audit output, matching the repo Findings tab.
-		q = q.Order("(" + deepDiveFindingsCountSQL + ") desc, updated_at desc")
+		// orderByExpr keeps the request out of the raw-subquery clause.
+		q = q.Order(orderByExpr("("+deepDiveFindingsCountSQL+")", dir, true)).Order("updated_at desc")
+	case "scanned":
+		// Order by each repo's latest scan id (the row the Last scan column
+		// renders), most-recent first by default; never-scanned repos (NULL)
+		// sort last under DESC. Correlated subquery, like the findings case.
+		q = q.Order(orderByExpr("(SELECT MAX(id) FROM scans WHERE scans.repository_id = repositories.id)", dir, true)).Order("updated_at desc")
+	case statusKey:
+		// Order by the same rank the scans index uses: the denormalised
+		// status_priority column (0=running .. 3=terminal), lowest-first by
+		// default so active repos surface. COALESCE pushes never-scanned repos
+		// last. The Status badge is computed live for display, but sorting can
+		// use the indexed column, exactly as /scans does.
+		q = q.Order(orderByExpr("COALESCE((SELECT MIN(status_priority) FROM scans WHERE scans.repository_id = repositories.id), 99)", dir, false)).Order("updated_at desc")
 	default:
-		sort = defaultSort
+		sortCol, dir = defaultSort, ""
 		q = q.Order("updated_at desc")
 	}
+	sort := joinSort(sortCol, dir)
 
 	var total int64
 	q.Count(&total)
 	page := paginate(r, total)
 
-	var repos []db.Repository
+	var repos []repoListFields
 	q.Limit(perPage).Offset((page.N - 1) * perPage).Find(&repos)
 
 	// Batch-load findings count and last scan per page (N rows) rather
@@ -678,6 +1013,33 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 			lastScans[scans[i].RepositoryID] = &scans[i]
 		}
 	}
+	statusScans := map[uint]*db.Scan{}
+	if len(repoIDs) > 0 {
+		// Status badge prefers active work over recency, so an older running
+		// scan outranks a newer queued one. Rank from status, not the
+		// denormalized status_priority (which can go stale); keep in lockstep
+		// with db.StatusPriorityFor.
+		var scans []db.Scan
+		s.DB.Raw(`
+			SELECT * FROM (
+				SELECT s.*, ROW_NUMBER() OVER (
+					PARTITION BY s.repository_id
+					ORDER BY CASE s.status
+						WHEN ? THEN 0
+						WHEN ? THEN 1
+						WHEN ? THEN 2
+						ELSE 3
+					END, s.id DESC
+				) AS rn
+				FROM scans s
+				WHERE s.repository_id IN ?
+			) ranked
+			WHERE rn = 1
+		`, db.ScanRunning, db.ScanQueued, db.ScanPaused, repoIDs).Scan(&scans)
+		for i := range scans {
+			statusScans[scans[i].RepositoryID] = &scans[i]
+		}
+	}
 
 	branchesByRepo := map[uint][]string{}
 	if len(repoIDs) > 0 {
@@ -701,14 +1063,11 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 	rows := make([]repoRow, 0, len(repos))
 	for _, repo := range repos {
 		rows = append(rows, repoRow{
-			Repository:    repo,
-			LastScan:      lastScans[repo.ID],
-			FindingsTotal: findingCounts[repo.ID],
-			// Read the cached size from the row; the worker refreshes it on
-			// each scan and a startup backfill seeds it, so the list never
-			// walks the clone cache per row (#126).
-			DiskBytes: repo.DiskBytes,
-			Branches:  branchesByRepo[repo.ID],
+			repoListFields: repo,
+			LastScan:       lastScans[repo.ID],
+			StatusScan:     statusScans[repo.ID],
+			FindingsTotal:  findingCounts[repo.ID],
+			Branches:       branchesByRepo[repo.ID],
 		})
 	}
 	languages := distinctLanguages(s.DB)
@@ -757,15 +1116,7 @@ func advisoryRepoID(a db.Advisory) uint { return a.RepositoryID }
 // severityOrder is a SQL CASE expression that ranks db.SeverityLevels
 // highest-first with unknown values last, derived from the same slice
 // SeverityAtLeast uses so the two never disagree.
-var severityOrder = func() string {
-	var b strings.Builder
-	b.WriteString("CASE severity")
-	for i, s := range db.SeverityLevels {
-		fmt.Fprintf(&b, " WHEN '%s' THEN %d", s, len(db.SeverityLevels)-1-i)
-	}
-	fmt.Fprintf(&b, " ELSE %d END", len(db.SeverityLevels))
-	return b.String()
-}()
+var severityOrder = db.SeverityOrderSQL()
 
 // loadByID loads the row whose primary key matches the request's {id}
 // path parameter, writing a 404 and returning ok=false when it does
@@ -775,7 +1126,12 @@ var severityOrder = func() string {
 //nolint:ireturn // T is a concrete struct at every call site, not an interface
 func loadByID[T any](s *Server, w http.ResponseWriter, r *http.Request) (T, bool) {
 	var v T
-	if err := s.DB.First(&v, r.PathValue("id")).Error; err != nil {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.NotFound(w, r)
+		return v, false
+	}
+	if err := s.DB.First(&v, id).Error; err != nil {
 		http.NotFound(w, r)
 		return v, false
 	}
@@ -832,12 +1188,11 @@ func loadRepoFindings(gdb *gorm.DB, repoID uint, category string) repoFindings {
 			scanIDs = append(scanIDs, f.ScanID)
 		}
 	}
-	var rows []struct {
-		ID        uint
-		SkillName string
-		Commit    string
-	}
-	gdb.Raw("SELECT id, COALESCE(skill_name, '') AS skill_name, COALESCE(`commit`, '') AS `commit` FROM scans WHERE id IN ?", scanIDs).Scan(&rows)
+	// Typed Find so GORM's dialector quotes the reserved-word column
+	// (`commit` on SQLite, "commit" on Postgres) and coerces NULL text to
+	// the Go zero value, replacing the previous Raw + COALESCE.
+	var rows []db.Scan
+	gdb.Select("id", "skill_name", "commit").Where("id IN ?", scanIDs).Find(&rows)
 	for _, row := range rows {
 		rf.ScanSkill[row.ID] = row.SkillName
 		rf.ScanCommit[row.ID] = row.Commit
@@ -869,18 +1224,35 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 	owner := r.URL.Query().Get("owner")
 	missed := r.URL.Query().Get("missed") == "1"
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
+	viability := productionViabilityFilter(r.URL.Query().Get("viability"))
 
-	sort := r.URL.Query().Get("sort")
-	switch sort {
+	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
+	switch sortCol {
 	case sortSeverity:
-		q = q.Order(severityOrder).Order("id desc")
+		// severityOrder ranks the most severe LOWEST, so the intuitive default
+		// (most severe first, shown as "desc") is ascending on the expression;
+		// !wantDesc flips the SQL direction relative to the logical one.
+		q = q.Order(orderBySuffix("("+severityOrder+")", !wantDesc(dir, true))).Order("findings.id desc")
 	case sortRepository:
 		q = q.Joins("JOIN repositories r ON r.id = findings.repository_id").
-			Order("r.name").Order("findings.id desc")
+			Order(orderByExpr("r.name", dir, false)).Order("findings.id desc")
+	case "title":
+		q = q.Order(orderByExpr("findings.title", dir, false)).Order("findings.id desc")
+	case statusKey:
+		q = q.Order(orderByExpr("findings.status", dir, false)).Order("findings.id desc")
+	case "repo_id":
+		q = q.Order(orderByExpr("findings.repository_id", dir, false)).Order("findings.id desc")
+	case "cwe":
+		q = q.Order(orderByExpr("findings.cwe", dir, false)).Order("findings.id desc")
+	case "model":
+		q = q.Order(orderByExpr("findings.model", dir, false)).Order("findings.id desc")
+	case "scan":
+		q = q.Order(orderByExpr("findings.scan_id", dir, true)).Order("findings.id desc")
 	default:
-		sort = defaultSort
+		sortCol, dir = defaultSort, ""
 		q = q.Order("id desc")
 	}
+	sort := joinSort(sortCol, dir)
 
 	var total int64
 	q.Count(&total)
@@ -891,10 +1263,17 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 
 	reposByID := loadRepoMap(s.DB, rows, findingRepoID)
 	anySubPath := false
+	// The model column always renders while model sorting is active:
+	// ascending sort puts unattributed rows first, so a page of empty
+	// models would otherwise hide the column — and its direction toggle —
+	// mid-sort.
+	anyModel := sortCol == "model"
 	for _, r := range rows {
 		if r.SubPath != "" {
 			anySubPath = true
-			break
+		}
+		if r.Model != "" {
+			anyModel = true
 		}
 	}
 	missedTotal, scannerTotal := s.findingToggleCounts(r, scanners)
@@ -902,10 +1281,11 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, "findings.html", map[string]any{
 		"Findings": rows, "Page": page, "Severity": sev, "Sort": sort,
 		"Category": category, "Categories": CWECategories(), "Uncategorized": UncategorizedCWE,
-		"Repos": reposByID, "Q": search, "AnySubPath": anySubPath,
+		"Repos": reposByID, "Q": search, "AnySubPath": anySubPath, "AnyModel": anyModel,
 		"Owner": owner, "Missed": missed, "MissedTotal": missedTotal,
 		"Scanners": scanners, "ScannerTotal": scannerTotal,
 		"Status": status, "Statuses": db.FindingLifecycles,
+		"Viability": viability,
 	})
 }
 
@@ -925,6 +1305,13 @@ func (s *Server) findingsIndexQuery(r *http.Request, includeScanners, includeMis
 		q = q.Where("repository_id IN (?)",
 			s.DB.Model(&db.Repository{}).Select("id").Where("owner = ?", owner))
 	}
+	if viability := productionViabilityFilter(r.URL.Query().Get("viability")); viability != "" {
+		if viability == "unassessed" {
+			q = q.Where("production_viability = '' OR production_viability IS NULL")
+		} else {
+			q = q.Where("production_viability = ?", viability)
+		}
+	}
 	if includeMissed && r.URL.Query().Get("missed") == "1" {
 		q = q.Where("missed_count > 0")
 	}
@@ -942,7 +1329,6 @@ func (s *Server) findingToggleCounts(r *http.Request, scanners bool) (int64, int
 
 	scannerWhere, scannerArgs := findingIndexWhereSQL(r, true, true)
 	scannerWhere = append(scannerWhere, scannerScanFilter)
-	scannerArgs = append(scannerArgs, deepDiveSkillName)
 
 	var counts struct {
 		MissedTotal  int64
@@ -965,7 +1351,6 @@ func findingIndexWhereSQL(r *http.Request, includeScanners, includeMissed bool) 
 	var args []any
 	if !includeScanners {
 		where = append(where, nonScannerScanFilter)
-		args = append(args, deepDiveSkillName)
 	}
 	if sev := r.URL.Query().Get("severity"); sev != "" {
 		where = append(where, "severity = ?")
@@ -980,12 +1365,13 @@ func findingIndexWhereSQL(r *http.Request, includeScanners, includeMissed bool) 
 		args = append(args, status)
 	}
 	if category := r.URL.Query().Get("category"); category != "" {
+		catalogued := cwe.CategorizedIDs()
 		switch {
-		case category == UncategorizedCWE && len(categorizedIDs) == 0:
+		case category == UncategorizedCWE && len(catalogued) == 0:
 			where = append(where, "cwe = ''")
 		case category == UncategorizedCWE:
 			where = append(where, "(cwe = '' OR cwe NOT IN ?)")
-			args = append(args, categorizedIDs)
+			args = append(args, catalogued)
 		case len(CWEsInCategory(category)) == 0:
 			where = append(where, "1 = 0")
 		default:
@@ -996,6 +1382,14 @@ func findingIndexWhereSQL(r *http.Request, includeScanners, includeMissed bool) 
 	if owner := r.URL.Query().Get("owner"); owner != "" {
 		where = append(where, "repository_id IN (SELECT id FROM repositories WHERE owner = ?)")
 		args = append(args, owner)
+	}
+	if viability := productionViabilityFilter(r.URL.Query().Get("viability")); viability != "" {
+		if viability == "unassessed" {
+			where = append(where, "(production_viability = '' OR production_viability IS NULL)")
+		} else {
+			where = append(where, "production_viability = ?")
+			args = append(args, viability)
+		}
 	}
 	if includeMissed && r.URL.Query().Get("missed") == "1" {
 		where = append(where, "missed_count > 0")
@@ -1019,13 +1413,31 @@ func applyFindingStatusFilter(q *gorm.DB, status string) *gorm.DB {
 	}
 }
 
+func productionViabilityFilter(value string) string {
+	switch value {
+	case db.ProductionViabilityViable, db.ProductionViabilityNonViable,
+		db.ProductionViabilitySampleOrTest, db.ProductionViabilityConditionalViable,
+		"unassessed":
+		return value
+	default:
+		return ""
+	}
+}
+
 func (s *Server) depScan(w http.ResponseWriter, r *http.Request) {
 	dep, ok := loadByID[db.Dependency](s, w, r)
 	if !ok {
 		return
 	}
 
-	repoURL := resolveDepRepoURL(r.Context(), dep)
+	// Order matters: a dependency carrying no PURL was never resolvable, so it
+	// keeps the 422 it would have got either way rather than being blamed on
+	// the operator's setting.
+	if dep.PURL != "" && !s.ecosystemsEnrichment {
+		http.Error(w, "cannot resolve "+dep.Name+": "+ecosystemsDisabled, http.StatusServiceUnavailable)
+		return
+	}
+	repoURL := s.resolvePURL(r.Context(), dep.PURL)
 	if repoURL == "" {
 		http.Error(w, "could not resolve repository URL for "+dep.Name, http.StatusUnprocessableEntity)
 		return
@@ -1033,9 +1445,14 @@ func (s *Server) depScan(w http.ResponseWriter, r *http.Request) {
 	s.addRepoAndScan(w, r, repoURL)
 }
 
-func resolveDepRepoURL(ctx context.Context, dep db.Dependency) string {
-	return resolvePURLRepo(ctx, dep.PURL)
-}
+// ecosystemsDisabled is what the import paths report when the operator turned
+// ecosyste.ms enrichment off: the resolution is the only way to get from a
+// PURL to a clone URL, so the action cannot run rather than silently no-op.
+const ecosystemsDisabled = "packages.ecosyste.ms enrichment is disabled"
+
+// noPURLError is what an SBOM package with no Package URL records: nothing to
+// look up, whether or not enrichment is on.
+const noPURLError = "no purl"
 
 // resolvePURLRepo asks packages.ecosyste.ms for the repository_url behind a
 // PURL. Returns empty string if the lookup fails or no repo is recorded.
@@ -1043,17 +1460,7 @@ func resolvePURLRepo(ctx context.Context, purl string) string {
 	if purl == "" {
 		return ""
 	}
-	_, raw, err := worker.FetchPackagesByPURL(ctx, purl)
-	if err != nil {
-		return ""
-	}
-	var pkgs []struct {
-		RepoURL string `json:"repository_url"`
-	}
-	if json.Unmarshal(raw, &pkgs) == nil && len(pkgs) > 0 && pkgs[0].RepoURL != "" {
-		return pkgs[0].RepoURL
-	}
-	return ""
+	return worker.ResolvePURLRepositoryURL(ctx, purl)
 }
 
 func (s *Server) dependentScan(w http.ResponseWriter, r *http.Request) {
@@ -1073,44 +1480,108 @@ const (
 	// first added. It owns the decision about which other skills to run;
 	// editing that skill changes the default pipeline with no Go changes.
 	defaultSkillName = "triage"
-	// deepDiveSkillName is the skill whose reports feed the Summary, Findings
-	// and Threat Model tabs on the repository page.
+	// deepDiveSkillName is the skill whose structured report feeds the
+	// Summary and Threat Model tabs on the repository page. The Findings tab
+	// and the deep-dive finding counts are broader: they also treat
+	// advisoryDeepDiveSkillName as curated (see nonScannerScanFilter and
+	// findingsScanIDs).
 	deepDiveSkillName = "security-deep-dive"
-	// nonScannerScanFilter selects findings whose parent scan is the
-	// security-deep-dive scanner, the legacy claude job (empty skill name),
-	// or has no recorded source — everything the UI groups under
-	// "non-scanner". scannerScanFilter is its structural inverse: the cheap
-	// tool scanners (semgrep, zizmor) and imported reports (CodeQL, Snyk,
-	// which carry the tool name as skill_name). Both take deepDiveSkillName
-	// as the single bound parameter; deriving one from the other keeps the
-	// Findings toggle and the dedup auto-enqueue agreeing on what "scanner"
-	// means without a second copy of the subquery to keep in sync.
-	nonScannerScanFilter = "scan_id IN (SELECT id FROM scans WHERE skill_name = ? OR skill_name = '' OR skill_name IS NULL)"
-	scannerScanFilter    = "NOT (" + nonScannerScanFilter + ")"
+	// advisoryDeepDiveSkillName re-audits a repo's past advisories for fix
+	// bypasses, incomplete fixes, and sibling bugs. Its output is curated LLM
+	// audit findings like security-deep-dive and vuln-scan, so it joins them in
+	// the Findings bucket (findingsBucketSkillSQL) and in isLLMAuditSkill rather
+	// than the Scanners tab.
+	advisoryDeepDiveSkillName = "advisory-deep-dive"
+	// vulnScanSkillName is the LLM-driven high-recall candidate scan. Like
+	// security-deep-dive it uses a model to find real vulnerabilities, so its
+	// findings belong in the curated Findings bucket alongside the deep-dive
+	// audit rather than the Scanners tab full of cheap tool output (#458).
+	vulnScanSkillName = "vuln-scan"
 	// threatModelSkillName is the skill whose report feeds the Threat Model
 	// tab when present; repos that predate it fall back to the boundaries
 	// section of the deep-dive report so older scans keep rendering.
 	threatModelSkillName = "threat-model"
+	reconSkillName       = "recon"
+	historySkillName     = "history"
 	zizmorSkillName      = "zizmor"
 )
 
-// deepDiveFindingsCountSQL is a correlated subselect that counts deep-dive
+// The Findings-bucket filters are vars rather than consts because they splice
+// the skill names through db.SQLStringLiteral for defense-in-depth quote
+// escaping — a function call, which a Go const initializer cannot contain.
+var (
+	// aliasedFindingsScanFilter is the Findings-bucket predicate for aggregate
+	// queries that join scans as `s`. It uses escaped literals because the
+	// maintainer index also embeds it in a correlated ORDER BY subquery, where
+	// GORM cannot bind values. The `s.skill_name IS NULL` arm also keeps empty
+	// LEFT JOIN groups at zero. Keep this in lockstep with findingsBucketSkillSQL.
+	aliasedFindingsScanFilter = "(s.skill_name IN (" + db.SQLStringLiteral(deepDiveSkillName) + ", " + db.SQLStringLiteral(vulnScanSkillName) + ", " + db.SQLStringLiteral(advisoryDeepDiveSkillName) + ") OR s.skill_name = '' OR s.skill_name IS NULL OR s.kind = 'import')"
+	// findingsBucketSkillSQL is the single source of truth for which scans'
+	// findings populate the curated Findings bucket: the LLM audit skills
+	// (security-deep-dive, vuln-scan, advisory-deep-dive), legacy claude jobs
+	// with an empty or NULL skill_name, and operator imports (kind='import'). An
+	// import is operator-submitted rather than a scanner this instance runs on
+	// its own schedule, while a raw scanner export is trimmed to the per-rule
+	// and per-result caps before anything is written (capScannerResult). That
+	// is why it sits with the audit findings and shows by default rather than
+	// behind the Scanners toggle. The skill names are spliced in as literals
+	// rather than bound parameters because this fragment is embedded raw into
+	// larger SQL (e.g. an Order clause) that can't carry args; each is escaped
+	// through db.SQLStringLiteral so a name that ever gained a quote is doubled
+	// rather than able to break out (see TestDeepDiveSkillNameSafeForSplicing).
+	// Parenthesised so it can be embedded in larger expressions without
+	// precedence surprises.
+	findingsBucketSkillSQL = "(skill_name IN (" + db.SQLStringLiteral(deepDiveSkillName) + ", " + db.SQLStringLiteral(vulnScanSkillName) + ", " + db.SQLStringLiteral(advisoryDeepDiveSkillName) + ") OR skill_name = '' OR skill_name IS NULL OR kind = 'import')"
+	// nonScannerScanFilter selects findings whose parent scan populates the
+	// Findings bucket (findingsBucketSkillSQL) — every finding the UI shows by
+	// default. scannerScanFilter is its structural inverse: the cheap tool
+	// scanners (semgrep, zizmor) that run as skills and carry the tool name as
+	// skill_name. Deriving both from findingsBucketSkillSQL keeps the Findings
+	// toggle, the repo Findings tab, and the dedup auto-enqueue agreeing on what
+	// "scanner" means without a second copy of the subquery to keep in sync — so
+	// vuln-scan findings and imports both count toward the dedup-pass threshold.
+	nonScannerScanFilter = "scan_id IN (SELECT id FROM scans WHERE " + findingsBucketSkillSQL + ")"
+	scannerScanFilter    = "NOT (" + nonScannerScanFilter + ")"
+)
+
+// deepDiveFindingsCountSQL is a correlated subselect that counts curated
 // findings for the surrounding repositories row. Used in the repos list
 // "findings" sort. Tool-scanner skills are excluded so the ordering matches
-// the counts shown in the Findings column.
+// the counts shown in the Findings column. The LLM audit skills
+// (security-deep-dive, vuln-scan, advisory-deep-dive), legacy rows, and
+// operator imports (kind='import') all count via findingsBucketSkillSQL, so the column agrees
+// with the Findings tab. The skill names are spliced into findingsBucketSkillSQL
+// as text (this fragment feeds an ORDER BY that can't take a bind parameter);
+// both are trusted compile-time constants kept free of SQL metacharacters by
+// TestDeepDiveSkillNameSafeForSplicing.
 var deepDiveFindingsCountSQL = `SELECT COUNT(*) FROM findings f
 	    WHERE f.repository_id = repositories.id
 	      AND f.status NOT IN (` + db.ClosedFindingLifecycleSQLValues() + `)
-	      AND f.scan_id IN (SELECT id FROM scans
-	        WHERE skill_name = '` + deepDiveSkillName + `' OR skill_name = '' OR skill_name IS NULL)`
+	      AND f.scan_id IN (SELECT id FROM scans WHERE ` + findingsBucketSkillSQL + `)`
 
 // findingsScanIDs returns a GORM subquery selecting scan IDs that belong to
-// the curated audit (security-deep-dive) or to legacy/empty skill_name rows.
-// Use it as a `scan_id IN (?)` filter to keep listings consistent with the
-// repo Findings tab.
+// the curated LLM audits (security-deep-dive, vuln-scan, advisory-deep-dive),
+// to legacy/empty skill_name rows, or to an operator import (kind='import') —
+// everything in findingsBucketSkillSQL. Use it as a `scan_id IN (?)` filter to
+// keep listings consistent with the repo Findings tab.
 func findingsScanIDs(gdb *gorm.DB) *gorm.DB {
-	return gdb.Model(&db.Scan{}).Select("id").
-		Where("skill_name = ? OR skill_name = '' OR skill_name IS NULL", deepDiveSkillName)
+	return gdb.Model(&db.Scan{}).Select("id").Where(findingsBucketSkillSQL)
+}
+
+// isLLMAuditSkill reports whether a finalized scan is one of the curated LLM
+// audits (security-deep-dive, vuln-scan, advisory-deep-dive) whose fresh output
+// drives the auto-triage funnels (finding-dedup and the revalidate pre-sort).
+// Unlike findingsBucketSkillSQL this deliberately excludes legacy empty/NULL
+// skill_name rows and imports: those are inert, not a live scan that just
+// produced new findings worth triaging.
+// llmAuditSkillNames are the curated model-driven audits: the skills whose
+// findings are a repository's working set rather than scanner output.
+func llmAuditSkillNames() []string {
+	return []string{deepDiveSkillName, vulnScanSkillName, advisoryDeepDiveSkillName}
+}
+
+func isLLMAuditSkill(skillName string) bool {
+	return slices.Contains(llmAuditSkillNames(), skillName)
 }
 
 func findingSupportsExposure(scan db.Scan) bool {
@@ -1137,12 +1608,26 @@ func (s *Server) findingStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := db.FindingLifecycle(r.FormValue(statusKey))
+	if status == db.FindingReady && strings.TrimSpace(f.DisclosureDraft) == "" {
+		http.Error(w, "a saved disclosure draft is required before marking ready", http.StatusUnprocessableEntity)
+		return
+	}
+	// Nothing to ask a peer when the finding is already reported: the outreach
+	// this gates has happened, and a no-op transition writes nothing, so it
+	// would leave the claim it just recorded standing.
+	if status == db.FindingReported && f.Status != db.FindingReported && !s.federationClaimGate(w, r, f) {
+		return
+	}
 	switch status {
 	case db.FindingNew, db.FindingEnriched, db.FindingTriaged, db.FindingReady,
 		db.FindingReported, db.FindingAcknowledged, db.FindingFixed, db.FindingPublished,
 		db.FindingRejected, db.FindingDuplicate:
-		if err := db.WriteFindingField(s.DB, f.ID, statusKey, string(status), db.SourceAnalyst, ""); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if err := db.WriteFindingField(s.DB.WithContext(r.Context()), f.ID, statusKey, string(status), db.SourceAnalyst, ""); err != nil {
+			if errors.Is(err, db.ErrFindingNonViable) {
+				http.Error(w, err.Error(), http.StatusPreconditionFailed)
+				return
+			}
+			http.Error(w, err.Error(), findingWriteErrorStatus(err, http.StatusInternalServerError))
 			return
 		}
 	default:
@@ -1172,12 +1657,13 @@ func (s *Server) findingExploitedInWild(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	evidence := strings.TrimSpace(r.FormValue("exploited_in_wild_evidence"))
-	if err := db.WriteFindingField(s.DB, f.ID, "exploited_in_wild", status, db.SourceAnalyst, ""); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	gdb := s.DB.WithContext(r.Context())
+	if err := db.WriteFindingField(gdb, f.ID, "exploited_in_wild", status, db.SourceAnalyst, ""); err != nil {
+		http.Error(w, err.Error(), findingWriteErrorStatus(err, http.StatusInternalServerError))
 		return
 	}
-	if err := db.WriteFindingField(s.DB, f.ID, "exploited_in_wild_evidence", evidence, db.SourceAnalyst, ""); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if err := db.WriteFindingField(gdb, f.ID, "exploited_in_wild_evidence", evidence, db.SourceAnalyst, ""); err != nil {
+		http.Error(w, err.Error(), findingWriteErrorStatus(err, http.StatusInternalServerError))
 		return
 	}
 	s.redirect(w, r, fmt.Sprintf("/findings/%d", f.ID))
@@ -1192,18 +1678,32 @@ const discloseSkillName = "disclose"
 // publicIssueSkillName is the skill the File public issue button runs.
 const publicIssueSkillName = "public-issue"
 
+// reportUpstreamSkillName is the skill that files a finding with the
+// maintainer through GitHub's private vulnerability reporting.
+const reportUpstreamSkillName = "report-upstream"
+
 // patchSkillName is the skill the Propose patch button runs.
 const patchSkillName = "patch"
+
+// reattackSkillName validates one immutable patch attempt with variant inputs.
+const reattackSkillName = "reattack"
 
 // mitigateSkillName is the skill the Draft mitigation button runs.
 const mitigateSkillName = "mitigate"
 
 func (s *Server) findingVerify(w http.ResponseWriter, r *http.Request) {
+	if !parseVerificationFeedback(w, r) {
+		return
+	}
 	s.runFindingSkill(w, r, verifySkillName, true)
 }
 
+func (s *Server) findingCritic(w http.ResponseWriter, r *http.Request) {
+	s.runFindingSkill(w, r, criticSkillName, true)
+}
+
 func (s *Server) findingDisclose(w http.ResponseWriter, r *http.Request) {
-	s.runFindingSkill(w, r, discloseSkillName, false)
+	s.runFindingSkill(w, r, discloseSkillName, true)
 }
 
 func (s *Server) findingPublicIssue(w http.ResponseWriter, r *http.Request) {
@@ -1214,11 +1714,20 @@ func (s *Server) findingPatchRun(w http.ResponseWriter, r *http.Request) {
 	s.runFindingSkill(w, r, patchSkillName, false)
 }
 
+func (s *Server) findingReattackRun(w http.ResponseWriter, r *http.Request) {
+	s.runFindingSkill(w, r, reattackSkillName, true)
+}
+
 func (s *Server) findingMitigate(w http.ResponseWriter, r *http.Request) {
 	s.runFindingSkill(w, r, mitigateSkillName, false)
 }
 
 func (s *Server) runFindingSkill(w http.ResponseWriter, r *http.Request, name string, skipOpen bool) {
+	if skipOpen {
+		// Keep the open-scan check and enqueue atomic with other finding launches.
+		s.agentEnqueueMu.Lock()
+		defer s.agentEnqueueMu.Unlock()
+	}
 	f, ok := loadByID[db.Finding](s, w, r)
 	if !ok {
 		return
@@ -1233,15 +1742,35 @@ func (s *Server) runFindingSkill(w http.ResponseWriter, r *http.Request, name st
 		http.Error(w, name+" skill is not installed", http.StatusPreconditionFailed)
 		return
 	}
+	opts, err := s.findingSkillScanOpts(f.ID, name, r.FormValue("model"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusPreconditionFailed)
+		return
+	}
 	if skipOpen {
-		if openScan, ok := s.openFindingSkillScan(f.ID, name); ok {
+		if openScan, ok := s.openFindingSkillScanForAttempt(f.ID, name, opts.RemediationAttemptID); ok {
 			setFlash(w, Flash{Category: warningKey, Title: name + " already queued or running"})
 			s.redirect(w, r, fmt.Sprintf("/scans/%d", openScan.ID))
 			return
 		}
 	}
-	scanID, err := s.enqueueSkillScoped(r.Context(), scan.RepositoryID, skill.ID, new(f.ID), r.FormValue("model"))
+	opts.FindingID = new(f.ID)
+	if name == verifySkillName {
+		opts.VerificationFeedback = r.PostForm.Get("feedback")
+	}
+	scanID, err := s.enqueueSkillWith(r.Context(), scan.RepositoryID, skill.ID, opts)
+	if errors.Is(err, ErrFederationClaimPending) {
+		// The claim is now recorded on the finding, so the page shows who to
+		// coordinate with and running the skill again goes through.
+		setFlash(w, Flash{Category: warningKey, Title: "A federation peer already holds this finding"})
+		s.redirect(w, r, fmt.Sprintf("/findings/%d", f.ID))
+		return
+	}
 	if err != nil {
+		if errors.Is(err, db.ErrFindingNonViable) {
+			http.Error(w, err.Error(), http.StatusPreconditionFailed)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1249,10 +1778,18 @@ func (s *Server) runFindingSkill(w http.ResponseWriter, r *http.Request, name st
 }
 
 func (s *Server) openFindingSkillScan(findingID uint, skillName string) (db.Scan, bool) {
+	return s.openFindingSkillScanForAttempt(findingID, skillName, nil)
+}
+
+func (s *Server) openFindingSkillScanForAttempt(findingID uint, skillName string, attemptID *uint) (db.Scan, bool) {
 	var scan db.Scan
-	err := s.DB.
+	query := s.DB.
 		Where("finding_id = ? AND skill_name = ? AND status IN ?",
-			findingID, skillName, []db.ScanStatus{db.ScanQueued, db.ScanRunning}).
+			findingID, skillName, []db.ScanStatus{db.ScanQueued, db.ScanRunning})
+	if attemptID != nil {
+		query = query.Where("remediation_attempt_id = ?", *attemptID)
+	}
+	err := query.
 		Order("status_priority asc, id desc").
 		First(&scan).Error
 	if err != nil {
@@ -1357,20 +1894,25 @@ func (s *Server) packages(w http.ResponseWriter, r *http.Request) {
 		q = q.Where("name LIKE ? OR p_url LIKE ? OR licenses LIKE ?", like, like, like)
 	}
 
-	sort := r.URL.Query().Get("sort")
-	switch sort {
+	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
+	switch sortCol {
 	case "name":
-		q = q.Order("name")
+		q = q.Order(orderByExpr("name", dir, false))
 	case "downloads":
-		q = q.Order("downloads desc")
+		q = q.Order(orderByExpr("downloads", dir, true))
 	case "dependents":
-		q = q.Order("dependent_repos desc")
+		q = q.Order(orderByExpr("dependent_repos", dir, true))
 	case "ecosystem":
-		q = q.Order("ecosystem, name")
+		q = q.Order(orderByExpr("ecosystem", dir, false)).Order("name")
+	case "registry":
+		q = q.Order(orderByExpr("registry_url", dir, false)).Order("name")
+	case "latest":
+		q = q.Order(orderByExpr("latest_release_at", dir, true)).Order("name")
 	default:
-		sort = "name"
+		sortCol, dir = "name", ""
 		q = q.Order("name")
 	}
+	sort := joinSort(sortCol, dir)
 
 	var total int64
 	q.Count(&total)
@@ -1390,7 +1932,12 @@ func (s *Server) packages(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) packageShow(w http.ResponseWriter, r *http.Request) {
 	var p db.Package
-	if err := s.DB.Preload("Repository").First(&p, r.PathValue("id")).Error; err != nil {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.DB.Preload("Repository").First(&p, id).Error; err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -1414,17 +1961,22 @@ func (s *Server) advisoriesList(w http.ResponseWriter, r *http.Request) {
 			like, like, like, like)
 	}
 
-	sort := r.URL.Query().Get("sort")
-	switch sort {
+	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
+	switch sortCol {
 	case "newest":
-		q = q.Order("published_at desc, id desc")
+		q = q.Order(orderByExpr("published_at", dir, true)).Order("id desc")
 	case sortRepository:
 		q = q.Joins("JOIN repositories r ON r.id = advisories.repository_id").
-			Order("r.name").Order("advisories.cvss_score desc")
+			Order(orderByExpr("r.name", dir, false)).Order("advisories.cvss_score desc")
+	case "title":
+		q = q.Order(orderByExpr("title", dir, false)).Order("id desc")
+	case sortSeverity:
+		q = q.Order(orderByExpr("cvss_score", dir, true)).Order("id desc")
 	default:
-		sort = "severity"
+		sortCol, dir = sortSeverity, ""
 		q = q.Order("cvss_score desc, id desc")
 	}
+	sort := joinSort(sortCol, dir)
 
 	var total int64
 	q.Count(&total)
@@ -1441,17 +1993,28 @@ func (s *Server) advisoriesList(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, "advisories.html", map[string]any{
 		"Advisories": rows, "Page": page, "Severity": sev, "Sort": sort,
 		"Severities": severities, "Repos": reposByID, "Q": search,
+		"AuditStatuses": s.latestAdvisoryAuditStatuses(rows),
 	})
 }
 
 type findingWorkflowData struct {
 	db.Finding
-	VerifyInFlight bool
+	VerifyInFlight     bool
+	CriticInFlight     bool
+	DiscloseInFlight   bool
+	HasDependents      bool
+	HasDisclosureDraft bool
+	DisclosureBlocked  bool
 }
 
 func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 	var f db.Finding
-	if err := s.DB.Preload("Labels").First(&f, r.PathValue("id")).Error; err != nil {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.DB.Preload("Labels").First(&f, id).Error; err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -1472,6 +2035,18 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 		Limit(historyRowCap).Find(&history)
 	reviews, _ := db.ListFindingReviews(s.DB, f.ID)
 	latestRevalidate := db.LatestRevalidateVerdict(s.DB, f.ID)
+	verifications, err := loadFindingVerificationViews(s.DB, f.ID)
+	if err != nil {
+		s.Log.Warn("load finding verifications", "finding", f.ID, "err", err)
+	}
+	attackPaths, err := loadFindingAttackPathViews(s.DB, f.ID)
+	if err != nil {
+		s.Log.Warn("load finding attack paths", "finding", f.ID, "err", err)
+	}
+	remediationAttempts, err := loadRemediationAttemptViews(s.DB, f.ID)
+	if err != nil {
+		s.Log.Warn("load remediation attempts", "finding", f.ID, "err", err)
+	}
 	var labels []db.FindingLabel
 	s.DB.Order("name").Find(&labels)
 	selected := make(map[string]bool, len(f.Labels))
@@ -1479,6 +2054,17 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 		selected[l.Name] = true
 	}
 	_, verifyInFlight := s.openFindingSkillScan(f.ID, verifySkillName)
+	_, criticInFlight := s.openFindingSkillScan(f.ID, criticSkillName)
+	_, discloseInFlight := s.openFindingSkillScan(f.ID, discloseSkillName)
+	var currentRemediationAttemptID *uint
+	if len(remediationAttempts) > 0 {
+		currentRemediationAttemptID = new(remediationAttempts[0].ID)
+	}
+	_, reattackInFlight := s.openFindingSkillScanForAttempt(f.ID, reattackSkillName, currentRemediationAttemptID)
+	hasDependents, err := repoHasDependents(s.DB, scan.RepositoryID)
+	if err != nil {
+		s.Log.Warn("count dependents", "repo", scan.RepositoryID, "err", err)
+	}
 
 	type exposureRow struct {
 		Dep    db.Dependent
@@ -1490,6 +2076,7 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 	var fdRows []db.FindingDependent
 	s.DB.Where("finding_id = ?", f.ID).Find(&fdRows)
 	exposures := make([]exposureRow, 0, len(fdRows))
+	dependentsByID := make(map[uint]db.Dependent)
 	if len(fdRows) > 0 {
 		depIDs := make([]uint, len(fdRows))
 		for i, r := range fdRows {
@@ -1497,13 +2084,13 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 		}
 		var depRows []db.Dependent
 		s.DB.Where("id IN ?", depIDs).Find(&depRows)
-		byID := make(map[uint]db.Dependent, len(depRows))
+		dependentsByID = make(map[uint]db.Dependent, len(depRows))
 		for _, d := range depRows {
-			byID[d.ID] = d
+			dependentsByID[d.ID] = d
 		}
 		for _, r := range fdRows {
 			exposures = append(exposures, exposureRow{
-				Dep:    byID[r.DependentID],
+				Dep:    dependentsByID[r.DependentID],
 				Status: r.Status,
 				Justif: r.Justification,
 				Why:    r.Rationale,
@@ -1513,33 +2100,73 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := map[string]any{
-		"F":                f,
-		"Scan":             scan,
-		"Repo":             repo,
-		"Notes":            notes,
-		"Communications":   comms,
-		"References":       refs,
-		"History":          history,
-		"HistoryTotal":     historyTotal,
-		"Reviews":          reviews,
-		"LatestRevalidate": latestRevalidate,
-		"AllLabels":        labels,
-		"Selected":         selected,
-		"Workflow":         findingWorkflowData{Finding: f, VerifyInFlight: verifyInFlight},
-		"Exposures":        exposures,
-		"ShowExposure":     findingSupportsExposure(scan),
+		"F":                   f,
+		"HasDisclosureDraft":  strings.TrimSpace(f.DisclosureDraft) != "",
+		"Scan":                scan,
+		"Repo":                repo,
+		"Notes":               notes,
+		"Communications":      comms,
+		"References":          refs,
+		"History":             history,
+		"HistoryTotal":        historyTotal,
+		"Reviews":             reviews,
+		"Verifications":       verifications,
+		"AttackPaths":         attackPaths,
+		"RemediationAttempts": remediationAttempts,
+		"ReattackInFlight":    reattackInFlight,
+		"LatestRevalidate":    latestRevalidate,
+		"AllLabels":           labels,
+		"Selected":            selected,
+		"Workflow": findingWorkflowData{
+			Finding:            f,
+			VerifyInFlight:     verifyInFlight,
+			CriticInFlight:     criticInFlight,
+			DiscloseInFlight:   discloseInFlight,
+			HasDependents:      hasDependents,
+			HasDisclosureDraft: strings.TrimSpace(f.DisclosureDraft) != "",
+			DisclosureBlocked:  db.FindingDisclosureBlocked(f),
+		},
+		"Exposures":     exposures,
+		"HasDependents": hasDependents,
+		"ShowExposure":  findingSupportsExposure(scan) && hasDependents,
 	}
-	if data["ShowExposure"].(bool) {
-		var depCount int64
-		s.DB.Model(&db.Dependent{}).Where("repository_id = ?", scan.RepositoryID).Count(&depCount)
-		data["HasDependents"] = depCount > 0
+	if len(verifications) > 0 {
+		data["LatestVerification"] = verifications[0]
 	}
+	if len(attackPaths) > 0 {
+		data["LatestAttackPath"] = attackPaths[0]
+	}
+	if len(remediationAttempts) > 0 {
+		data["CurrentRemediation"] = remediationAttempts[0]
+	}
+	vinceReason := "VINCE API key is not configured"
+	vinceReady := false
+	if s.VINCE.Enabled() {
+		if err := vinceEligibility(f, notes, refs); err != nil {
+			vinceReason = err.Error()
+		} else {
+			vinceReady = true
+			vinceReason = ""
+		}
+	}
+	data["VINCEReady"] = vinceReady
+	data["VINCEReason"] = vinceReason
 	if id, c, ok := LookupCWE(f.CWE); ok {
 		data["CWE"] = map[string]any{"ID": id, "Name": c.Name, "Description": c.Description}
+	}
+	if guide, err := loadFindingMigrationGuide(s.DB, repo, fdRows, dependentsByID); err != nil {
+		s.Log.Warn("load finding migration guide", "finding", f.ID, "err", err)
+	} else if guide != nil {
+		data["MigrationGuide"] = guide
 	}
 	if patchScan, patchRep, _ := s.latestPatchScan(f.ID); patchRep != nil {
 		data["PatchScan"] = patchScan
 		data["Patch"] = patchRep
+	}
+	if convs, err := db.ConversationsFor(s.DB, repo.ID, &f.ID); err != nil {
+		s.Log.Warn("load finding conversations", "finding", f.ID, "err", err)
+	} else {
+		data["Conversations"] = convs
 	}
 	s.render(w, r, "finding_show.html", data)
 }
@@ -1626,7 +2253,7 @@ func (s *Server) repoBranches(w http.ResponseWriter, r *http.Request) {
 func (s *Server) repoBulkCreate(w http.ResponseWriter, r *http.Request) {
 	raw := r.FormValue("urls")
 	lines := strings.Split(raw, "\n")
-	var created, skipped int
+	var created, queued, skipped int
 	var invalid []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -1643,19 +2270,25 @@ func (s *Server) repoBulkCreate(w http.ResponseWriter, r *http.Request) {
 			invalid = append(invalid, line)
 			continue
 		}
-		if isNew {
+		switch {
+		case isNew:
 			created++
-		} else {
+		case input.SubPath != "" || input.Branch != "":
+			// The repo already existed, but a sub-package or branch scan was
+			// still enqueued (createOrTriageRepo only no-ops a bare re-add), so
+			// this line did do something — don't report it as "already present".
+			queued++
+		default:
 			skipped++
 		}
 	}
-	if created == 0 && skipped == 0 && len(invalid) == 0 {
+	if created == 0 && queued == 0 && skipped == 0 && len(invalid) == 0 {
 		http.Error(w, "no URLs supplied", http.StatusUnprocessableEntity)
 		return
 	}
 	setFlash(w, Flash{
-		Category:    bulkToastCategory(created, invalid),
-		Title:       bulkToastTitle(created, skipped, len(invalid)),
+		Category:    bulkToastCategory(created, queued, invalid),
+		Title:       bulkToastTitle(created, queued, skipped, len(invalid)),
 		Description: bulkToastDescription(invalid),
 	})
 	s.redirect(w, r, "/")
@@ -1676,6 +2309,14 @@ func (s *Server) createOrTriageRepo(ctx context.Context, input RepoInput, model 
 			return db.Repository{}, false, fmt.Errorf("local path %s is not a directory", path)
 		}
 	}
+	// Reject a traversal attempt in a submitted sub-path (repo#../x) before it
+	// is stored on a Subproject or a scan, and normalise it so equivalent forms
+	// dedupe.
+	cleanedSub, err := worker.CleanSubPath(input.SubPath)
+	if err != nil {
+		return db.Repository{}, false, err
+	}
+	input.SubPath = cleanedSub
 	existing := int64(0)
 	s.DB.Model(&db.Repository{}).Where("url = ?", input.CloneURL).Count(&existing)
 	// Owner, FullName, and HTMLURL seed from ParseRepoInput so the orgs
@@ -1700,6 +2341,16 @@ func (s *Server) createOrTriageRepo(ctx context.Context, input RepoInput, model 
 	// upstream entry; the goroutine is best-effort and detached from ctx.
 	if isNew && !repo.IsLocal() && s.prefetchEcosystems != nil {
 		s.prefetchEcosystems(repo.ID)
+	}
+	// A repo#sub/dir (or /tree/<branch>/<path>) submission names a specific
+	// sub-package. Record it as a first-class Subproject now so it is navigable
+	// immediately, without waiting for the subprojects skill to rediscover it;
+	// the skill's later upsert (keyed on repo+path) adopts and enriches this
+	// row rather than duplicating it.
+	if input.SubPath != "" {
+		if err := db.EnsureSubproject(s.DB, repo.ID, input.SubPath); err != nil {
+			s.Log.Warn("ensure submitted subproject", "repo", repo.ID, "path", input.SubPath, "err", err)
+		}
 	}
 	if !triage {
 		return repo, isNew, nil
@@ -1726,18 +2377,21 @@ func (s *Server) createOrTriageRepo(ctx context.Context, input RepoInput, model 
 	return repo, isNew, nil
 }
 
-func bulkToastCategory(created int, invalid []string) string {
-	if created > 0 && len(invalid) == 0 {
+func bulkToastCategory(created, queued int, invalid []string) string {
+	if created+queued > 0 && len(invalid) == 0 {
 		return successKey
 	}
-	if created == 0 && len(invalid) > 0 {
+	if created+queued == 0 && len(invalid) > 0 {
 		return errorKey
 	}
 	return warningKey
 }
 
-func bulkToastTitle(created, skipped, invalid int) string {
+func bulkToastTitle(created, queued, skipped, invalid int) string {
 	parts := []string{fmt.Sprintf("%d added", created)}
+	if queued > 0 {
+		parts = append(parts, fmt.Sprintf("%d scan(s) queued", queued))
+	}
 	if skipped > 0 {
 		parts = append(parts, fmt.Sprintf("%d already present", skipped))
 	}
@@ -1769,32 +2423,267 @@ func (s *Server) repoScanActionCounts(repoID uint) (active, paused int64) {
 	return active, paused
 }
 
+// repoScansFragment re-renders just the Scans tab's table, which the tab's SSE
+// listener requests when a scan on this repository changes. It deliberately
+// skips loadRepoShowView: that pulls findings, dependencies, the inventory, the
+// threat model and more, none of which this table reads.
+func (s *Server) repoScansFragment(w http.ResponseWriter, r *http.Request) {
+	repo, ok := loadByID[db.Repository](s, w, r)
+	if !ok {
+		return
+	}
+	// Only htmx has any use for a layout-less table. Sending anyone else to the
+	// tab itself also keeps a stray visit from popping the flash cookie into a
+	// fragment that has no #toaster to show it in.
+	if !isHX(r) {
+		http.Redirect(w, r, fmt.Sprintf("/repositories/%d#rt3", repo.ID), http.StatusSeeOther)
+		return
+	}
+	scans := loadRepoLatestScanRows(s.DB, repo.ID)
+	active, paused := s.repoScanActionCounts(repo.ID)
+	s.render(w, r, "repo_scans.html", map[string]any{
+		"Repo": repo, "Scans": scans,
+		"ActiveScans": int(active), "PausedScans": int(paused),
+		"FailedScans": countFailedScans(scans),
+	})
+}
+
 func (s *Server) repoShow(w http.ResponseWriter, r *http.Request) {
 	repo, ok := loadByID[db.Repository](s, w, r)
 	if !ok {
 		return
 	}
+	scans := loadRepoLatestScans(s.DB, repo.ID)
+	latest, tmScan := s.repoPrimaryScans(scans)
+	view := s.loadRepoShowView(repo, scans, latest, tmScan, r.URL.Query())
+	data := view.renderData()
+	if convs, err := db.ConversationsFor(s.DB, repo.ID, nil); err != nil {
+		s.Log.Warn("load repo conversations", "repo", repo.ID, "err", err)
+	} else {
+		data["Conversations"] = convs
+	}
+	s.render(w, r, "repo_show.html", data)
+}
+
+type repoShowView struct {
+	Repo             db.Repository
+	Scans            []db.Scan
+	Latest           *db.Scan
+	Findings         repoFindings
+	Expected         repoExpectedView
+	Dependencies     repoDependencyView
+	Inventory        repoInventoryView
+	Subprojects      repoSubprojectView
+	Maintainers      []db.Maintainer
+	Alternatives     []db.PackageAlternative
+	ShowAlternatives bool
+	IgnoredPaths     []string
+	HealthSummary    string
+	Skills           []db.Skill
+	Workbench        Workbench
+	ThreatModel      map[string]any
+	Category         string
+	TMCommit         string
+	NewFindingCount  int
+	FailedScans      int
+	ActiveScans      int
+	PausedScans      int
+	TotalCost        float64
+	// GlobalScanSchedule is the settings-level default schedule, shown on
+	// the repo page so "inherit" spells out what it inherits.
+	GlobalScanSchedule string
+}
+
+func (s *Server) loadRepoShowView(
+	repo db.Repository,
+	scans []db.Scan,
+	latest, tmScan *db.Scan,
+	query url.Values,
+) repoShowView {
+	category := query.Get("category")
+	findings := loadRepoFindings(s.DB, repo.ID, category)
+	deps := s.loadRepoDependencyView(repo.ID, query.Get("deps") == "all")
+	inventory := s.loadRepoInventoryView(repo.ID, deps.Groups)
+	maintainers := s.repoMaintainers(repo.ID)
+	evidenceComplete, err := db.RepositoryHealthEvidenceComplete(s.DB, repo.ID)
+	if err != nil {
+		s.Log.Error("repository health evidence", "repo", repo.ID, "err", err)
+	}
+	health := db.AssessRepositoryHealth(repo, inventory.Packages, maintainers, evidenceComplete, time.Now())
+	alternatives, err := loadPackageAlternatives(s.DB, repo.ID)
+	if err != nil {
+		s.Log.Error("load package alternatives", "repo", repo.ID, "err", err)
+	}
+	ignoredPaths := repoIgnoredPaths(repo)
+	// activeScans drives both the delete-confirm warning (a running scan keeps
+	// writing into the repo's clone/workspace until it returns) and the "Cancel
+	// all" button; pausedScans drives "Resume all". Both are counted over every
+	// scan, not the latest-per-skill set.
+	activeScans, pausedScans := s.repoScanActionCounts(repo.ID)
+	globalSchedule, _ := db.GetSetting(s.DB, db.SettingScanSchedule)
+	return repoShowView{
+		Repo:               repo,
+		Scans:              scans,
+		Latest:             latest,
+		Findings:           findings,
+		Expected:           loadRepoExpectedView(s.DB, repo.ID, latest, findings),
+		Dependencies:       deps,
+		Inventory:          inventory,
+		Subprojects:        s.loadRepoSubprojectView(repo.ID),
+		Maintainers:        maintainers,
+		Alternatives:       alternatives,
+		ShowAlternatives:   showPackageAlternatives(repo, alternatives),
+		IgnoredPaths:       ignoredPaths,
+		HealthSummary:      health.Summary,
+		Skills:             s.activeRepoSkills(),
+		Workbench:          loadWorkbench(s.DB, &repo, workbenchSeed(tmScan)),
+		ThreatModel:        scanThreatModelReport(tmScan),
+		Category:           category,
+		TMCommit:           scanCommit(tmScan),
+		NewFindingCount:    int(repoNewFindingsCount(s.DB, repo.ID, category)),
+		FailedScans:        countFailedScans(scans),
+		ActiveScans:        int(activeScans),
+		PausedScans:        int(pausedScans),
+		TotalCost:          repoTotalCost(s.DB, repo.ID),
+		GlobalScanSchedule: globalSchedule,
+	}
+}
+
+func (v repoShowView) renderData() map[string]any {
+	return map[string]any{
+		"Repo":                  v.Repo,
+		"Scans":                 v.Scans,
+		"Latest":                v.Latest,
+		"Findings":              v.Findings.DeepDive,
+		"FindingsTotal":         v.Findings.DeepDiveTotal,
+		"ScannerFindings":       v.Findings.Scanners,
+		"ScannerFindingsTotal":  v.Findings.ScannersTotal,
+		"ScanSkill":             v.Findings.ScanSkill,
+		"ScanCommit":            v.Findings.ScanCommit,
+		"ExpectedFindings":      v.Expected.Matches.Expected,
+		"ExpectedMatched":       v.Expected.Matches.MatchedTotal,
+		"ExpectedFindingStatus": v.Expected.FindingStatus,
+		"NewFindingCount":       v.NewFindingCount,
+		"FailedScans":           v.FailedScans,
+		"ActiveScans":           v.ActiveScans,
+		"PausedScans":           v.PausedScans,
+		"TotalCost":             v.TotalCost,
+		"HealthSummary":         v.HealthSummary,
+		// Cached on the row, refreshed by the worker after each scan (#126).
+		"DiskBytes":          v.Repo.DiskBytes,
+		"TMCommit":           v.TMCommit,
+		"DepsCommit":         v.Dependencies.Commit,
+		"Deps":               v.Dependencies.Groups,
+		"DepsTotal":          v.Dependencies.Total,
+		"Pkgs":               v.Inventory.Packages,
+		"Dependents":         v.Inventory.Dependents,
+		"DependentsTotal":    v.Inventory.DependentsTotal,
+		"Advisories":         v.Inventory.Advisories,
+		"AdvisoriesTotal":    v.Inventory.AdvisoriesTotal,
+		"AdvisoryAudits":     v.Inventory.AdvisoryAudits,
+		"Maintainers":        v.Maintainers,
+		"Alternatives":       v.Alternatives,
+		"ShowAlternatives":   v.ShowAlternatives,
+		"IgnoredPaths":       v.IgnoredPaths,
+		"ThreatModel":        v.ThreatModel,
+		"KnownURLs":          v.Inventory.KnownURLs,
+		"KnownPURLs":         v.Inventory.KnownPURLs,
+		"ShowAllDeps":        v.Dependencies.ShowAll,
+		"HiddenDeps":         v.Dependencies.Hidden,
+		"Skills":             v.Skills,
+		"Subprojects":        v.Subprojects.Rows,
+		"SubScanCount":       v.Subprojects.ScanCount,
+		"Workbench":          v.Workbench,
+		"Category":           v.Category,
+		"Categories":         CWECategories(),
+		"Uncategorized":      UncategorizedCWE,
+		"TabRowCap":          int64(tabRowCap),
+		"GlobalScanSchedule": v.GlobalScanSchedule,
+	}
+}
+
+func scanThreatModelReport(scan *db.Scan) map[string]any {
+	if scan == nil {
+		return nil
+	}
+	var report map[string]any
+	_ = json.Unmarshal([]byte(scan.Report), &report)
+	return report
+}
+
+func scanCommit(scan *db.Scan) string {
+	if scan == nil {
+		return ""
+	}
+	return scan.Commit
+}
+
+func repoTotalCost(gdb *gorm.DB, repoID uint) float64 {
+	var total float64
+	gdb.Model(&db.Scan{}).Where("repository_id = ?", repoID).
+		Select("COALESCE(SUM(cost_usd), 0)").Scan(&total)
+	return total
+}
+
+func (s *Server) repoMaintainers(repoID uint) []db.Maintainer {
+	var maintainers []db.Maintainer
+	s.DB.Joins("JOIN repository_maintainers ON repository_maintainers.maintainer_id = maintainers.id").
+		Where("repository_maintainers.repository_id = ?", repoID).Find(&maintainers)
+	return maintainers
+}
+
+func (s *Server) activeRepoSkills() []db.Skill {
+	var skills []db.Skill
+	s.DB.Where("active = ?", true).Order("name").Find(&skills)
+	return skills
+}
+
+func loadRepoLatestScans(gdb *gorm.DB, repoID uint) []db.Scan {
+	return loadRepoLatestScansSelect(gdb, repoID, "s.*")
+}
+
+// scanRowColumns is everything the Scans table renders — every field scan-row
+// and scan-actions read — and none of the large text columns (log, report,
+// prompt) they don't. TestRepoScansFragment_rowMatchesTheFullPage fails if this
+// projection ever falls behind the template.
+const scanRowColumns = `s.id, s.repository_id, s.skill_id, s.skill_name, s.kind, s.ref,
+	s.sub_path, s.rescan_mode, s.status, s.max_turns_hit, s.refusal_audit_warning,
+	s.findings_count, s.model, s.cost_usd, s."commit", s.started_at, s.finished_at`
+
+// loadRepoLatestScanRows is loadRepoLatestScans projected down to what the Scans
+// table renders. The repo page itself still needs whole rows (repoPrimaryScans
+// reads Report to pick the deep-dive and threat-model scans), but the table
+// re-renders on every scan-status event, and pulling each scan's full log and
+// report per refresh is megabytes of text nothing on screen reads.
+func loadRepoLatestScanRows(gdb *gorm.DB, repoID uint) []db.Scan {
+	return loadRepoLatestScansSelect(gdb, repoID, scanRowColumns)
+}
+
+func loadRepoLatestScansSelect(gdb *gorm.DB, repoID uint, columns string) []db.Scan {
 	var scans []db.Scan
 	// Per (skill_name, sub_path) we want just the latest scan — the repo
 	// page should read like "this is the state of each job on this repo",
 	// not a scroll of every historical attempt. Older runs are still
 	// reachable via /scans/{id} and the global /scans index.
-	s.DB.Raw(`
-		SELECT s.* FROM scans s
+	gdb.Raw(`
+		SELECT `+columns+` FROM scans s
 		JOIN (
 			SELECT COALESCE(skill_name, '') AS sn, COALESCE(sub_path, '') AS sp, MAX(id) AS max_id
 			FROM scans WHERE repository_id = ?
 			GROUP BY sn, sp
 		) latest ON latest.max_id = s.id
 		ORDER BY s.id DESC
-	`, repo.ID).Scan(&scans)
+	`, repoID).Scan(&scans)
+	return scans
+}
 
+func (s *Server) repoPrimaryScans(scans []db.Scan) (latest, threatModel *db.Scan) {
 	// The security-deep-dive skill owns the structured audit report; the
 	// Summary and Findings tabs render from its scans. The Threat Model tab
 	// renders the threat-model skill's report when one exists, falling back
 	// to the deep-dive report's boundaries/inventory section so repositories
 	// scanned before the threat-model skill landed keep their tab content.
-	var latest, tmScan, tmFallback *db.Scan
+	var fallback *db.Scan
 	for i := range scans {
 		sc := &scans[i]
 		switch sc.SkillName {
@@ -1803,168 +2692,134 @@ func (s *Server) repoShow(w http.ResponseWriter, r *http.Request) {
 				latest = sc
 				s.DB.Where("scan_id = ?", latest.ID).Find(&latest.Findings)
 			}
-			if tmFallback == nil && sc.Status == db.ScanDone && sc.Report != "" {
-				tmFallback = sc
+			if fallback == nil && sc.Status == db.ScanDone && sc.Report != "" {
+				fallback = sc
 			}
 		case threatModelSkillName:
-			if tmScan == nil && sc.Status == db.ScanDone && sc.Report != "" {
-				tmScan = sc
+			if threatModel == nil && sc.Status == db.ScanDone && sc.Report != "" {
+				threatModel = sc
 			}
 		}
-		if latest != nil && tmScan != nil && tmFallback != nil {
+		if latest != nil && threatModel != nil && fallback != nil {
 			break
 		}
 	}
-	if tmScan == nil {
-		tmScan = tmFallback
+	if threatModel == nil {
+		threatModel = fallback
 	}
-	var threatModel map[string]any
-	if tmScan != nil {
-		_ = json.Unmarshal([]byte(tmScan.Report), &threatModel)
-	}
-	wb := loadWorkbench(s.DB, &repo, workbenchSeed(tmScan))
+	return latest, threatModel
+}
 
-	var totalCost float64
-	s.DB.Model(&db.Scan{}).Where("repository_id = ?", repo.ID).
-		Select("COALESCE(SUM(cost_usd), 0)").Scan(&totalCost)
-
-	category := r.URL.Query().Get("category")
-	rf := loadRepoFindings(s.DB, repo.ID, category)
-
+func repoNewFindingsCount(gdb *gorm.DB, repoID uint, category string) int64 {
 	// Count deep-dive findings still awaiting verification, scoped to the
 	// same category filter as the visible list. Drives the "Verify all new"
 	// button on the Findings tab; the bulk handler acts on this exact set.
-	newFindingsQuery := s.DB.Model(&db.Finding{}).
+	q := gdb.Model(&db.Finding{}).
 		Where("repository_id = ? AND status = ? AND scan_id IN (?)",
-			repo.ID, db.FindingNew, findingsScanIDs(s.DB))
+			repoID, db.FindingNew, findingsScanIDs(gdb))
 	if category != "" {
-		newFindingsQuery = applyCWECategoryFilter(newFindingsQuery, category)
+		q = applyCWECategoryFilter(q, category)
 	}
-	var newFindings int64
-	newFindingsQuery.Count(&newFindings)
+	var total int64
+	q.Count(&total)
+	return total
+}
 
-	var maintainers []db.Maintainer
-	s.DB.Joins("JOIN repository_maintainers ON repository_maintainers.maintainer_id = maintainers.id").
-		Where("repository_maintainers.repository_id = ?", repo.ID).Find(&maintainers)
+type repoDependencyView struct {
+	Groups  []DepGroup
+	Total   int64
+	Hidden  int64
+	ShowAll bool
+	Commit  string
+}
 
+func (s *Server) loadRepoDependencyView(repoID uint, showAll bool) repoDependencyView {
 	// Apply the runtime-only filter in SQL before capping, so the first N
 	// rows on the default tab are runtime deps, not whatever sorts first
 	// by name. hiddenDeps and depsTotal both describe the same set the tab
 	// is rendering.
-	showAllDeps := r.URL.Query().Get("deps") == "all"
 	hiddenTypes := []string{db.DependencyDev, db.DependencyTest, db.DependencyBuild}
-	var hiddenDeps int64
+	var hidden int64
 	s.DB.Model(&db.Dependency{}).
-		Where("repository_id = ? AND dependency_type IN ?", repo.ID, hiddenTypes).
-		Count(&hiddenDeps)
-	depQ := s.DB.Model(&db.Dependency{}).Where("repository_id = ?", repo.ID)
-	if !showAllDeps {
-		depQ = depQ.Where("dependency_type NOT IN ?", hiddenTypes)
+		Where("repository_id = ? AND dependency_type IN ?", repoID, hiddenTypes).
+		Count(&hidden)
+	q := s.DB.Model(&db.Dependency{}).Where("repository_id = ?", repoID)
+	if !showAll {
+		q = q.Where("dependency_type NOT IN ?", hiddenTypes)
 	}
-	var depsTotal int64
-	depQ.Count(&depsTotal)
+	var total int64
+	q.Count(&total)
 	var rawDeps []db.Dependency
-	depQ.Order("ecosystem, name, manifest_kind desc").Limit(tabRowCap).Find(&rawDeps)
-	deps := groupDeps(rawDeps)
-
-	var depsCommit string
-	if len(deps) > 0 {
-		depsCommit = s.latestDepsCommit(repo.ID)
+	q.Order("ecosystem, name, manifest_kind desc").Limit(tabRowCap).Find(&rawDeps)
+	groups := groupDeps(rawDeps)
+	commit := ""
+	if len(groups) > 0 {
+		commit = s.latestDepsCommit(repoID)
 	}
+	return repoDependencyView{Groups: groups, Total: total, Hidden: hidden, ShowAll: showAll, Commit: commit}
+}
 
-	var pkgs []db.Package
-	s.DB.Where("repository_id = ?", repo.ID).Order("dependent_repos desc, downloads desc").Find(&pkgs)
+type repoInventoryView struct {
+	Packages        []db.Package
+	Dependents      []db.Dependent
+	DependentsTotal int64
+	Advisories      []db.Advisory
+	AdvisoriesTotal int64
+	AdvisoryAudits  map[uint]string
+	KnownPURLs      map[string]uint
+	KnownURLs       map[string]uint
+}
 
-	var dependents []db.Dependent
-	var dependentsTotal int64
-	s.DB.Model(&db.Dependent{}).Where("repository_id = ?", repo.ID).Count(&dependentsTotal)
-	s.DB.Where("repository_id = ?", repo.ID).Order("dependent_repos desc").
-		Limit(tabRowCap).Find(&dependents)
+func (s *Server) loadRepoInventoryView(repoID uint, deps []DepGroup) repoInventoryView {
+	var inv repoInventoryView
+	s.DB.Where("repository_id = ?", repoID).Order("dependent_repos desc, downloads desc").Find(&inv.Packages)
+	s.DB.Model(&db.Dependent{}).Where("repository_id = ?", repoID).Count(&inv.DependentsTotal)
+	s.DB.Where("repository_id = ?", repoID).Order("dependent_repos desc").
+		Limit(tabRowCap).Find(&inv.Dependents)
+	s.DB.Model(&db.Advisory{}).Where("repository_id = ?", repoID).Count(&inv.AdvisoriesTotal)
+	s.DB.Where("repository_id = ?", repoID).Order("cvss_score desc").
+		Limit(tabRowCap).Find(&inv.Advisories)
+	inv.AdvisoryAudits = s.latestAdvisoryAuditStatuses(inv.Advisories)
+	inv.KnownPURLs = s.lookupKnownPURLs(deps)
+	inv.KnownURLs = s.lookupKnownURLs(inv.Dependents)
+	return inv
+}
 
-	var advisories []db.Advisory
-	var advisoriesTotal int64
-	s.DB.Model(&db.Advisory{}).Where("repository_id = ?", repo.ID).Count(&advisoriesTotal)
-	s.DB.Where("repository_id = ?", repo.ID).Order("cvss_score desc").
-		Limit(tabRowCap).Find(&advisories)
+type repoSubprojectView struct {
+	Rows      []db.Subproject
+	ScanCount map[string]int
+}
 
-	knownPURLs := s.lookupKnownPURLs(deps)
-	knownURLs := s.lookupKnownURLs(dependents)
-
-	// Pass repo html_url and commit for location links in threat model
-	tmCommit := ""
-	if tmScan != nil {
-		tmCommit = tmScan.Commit
+func (s *Server) loadRepoSubprojectView(repoID uint) repoSubprojectView {
+	view := repoSubprojectView{ScanCount: map[string]int{}}
+	s.DB.Where("repository_id = ?", repoID).Order("path").Find(&view.Rows)
+	if len(view.Rows) == 0 {
+		return view
 	}
-
-	var activeSkills []db.Skill
-	s.DB.Where("active = ?", true).Order("name").Find(&activeSkills)
-
-	var subprojects []db.Subproject
-	s.DB.Where("repository_id = ?", repo.ID).Order("path").Find(&subprojects)
-	subScanCount := map[string]int{}
-	if len(subprojects) > 0 {
-		rows := make([]struct {
-			SubPath string
-			N       int
-		}, 0)
-		s.DB.Raw(`SELECT sub_path, COUNT(*) AS n FROM scans
-			WHERE repository_id = ? AND sub_path != '' GROUP BY sub_path`,
-			repo.ID).Scan(&rows)
-		for _, r := range rows {
-			subScanCount[r.SubPath] = r.N
-		}
+	rows := make([]struct {
+		SubPath string
+		N       int
+	}, 0)
+	s.DB.Raw(`SELECT sub_path, COUNT(*) AS n FROM scans
+		WHERE repository_id = ? AND sub_path != '' GROUP BY sub_path`,
+		repoID).Scan(&rows)
+	for _, r := range rows {
+		view.ScanCount[r.SubPath] = r.N
 	}
+	return view
+}
 
+func countFailedScans(scans []db.Scan) int {
 	// Count failed scans in the latest-per-skill set: same scope as the
 	// retry-failed handler would act on for this repo. Drives the
 	// "Retry failed" button on the Scans tab.
-	var failedScans int
+	total := 0
 	for _, sc := range scans {
 		if sc.Status == db.ScanFailed {
-			failedScans++
+			total++
 		}
 	}
-
-	// activeScans drives both the delete-confirm warning (a running scan keeps
-	// writing into the repo's clone/workspace until it returns) and the "Cancel
-	// all" button; pausedScans drives "Resume all". Both are counted over every
-	// scan, not the latest-per-skill set.
-	activeScans, pausedScans := s.repoScanActionCounts(repo.ID)
-
-	data := map[string]any{
-		"Repo": repo, "Scans": scans, "Latest": latest,
-		"Findings":             rf.DeepDive,
-		"FindingsTotal":        rf.DeepDiveTotal,
-		"ScannerFindings":      rf.Scanners,
-		"ScannerFindingsTotal": rf.ScannersTotal,
-		"ScanSkill":            rf.ScanSkill,
-		"ScanCommit":           rf.ScanCommit,
-		"NewFindingCount":      int(newFindings),
-		"FailedScans":          failedScans,
-		"ActiveScans":          int(activeScans),
-		"PausedScans":          int(pausedScans),
-		"TotalCost":            totalCost,
-		// Cached on the row, refreshed by the worker after each scan (#126).
-		"DiskBytes":  repo.DiskBytes,
-		"TMCommit":   tmCommit,
-		"DepsCommit": depsCommit,
-		"Deps":       deps, "DepsTotal": depsTotal,
-		"Pkgs":       pkgs,
-		"Dependents": dependents, "DependentsTotal": dependentsTotal,
-		"Advisories": advisories, "AdvisoriesTotal": advisoriesTotal,
-		"Maintainers": maintainers, "ThreatModel": threatModel,
-		"KnownURLs": knownURLs, "KnownPURLs": knownPURLs,
-		"ShowAllDeps": showAllDeps, "HiddenDeps": hiddenDeps,
-		"Skills":        activeSkills,
-		"Subprojects":   subprojects,
-		"SubScanCount":  subScanCount,
-		"Workbench":     wb,
-		"Category":      category,
-		"Categories":    CWECategories(),
-		"Uncategorized": UncategorizedCWE,
-		"TabRowCap":     int64(tabRowCap),
-	}
-	s.render(w, r, "repo_show.html", data)
+	return total
 }
 
 // latestDepsCommit returns the commit of the latest successful dependencies
@@ -1977,8 +2832,11 @@ func (s *Server) latestDepsCommit(repoID uint) string {
 	var commits []string
 	s.DB.Model(&db.Scan{}).
 		Joins("JOIN skills ON skills.id = scans.skill_id").
-		Where("scans.repository_id = ? AND skills.output_kind = ? AND scans.status = ? AND scans.`commit` <> ''",
+		Where("scans.repository_id = ? AND skills.output_kind = ? AND scans.status = ?",
 			repoID, "dependencies", db.ScanDone).
+		// Not(map) lets GORM's dialector quote the reserved-word column
+		// against the model's table instead of hardcoding scans.`commit`.
+		Not(map[string]any{"commit": ""}).
 		Order("scans.id DESC").
 		Limit(1).
 		Pluck("scans.commit", &commits)
@@ -1993,6 +2851,10 @@ func (s *Server) repoScan(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if strings.TrimSpace(r.FormValue("rescan_mode")) == db.ScanRescanModeDiff {
+		s.repoDiffScan(w, r, repo)
+		return
+	}
 	// The "New scan" button enqueues the deep-dive skill; everything else is
 	// triggered either by the triage skill or by the explicit Run skill menu.
 	var skill db.Skill
@@ -2001,13 +2863,63 @@ func (s *Server) repoScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := s.enqueueSkillWith(r.Context(), repo.ID, skill.ID, ScanOpts{
-		Model:   r.FormValue("model"),
-		SubPath: strings.TrimSpace(r.FormValue("sub_path")),
+		Model:      r.FormValue("model"),
+		SubPath:    strings.TrimSpace(r.FormValue("sub_path")),
+		RescanMode: strings.TrimSpace(r.FormValue("rescan_mode")),
+		ScanGroup:  uuid.NewString(),
 	}); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.redirect(w, r, fmt.Sprintf("/repositories/%d", repo.ID))
+}
+
+func (s *Server) repoDiffScan(w http.ResponseWriter, r *http.Request, repo db.Repository) {
+	queued, err := s.enqueueDiffRescanGroup(r.Context(), repo.ID,
+		r.FormValue("model"), strings.TrimSpace(r.FormValue("sub_path")))
+	if err != nil {
+		if errors.Is(err, errDeepDiveMissing) {
+			http.Error(w, err.Error(), http.StatusPreconditionFailed)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("Diff rescan queued %d scan(s)", queued)})
+	s.redirect(w, r, fmt.Sprintf("/repositories/%d#rt3", repo.ID))
+}
+
+var errDeepDiveMissing = errors.New(deepDiveSkillName + " skill is not installed")
+
+// enqueueDiffRescanGroup enqueues recon, history, embedded-native, threat-model,
+// and semgrep as one diff-rescan group. A completed threat-model fans out the
+// deep-dive scans.
+// Missing auxiliary skills are tolerated; a missing deep-dive is
+// errDeepDiveMissing, checked before the first enqueue so the group is
+// all-or-nothing. Shared by the "Diff rescan" button and the scheduler.
+func (s *Server) enqueueDiffRescanGroup(ctx context.Context, repoID uint, model, subPath string) (int, error) {
+	var deepDive db.Skill
+	if err := s.DB.Where("name = ? AND active = ?", deepDiveSkillName, true).First(&deepDive).Error; err != nil {
+		return 0, errDeepDiveMissing
+	}
+	group := uuid.NewString()
+	queued := 0
+	for _, name := range []string{reconSkillName, historySkillName, "embedded-native", threatModelSkillName, "semgrep"} {
+		var skill db.Skill
+		if err := s.DB.Where("name = ? AND active = ?", name, true).First(&skill).Error; err != nil {
+			continue
+		}
+		if _, err := s.enqueueSkillWith(ctx, repoID, skill.ID, ScanOpts{
+			Model:      model,
+			SubPath:    subPath,
+			RescanMode: db.ScanRescanModeDiff,
+			ScanGroup:  group,
+		}); err != nil {
+			return queued, err
+		}
+		queued++
+	}
+	return queued, nil
 }
 
 // repoScanAll is the bulk equivalent of the per-subproject "Scan" button: it
@@ -2031,6 +2943,10 @@ func (s *Server) repoScanAll(w http.ResponseWriter, r *http.Request) {
 	s.DB.Where("repository_id = ?", repo.ID).Order("path").Find(&subprojects)
 
 	model := r.FormValue("model")
+	// One shared group across the whole fan-out: every subproject deep-dive
+	// enqueued by this click is a sibling, so each can read the others'
+	// findings via ?scan_group= while they run in parallel.
+	group := uuid.NewString()
 	var queued, skipped, errored int
 	for _, sub := range subprojects {
 		var inflight int64
@@ -2043,8 +2959,9 @@ func (s *Server) repoScanAll(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if _, err := s.enqueueSkillWith(r.Context(), repo.ID, skill.ID, ScanOpts{
-			Model:   model,
-			SubPath: sub.Path,
+			Model:     model,
+			SubPath:   sub.Path,
+			ScanGroup: group,
 		}); err != nil {
 			errored++
 			continue
@@ -2100,71 +3017,223 @@ func (s *Server) repoDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Collected before the transaction deletes the scan rows: each scan's
-	// per-scan workspace and claude session store under DataDir are reclaimed
-	// after the commit.
-	var scanIDs []uint
-	s.DB.Model(&db.Scan{}).Where("repository_id = ?", repo.ID).Pluck("id", &scanIDs)
+	deleted, err := s.deleteRepository(repo)
+	if err != nil {
+		if errors.Is(err, errRepositoryDeleteInFlight) {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.removeRepositoryArtifacts(deleted)
+
+	setFlash(w, Flash{Category: "success", Title: "Repository deleted",
+		Description: repo.Name + " and all its scans, findings and cached clone were removed."})
+	s.redirect(w, r, "/")
+}
+
+type deletedRepository struct {
+	Repo            db.Repository
+	ScanIDs         []uint
+	ConversationIDs []uint
+}
+
+var errRepositoryDeleteInFlight = errors.New("repository has queued, running, or paused scans")
+
+func (s *Server) deleteRepository(repo db.Repository) (deletedRepository, error) {
+	deleted := deletedRepository{Repo: repo}
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		// Match scans by the *finding's* repo, not the scan's own: a finding-
 		// scoped scan can in principle live on a different repository_id than
 		// the finding it points at, and any scan referencing a doomed finding
-		// must have its NO ACTION link cleared or the finding delete 787s. The
-		// subquery also avoids materialising a (possibly >999) id list.
-		const findingsOfRepo = "finding_id IN (SELECT id FROM findings WHERE repository_id = ?)"
+		// must have its NO ACTION link cleared or the finding delete 787s.
+		var inFlight int64
+		if err := tx.Model(&db.Scan{}).
+			Where("(repository_id = ? OR "+findingsOfRepo+") AND status IN ?", repo.ID, repo.ID, inFlightScanStatuses()).
+			Count(&inFlight).Error; err != nil {
+			return err
+		}
+		if inFlight > 0 {
+			return fmt.Errorf("%w; cancel or wait for %d linked scan(s) before deleting", errRepositoryDeleteInFlight, inFlight)
+		}
+		// Collected before the transaction deletes the scan rows: each scan's
+		// per-scan workspace and claude session store under DataDir are reclaimed
+		// after the commit.
+		if err := tx.Model(&db.Scan{}).Where("repository_id = ?", repo.ID).Pluck("id", &deleted.ScanIDs).Error; err != nil {
+			return err
+		}
+		// Chat conversation workspaces are reclaimed after the commit, same as
+		// scan workspaces. Finding-scoped conversations carry the finding's
+		// repository_id, so this covers them too.
+		if err := tx.Model(&db.Conversation{}).Where("repository_id = ?", repo.ID).Pluck("id", &deleted.ConversationIDs).Error; err != nil {
+			return err
+		}
 		if err := tx.Model(&db.Scan{}).Where(findingsOfRepo, repo.ID).
 			Update("finding_id", nil).Error; err != nil {
 			return err
 		}
-		// Finding children. notes/comms/refs/history cascade from a finding
-		// delete, but are removed here too so the cleanup stays correct even
-		// when foreign_keys happens to be off on the serving connection.
-		if err := tx.Exec("DELETE FROM finding_labels_join WHERE "+findingsOfRepo, repo.ID).Error; err != nil {
+		if err := deleteFindingChildren(tx, repo.ID); err != nil {
 			return err
 		}
 		for _, child := range []any{
-			&db.FindingNote{}, &db.FindingCommunication{}, &db.FindingReference{},
-			&db.FindingHistory{}, &db.FindingDependent{},
-		} {
-			if err := tx.Where(findingsOfRepo, repo.ID).Delete(child).Error; err != nil {
-				return err
-			}
-		}
-		for _, child := range []any{
 			&db.Finding{}, &db.Scan{}, &db.Subproject{}, &db.Dependency{},
-			&db.Dependent{}, &db.Package{}, &db.Advisory{},
+			&db.Dependent{}, &db.Package{}, &db.Advisory{}, &db.SBOMUpload{},
 		} {
 			if err := tx.Where("repository_id = ?", repo.ID).Delete(child).Error; err != nil {
 				return err
 			}
 		}
-		if err := tx.Model(&db.SBOMPackage{}).Where("repository_id = ?", repo.ID).
-			Update("repository_id", nil).Error; err != nil {
+		// Generated snapshots for the deleted repo were removed above via
+		// repository_id; packages in other uploads that resolved to this repo
+		// as their source keep their row but drop the pointer.
+		if err := tx.Model(&db.SBOMPackage{}).Where("source_repository_id = ?", repo.ID).
+			Update("source_repository_id", nil).Error; err != nil {
 			return err
 		}
 		if err := tx.Exec("DELETE FROM repository_maintainers WHERE repository_id = ?", repo.ID).Error; err != nil {
 			return err
 		}
+		if err := deleteRepoConversations(tx, repo.ID); err != nil {
+			return err
+		}
+		if err := reopenRepoInterchangeRecords(tx, repo.ID); err != nil {
+			return err
+		}
 		return tx.Delete(&repo).Error
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return deletedRepository{}, err
 	}
+	return deleted, nil
+}
 
-	if err := os.RemoveAll(worker.RepoCacheRoot(s.Worker.DataDir, repo.URL)); err != nil {
-		s.Log.Error("repoDelete: remove clone cache", "repo", repo.ID, "err", err)
+func (s *Server) removeRepositoryArtifacts(deleted deletedRepository) {
+	if err := os.RemoveAll(worker.RepoCacheRoot(s.Worker.DataDir, deleted.Repo.URL)); err != nil {
+		s.Log.Error("repoDelete: remove clone cache", "repo", deleted.Repo.ID, "err", err)
 	}
-	for _, id := range scanIDs {
+	for _, id := range deleted.ScanIDs {
 		if err := s.Worker.RemoveScanArtifacts(id); err != nil {
 			s.Log.Error("repoDelete: remove scan workspace", "scan", id, "err", err)
 		}
 	}
+	for _, id := range deleted.ConversationIDs {
+		if err := s.Worker.RemoveChatArtifacts(id); err != nil {
+			s.Log.Error("repoDelete: remove chat workspace", "conv", id, "err", err)
+		}
+	}
+}
 
-	setFlash(w, Flash{Category: "success", Title: "Repository deleted",
-		Description: repo.Name + " and all its scans, findings and cached clone were removed."})
-	s.redirect(w, r, "/")
+type deletedFinding struct {
+	ConversationIDs []uint
+}
+
+var errFindingDeleteInFlight = errors.New("finding has queued, running, or paused scans")
+
+func (s *Server) deleteFinding(finding db.Finding) (deletedFinding, error) {
+	var deleted deletedFinding
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		var inFlight int64
+		if err := tx.Model(&db.Scan{}).
+			Where("finding_id = ? AND status IN ?", finding.ID, inFlightScanStatuses()).
+			Count(&inFlight).Error; err != nil {
+			return err
+		}
+		if inFlight > 0 {
+			return fmt.Errorf("%w; cancel or wait for %d linked scan(s) before deleting", errFindingDeleteInFlight, inFlight)
+		}
+		if err := tx.Model(&db.Conversation{}).Where("finding_id = ?", finding.ID).
+			Pluck("id", &deleted.ConversationIDs).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&db.Scan{}).Where("finding_id = ?", finding.ID).
+			Update("finding_id", nil).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec("DELETE FROM finding_labels_join WHERE finding_id = ?", finding.ID).Error; err != nil {
+			return err
+		}
+		for _, child := range []any{
+			&db.FindingNote{}, &db.FindingCommunication{}, &db.FindingReference{},
+			&db.FindingHistory{}, &db.FindingDependent{}, &db.FindingReview{},
+		} {
+			if err := tx.Where("finding_id = ?", finding.ID).Delete(child).Error; err != nil {
+				return err
+			}
+		}
+		if err := deleteFindingConversations(tx, finding.ID); err != nil {
+			return err
+		}
+		return tx.Delete(&finding).Error
+	})
+	if err != nil {
+		return deletedFinding{}, err
+	}
+	return deleted, nil
+}
+
+func inFlightScanStatuses() []db.ScanStatus {
+	return []db.ScanStatus{db.ScanQueued, db.ScanRunning, db.ScanPaused}
+}
+
+func (s *Server) removeFindingArtifacts(deleted deletedFinding) {
+	for _, id := range deleted.ConversationIDs {
+		if err := s.Worker.RemoveChatArtifacts(id); err != nil {
+			s.Log.Error("deleteFinding: remove chat workspace", "conv", id, "err", err)
+		}
+	}
+}
+
+// findingsOfRepo matches the rows linked to a repository's findings. Written
+// as a subquery rather than a materialised id list, which could exceed
+// sqlite's variable limit on a repository with many findings.
+const findingsOfRepo = "finding_id IN (SELECT id FROM findings WHERE repository_id = ?)"
+
+// deleteFindingChildren removes the rows hanging off a repository's findings.
+// notes/comms/refs/history cascade from the finding delete, but are removed
+// explicitly too so the cleanup stays correct even when foreign_keys happens
+// to be off on the connection serving the delete.
+func deleteFindingChildren(tx *gorm.DB, repoID uint) error {
+	if err := tx.Exec("DELETE FROM finding_labels_join WHERE "+findingsOfRepo, repoID).Error; err != nil {
+		return err
+	}
+	for _, child := range []any{
+		&db.FindingNote{}, &db.FindingCommunication{}, &db.FindingReference{},
+		&db.FindingHistory{}, &db.FindingDependent{}, &db.FindingReview{},
+	} {
+		if err := tx.Where(findingsOfRepo, repoID).Delete(child).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteRepoConversations removes a repository's chat conversations and their
+// messages. Finding-scoped conversations carry the finding's repository_id, so
+// matching on it covers them too.
+func deleteRepoConversations(tx *gorm.DB, repoID uint) error {
+	if err := tx.Exec("DELETE FROM chat_messages WHERE conversation_id IN (SELECT id FROM conversations WHERE repository_id = ?)", repoID).Error; err != nil {
+		return err
+	}
+	return tx.Where("repository_id = ?", repoID).Delete(&db.Conversation{}).Error
+}
+
+// reopenRepoInterchangeRecords re-opens the peer records already applied to a
+// repository that is being deleted. The records themselves are not children
+// of it and stay: their stamp only ever meant "that row carries it", and
+// leaving it set would keep the next import pass from re-applying a
+// still-standing opt-out to the row a re-added repository gets.
+func reopenRepoInterchangeRecords(tx *gorm.DB, repoID uint) error {
+	return tx.Model(&db.InterchangeRecord{}).Where("applied_repository_id = ?", repoID).
+		Updates(map[string]any{"applied_at": nil, "applied_repository_id": 0}).Error
+}
+
+func deleteFindingConversations(tx *gorm.DB, findingID uint) error {
+	if err := tx.Exec("DELETE FROM chat_messages WHERE conversation_id IN (SELECT id FROM conversations WHERE finding_id = ?)", findingID).Error; err != nil {
+		return err
+	}
+	return tx.Where("finding_id = ?", findingID).Delete(&db.Conversation{}).Error
 }
 
 // repoDisclosureChannel lets the analyst overwrite (or clear) the
@@ -2177,12 +3246,58 @@ func (s *Server) repoDisclosureChannel(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	value := strings.TrimSpace(r.FormValue("disclosure_channel"))
-	if err := s.DB.Model(&db.Repository{}).Where("id = ?", repo.ID).
-		Update("disclosure_channel", value).Error; err != nil {
+	// Not trimmed here: SetDisclosureChannel trims, and it has to, since the
+	// comparison that decides whether to re-stamp the route record's
+	// verified_at is made against the trimmed value.
+	if err := db.SetDisclosureChannel(s.DB, repo.ID, r.FormValue("disclosure_channel")); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.redirect(w, r, fmt.Sprintf("/repositories/%d", repo.ID))
+}
+
+// repoScheduleUpdate saves a repository's recurring-scan settings:
+// its schedule (empty = inherit the global default, "off" = disabled,
+// "daily"/"weekly"/cron otherwise) and optional upstream URL for staging
+// copies. NextScheduledScanAt resets to null so the next scheduler tick
+// recomputes it from the new schedule.
+func (s *Server) repoScheduleUpdate(w http.ResponseWriter, r *http.Request) {
+	repo, ok := loadByID[db.Repository](s, w, r)
+	if !ok {
+		return
+	}
+	schedule := strings.TrimSpace(r.FormValue("scan_schedule"))
+	if schedule == "custom" {
+		schedule = strings.TrimSpace(r.FormValue("scan_schedule_cron"))
+	}
+	if schedule != "" && schedule != ScheduleOff {
+		if _, err := ScheduleNext(schedule, time.Now()); err != nil {
+			http.Error(w, "invalid schedule: "+err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+	}
+	upstream := strings.TrimSpace(r.FormValue("upstream_url"))
+	if upstream != "" && !strings.HasPrefix(upstream, "https://") {
+		http.Error(w, "upstream URL must start with https://", http.StatusUnprocessableEntity)
+		return
+	}
+	if upstream != "" {
+		input, err := ParseRepoInput(upstream)
+		if err != nil {
+			http.Error(w, strings.Replace(err.Error(), "repository URL", "upstream URL", 1), http.StatusUnprocessableEntity)
+			return
+		}
+		upstream = input.CloneURL
+	}
+	if err := s.DB.Model(&db.Repository{}).Where("id = ?", repo.ID).Updates(map[string]any{
+		"scan_schedule":          schedule,
+		"upstream_url":           upstream,
+		"next_scheduled_scan_at": nil,
+	}).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	setFlash(w, Flash{Category: successKey, Title: "Scan schedule updated"})
 	s.redirect(w, r, fmt.Sprintf("/repositories/%d", repo.ID))
 }
 
@@ -2197,15 +3312,46 @@ type ScanOpts struct {
 	// BaselineScanID marks a fix-validation anchor scan and pins the baseline
 	// scan it diffs against. See validate_fix.go.
 	BaselineScanID *uint
-	SubPath        string
-	Ref            string
-	Profile        string
+	// RemediationAttemptID pins a re-attack to the exact gated patch selected
+	// at enqueue time. It is nil for every other skill.
+	RemediationAttemptID *uint
+	SubPath              string
+	// ScopeMode overrides the instance-default subproject staging mode
+	// ("hard"|"soft") for this scan. Empty inherits config.SubprojectScope.
+	// Carried on retry/resume so a run reproduces the mode it actually used,
+	// including one the automatic soft fallback widened to.
+	ScopeMode string
+	Ref       string
+	Profile   string
+	// RescanMode requests full or diff coverage. Empty preserves the existing
+	// full-scan behavior. A requested diff scan can fall back to full coverage
+	// once the worker resolves the clone and baseline.
+	RescanMode string
+	// DiffBaseScanID pins the baseline for a diff rescan. Nil asks the worker
+	// to choose the latest compatible same-skill completed scan.
+	DiffBaseScanID *uint
+	// ScanGroup tags this scan as part of a parallel batch so in-flight audit
+	// skills can list sibling findings before re-filing them. Empty
+	// when the scan is not part of a batch.
+	ScanGroup string
+	// FocusArea is the complete audit focus serialized as JSON. It is an
+	// internal orchestration input, not an operator-supplied API field.
+	FocusArea       string
+	TriageScanID    *uint
+	ExplorationMode string
+	ExplorationPath string
 	// SessionID and ResumedFromScanID carry a failed scan's claude session
 	// into its retry so the new run continues the conversation with
 	// `claude -p --resume` instead of restarting from turn 0. Both empty
 	// on a normal (non-resuming) enqueue. See scanRetry.
 	SessionID         string
 	ResumedFromScanID *uint
+	// ParentScanID records the scan this enqueue is a rerun of. Unlike
+	// ResumedFromScanID it is the immediate parent and is set on every
+	// retry, including retries that start a fresh harness session, so the
+	// rerun chain stays walkable hop by hop. Nil on a first-time enqueue.
+	ParentScanID         *uint
+	VerificationFeedback string
 	// ImportPayload is the raw uploaded report for an ingest-skill run
 	// created by the /v1/import fallback; the worker stages it into the
 	// workspace at import/report. Empty for every other enqueue.
@@ -2222,6 +3368,38 @@ func (s *Server) enqueueSkillScoped(ctx context.Context, repoID, skillID uint, f
 	return s.enqueueSkillWith(ctx, repoID, skillID, ScanOpts{Model: model, FindingID: findingID})
 }
 
+// enqueueRepoScopedSkillIfIdle serializes the open-scan check and enqueue for
+// repo-scoped auto-enqueue paths (advisory audit, finding-dedup) under
+// agentEnqueueMu so concurrent scan finalizers cannot both pass the check.
+func (s *Server) enqueueRepoScopedSkillIfIdle(ctx context.Context, repoID, skillID uint) error {
+	s.agentEnqueueMu.Lock()
+	defer s.agentEnqueueMu.Unlock()
+	// These auto-enqueue paths (advisory audit, finding-dedup) are repo-root
+	// scoped, never sub-path scoped.
+	if s.hasOpenRepoScopedScan(repoID, skillID, "") {
+		return nil
+	}
+	_, err := s.enqueueSkillWith(ctx, repoID, skillID, ScanOpts{})
+	return err
+}
+
+// enqueueFindingScopedSkillIfIdle serializes the open-scan check and enqueue
+// for finding-scoped auto-enqueue paths (revalidate, verify) under
+// agentEnqueueMu. Avoids piling duplicate work onto the queue when the same
+// finding is observed by both an import and a rescan, or when two findings
+// parsers race. opts.FindingID is set from findingID; callers pass only the
+// extra opts they need (Profile).
+func (s *Server) enqueueFindingScopedSkillIfIdle(ctx context.Context, repoID, findingID, skillID uint, opts ScanOpts) error {
+	s.agentEnqueueMu.Lock()
+	defer s.agentEnqueueMu.Unlock()
+	if s.hasOpenFindingScopedScan(findingID, skillID) {
+		return nil
+	}
+	opts.FindingID = &findingID
+	_, err := s.enqueueSkillWith(ctx, repoID, skillID, opts)
+	return err
+}
+
 // enqueueSkillWith creates a skill scan using the given ScanOpts. Empty
 // fields default cleanly: unset FindingID means not-finding-scoped, empty
 // SubPath means root-scoped. Model precedence is: explicit opts.Model >
@@ -2230,23 +3408,51 @@ func (s *Server) enqueueSkillScoped(ctx context.Context, repoID, skillID uint, f
 // explicit opts.Effort > the runtime default effort.
 func (s *Server) enqueueSkillWith(ctx context.Context, repoID, skillID uint, opts ScanOpts) (uint, error) {
 	var repo db.Repository
-	if err := s.DB.Select("id, url").First(&repo, repoID).Error; err != nil {
+	if err := s.DB.Select("id, url, federation_opt_out_at").First(&repo, repoID).Error; err != nil {
 		return 0, err
 	}
-	var sk db.Skill
-	hasSkill := s.DB.Select("name, requires_remote, requires_profile, model").First(&sk, skillID).Error == nil
-	if repo.IsLocal() && hasSkill && sk.RequiresRemote {
-		return 0, fmt.Errorf("%w: %q", ErrSkillRequiresRemote, sk.Name)
+	if repo.FederationOptedOut() {
+		return 0, ErrRepoFederationOptOut
 	}
-	if hasSkill && sk.RequiresProfile != "" && opts.Profile != "" && opts.Profile != sk.RequiresProfile {
-		return 0, fmt.Errorf("%w: %q needs %q, got %q", ErrSkillProfileMismatch, sk.Name, sk.RequiresProfile, opts.Profile)
+	sk, hasSkill, err := s.skillEnqueuePreflight(repo, skillID, opts)
+	if err != nil {
+		return 0, err
+	}
+	switch opts.RescanMode {
+	case "", db.ScanRescanModeFull:
+		opts.RescanMode = db.ScanRescanModeFull
+	case db.ScanRescanModeDiff:
+	default:
+		return 0, fmt.Errorf("%w: %q", ErrInvalidRescanMode, opts.RescanMode)
 	}
 	if err := worker.ValidateGitRef(opts.Ref); err != nil {
 		return 0, fmt.Errorf("%w: %v", ErrInvalidRef, err)
 	}
+	if strings.TrimSpace(opts.FocusArea) != "" {
+		area, err := repoconfig.DecodeFocusAreaJSON(opts.FocusArea)
+		if err != nil {
+			return 0, fmt.Errorf("invalid scan focus area: %w", err)
+		}
+		opts.FocusArea, err = repoconfig.EncodeFocusAreaJSON(area)
+		if err != nil {
+			return 0, fmt.Errorf("encode scan focus area: %w", err)
+		}
+	}
+	if err := s.refuseClaimedOutreach(ctx, opts, sk, hasSkill); err != nil {
+		return 0, err
+	}
+	if err := normalizeVerificationOpts(&opts, sk.Name); err != nil {
+		return 0, err
+	}
 	if !ValidModelPreference(opts.Model) && hasSkill {
 		opts.Model = sk.Model
 	}
+	// Overage fallback: while the subscription is past its included quota, rewrite
+	// the expensive tiers (max/high, and the empty default that resolves to high)
+	// to mid (Sonnet), when enabled. An explicit concrete model id is left alone.
+	// The resolved model is snapshotted onto the scan below, so this applies to
+	// scans enqueued from now on (including triage's fan-out), not queued ones.
+	opts.Model = applyOverageDowngrade(opts.Model, s.Worker.ShouldDowngradeModel())
 	opts.Model = resolveModelPreference(s.DB, opts.Model, s.DefaultModel())
 	if !ValidEffort(opts.Effort) {
 		opts.Effort = s.DefaultEffort()
@@ -2256,27 +3462,65 @@ func (s *Server) enqueueSkillWith(ctx context.Context, repoID, skillID uint, opt
 		kind = worker.JobExposure
 	}
 	scan := db.Scan{
-		RepositoryID:      repoID,
-		Kind:              kind,
-		Status:            db.ScanQueued,
-		StatusPriority:    db.StatusPriorityFor(db.ScanQueued),
-		Model:             opts.Model,
-		Effort:            opts.Effort,
-		SkillID:           &skillID,
-		SkillName:         sk.Name,
-		FindingID:         opts.FindingID,
-		DependentID:       opts.DependentID,
-		BaselineScanID:    opts.BaselineScanID,
-		SubPath:           opts.SubPath,
-		Ref:               opts.Ref,
-		Profile:           opts.Profile,
-		SessionID:         opts.SessionID,
-		ResumedFromScanID: opts.ResumedFromScanID,
-		ImportPayload:     opts.ImportPayload,
-		SkillsRepoSHA:     s.SkillsRepoSHA,
-		APIToken:          NewAPIToken(),
+		RepositoryID:         repoID,
+		Kind:                 kind,
+		Status:               db.ScanQueued,
+		StatusPriority:       db.StatusPriorityFor(db.ScanQueued),
+		Model:                opts.Model,
+		Effort:               opts.Effort,
+		SkillID:              &skillID,
+		SkillVersion:         sk.Version,
+		SkillSchemaVersion:   skillSchemaVersion(sk),
+		SkillName:            sk.Name,
+		FindingID:            opts.FindingID,
+		DependentID:          opts.DependentID,
+		BaselineScanID:       opts.BaselineScanID,
+		RemediationAttemptID: opts.RemediationAttemptID,
+		SubPath:              opts.SubPath,
+		ScopeMode:            opts.ScopeMode,
+		ScanGroup:            opts.ScanGroup,
+		FocusArea:            opts.FocusArea,
+		TriageScanID:         opts.TriageScanID,
+		ExplorationMode:      opts.ExplorationMode,
+		ExplorationPath:      opts.ExplorationPath,
+		Ref:                  opts.Ref,
+		RescanMode:           opts.RescanMode,
+		DiffBaseScanID:       opts.DiffBaseScanID,
+		Profile:              opts.Profile,
+		SessionID:            opts.SessionID,
+		ResumedFromScanID:    opts.ResumedFromScanID,
+		ParentScanID:         opts.ParentScanID,
+		VerificationFeedback: opts.VerificationFeedback,
+		ImportPayload:        opts.ImportPayload,
+		SkillsRepoSHA:        s.SkillsRepoSHA,
+		APIToken:             NewAPIToken(),
 	}
-	if err := s.DB.Create(&scan).Error; err != nil {
+	if err := s.validateExploratoryEnqueue(&scan, &sk); err != nil {
+		return 0, err
+	}
+	// The opt-out check at the top of this function ran before every field above
+	// was resolved, so re-check it inside the creating transaction: the row is
+	// write-locked from the INSERT until commit, which leaves an opt-out only two
+	// places to land. Before the INSERT, and the read below sees it and rolls the
+	// scan back; after the commit, and the sweep that follows recording it finds a
+	// queued row to cancel. Reading before the INSERT instead would put the window
+	// back where it was, just narrower.
+	if err := s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&scan).Error; err != nil {
+			return err
+		}
+		if err := checkExploratoryDuplicate(tx, &scan); err != nil {
+			return err
+		}
+		var live db.Repository
+		if err := tx.Select("id, federation_opt_out_at").First(&live, repoID).Error; err != nil {
+			return err
+		}
+		if live.FederationOptedOut() {
+			return ErrRepoFederationOptOut
+		}
+		return nil
+	}); err != nil {
 		return 0, err
 	}
 	prio := worker.PrioScan
@@ -2284,10 +3528,41 @@ func (s *Server) enqueueSkillWith(ctx context.Context, repoID, skillID uint, opt
 		prio = worker.PrioFinding
 	}
 	if err := s.Queue.Enqueue(ctx, kind, scan.ID, prio); err != nil {
-		return 0, err
+		enqueueErr := fmt.Errorf("enqueue scan %d: %w", scan.ID, err)
+		now := time.Now()
+		if markErr := s.DB.Model(&db.Scan{}).Where("id = ?", scan.ID).Updates(map[string]any{
+			"status":          db.ScanFailed,
+			"status_priority": db.StatusPriorityFor(db.ScanFailed),
+			"error":           enqueueErr.Error(),
+			"finished_at":     &now,
+		}).Error; markErr != nil {
+			return 0, errors.Join(enqueueErr, fmt.Errorf("mark scan failed: %w", markErr))
+		}
+		return 0, enqueueErr
 	}
 	s.DB.Model(&db.Repository{}).Where("id = ?", repoID).Update("updated_at", time.Now())
+	// Published without the scan ID on purpose: no open page holds a row for a
+	// scan that did not exist a moment ago, so the lists re-fetch their table
+	// rather than trying to swap a row that is not there.
+	s.publishScanList(repoID)
 	return scan.ID, nil
+}
+
+func (s *Server) skillEnqueuePreflight(repo db.Repository, skillID uint, opts ScanOpts) (db.Skill, bool, error) {
+	var sk db.Skill
+	hasSkill := s.DB.Select("name, version, metadata, requires_remote, requires_profile, model, source_path").First(&sk, skillID).Error == nil
+	if hasSkill && opts.FindingID != nil {
+		if err := s.ensureFindingReportable(*opts.FindingID, sk.Name); err != nil {
+			return db.Skill{}, false, err
+		}
+	}
+	if repo.IsLocal() && hasSkill && sk.RequiresRemote {
+		return db.Skill{}, false, fmt.Errorf("%w: %q", ErrSkillRequiresRemote, sk.Name)
+	}
+	if hasSkill && sk.RequiresProfile != "" && opts.Profile != "" && opts.Profile != sk.RequiresProfile {
+		return db.Skill{}, false, fmt.Errorf("%w: %q needs %q, got %q", ErrSkillProfileMismatch, sk.Name, sk.RequiresProfile, opts.Profile)
+	}
+	return sk, hasSkill, nil
 }
 
 const (
@@ -2465,18 +3740,26 @@ const cspPolicy = "default-src 'self'; " +
 	"frame-ancestors 'none'; " +
 	"object-src 'none'"
 
+// localHost reports whether the request Host is the loopback name or address
+// the web server is bound to. Extracted from securityHeaders so a route can
+// distinguish "a caller on the host, no credential needed" from "a caller that
+// cannot satisfy the host check and must authenticate instead"; see
+// openAPISpecHandler.
+func localHost(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
 // securityHeaders enforces T3 mitigations: host header check to prevent DNS
 // rebinding, Sec-Fetch-Site check on POST to prevent cross-origin CSRF, and
 // a CSP that prevents stored XSS in any rendered content from executing JS.
 func securityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", cspPolicy)
-		host := r.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		host = strings.Trim(host, "[]")
-		if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		if !localHost(r.Host) {
 			http.Error(w, "forbidden: invalid host", http.StatusForbidden)
 			return
 		}

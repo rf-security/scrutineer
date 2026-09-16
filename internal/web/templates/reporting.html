@@ -1,0 +1,215 @@
+{{template "head" .}}
+{{$r := .Report}}
+
+<div class="flex items-start justify-between gap-4 mb-6">
+  <div>
+    {{template "crumbs" (crumbs "Reporting" "")}}
+    <h2 class="text-2xl font-semibold mt-1 flex items-center gap-2">
+      <i data-lucide="file-chart-column"></i> Reporting
+    </h2>
+  </div>
+  <div class="flex items-center gap-2 shrink-0" hx-boost="false">
+    <a href="/reporting/report.csv?interval={{$r.Interval.Key}}{{if $r.MinSeverity}}&amp;severity={{$r.MinSeverity}}{{end}}" class="btn-outline">
+      <i data-lucide="download"></i> CSV
+    </a>
+    <a href="/reporting/report.json?interval={{$r.Interval.Key}}{{if $r.MinSeverity}}&amp;severity={{$r.MinSeverity}}{{end}}" class="btn-outline">
+      <i data-lucide="download"></i> JSON
+    </a>
+  </div>
+</div>
+
+<p class="text-sm text-muted-foreground mb-4">
+  Scan activity over a rolling window, with the per-scan cost and token averages.
+  Runs are counted when they begin and again when they finish, so a run spanning the
+  boundary is a start in one period and a completion in the next; queued runs count
+  in neither.
+  {{if $r.Since}}Covering {{$r.Since.Format "2006-01-02 15:04 UTC"}} onward.{{else}}Covering every scan on record.{{end}}
+</p>
+
+<div class="flex flex-wrap items-center justify-between gap-x-8 gap-y-3 mb-6">
+  <div class="flex items-center gap-2">
+    <span class="text-sm font-medium text-muted-foreground">Period</span>
+    <div class="flex items-center gap-1">
+      {{range $.Intervals}}
+        <a href="/reporting?interval={{.Key}}{{if $r.MinSeverity}}&amp;severity={{$r.MinSeverity}}{{end}}"
+           class="{{if eq $r.Interval.Key .Key}}btn-outline{{else}}btn-sm-ghost{{end}}">{{.Label}}</a>
+      {{end}}
+    </div>
+  </div>
+  <div class="flex items-center gap-2">
+    <span class="text-sm font-medium text-muted-foreground">Minimum severity</span>
+    <div class="flex items-center gap-1">
+      <a href="/reporting?interval={{$r.Interval.Key}}"
+         class="{{if not $r.MinSeverity}}btn-outline{{else}}btn-sm-ghost{{end}}">All</a>
+      {{range $.Severities}}
+        <a href="/reporting?interval={{$r.Interval.Key}}&amp;severity={{.}}"
+           class="{{if eq $r.MinSeverity .}}btn-outline{{else}}btn-sm-ghost{{end}}">{{.}}</a>
+      {{end}}
+    </div>
+  </div>
+</div>
+
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+  <div class="card p-4">
+    <p class="text-sm text-muted-foreground">Repositories scanned</p>
+    <p class="text-2xl font-semibold mt-1">{{bignum $r.Totals.ReposScanned}}</p>
+  </div>
+  <div class="card p-4">
+    <p class="text-sm text-muted-foreground">Scan runs started</p>
+    <p class="text-2xl font-semibold mt-1">{{bignum $r.Totals.ScansStarted}}</p>
+    {{if $r.Totals.ReposScanned}}
+      <p class="text-xs text-muted-foreground mt-1">&#8776;{{printf "%.1f" $r.Totals.ScansPerRepo}} per repository</p>
+    {{end}}
+  </div>
+  <div class="card p-4">
+    <p class="text-sm text-muted-foreground">Scan runs completed</p>
+    <p class="text-2xl font-semibold mt-1">{{bignum $r.Totals.ScansCompleted}}</p>
+    {{if $r.Totals.ScansStarted}}
+      <p class="text-xs text-muted-foreground mt-1">{{pct $r.Totals.CompletionRate}} of runs started</p>
+    {{end}}
+  </div>
+  <div class="card p-4">
+    <p class="text-sm text-muted-foreground">Findings{{if $r.MinSeverity}} ({{$r.MinSeverity}}+){{end}}</p>
+    <p class="text-2xl font-semibold mt-1">{{bignum $r.Totals.Findings}}</p>
+  </div>
+</div>
+
+<h3 class="text-lg font-semibold mb-1">Cost averages</h3>
+<p class="text-sm text-muted-foreground mb-3">
+  Averaged per completed scan with a recorded cost. Cost is API list-price equivalent,
+  not what a subscription was billed. Input excludes cached reads, so total tokens is
+  the better measure of how much the model processed.
+</p>
+{{if $r.AllTime.Runs}}
+  {{/* Since is nil only when the selected period already IS all time. The
+       period and all-time columns are then the same population, so showing
+       both would repeat one number under two identical headings. */}}
+  {{$bounded := $r.Since}}
+  <div class="overflow-x-auto mb-8">
+    <table class="table w-full">
+      <thead><tr>
+        <th>Metric</th>
+        {{if $bounded}}<th class="text-right">{{$r.Interval.Label}}</th>{{end}}
+        <th class="text-right">All time</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td class="font-medium">Scans counted</td>
+          {{if $bounded}}<td class="text-right">{{bignum $r.Period.Runs}}</td>{{end}}
+          <td class="text-right{{if $bounded}} text-muted-foreground{{end}}">{{bignum $r.AllTime.Runs}}</td>
+        </tr>
+        <tr>
+          <td class="font-medium">Average cost</td>
+          {{if $bounded}}<td class="text-right">{{usd $r.Period.CostUSD}}</td>{{end}}
+          <td class="text-right{{if $bounded}} text-muted-foreground{{end}}">{{usd $r.AllTime.CostUSD}}</td>
+        </tr>
+        <tr>
+          <td class="font-medium">Average input tokens</td>
+          {{if $bounded}}<td class="text-right">{{printf "%.0f" $r.Period.InputTokens}}</td>{{end}}
+          <td class="text-right{{if $bounded}} text-muted-foreground{{end}}">{{printf "%.0f" $r.AllTime.InputTokens}}</td>
+        </tr>
+        <tr>
+          <td class="font-medium">Average output tokens</td>
+          {{if $bounded}}<td class="text-right">{{printf "%.0f" $r.Period.OutputTokens}}</td>{{end}}
+          <td class="text-right{{if $bounded}} text-muted-foreground{{end}}">{{printf "%.0f" $r.AllTime.OutputTokens}}</td>
+        </tr>
+        <tr>
+          <td class="font-medium">Average cache read tokens</td>
+          {{if $bounded}}<td class="text-right">{{printf "%.0f" $r.Period.CacheReadTokens}}</td>{{end}}
+          <td class="text-right{{if $bounded}} text-muted-foreground{{end}}">{{printf "%.0f" $r.AllTime.CacheReadTokens}}</td>
+        </tr>
+        <tr>
+          <td class="font-medium">Average cache write tokens</td>
+          {{if $bounded}}<td class="text-right">{{printf "%.0f" $r.Period.CacheWriteTokens}}</td>{{end}}
+          <td class="text-right{{if $bounded}} text-muted-foreground{{end}}">{{printf "%.0f" $r.AllTime.CacheWriteTokens}}</td>
+        </tr>
+        <tr>
+          <td class="font-medium">Average total tokens</td>
+          {{if $bounded}}<td class="text-right">{{printf "%.0f" $r.Period.TotalTokens}}</td>{{end}}
+          <td class="text-right{{if $bounded}} text-muted-foreground{{end}}">{{printf "%.0f" $r.AllTime.TotalTokens}}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+{{else}}
+  <div class="mb-8">
+    {{template "empty" (dict "Icon" "coins" "Title" "No costed scans yet" "Body" "Averages appear once a scan has completed with a recorded cost.")}}
+  </div>
+{{end}}
+
+<h3 class="text-lg font-semibold mb-1">By model</h3>
+<p class="text-sm text-muted-foreground mb-3">
+  The period's activity sliced by model. Scan runs and cost group by the model each
+  run used; findings group by the model that first produced them, so findings imported
+  from another instance's bundle count under the model that found them there, not the
+  local import run. Rows without a model have no model attribution recorded.
+</p>
+{{if $r.Models}}
+  <div class="overflow-x-auto mb-8">
+    <table class="table w-full">
+      <thead><tr>
+        <th>Model</th>
+        <th class="text-right">Started</th>
+        <th class="text-right">Completed</th>
+        <th class="text-right">Findings{{if $r.MinSeverity}} ({{$r.MinSeverity}}+){{end}}</th>
+        <th class="text-right">Cost</th>
+        <th class="text-right">Total tokens</th>
+        <th class="text-right">Avg cost/scan</th>
+      </tr></thead>
+      <tbody>
+      {{range $r.Models}}
+        <tr>
+          <td class="font-medium">{{if .Model}}{{.Model}}{{else}}<span class="text-muted-foreground">(not recorded)</span>{{end}}</td>
+          <td class="text-right text-muted-foreground">{{bignum .ScansStarted}}</td>
+          <td class="text-right text-muted-foreground">{{bignum .ScansCompleted}}</td>
+          <td class="text-right text-muted-foreground">{{bignum .Findings}}</td>
+          <td class="text-right">{{usd .CostUSD}}</td>
+          <td class="text-right text-muted-foreground">{{bignum .TotalTokens}}</td>
+          <td class="text-right text-muted-foreground">{{if .ScansAveraged}}{{usd .AvgCostUSD}}{{else}}-{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+{{else}}
+  <div class="mb-8">
+    {{template "empty" (dict "Icon" "bot" "Title" "No activity in this window" "Body" "The model breakdown appears once a scan has run or a finding has been reported.")}}
+  </div>
+{{end}}
+
+<h3 class="text-lg font-semibold mb-1">Daily breakdown</h3>
+<p class="text-sm text-muted-foreground mb-3">
+  Totals per day. The CSV and JSON exports add each day's per-scan averages, which are
+  taken over that day's completed and costed runs rather than over the Cost column here.
+</p>
+{{if $r.Days}}
+  <div class="overflow-x-auto">
+    <table class="table w-full">
+      <thead><tr>
+        <th>Date</th>
+        <th class="text-right">Repositories</th>
+        <th class="text-right">Started</th>
+        <th class="text-right">Completed</th>
+        <th class="text-right">Findings{{if $r.MinSeverity}} ({{$r.MinSeverity}}+){{end}}</th>
+        <th class="text-right">Cost</th>
+        <th class="text-right">Total tokens</th>
+      </tr></thead>
+      <tbody>
+      {{range $r.Days}}
+        <tr>
+          <td class="font-medium">{{.Date}}</td>
+          <td class="text-right text-muted-foreground">{{bignum .ReposScanned}}</td>
+          <td class="text-right text-muted-foreground">{{bignum .ScansStarted}}</td>
+          <td class="text-right text-muted-foreground">{{bignum .ScansCompleted}}</td>
+          <td class="text-right text-muted-foreground">{{bignum .Findings}}</td>
+          <td class="text-right">{{usd .CostUSD}}</td>
+          <td class="text-right text-muted-foreground">{{bignum .TotalTokens}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+{{else}}
+  {{template "empty" (dict "Icon" "calendar-off" "Title" "No activity in this window" "Body" "Widen the interval, or run a scan to start populating the report.")}}
+{{end}}
+{{template "foot" .}}

@@ -9,6 +9,27 @@ import (
 	"scrutineer/internal/db"
 )
 
+const maintainerRepositoryCountSQL = `(
+	SELECT COUNT(*)
+	FROM repository_maintainers rm_count
+	WHERE rm_count.maintainer_id = maintainers.id
+)`
+
+var maintainerFindingCountSQL = `(
+	SELECT COUNT(f.id)
+	FROM repository_maintainers rm_count
+	JOIN findings f ON f.repository_id = rm_count.repository_id
+	LEFT JOIN scans s ON s.id = f.scan_id
+	WHERE rm_count.maintainer_id = maintainers.id
+	  AND ` + aliasedFindingsScanFilter + `
+)`
+
+type maintainerListRow struct {
+	db.Maintainer
+	RepositoryCount int `gorm:"column:repository_count"`
+	FindingCount    int `gorm:"column:finding_count"`
+}
+
 func (s *Server) maintainersList(w http.ResponseWriter, r *http.Request) {
 	q := s.DB.Model(&db.Maintainer{})
 	status := r.URL.Query().Get(statusKey)
@@ -23,65 +44,49 @@ func (s *Server) maintainersList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	const nameSort = "name"
-	sort := r.URL.Query().Get("sort")
-	switch sort {
+	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
+	switch sortCol {
+	case "findings":
+		q = q.Order(orderByExpr(maintainerFindingCountSQL, dir, true)).
+			Order("CASE WHEN name = '' THEN 1 ELSE 0 END, name, login")
+	case "repos":
+		q = q.Order(orderByExpr(maintainerRepositoryCountSQL, dir, true)).
+			Order("CASE WHEN name = '' THEN 1 ELSE 0 END, name, login")
 	case "login":
-		q = q.Order("login")
+		q = q.Order(orderByExpr("login", dir, false))
 	case statusKey:
-		q = q.Order("status, name")
+		q = q.Order(orderByExpr("status", dir, false)).Order("name")
+	case "email":
+		q = q.Order(orderByExpr("email", dir, false)).Order("name")
+	case "company":
+		q = q.Order(orderByExpr("company", dir, false)).Order("name")
 	case "newest":
-		q = q.Order("id desc")
+		q = q.Order(orderByExpr("id", dir, true))
+	case nameSort:
+		// Push empty names to the end regardless of direction.
+		q = q.Order("CASE WHEN name = '' THEN 1 ELSE 0 END").
+			Order(orderByExpr("name", dir, false)).Order("login")
 	default:
-		sort = nameSort
-		// Push empty names to the end instead of the front.
+		sortCol, dir = nameSort, ""
 		q = q.Order("CASE WHEN name = '' THEN 1 ELSE 0 END, name, login")
 	}
+	sort := joinSort(sortCol, dir)
 
 	var total int64
 	q.Count(&total)
 	page := paginate(r, total)
 
-	var rows []db.Maintainer
-	q.Preload("Repositories").
-		Limit(perPage).Offset((page.N - 1) * perPage).Find(&rows)
-
-	// Batch-count findings across each maintainer's linked repositories
-	// in a single grouped query rather than one query per maintainer.
-	findingCounts := map[uint]int{}
-	if len(rows) > 0 {
-		ids := make([]uint, 0, len(rows))
-		for _, m := range rows {
-			ids = append(ids, m.ID)
-		}
-		type row struct {
-			MaintainerID uint
-			N            int
-		}
-		var counts []row
-		// LEFT JOIN scans so the COUNT only includes deep-dive findings.
-		// Scanner output (zizmor, semgrep) is per-repo lint noise and
-		// shouldn't drive maintainer routing.
-		s.DB.Raw(`
-			SELECT rm.maintainer_id, COUNT(f.id) AS n
-			FROM repository_maintainers rm
-			LEFT JOIN findings f ON f.repository_id = rm.repository_id
-			LEFT JOIN scans s ON s.id = f.scan_id
-			WHERE rm.maintainer_id IN ?
-			  AND (s.skill_name IS NULL OR s.skill_name = '' OR s.skill_name = ?)
-			GROUP BY rm.maintainer_id
-		`, ids, deepDiveSkillName).Scan(&counts)
-		for _, c := range counts {
-			findingCounts[c.MaintainerID] = c.N
-		}
-	}
+	var rows []maintainerListRow
+	q.Select("maintainers.*, " + maintainerRepositoryCountSQL + " AS repository_count, " +
+		maintainerFindingCountSQL + " AS finding_count").
+		Limit(perPage).Offset((page.N - 1) * perPage).Scan(&rows)
 
 	s.render(w, r, "maintainers.html", map[string]any{
-		"Maintainers":   rows,
-		"Page":          page,
-		"Status":        status,
-		"Q":             search,
-		"Sort":          sort,
-		"FindingCounts": findingCounts,
+		"Maintainers": rows,
+		"Page":        page,
+		"Status":      status,
+		"Q":           search,
+		"Sort":        sort,
 	})
 }
 
@@ -105,7 +110,12 @@ func (s *Server) maintainerDoNotContact(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) maintainerShow(w http.ResponseWriter, r *http.Request) {
 	var m db.Maintainer
-	if err := s.DB.Preload("Repositories").First(&m, r.PathValue("id")).Error; err != nil {
+	id, err := strconv.Atoi(r.PathValue("id"))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := s.DB.Preload("Repositories").First(&m, id).Error; err != nil {
 		http.NotFound(w, r)
 		return
 	}

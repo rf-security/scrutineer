@@ -11,32 +11,33 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/db/dbtest"
 	"scrutineer/internal/queue"
 	"scrutineer/internal/worker"
 )
 
 func newTestServer(t testing.TB) (*Server, func()) {
 	t.Helper()
-	gdb, err := db.Open("file::memory:?cache=shared")
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	sqldb, _ := gdb.DB()
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	q, err := queue.New(sqldb, log, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(gdb, q, log, NewBroker(), &worker.Worker{})
+	s, err := New(gdb, q, log, NewBroker(), &worker.Worker{DB: gdb})
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.Backend = worker.HarnessName(worker.ClaudeHarness{})
 	s.resolvePURL = func(context.Context, string) string { return "" }
 	s.resolveSync = true
 	s.prefetchEcosystems = func(uint) {}
@@ -108,6 +109,29 @@ func TestLoadByID(t *testing.T) {
 	w = httptest.NewRecorder()
 	if _, ok := loadByID[db.Repository](s, w, r); ok || w.Code != http.StatusNotFound {
 		t.Errorf("missing id: ok=%v code=%d, want false/404", ok, w.Code)
+	}
+
+	// A non-numeric id must 404 before reaching the DB rather than being
+	// spliced into the GORM inline condition as raw SQL (the SQLi this
+	// fix closes).
+	r.SetPathValue("id", "1; DROP TABLE repositories")
+	w = httptest.NewRecorder()
+	if _, ok := loadByID[db.Repository](s, w, r); ok || w.Code != http.StatusNotFound {
+		t.Errorf("injection id: ok=%v code=%d, want false/404", ok, w.Code)
+	}
+}
+
+// TestFindingShow_nonNumericID covers the same SQLi guard on a handler
+// that loads via Preload("...").First, exercising the second code path
+// (handlers that parse the id inline rather than through loadByID).
+func TestFindingShow_nonNumericID(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", "/findings/abc"))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("non-numeric finding id: code=%d, want 404", w.Code)
 	}
 }
 
@@ -225,6 +249,49 @@ func TestMaintainersIndex_rendersFindingsCountAndDNCBadge(t *testing.T) {
 	// Alice carries the DNC badge; Bob should not.
 	if !strings.Contains(body, `data-tooltip="Do not contact">DNC`) {
 		t.Errorf("missing DNC badge for alice")
+	}
+}
+
+// Imports show in the Findings tab, so they must also count toward the
+// maintainer index badge. Regression for the aliasedFindingsScanFilter drift:
+// the count query once filtered skill_name only and silently dropped imports.
+func TestMaintainersIndex_countsImportedFindings(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/foo/bar.git", Name: "bar"}
+	s.DB.Create(&repo)
+
+	// One deep-dive audit finding and one operator-import finding. An import
+	// scan carries the producing tool's name as skill_name with kind=import —
+	// the same shape import.go writes — so a skill_name-only filter misses it.
+	dd := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&dd)
+	imp := db.Scan{RepositoryID: repo.ID, Kind: "import", Status: db.ScanDone, SkillName: "trivy"}
+	s.DB.Create(&imp)
+	// A scanner finding stays out of the count — per-repo lint noise.
+	sg := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "semgrep"}
+	s.DB.Create(&sg)
+	s.DB.Create(&db.Finding{ScanID: dd.ID, RepositoryID: repo.ID, Title: "audit", Severity: "High"})
+	s.DB.Create(&db.Finding{ScanID: imp.ID, RepositoryID: repo.ID, Title: "imported", Severity: "Medium"})
+	s.DB.Create(&db.Finding{ScanID: sg.ID, RepositoryID: repo.ID, Title: "scanner", Severity: "Low"})
+
+	alice := db.Maintainer{Login: "alice", Name: "Alice", Status: db.MaintainerActive}
+	s.DB.Create(&alice)
+	if err := s.DB.Model(&repo).Association("Maintainers").Append([]db.Maintainer{alice}); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", "/maintainers"))
+	if w.Code != 200 {
+		t.Fatalf("status %d", w.Code)
+	}
+	body := w.Body.String()
+	// deep-dive + import = 2; the semgrep scanner finding is excluded. Before
+	// the fix this rendered 1 (import dropped); a scanner leak would render 3.
+	if !strings.Contains(body, `<span class="badge-destructive">2</span>`) {
+		t.Errorf("expected maintainer findings badge of 2 (deep-dive + import, scanner excluded); body=%s", body)
 	}
 }
 
@@ -371,6 +438,7 @@ func TestNavKey(t *testing.T) {
 		"/repositories/7": "repos",
 		"/findings":       "findings",
 		"/findings/42":    "findings",
+		"/benchmark":      "benchmark",
 		"/scans/1":        "scans",
 		"/sboms":          "sboms",
 		"/usage":          "usage",
@@ -745,6 +813,70 @@ func TestFindingsSearchFilters(t *testing.T) {
 	}
 }
 
+func TestFindings_modelColumnAndSort(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/x", Name: "x"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "security-deep-dive", Model: "model-col-test"}
+	s.DB.Create(&scan)
+	f := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "SSRF in image fetcher",
+		Severity: "High", Location: "fetch.go:42", Model: "model-col-test"}
+	s.DB.Create(&f)
+
+	for _, path := range []string{
+		"/findings",                       // list renders the model column once any row has one
+		"/findings?sort=model",            // and the column sorts without erroring
+		fmt.Sprintf("/findings/%d", f.ID), // detail page shows the finding's own model
+	} {
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, localReq("GET", path))
+		if w.Code != 200 {
+			t.Errorf("%s status %d", path, w.Code)
+			continue
+		}
+		if !strings.Contains(w.Body.String(), "model-col-test") {
+			t.Errorf("%s does not show the finding's model", path)
+		}
+	}
+}
+
+// TestFindings_modelSortKeepsColumnVisible pins the interaction between the
+// rows-driven column toggle and model sorting: ascending model sort puts
+// unattributed rows first, and a page of empty models must not hide the
+// column — and with it the direction toggle — mid-sort. The th-sort link
+// (sort=model) only renders with the header, so its presence is the column's.
+func TestFindings_modelSortKeepsColumnVisible(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/x", Name: "x"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "security-deep-dive"}
+	s.DB.Create(&scan)
+	s.DB.Create(&db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "unattributed",
+		Severity: "High", Location: "a.go:1"})
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", "/findings"))
+	if w.Code != 200 {
+		t.Fatalf("status %d", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "sort=model") {
+		t.Errorf("model column rendered with no models on the page and no model sort")
+	}
+
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", "/findings?sort=model"))
+	if w.Code != 200 {
+		t.Fatalf("sorted status %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "sort=model") {
+		t.Errorf("model column hidden while model sorting is active")
+	}
+}
+
 func TestFindings_categoryFilter(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -939,6 +1071,84 @@ func TestOrgsList_aggregatesByOwner(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q", want)
+		}
+	}
+}
+
+// The orgs index finding total is a sibling of the maintainer count and once
+// drifted the same way: imports showed in the Findings tab but were filtered
+// out of the cross-org total. Regression for aliasedFindingsScanFilter.
+func TestOrgsList_countsImportedFindings(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	// Single owner, single repo (Repos column = 1, so a "2" badge can only be
+	// the findings total). One deep-dive finding plus one import finding; a
+	// zizmor scanner finding stays in the per-repo Scanners tab, not the total.
+	repo := db.Repository{URL: "https://example.com/acme/svc", Name: "svc", Owner: "acme"}
+	s.DB.Create(&repo)
+	dd := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&dd)
+	imp := db.Scan{RepositoryID: repo.ID, Kind: "import", Status: db.ScanDone, SkillName: "grype"}
+	s.DB.Create(&imp)
+	sg := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "zizmor"}
+	s.DB.Create(&sg)
+	s.DB.Create(&db.Finding{ScanID: dd.ID, RepositoryID: repo.ID, Title: "audit", Severity: "High"})
+	s.DB.Create(&db.Finding{ScanID: imp.ID, RepositoryID: repo.ID, Title: "imported", Severity: "Medium"})
+	s.DB.Create(&db.Finding{ScanID: sg.ID, RepositoryID: repo.ID, Title: "scanner", Severity: "Low"})
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", "/orgs"))
+	if w.Code != 200 {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	// deep-dive + import = 2; the zizmor scanner finding is excluded. Before
+	// the fix this rendered 1 (import dropped); a scanner leak would render 3.
+	if !strings.Contains(body, `<span class="badge-destructive">2</span>`) {
+		t.Errorf("expected org findings total badge of 2 (deep-dive + import, scanner excluded); body=%s", body)
+	}
+}
+
+// TestIndexTotals_countVulnScanFindings pins vuln-scan's inclusion in the
+// maintainers/orgs index aggregates: aliasedFindingsScanFilter was widened to
+// s.skill_name IN (?, ?) so vuln-scan findings count toward the cross-repo
+// totals alongside deep-dive, while scanner output stays excluded. It exercises
+// the second bound placeholder (vulnScanSkillName) in BOTH aggregate queries —
+// the path TestVulnScanBucketedAsFinding (repo bucket + /findings toggle) and
+// the import-count tests (first placeholder + kind='import') do not reach.
+func TestIndexTotals_countVulnScanFindings(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	// One owner + one maintainer on a single repo. Two vuln-scan findings count
+	// toward both index totals; a semgrep scanner finding stays out. A "2" badge
+	// is unambiguous (Repos column = 1) and separates the correct total from a
+	// regression: 0 if vuln-scan were treated as a scanner, 3 if semgrep leaked.
+	repo := db.Repository{URL: "https://example.com/acme/svc", Name: "svc", Owner: "acme"}
+	s.DB.Create(&repo)
+	vs := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: vulnScanSkillName}
+	s.DB.Create(&vs)
+	sg := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "semgrep"}
+	s.DB.Create(&sg)
+	s.DB.Create(&db.Finding{ScanID: vs.ID, RepositoryID: repo.ID, Title: "vuln-scan a", Severity: "High"})
+	s.DB.Create(&db.Finding{ScanID: vs.ID, RepositoryID: repo.ID, Title: "vuln-scan b", Severity: "Medium"})
+	s.DB.Create(&db.Finding{ScanID: sg.ID, RepositoryID: repo.ID, Title: "scanner", Severity: "Low"})
+
+	alice := db.Maintainer{Login: "alice", Name: "Alice", Status: db.MaintainerActive}
+	s.DB.Create(&alice)
+	if err := s.DB.Model(&repo).Association("Maintainers").Append([]db.Maintainer{alice}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"/maintainers", "/orgs"} {
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, localReq("GET", path))
+		if w.Code != 200 {
+			t.Fatalf("GET %s: status %d", path, w.Code)
+		}
+		if body := w.Body.String(); !strings.Contains(body, `<span class="badge-destructive">2</span>`) {
+			t.Errorf("GET %s: want vuln-scan findings total badge of 2 (semgrep excluded); body=%s", path, body)
 		}
 	}
 }
@@ -1262,6 +1472,60 @@ func TestFindings_scannerToggle(t *testing.T) {
 	}
 }
 
+func TestDeepDiveSkillNameSafeForSplicing(t *testing.T) {
+	// deepDiveSkillName, vulnScanSkillName and advisoryDeepDiveSkillName are
+	// spliced into findingsBucketSkillSQL as raw single-quoted literals (it feeds
+	// SQL such as the deepDiveFindingsCountSQL ORDER BY subquery, which cannot
+	// take a bind parameter), so none may ever carry a SQL metacharacter. This
+	// tripwire fails loudly if a refactor changes a constant or makes a value
+	// dynamic.
+	for _, name := range []string{deepDiveSkillName, vulnScanSkillName, advisoryDeepDiveSkillName} {
+		if strings.ContainsAny(name, "'\";\\\x00") {
+			t.Errorf("skill name %q must stay free of SQL metacharacters; it is spliced into findingsBucketSkillSQL", name)
+		}
+		// The literal it is spliced as must be a faithful single-quote wrap —
+		// the same output db.SQLStringLiteral would produce — and must actually
+		// appear in findingsBucketSkillSQL.
+		quoted := db.SQLStringLiteral(name)
+		if quoted != "'"+name+"'" {
+			t.Errorf("SQLStringLiteral(%q) = %q, want simple quoting", name, quoted)
+		}
+		if !strings.Contains(findingsBucketSkillSQL, quoted) {
+			t.Errorf("findingsBucketSkillSQL %q must splice %s as %q", findingsBucketSkillSQL, name, quoted)
+		}
+	}
+}
+
+func TestFindings_importsShownByDefault(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/imp", Name: "imp"}
+	s.DB.Create(&repo)
+	// An operator import: kind=import, with the producing tool in skill_name.
+	imp := db.Scan{RepositoryID: repo.ID, Kind: "import", Status: db.ScanDone, SkillName: "CodeQL"}
+	s.DB.Create(&imp)
+	// A genuine tool scanner running as a skill must stay hidden by default.
+	sg := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "semgrep"}
+	s.DB.Create(&sg)
+	s.DB.Create(&db.Finding{ScanID: imp.ID, RepositoryID: repo.ID, Title: "imported-finding", Severity: "High"})
+	s.DB.Create(&db.Finding{ScanID: sg.ID, RepositoryID: repo.ID, Title: "semgrep-finding", Severity: "High"})
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", "/findings"))
+	body := w.Body.String()
+	if !strings.Contains(body, "imported-finding") {
+		t.Error("imported findings should appear in the default findings list")
+	}
+	if strings.Contains(body, "semgrep-finding") {
+		t.Error("tool-scanner findings should still be hidden by default")
+	}
+	// The scanners toggle counts only the genuine scanner, not the import.
+	if !strings.Contains(body, "Include scanners (1)") {
+		t.Errorf("scanner badge should count only the semgrep finding, not the import: %s", body)
+	}
+}
+
 func TestFindingShow_rendersMissedCount(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -1293,6 +1557,43 @@ func TestFindingShow_rendersMissedCount(t *testing.T) {
 	}
 }
 
+func TestFindingShow_rendersLatestVerificationScore(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "security-deep-dive"}
+	s.DB.Create(&scan)
+	finding := db.Finding{
+		ScanID: scan.ID, RepositoryID: repo.ID, Title: "graded", Severity: "Medium", Status: db.FindingEnriched,
+		SeverityCaps: "authorization control held; severity capped at Medium", SeverityCalibrationIncomplete: true,
+	}
+	s.DB.Create(&finding)
+	verifyScan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: verifySkillName, FindingID: new(finding.ID)}
+	s.DB.Create(&verifyScan)
+	score := 1.0
+	s.DB.Create(&db.FindingVerification{
+		FindingID: finding.ID, ScanID: verifyScan.ID, Status: "confirmed", Score: &score,
+		Report: `{"status":"confirmed","attack_tree":{"goal":"Trigger parser panic","root_id":"AT1","verdict":"reachable","nodes":[{"id":"AT1","parent_id":null,"kind":"goal","description":"Trigger parser panic","status":"satisfied","evidence":"attempts 1-3 panic"},{"id":"AT2","parent_id":"AT1","kind":"entry_point","description":"Call public Parse","status":"satisfied","evidence":"api.go:18"},{"id":"AT3","parent_id":"AT2","kind":"sink","description":"Reach parser sink","status":"satisfied","evidence":"parser.go:42"}],"blockers":[]},"attempts":[{"number":1,"outcome":"reproduced","evidence":"same panic","failure_class":"panic","crash_site":"parser.go:42"},{"number":2,"outcome":"reproduced","evidence":"same panic","failure_class":"panic","crash_site":"parser.go:42"},{"number":3,"outcome":"reproduced","evidence":"same panic","failure_class":"panic","crash_site":"parser.go:42"}],"criteria":{"poc_well_formed":{"verdict":"pass","method":"run","evidence":"parsed","counterevidence":"","proof_gap":"","confidence":"high"},"reproduces_three_of_three":{"verdict":"pass","method":"run three times","evidence":"3/3","counterevidence":"","proof_gap":"","confidence":"high"},"claimed_failure_class":{"verdict":"pass","method":"trace","evidence":"panic","counterevidence":"","proof_gap":"","confidence":"high"},"public_interface_to_first_party_sink":{"verdict":"pass","method":"stack","evidence":"public API to parser.go","counterevidence":"","proof_gap":"","confidence":"high"},"deterministic":{"verdict":"pass","method":"compare","evidence":"same site","counterevidence":"","proof_gap":"","confidence":"high"},"control_bypass":{"matched_controls":[],"assessments":[]}}}`,
+	})
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/findings/%d", finding.ID)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{"Verification history", "confirmed", "100%", "Attack path", "Parent", "reachable", "Trigger parser panic", "AT2", "Reach parser sink", "PoC well formed", "#1", "same panic", "authorization control held; severity capped at Medium", "Calibration incomplete", fmt.Sprintf("scan #%d", verifyScan.ID)} {
+		if !strings.Contains(body, want) {
+			t.Errorf("finding page missing %q", want)
+		}
+	}
+	if strings.Contains(body, "Control bypass") {
+		t.Error("finding page should omit an empty control-bypass gate")
+	}
+}
+
 func TestFindingShow_disablesVerifyActionWhenVerifyInFlight(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -1312,10 +1613,10 @@ func TestFindingShow_disablesVerifyActionWhenVerifyInFlight(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", w.Code, body)
 	}
-	if strings.Contains(body, fmt.Sprintf(`hx-post="/findings/%d/verify"`, f.ID)) {
-		t.Error("finding page should not render an active verify action while verify is in flight")
+	if strings.Contains(body, "Run verification</button>") || strings.Contains(body, "Rerun verification</button>") {
+		t.Error("finding page should not render a verify submit button while verify is in flight")
 	}
-	if !strings.Contains(body, `button type="button" class="btn" disabled`) || !strings.Contains(body, "Verify in progress") {
+	if !strings.Contains(body, `maxlength="4000" disabled`) || !strings.Contains(body, `button type="button" class="btn-outline" disabled`) || !strings.Contains(body, "Verification in progress") {
 		t.Errorf("finding page should render disabled verify state, body=%s", body)
 	}
 }
@@ -1420,6 +1721,57 @@ func TestFindingShow_hidesExposureForZizmorFindings(t *testing.T) {
 	}
 }
 
+func TestFindingShow_hidesExposureWhenNoDependents(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&scan)
+	f := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "app issue", Severity: "High"}
+	s.DB.Create(&f)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/findings/%d", f.ID)))
+	body := w.Body.String()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, body)
+	}
+	if strings.Contains(body, "Dependent exposure") || strings.Contains(body, "/exposure") {
+		t.Error("findings without dependents should not render dependent exposure controls")
+	}
+	if strings.Contains(body, "CSAF VEX") {
+		t.Error("findings without dependents should not advertise CSAF VEX in the disclosure bundle")
+	}
+}
+
+func TestFindingShow_rendersExposureWhenDependentsExist(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&scan)
+	f := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "library issue", Severity: "High"}
+	s.DB.Create(&f)
+	dep := db.Dependent{RepositoryID: repo.ID, Name: "downstream", Ecosystem: "go", RepositoryURL: "https://example.com/downstream"}
+	s.DB.Create(&dep)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/findings/%d", f.ID)))
+	body := w.Body.String()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, body)
+	}
+	for _, want := range []string{"Dependent exposure", "/exposure", "CSAF VEX"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dependent-backed finding missing %q", want)
+		}
+	}
+}
+
 func TestFindingShow_rendersPublicIssueActionForReadyFinding(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -1469,6 +1821,274 @@ func TestFindingShow_hidesPublicIssueActionForHighSeverityReadyFinding(t *testin
 		if strings.Contains(body, "File public issue") {
 			t.Errorf("%s ready finding page should not render public issue label", severity)
 		}
+	}
+}
+
+func TestFindingShow_operatorWorkflowWhenNoDependents(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/foo/app", Name: "app"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&scan)
+
+	cases := []struct {
+		status db.FindingLifecycle
+		want   []string
+	}{
+		{db.FindingTriaged, []string{"Triaged, ready for operator handoff", "patch or mitigation"}},
+		{db.FindingReady, []string{"Remediation handoff ready", "share with the operator", "Mark shared"}},
+		{db.FindingReported, []string{"Shared with operator", "remediation owner"}},
+		{db.FindingAcknowledged, []string{"Operator acknowledged", "remediation owner is working on a fix"}},
+		{db.FindingFixed, []string{"internal advisory"}},
+		{db.FindingPublished, []string{"Closed out", "Internal advisory or remediation follow-up is complete"}},
+	}
+	for _, tc := range cases {
+		f := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: string(tc.status) + " finding",
+			Severity: "High", Status: tc.status}
+		s.DB.Create(&f)
+
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/findings/%d", f.ID)))
+		body := w.Body.String()
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status %d: %s", tc.status, w.Code, body)
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s finding page missing no-dependent workflow text %q", tc.status, want)
+			}
+		}
+		for _, gone := range []string{"send to the maintainer", "Mark as reported"} {
+			if strings.Contains(body, gone) {
+				t.Errorf("%s finding page should not render dependent-disclosure text %q", tc.status, gone)
+			}
+		}
+	}
+}
+
+func TestFindingShow_dependentWorkflowWhenDependentsExist(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/foo/lib", Name: "lib"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&scan)
+	s.DB.Create(&db.Dependent{RepositoryID: repo.ID, Name: "downstream", Ecosystem: "npm"})
+	f := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "ready finding",
+		Severity: "High", Status: db.FindingReady, DisclosureDraft: "## Summary\n\nReviewed draft."}
+	s.DB.Create(&f)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/findings/%d", f.ID)))
+	body := w.Body.String()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, body)
+	}
+	for _, want := range []string{"Disclosure draft ready", "send to the maintainer", "Mark as reported"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("dependent workflow missing %q", want)
+		}
+	}
+	for _, gone := range []string{"Remediation handoff ready", "Mark shared"} {
+		if strings.Contains(body, gone) {
+			t.Errorf("dependent workflow should not render no-dependent text %q", gone)
+		}
+	}
+}
+
+func TestFindingShow_disclosureWorkflowStates(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/foo/lib", Name: "lib"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&scan)
+	s.DB.Create(&db.Dependent{RepositoryID: repo.ID, Name: "downstream", Ecosystem: "npm"})
+
+	noDraft := db.Finding{
+		ScanID: scan.ID, RepositoryID: repo.ID, Title: "awaiting draft",
+		Severity: "High", Status: db.FindingTriaged,
+	}
+	withDraft := db.Finding{
+		ScanID: scan.ID, RepositoryID: repo.ID, Title: "drafted finding",
+		Severity: "High", Status: db.FindingTriaged,
+		DisclosureDraft: "## Summary\n\nA saved **disclosure** with `inline code`.\n",
+	}
+	s.DB.Create(&noDraft)
+	s.DB.Create(&withDraft)
+
+	renderFinding := func(id uint) string {
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/findings/%d", id)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("finding %d status %d: %s", id, w.Code, w.Body)
+		}
+		return w.Body.String()
+	}
+
+	before := renderFinding(noDraft.ID)
+	if !strings.Contains(before, "Draft disclosure") {
+		t.Errorf("finding without a draft is missing the generation action:\n%s", before)
+	}
+	if !strings.Contains(before, "Export report") || strings.Contains(before, "Export disclosure") {
+		t.Errorf("finding without a draft should retain the generic report export:\n%s", before)
+	}
+	for _, want := range []string{
+		`id="disclosure"`,
+		`data-disclosure-editor`,
+		`action="/findings/` + strconv.FormatUint(uint64(noDraft.ID), 10) + `/disclosure-draft"`,
+		`name="disclosure_draft"`,
+		`data-disclosure-form>`,
+		`data-disclosure-preview hidden>`,
+		`<div id="disclosure-edit-panel-`,
+		`role="tab"`,
+		`role="tabpanel"`,
+		`data-disclosure-preview-stale`,
+		"Nothing saved yet. Save your draft to preview it.",
+		"Write or paste a disclosure draft below",
+	} {
+		if !strings.Contains(before, want) {
+			t.Errorf("finding without a draft is missing manual editor state %q:\n%s", want, before)
+		}
+	}
+	if strings.Contains(before, "Review disclosure") || strings.Contains(before, "Needs review") {
+		t.Errorf("finding without a draft rendered generated-draft affordances:\n%s", before)
+	}
+	if strings.Contains(before, "Showing the saved draft. Save your edits to update this preview.") {
+		t.Errorf("finding without a draft claims it is previewing saved text:\n%s", before)
+	}
+	if strings.Contains(before, `<form id="disclosure-edit-panel-`) {
+		t.Errorf("edit form must not override its native ARIA role:\n%s", before)
+	}
+	if !strings.Contains(before, `disabled title="A saved disclosure draft is required before marking ready"`) {
+		t.Errorf("finding without a draft does not visibly gate Mark ready:\n%s", before)
+	}
+
+	after := renderFinding(withDraft.ID)
+	for _, want := range []string{
+		"Draft generated",
+		"Needs review",
+		"Export disclosure",
+		`href="#disclosure"`,
+		"Review disclosure",
+		"Regenerate draft",
+		`hx-confirm="Regenerating may overwrite the latest saved disclosure edits. Continue?"`,
+		`id="disclosure"`,
+		`data-disclosure-preview`,
+		`data-disclosure-preview-stale`,
+		`data-disclosure-editor`,
+		`data-disclosure-form hidden>`,
+		`role="tab"`,
+		`role="tabpanel"`,
+		"Showing the saved draft. Save your edits to update this preview.",
+		`action="/findings/` + strconv.FormatUint(uint64(withDraft.ID), 10) + `/disclosure-draft"`,
+		`name="disclosure_draft"`,
+		">Preview<",
+		">Edit<",
+		">Save<",
+		">Cancel<",
+		`href="/findings/` + strconv.FormatUint(uint64(withDraft.ID), 10) + `/disclosure.md"`,
+		`href="/findings/` + strconv.FormatUint(uint64(withDraft.ID), 10) + `/report.md"`,
+		"Export finding report",
+	} {
+		if !strings.Contains(after, want) {
+			t.Errorf("finding with a draft is missing %q:\n%s", want, after)
+		}
+	}
+	if strings.Count(after, `name="disclosure_draft"`) != 1 {
+		t.Errorf("disclosure draft should have one obvious editor, got %d:\n%s",
+			strings.Count(after, `name="disclosure_draft"`), after)
+	}
+	if strings.Contains(after, "Nothing saved yet. Save your draft to preview it.") {
+		t.Errorf("finding with a draft rendered empty-draft preview copy:\n%s", after)
+	}
+
+	queued := db.Scan{
+		RepositoryID: repo.ID, Kind: worker.JobSkill, SkillName: discloseSkillName,
+		FindingID: &noDraft.ID, Status: db.ScanQueued, StatusPriority: db.StatusPriorityFor(db.ScanQueued),
+	}
+	s.DB.Create(&queued)
+	drafting := renderFinding(noDraft.ID)
+	if !strings.Contains(drafting, "Drafting disclosure") || strings.Contains(drafting, `hx-post="/findings/`+strconv.FormatUint(uint64(noDraft.ID), 10)+`/disclose"`) {
+		t.Errorf("queued first draft did not disable disclosure enqueue: %s", drafting)
+	}
+
+	running := db.Scan{
+		RepositoryID: repo.ID, Kind: worker.JobSkill, SkillName: discloseSkillName,
+		FindingID: &withDraft.ID, Status: db.ScanRunning, StatusPriority: db.StatusPriorityFor(db.ScanRunning),
+	}
+	s.DB.Create(&running)
+	regenerating := renderFinding(withDraft.ID)
+	if !strings.Contains(regenerating, "Regeneration in progress") || !strings.Contains(regenerating, "Review disclosure") ||
+		strings.Contains(regenerating, `hx-post="/findings/`+strconv.FormatUint(uint64(withDraft.ID), 10)+`/disclose"`) {
+		t.Errorf("running regeneration did not preserve review and disable enqueue: %s", regenerating)
+	}
+}
+
+func TestFindingShow_readyWithoutDraftOffersEditor(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/foo/lib", Name: "lib"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&scan)
+	s.DB.Create(&db.Dependent{RepositoryID: repo.ID, Name: "downstream", Ecosystem: "npm"})
+	finding := db.Finding{
+		ScanID: scan.ID, RepositoryID: repo.ID, Title: "historical ready finding",
+		Severity: "High", Status: db.FindingReady,
+	}
+	s.DB.Create(&finding)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/findings/%d", finding.ID)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`id="disclosure"`, `data-disclosure-form>`, "No saved disclosure draft", "Write or paste a disclosure draft below"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("historical ready finding missing %q: %s", want, body)
+		}
+	}
+	if strings.Contains(body, "The saved draft is prepared") || strings.Contains(body, "Review disclosure") {
+		t.Errorf("historical ready finding claims a saved draft exists: %s", body)
+	}
+}
+
+func TestFindingStatus_readyRequiresDisclosureDraft(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := seedFindingForForm(t, s)
+	if err := s.DB.Model(&f).Update("status", db.FindingTriaged).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	path := fmt.Sprintf("/findings/%d/status", f.ID)
+	w := postForm(t, s, path, url.Values{"status": {string(db.FindingReady)}})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status without draft = %d, want 422; body=%s", w.Code, w.Body)
+	}
+	var got db.Finding
+	s.DB.First(&got, f.ID)
+	if got.Status != db.FindingTriaged {
+		t.Errorf("status changed without a draft: %q", got.Status)
+	}
+
+	if err := db.WriteFindingField(s.DB, f.ID, "disclosure_draft", "## Reviewed draft", db.SourceAnalyst, ""); err != nil {
+		t.Fatal(err)
+	}
+	w = postForm(t, s, path, url.Values{"status": {string(db.FindingReady)}})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status with draft = %d, want 303; body=%s", w.Code, w.Body)
+	}
+	s.DB.First(&got, f.ID)
+	if got.Status != db.FindingReady {
+		t.Errorf("status = %q, want ready", got.Status)
 	}
 }
 
@@ -1779,6 +2399,142 @@ func TestMaintainersSortOptions(t *testing.T) {
 	}
 }
 
+func TestMaintainersSortByRepositoryAndFindingCounts(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	maintainers := []db.Maintainer{
+		{Login: "none", Name: "A None"},
+		{Login: "one", Name: "B One"},
+		{Login: "many", Name: "C Many"},
+		{Login: "noisy", Name: "D Noisy"},
+	}
+	for i := range maintainers {
+		if err := s.DB.Create(&maintainers[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type repoSeed struct {
+		name       string
+		maintainer int
+		skill      string
+		findings   int
+	}
+	seeds := []repoSeed{
+		{name: "one", maintainer: 1, skill: deepDiveSkillName, findings: 1},
+		{name: "many-a", maintainer: 2, skill: deepDiveSkillName, findings: 1},
+		{name: "many-b", maintainer: 2, skill: "trivy", findings: 1},
+		{name: "noisy", maintainer: 3, skill: "semgrep", findings: 5},
+	}
+	for _, seed := range seeds {
+		repo := db.Repository{URL: "https://github.com/example/" + seed.name, Name: seed.name}
+		if err := s.DB.Create(&repo).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DB.Model(&repo).Association("Maintainers").Append(&maintainers[seed.maintainer]); err != nil {
+			t.Fatal(err)
+		}
+		kind := "skill"
+		if seed.skill == "trivy" {
+			kind = "import"
+		}
+		scan := db.Scan{RepositoryID: repo.ID, Kind: kind, Status: db.ScanDone, SkillName: seed.skill}
+		if err := s.DB.Create(&scan).Error; err != nil {
+			t.Fatal(err)
+		}
+		for i := range seed.findings {
+			finding := db.Finding{
+				ScanID: scan.ID, RepositoryID: repo.ID,
+				Title: fmt.Sprintf("%s-%d", seed.name, i), Severity: "High",
+			}
+			if err := s.DB.Create(&finding).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	order := func(path string) []string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, localReq("GET", path))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status %d: %s", path, w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		logins := []string{"none", "one", "many", "noisy"}
+		positions := make(map[string]int, len(logins))
+		for _, login := range logins {
+			positions[login] = strings.Index(body, ">"+login+"</td>")
+			if positions[login] < 0 {
+				t.Fatalf("%s missing maintainer %q", path, login)
+			}
+		}
+		sort.Slice(logins, func(i, j int) bool {
+			return positions[logins[i]] < positions[logins[j]]
+		})
+		return logins
+	}
+
+	assertOrder := func(path string, want []string) {
+		t.Helper()
+		if got := order(path); !slices.Equal(got, want) {
+			t.Errorf("%s order = %v, want %v", path, got, want)
+		}
+	}
+	assertOrder("/maintainers?sort=findings", []string{"many", "one", "none", "noisy"})
+	assertOrder("/maintainers?sort=findings.asc", []string{"none", "noisy", "one", "many"})
+	assertOrder("/maintainers?sort=repos", []string{"many", "one", "noisy", "none"})
+	assertOrder("/maintainers?sort=repos.asc", []string{"none", "one", "noisy", "many"})
+}
+
+func TestMaintainersCountSortRunsBeforePagination(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	for i := range perPage {
+		m := db.Maintainer{Login: fmt.Sprintf("filler-%02d", i), Name: fmt.Sprintf("A Filler %02d", i)}
+		if err := s.DB.Create(&m).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	priority := db.Maintainer{Login: "priority", Name: "Z Priority"}
+	if err := s.DB.Create(&priority).Error; err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "https://github.com/example/priority", Name: "priority"}
+	if err := s.DB.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Model(&repo).Association("Maintainers").Append(&priority); err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	if err := s.DB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&db.Finding{
+		ScanID: scan.ID, RepositoryID: repo.ID, Title: "priority finding", Severity: "High",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	for _, key := range []string{"repos", "findings"} {
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, localReq("GET", "/maintainers?sort="+key))
+		if w.Code != http.StatusOK {
+			t.Fatalf("sort=%s status %d: %s", key, w.Code, w.Body.String())
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, ">priority</td>") {
+			t.Errorf("sort=%s omitted high-count maintainer from page one", key)
+		}
+		if got := strings.Count(body, `<tr id="maintainer-`); got != perPage {
+			t.Errorf("sort=%s rendered %d rows, want %d", key, got, perPage)
+		}
+	}
+}
+
 func TestMaintainersSearchFilters(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -1889,7 +2645,8 @@ func TestFindingDiscloseEnqueuesDiscloseSkill(t *testing.T) {
 	if w.Code != http.StatusSeeOther {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
-	if !strings.HasPrefix(w.Header().Get("Location"), "/scans/") {
+	firstLocation := w.Header().Get("Location")
+	if !strings.HasPrefix(firstLocation, "/scans/") {
 		t.Errorf("expected redirect to scan, got %q", w.Header().Get("Location"))
 	}
 
@@ -1900,6 +2657,17 @@ func TestFindingDiscloseEnqueuesDiscloseSkill(t *testing.T) {
 	}
 	if row.APIToken == "" {
 		t.Error("scan missing api token")
+	}
+
+	w = httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req.Clone(req.Context()))
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != firstLocation {
+		t.Errorf("duplicate disclose = %d redirect %q, want existing scan %q", w.Code, w.Header().Get("Location"), firstLocation)
+	}
+	var count int64
+	s.DB.Model(&db.Scan{}).Where("finding_id = ? AND skill_name = ?", finding.ID, discloseSkillName).Count(&count)
+	if count != 1 {
+		t.Errorf("disclose scans = %d, want one in-flight scan", count)
 	}
 }
 
@@ -2000,6 +2768,60 @@ func TestFindingPatchRunEnqueuesPatchSkill(t *testing.T) {
 	s.DB.Where("skill_id = ?", patch.ID).First(&row)
 	if row.FindingID == nil || *row.FindingID != finding.ID {
 		t.Errorf("scan FindingID = %v, want %d", row.FindingID, finding.ID)
+	}
+}
+
+func TestFindingReattackRunPinsLatestRemediationAttempt(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/foo/bar", Name: "bar"}
+	s.DB.Create(&repo)
+	parent := db.Scan{RepositoryID: repo.ID, Kind: worker.JobSkill, Status: db.ScanDone, SkillName: "security-deep-dive"}
+	s.DB.Create(&parent)
+	finding := db.Finding{ScanID: parent.ID, RepositoryID: repo.ID, FindingID: "F1", Title: "x", Severity: "High", Status: db.FindingTriaged}
+	s.DB.Create(&finding)
+	patchScan := db.Scan{RepositoryID: repo.ID, Kind: worker.JobSkill, Status: db.ScanDone, SkillName: patchSkillName, FindingID: &finding.ID}
+	s.DB.Create(&patchScan)
+	attempt := db.RemediationAttempt{FindingID: finding.ID, PatchScanID: patchScan.ID, Attempt: 1, Patch: "diff", BaseCommit: "deadbeef"}
+	s.DB.Create(&attempt)
+	skill := db.Skill{Name: reattackSkillName, Body: "b", OutputFile: "report.json", OutputKind: "reattack", Version: 1, Active: true, Source: "ui"}
+	s.DB.Create(&skill)
+
+	req := httptest.NewRequest("POST", fmt.Sprintf("/findings/%d/reattack", finding.ID), nil)
+	req.Host = testHost
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	var scan db.Scan
+	if err := s.DB.Where("skill_id = ?", skill.ID).First(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	if scan.RemediationAttemptID == nil || *scan.RemediationAttemptID != attempt.ID || scan.Ref != attempt.BaseCommit {
+		t.Errorf("reattack scan = %+v, want attempt %d at ref %q", scan, attempt.ID, attempt.BaseCommit)
+	}
+}
+
+func TestFindingReattackRunRequiresGatedPatch(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	repo := db.Repository{URL: "https://github.com/foo/bar", Name: "bar"}
+	s.DB.Create(&repo)
+	parent := db.Scan{RepositoryID: repo.ID, Kind: worker.JobSkill, Status: db.ScanDone}
+	s.DB.Create(&parent)
+	finding := db.Finding{ScanID: parent.ID, RepositoryID: repo.ID, Title: "x", Severity: "High"}
+	s.DB.Create(&finding)
+	s.DB.Create(&db.Skill{Name: reattackSkillName, Body: "b", OutputFile: "report.json", OutputKind: "reattack", Active: true})
+	req := httptest.NewRequest("POST", fmt.Sprintf("/findings/%d/reattack", finding.ID), nil)
+	req.Host = testHost
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d, want 412: %s", w.Code, w.Body)
 	}
 }
 
@@ -2106,7 +2928,7 @@ func TestEnqueueSkillWith_effort(t *testing.T) {
 	}
 }
 
-func TestEnqueueSkillWith_stampsSkillsRepoSHA(t *testing.T) {
+func TestEnqueueSkillWith_stampsBenchmarkVersionFields(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	s.SkillsRepoSHA = "feedface0123456789abcdef0123456789abcdef"
@@ -2114,7 +2936,7 @@ func TestEnqueueSkillWith_stampsSkillsRepoSHA(t *testing.T) {
 	repo := db.Repository{URL: "https://github.com/foo/bar", Name: "bar"}
 	s.DB.Create(&repo)
 	skill := db.Skill{Name: "lite", Body: "b", OutputFile: "r.json", OutputKind: "freeform",
-		Version: 1, Active: true, Source: "ui"}
+		Version: 7, Metadata: `{"scrutineer.version":1}`, Active: true, Source: "ui"}
 	s.DB.Create(&skill)
 
 	scanID, err := s.enqueueSkillWith(context.Background(), repo.ID, skill.ID, ScanOpts{})
@@ -2125,6 +2947,12 @@ func TestEnqueueSkillWith_stampsSkillsRepoSHA(t *testing.T) {
 	s.DB.First(&sc, scanID)
 	if sc.SkillsRepoSHA != s.SkillsRepoSHA {
 		t.Errorf("scan.SkillsRepoSHA = %q, want %q", sc.SkillsRepoSHA, s.SkillsRepoSHA)
+	}
+	if sc.SkillVersion != skill.Version {
+		t.Errorf("scan.SkillVersion = %d, want %d", sc.SkillVersion, skill.Version)
+	}
+	if sc.SkillSchemaVersion != 1 {
+		t.Errorf("scan.SkillSchemaVersion = %d, want 1", sc.SkillSchemaVersion)
 	}
 }
 
@@ -2200,6 +3028,33 @@ func TestEnqueueSkillWith_profileMismatch(t *testing.T) {
 
 	if _, err := s.enqueueSkillWith(context.Background(), repo.ID, phpSkill.ID, ScanOpts{}); err != nil {
 		t.Errorf("empty profile (auto-detect) should not be gated at enqueue, got %v", err)
+	}
+}
+
+func TestEnqueueSkillWith_queueFailureMarksScanFailed(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/foo/bar", Name: "bar"}
+	s.DB.Create(&repo)
+	skill := db.Skill{Name: "audit", Body: "b", OutputFile: "r.json", OutputKind: "freeform", Version: 1, Active: true, Source: "ui"}
+	s.DB.Create(&skill)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := s.enqueueSkillWith(ctx, repo.ID, skill.ID, ScanOpts{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("enqueue error = %v, want context canceled", err)
+	}
+
+	var scan db.Scan
+	if err := s.DB.Where("repository_id = ? AND skill_id = ?", repo.ID, skill.ID).First(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	if scan.Status != db.ScanFailed || scan.StatusPriority != db.StatusPriorityFor(db.ScanFailed) {
+		t.Errorf("scan status = %q priority = %d, want failed/%d", scan.Status, scan.StatusPriority, db.StatusPriorityFor(db.ScanFailed))
+	}
+	if scan.FinishedAt == nil || !strings.Contains(scan.Error, "context canceled") {
+		t.Errorf("scan failure fields = %+v", scan)
 	}
 }
 
@@ -2396,6 +3251,87 @@ func TestRepoScanAll(t *testing.T) {
 	}
 	if f := flashFrom(t, w); !strings.Contains(f.Title, "2 queued") || !strings.Contains(f.Title, "1 already running") {
 		t.Errorf("flash = %q, want 2 queued / 1 already running", f.Title)
+	}
+	// The cohort shares one non-empty scan_group so each sibling can read the
+	// others' findings via ?scan_group= while they run in parallel.
+	if queued[0].ScanGroup == "" {
+		t.Error("scan-all cohort should carry a scan_group")
+	}
+	if queued[0].ScanGroup != queued[1].ScanGroup {
+		t.Errorf("scan-all scans should share one scan_group, got %q and %q",
+			queued[0].ScanGroup, queued[1].ScanGroup)
+	}
+}
+
+func TestRepoScan_setsScanGroup(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/foo/bar", Name: "bar"}
+	s.DB.Create(&repo)
+	deepDive := db.Skill{Name: deepDiveSkillName, Body: "b", OutputFile: "r.json",
+		OutputKind: "freeform", Version: 1, Active: true, Source: "ui"}
+	s.DB.Create(&deepDive)
+
+	req := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/scan", repo.ID), nil)
+	req.Host = testHost
+	s.Handler().ServeHTTP(httptest.NewRecorder(), req)
+
+	var sc db.Scan
+	if err := s.DB.Where("repository_id = ?", repo.ID).First(&sc).Error; err != nil {
+		t.Fatalf("no scan created: %v", err)
+	}
+	if sc.ScanGroup == "" {
+		t.Error("a single New-scan run should still carry a scan_group")
+	}
+}
+
+func TestRepoScan_diffRescanQueuesGroupedSkills(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/foo/bar", Name: "bar"}
+	s.DB.Create(&repo)
+	for _, name := range []string{reconSkillName, historySkillName, "embedded-native", threatModelSkillName, "semgrep", deepDiveSkillName} {
+		s.DB.Create(&db.Skill{Name: name, Body: "b", OutputFile: "r.json",
+			OutputKind: "freeform", Version: 1, Active: true, Source: "ui"})
+	}
+
+	body := strings.NewReader("rescan_mode=diff")
+	req := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/scan", repo.ID), body)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Host = testHost
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	var scans []db.Scan
+	if err := s.DB.Where("repository_id = ?", repo.ID).Order("skill_name").Find(&scans).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(scans) != 5 {
+		t.Fatalf("queued scans = %d, want 5", len(scans))
+	}
+	group := scans[0].ScanGroup
+	if group == "" {
+		t.Fatal("diff rescan group is empty")
+	}
+	gotNames := map[string]bool{}
+	for _, sc := range scans {
+		gotNames[sc.SkillName] = true
+		if sc.RescanMode != db.ScanRescanModeDiff {
+			t.Errorf("%s RescanMode = %q, want diff", sc.SkillName, sc.RescanMode)
+		}
+		if sc.ScanGroup != group {
+			t.Errorf("%s ScanGroup = %q, want shared %q", sc.SkillName, sc.ScanGroup, group)
+		}
+	}
+	for _, name := range []string{reconSkillName, historySkillName, "embedded-native", threatModelSkillName, "semgrep"} {
+		if !gotNames[name] {
+			t.Errorf("missing queued %s scan", name)
+		}
+	}
+	if gotNames[deepDiveSkillName] {
+		t.Error("diff rescan should wait for threat-model to fan out deep dives")
 	}
 }
 
@@ -2972,6 +3908,42 @@ func TestBulkImport_skipsDuplicates(t *testing.T) {
 	}
 }
 
+func TestBulkImport_subPathQueuesOnExistingRepo(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	triage := db.Skill{Name: "triage", Description: "o", Body: "b", Active: true, Source: "ui", Version: 1}
+	s.DB.Create(&triage)
+	repo := db.Repository{URL: "https://github.com/rails/rails", Name: "rails"}
+	s.DB.Create(&repo)
+
+	// The repo already exists, but this line names a sub-package, so it queues
+	// a scoped scan rather than being a no-op re-add.
+	form := url.Values{"urls": {"https://github.com/rails/rails#activesupport"}}
+	req := httptest.NewRequest("POST", "/repositories/bulk", strings.NewReader(form.Encode()))
+	req.Host = testHost
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	f := flashFrom(t, w)
+	if !strings.Contains(f.Title, "queued") || strings.Contains(f.Title, "already present") {
+		t.Errorf("existing-repo sub-path add should report queued, not already present: %+v", f)
+	}
+	var scans []db.Scan
+	s.DB.Where("skill_id = ? AND sub_path = ?", triage.ID, "activesupport").Find(&scans)
+	if len(scans) != 1 {
+		t.Errorf("want 1 activesupport-scoped scan, got %d", len(scans))
+	}
+	var n int64
+	s.DB.Model(&db.Subproject{}).Where("repository_id = ? AND path = ?", repo.ID, "activesupport").Count(&n)
+	if n != 1 {
+		t.Errorf("want the submitted subproject recorded, got %d", n)
+	}
+}
+
 func TestBulkImport_rejectsNonHTTPS(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -3206,6 +4178,91 @@ func TestRepoList_showsLastScanDate(t *testing.T) {
 	}
 }
 
+func TestRepoList_statusScanPrecedence(t *testing.T) {
+	type scanSeed struct {
+		status db.ScanStatus
+		at     time.Time
+	}
+	cases := []struct {
+		name       string
+		scans      []scanSeed
+		wantBadge  string
+		wantAbsent string
+		wantLatest string
+	}{
+		{
+			name: "running beats newer queued",
+			scans: []scanSeed{
+				{status: db.ScanRunning, at: time.Date(2026, time.July, 1, 9, 45, 0, 0, time.UTC)},
+				{status: db.ScanQueued, at: time.Date(2026, time.July, 1, 9, 47, 0, 0, time.UTC)},
+			},
+			wantBadge:  "running",
+			wantAbsent: "queued",
+			wantLatest: "2026-07-01 09:47",
+		},
+		{
+			name: "queued beats newer paused",
+			scans: []scanSeed{
+				{status: db.ScanQueued, at: time.Date(2026, time.July, 1, 10, 1, 0, 0, time.UTC)},
+				{status: db.ScanPaused, at: time.Date(2026, time.July, 1, 10, 2, 0, 0, time.UTC)},
+			},
+			wantBadge:  "queued",
+			wantLatest: "2026-07-01 10:02",
+		},
+		{
+			name: "paused beats newer terminal",
+			scans: []scanSeed{
+				{status: db.ScanPaused, at: time.Date(2026, time.July, 1, 10, 3, 0, 0, time.UTC)},
+				{status: db.ScanDone, at: time.Date(2026, time.July, 1, 10, 4, 0, 0, time.UTC)},
+			},
+			wantBadge:  "paused",
+			wantLatest: "2026-07-01 10:04",
+		},
+		{
+			name: "terminal only uses latest terminal",
+			scans: []scanSeed{
+				{status: db.ScanDone, at: time.Date(2026, time.July, 1, 10, 5, 0, 0, time.UTC)},
+				{status: db.ScanFailed, at: time.Date(2026, time.July, 1, 10, 6, 0, 0, time.UTC)},
+			},
+			wantBadge:  "failed",
+			wantLatest: "2026-07-01 10:06",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+			repo := db.Repository{URL: "https://github.com/homebrew/ruby-macho/" + strings.ReplaceAll(tc.name, " ", "-"), Name: "ruby-macho"}
+			s.DB.Create(&repo)
+			for i, seed := range tc.scans {
+				s.DB.Create(&db.Scan{
+					RepositoryID: repo.ID,
+					Kind:         "skill",
+					SkillName:    fmt.Sprintf("skill-%d", i),
+					Status:       seed.status,
+					CreatedAt:    seed.at,
+				})
+			}
+
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, localReq("GET", "/"))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", w.Code, w.Body)
+			}
+			row := requireRepoListRow(t, w.Body.String(), repo.ID)
+			if !strings.Contains(row, " "+tc.wantBadge+"</span>") {
+				t.Errorf("repo row status = %s, want %s", row, tc.wantBadge)
+			}
+			if tc.wantAbsent != "" && strings.Contains(row, " "+tc.wantAbsent+"</span>") {
+				t.Errorf("repo row should not render %s: %s", tc.wantAbsent, row)
+			}
+			if !strings.Contains(row, tc.wantLatest) {
+				t.Errorf("last scan timestamp should still come from the newest scan: %s", row)
+			}
+		})
+	}
+}
+
 func TestLayout_linksToProjectResources(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -3296,34 +4353,67 @@ func TestScansIndex_maxTurnsScanShowsBadgeAndRetry(t *testing.T) {
 	}
 }
 
-func TestRetry_preservesSubPath(t *testing.T) {
-	s, done := newTestServer(t)
-	defer done()
-
-	repo := db.Repository{URL: "https://github.com/apache/airflow.git", Name: "airflow"}
-	s.DB.Create(&repo)
-	skill := db.Skill{Name: "security-deep-dive", Description: "x", Body: "b", Active: true, Source: "ui", Version: 1}
-	s.DB.Create(&skill)
-	orig := db.Scan{
-		RepositoryID: repo.ID, Kind: "skill", Status: db.ScanFailed,
-		SkillID: &skill.ID, SkillName: "security-deep-dive",
-		SubPath: "airflow-core", FinishedAt: new(time.Now()),
+func TestRetry_preservesScanFields(t *testing.T) {
+	cases := []struct {
+		name  string
+		set   func(*db.Scan)
+		check func(*testing.T, db.Scan)
+	}{
+		{"sub_path", func(sc *db.Scan) { sc.SubPath = "airflow-core" }, func(t *testing.T, f db.Scan) {
+			if f.SubPath != "airflow-core" {
+				t.Errorf("retry lost sub-path: got %q, want airflow-core", f.SubPath)
+			}
+		}},
+		{"scan_group", func(sc *db.Scan) { sc.ScanGroup = "grp-7" }, func(t *testing.T, f db.Scan) {
+			if f.ScanGroup != "grp-7" {
+				t.Errorf("retry lost scan group: got %q, want grp-7", f.ScanGroup)
+			}
+		}},
+		{"focus_area", func(sc *db.Scan) { sc.FocusArea = `{"name":"parser","paths":["src/**"],"surface":"request bytes"}` }, func(t *testing.T, f db.Scan) {
+			if f.FocusArea == "" || !strings.Contains(f.FocusArea, `"name":"parser"`) {
+				t.Errorf("retry lost focus area: %q", f.FocusArea)
+			}
+		}},
+		{"exploration", func(sc *db.Scan) {
+			sc.TriageScanID = new(uint(17))
+			sc.ExplorationMode = worker.ExplorationRandomDig
+			sc.ExplorationPath = "lib"
+		}, func(t *testing.T, f db.Scan) {
+			if f.TriageScanID == nil || *f.TriageScanID != 17 || f.ExplorationMode != worker.ExplorationRandomDig || f.ExplorationPath != "lib" {
+				t.Errorf("retry lost exploratory inputs: %+v", f)
+			}
+		}},
 	}
-	s.DB.Create(&orig)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
 
-	req := httptest.NewRequest("POST", fmt.Sprintf("/scans/%d/retry", orig.ID), nil)
-	req.Host = testHost
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
-	if w.Code != http.StatusSeeOther {
-		t.Fatalf("retry status %d: %s", w.Code, w.Body)
-	}
+			repo := db.Repository{URL: "https://github.com/apache/airflow.git", Name: "airflow"}
+			s.DB.Create(&repo)
+			skill := db.Skill{Name: "security-deep-dive", Description: "x", Body: "b", Active: true, Source: "disk", SourcePath: "../../skills/security-deep-dive", Version: 1}
+			s.DB.Create(&skill)
+			orig := db.Scan{
+				RepositoryID: repo.ID, Kind: "skill", Status: db.ScanFailed,
+				SkillID: &skill.ID, SkillName: "security-deep-dive",
+				FinishedAt: new(time.Now()),
+			}
+			tc.set(&orig)
+			s.DB.Create(&orig)
 
-	var fresh db.Scan
-	s.DB.Where("id != ?", orig.ID).First(&fresh)
-	if fresh.SubPath != "airflow-core" {
-		t.Errorf("retry lost sub-path: got %q, want airflow-core", fresh.SubPath)
+			req := httptest.NewRequest("POST", fmt.Sprintf("/scans/%d/retry", orig.ID), nil)
+			req.Host = testHost
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, req)
+			if w.Code != http.StatusSeeOther {
+				t.Fatalf("retry status %d: %s", w.Code, w.Body)
+			}
+
+			var fresh db.Scan
+			s.DB.Where("id != ?", orig.ID).First(&fresh)
+			tc.check(t, fresh)
+		})
 	}
 }
 
@@ -3364,9 +4454,10 @@ func TestRetry_maxTurnsDoneScanResumesSession(t *testing.T) {
 	}
 }
 
-func TestRetry_preservesImportPayload(t *testing.T) {
-	// An ingest scan's input is the uploaded payload, not ./src. Both
-	// retry paths must carry it or the rerun stages no import/report.
+func TestRetry_preservesPinnedInputs(t *testing.T) {
+	// An ingest scan's input is the uploaded payload, not ./src, while a
+	// reattack must retain its remediation attempt. Both retry paths must
+	// preserve these pins or the worker cannot reproduce the original run.
 	s, done := newTestServer(t)
 	defer done()
 
@@ -3375,10 +4466,11 @@ func TestRetry_preservesImportPayload(t *testing.T) {
 	skill := db.Skill{Name: "ingest", Description: "x", Body: "b", Active: true, Source: "ui", Version: 1}
 	s.DB.Create(&skill)
 	payload := []byte(`{"vendor":"weird","items":[1]}`)
+	attemptID := uint(42)
 	orig := db.Scan{
 		RepositoryID: repo.ID, Kind: "skill", Status: db.ScanFailed,
 		SkillID: &skill.ID, SkillName: "ingest",
-		ImportPayload: payload, FinishedAt: new(time.Now()),
+		ImportPayload: payload, RemediationAttemptID: &attemptID, FinishedAt: new(time.Now()),
 	}
 	s.DB.Create(&orig)
 
@@ -3395,6 +4487,9 @@ func TestRetry_preservesImportPayload(t *testing.T) {
 	s.DB.Where("id != ?", orig.ID).First(&fresh)
 	if string(fresh.ImportPayload) != string(payload) {
 		t.Errorf("single retry lost import payload: got %q", fresh.ImportPayload)
+	}
+	if fresh.RemediationAttemptID == nil || *fresh.RemediationAttemptID != attemptID {
+		t.Errorf("single retry remediation attempt = %v, want %d", fresh.RemediationAttemptID, attemptID)
 	}
 
 	// Bulk retry-failed path uses a column Select; it must include the
@@ -3413,6 +4508,9 @@ func TestRetry_preservesImportPayload(t *testing.T) {
 	s.DB.Where("id != ?", orig.ID).First(&bulk)
 	if string(bulk.ImportPayload) != string(payload) {
 		t.Errorf("bulk retry lost import payload: got %q", bulk.ImportPayload)
+	}
+	if bulk.RemediationAttemptID == nil || *bulk.RemediationAttemptID != attemptID {
+		t.Errorf("bulk retry remediation attempt = %v, want %d", bulk.RemediationAttemptID, attemptID)
 	}
 }
 
@@ -3482,39 +4580,60 @@ func TestScansRetryFailed(t *testing.T) {
 	}
 }
 
-func TestScansRetryFailed_preservesEffort(t *testing.T) {
-	s, done := newTestServer(t)
-	defer done()
-	// Force the runtime default away from the scan's effort so a dropped
-	// `effort` column in the retry Select would surface as "low", not "max".
-	s.SetDefaultEffort("low")
-
-	repo := db.Repository{URL: "https://example.com/x.git", Name: "x"}
-	s.DB.Create(&repo)
-	skill := db.Skill{Name: "deep-dive", Description: "x", Body: "b", Active: true, Source: "ui", Version: 1}
-	s.DB.Create(&skill)
-	orig := db.Scan{
-		RepositoryID: repo.ID, Kind: "skill", Status: db.ScanFailed,
-		StatusPriority: db.StatusPriorityFor(db.ScanFailed),
-		SkillID:        &skill.ID, SkillName: "deep-dive", Effort: "max",
+func TestScansRetryFailed_preservesScanFields(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(*Server, *db.Scan)
+		check func(*testing.T, db.Scan)
+	}{
+		{"effort", func(s *Server, sc *db.Scan) {
+			// Force the runtime default away from the scan's effort so a dropped
+			// `effort` column in the retry Select would surface as "low", not "max".
+			s.SetDefaultEffort("low")
+			sc.Effort = "max"
+		}, func(t *testing.T, f db.Scan) {
+			if f.Effort != "max" {
+				t.Errorf("retry lost effort: got %q, want max", f.Effort)
+			}
+		}},
+		{"scan_group", func(_ *Server, sc *db.Scan) { sc.ScanGroup = "grp-7" }, func(t *testing.T, f db.Scan) {
+			if f.ScanGroup != "grp-7" {
+				t.Errorf("retry lost scan group: got %q, want grp-7", f.ScanGroup)
+			}
+		}},
 	}
-	s.DB.Create(&orig)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
 
-	req := httptest.NewRequest("POST", "/scans/retry-failed", nil)
-	req.Host = testHost
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, req)
-	if w.Code != http.StatusSeeOther {
-		t.Fatalf("status %d: %s", w.Code, w.Body)
-	}
+			repo := db.Repository{URL: "https://example.com/x.git", Name: "x"}
+			s.DB.Create(&repo)
+			skill := db.Skill{Name: "deep-dive", Description: "x", Body: "b", Active: true, Source: "ui", Version: 1}
+			s.DB.Create(&skill)
+			orig := db.Scan{
+				RepositoryID: repo.ID, Kind: "skill", Status: db.ScanFailed,
+				StatusPriority: db.StatusPriorityFor(db.ScanFailed),
+				SkillID:        &skill.ID, SkillName: "deep-dive",
+			}
+			tc.setup(s, &orig)
+			s.DB.Create(&orig)
 
-	var fresh db.Scan
-	if err := s.DB.Where("id != ?", orig.ID).First(&fresh).Error; err != nil {
-		t.Fatal(err)
-	}
-	if fresh.Effort != "max" {
-		t.Errorf("retry lost effort: got %q, want max", fresh.Effort)
+			req := httptest.NewRequest("POST", "/scans/retry-failed", nil)
+			req.Host = testHost
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, req)
+			if w.Code != http.StatusSeeOther {
+				t.Fatalf("status %d: %s", w.Code, w.Body)
+			}
+
+			var fresh db.Scan
+			if err := s.DB.Where("id != ?", orig.ID).First(&fresh).Error; err != nil {
+				t.Fatal(err)
+			}
+			tc.check(t, fresh)
+		})
 	}
 }
 
@@ -3614,17 +4733,19 @@ func TestScansRetryFailed_filtersBySkill(t *testing.T) {
 	s.DB.Create(&a)
 	s.DB.Create(&b)
 
-	mk := func(name string, sk uint) {
+	// Distinct sub_paths keep the two alpha failures in separate tuples, so
+	// both are eligible under the newest-failure-per-tuple dedup.
+	mk := func(name string, sk uint, subPath string) {
 		sc := db.Scan{
 			RepositoryID: repo.ID, Kind: "skill", Status: db.ScanFailed,
 			StatusPriority: db.StatusPriorityFor(db.ScanFailed),
-			SkillID:        &sk, SkillName: name,
+			SkillID:        &sk, SkillName: name, SubPath: subPath,
 		}
 		s.DB.Create(&sc)
 	}
-	mk("alpha", a.ID)
-	mk("alpha", a.ID)
-	mk("bravo", b.ID)
+	mk("alpha", a.ID, "one")
+	mk("alpha", a.ID, "two")
+	mk("bravo", b.ID, "")
 
 	req := httptest.NewRequest("POST", "/scans/retry-failed?skill=alpha", nil)
 	req.Host = testHost
@@ -3772,16 +4893,18 @@ func TestScansRetryFailed_repositoryScopeRedirects(t *testing.T) {
 	s.DB.Create(&rB)
 	skill := db.Skill{Name: "deep-dive", Description: "x", Body: "b", Active: true, Source: "ui", Version: 1}
 	s.DB.Create(&skill)
-	mk := func(repoID uint) {
+	// Distinct sub_paths keep rA's two failures in separate tuples, so both
+	// are eligible under the newest-failure-per-tuple dedup.
+	mk := func(repoID uint, subPath string) {
 		s.DB.Create(&db.Scan{
 			RepositoryID: repoID, Kind: "skill", Status: db.ScanFailed,
 			StatusPriority: db.StatusPriorityFor(db.ScanFailed),
-			SkillID:        &skill.ID, SkillName: "deep-dive",
+			SkillID:        &skill.ID, SkillName: "deep-dive", SubPath: subPath,
 		})
 	}
-	mk(rA.ID)
-	mk(rA.ID)
-	mk(rB.ID)
+	mk(rA.ID, "one")
+	mk(rA.ID, "two")
+	mk(rB.ID, "")
 
 	req := httptest.NewRequest("POST",
 		fmt.Sprintf("/scans/retry-failed?repository=%d", rA.ID), nil)
@@ -3970,18 +5093,20 @@ func TestScanResumePaused(t *testing.T) {
 	}
 }
 
-func TestJobs_showsPlanLimitResumeActions(t *testing.T) {
+func TestJobs_showsAccountPauseResumeActions(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 
 	repo := db.Repository{URL: "https://example.com/x.git", Name: "x"}
 	s.DB.Create(&repo)
-	// A scan auto-paused because the account hit the Claude token limit. The
-	// banner should surface it and the Resume-paused action should be offered.
+	resetAt := time.Date(2026, 7, 1, 12, 30, 0, 0, time.UTC)
+	// A scan auto-paused because the account hit an account-level Claude problem.
+	// The banner should surface it and the Resume-paused action should be offered.
 	s.DB.Create(&db.Scan{
 		RepositoryID: repo.ID, Kind: "skill", Status: db.ScanPaused,
 		StatusPriority: db.StatusPriorityFor(db.ScanPaused),
-		Error:          "Claude plan limit reached. Queued scan paused automatically; resume after the limit resets.",
+		Error:          worker.AccountPausePrefix + " Queued scan paused automatically; resume once the account recovers.",
+		PausedUntil:    &resetAt,
 	})
 
 	w := httptest.NewRecorder()
@@ -3990,7 +5115,7 @@ func TestJobs_showsPlanLimitResumeActions(t *testing.T) {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"Claude plan limit reached", "/scans/resume-paused"} {
+	for _, want := range []string{worker.AccountPausePrefix, "/scans/resume-paused", "2026-07-01 12:30 UTC"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing %q in jobs body", want)
 		}
@@ -4049,6 +5174,54 @@ func TestScanShowRenders(t *testing.T) {
 	}
 }
 
+func TestScanShow_discloseCompletionLinksToSavedDraft(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "u", Name: "n"}
+	s.DB.Create(&repo)
+	origin := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&origin)
+	finding := db.Finding{
+		ScanID: origin.ID, RepositoryID: repo.ID, Title: "drafted", Status: db.FindingTriaged,
+		DisclosureDraft: "## Summary\n\nSaved draft.",
+	}
+	s.DB.Create(&finding)
+	scan := db.Scan{
+		RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: discloseSkillName,
+		FindingID: &finding.ID,
+		Report:    `{"ghsa":{"summary":"Drafted","description":"## Summary\n\nSaved draft."}}`,
+	}
+	s.DB.Create(&scan)
+
+	render := func() string {
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/scans/%d", scan.ID)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", w.Code, w.Body)
+		}
+		return w.Body.String()
+	}
+
+	body := render()
+	for _, want := range []string{
+		"Disclosure draft generated",
+		"The saved draft is ready for analyst review and editing.",
+		fmt.Sprintf(`/findings/%d#disclosure`, finding.ID),
+		"Review disclosure",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("completed disclose scan missing %q: %s", want, body)
+		}
+	}
+
+	scan.Report = `{"error":"insufficient prose"}`
+	s.DB.Save(&scan)
+	if body = render(); strings.Contains(body, "Disclosure draft generated") {
+		t.Errorf("refused disclose scan rendered a generation success message: %s", body)
+	}
+}
+
 func TestSettingsShow_rendersThemeOptions(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -4069,7 +5242,7 @@ func TestSettingsShow_rendersThemeOptions(t *testing.T) {
 func TestSettingsShow_rendersAboutAndScannerFindings(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
-	s.Commit = "abcdef1234567890"
+	s.Version = "2026.07.12.1"
 
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, localReq("GET", "/settings"))
@@ -4077,14 +5250,13 @@ func TestSettingsShow_rendersAboutAndScannerFindings(t *testing.T) {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"Scanner findings", "About", "Scrutineer commit", "Claude Code", "Semgrep", "Zizmor", "Docker"} {
+	for _, want := range []string{"Scanner findings", "About", "Scrutineer version", "Backend (claude)", "Semgrep", "Zizmor", "Container runtime"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("settings page missing %q", want)
 		}
 	}
-	// Commit is rendered short (first 12 chars).
-	if !strings.Contains(body, "abcdef123456") {
-		t.Error("settings page missing shortened commit SHA")
+	if !strings.Contains(body, "2026.07.12.1") {
+		t.Error("settings page missing Scrutineer version")
 	}
 }
 
@@ -4126,6 +5298,86 @@ func TestSettingsUpdateTheme_rejectsInvalid(t *testing.T) {
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Errorf("want 422 for invalid theme, got %d", w.Code)
+	}
+}
+
+func TestSettingsUpdateColorScheme_setsCookie(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	form := url.Values{"color_scheme": {"dark"}}
+	req := httptest.NewRequest("POST", "/settings/color-scheme", strings.NewReader(form.Encode()))
+	req.Host = testHost
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+
+	var found bool
+	for _, sc := range w.Header().Values("Set-Cookie") {
+		if strings.HasPrefix(sc, "color_scheme=dark") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("color_scheme cookie not set; cookies: %v", w.Header().Values("Set-Cookie"))
+	}
+}
+
+func TestSettingsUpdateColorScheme_rejectsInvalid(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	form := url.Values{"color_scheme": {"sepia"}}
+	req := httptest.NewRequest("POST", "/settings/color-scheme", strings.NewReader(form.Encode()))
+	req.Host = testHost
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("want 422 for invalid color scheme, got %d", w.Code)
+	}
+}
+
+func TestHumanDuration(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "0s"},
+		{999 * time.Millisecond, "0s"},
+		{45 * time.Second, "45s"},
+		{3 * time.Minute, "3m"},
+		{2 * time.Hour, "2h"},
+		{2*time.Hour + 30*time.Minute, "2h30m"},
+		{50 * time.Hour, "2d"},
+	} {
+		if got := humanDuration(tc.d); got != tc.want {
+			t.Errorf("humanDuration(%v) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
+func TestOrgActivityLess(t *testing.T) {
+	early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	late := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	a := orgRow{LastActivity: &early}
+	b := orgRow{LastActivity: &late}
+	n := orgRow{LastActivity: nil}
+
+	if !orgActivityLess(a, b) || orgActivityLess(b, a) {
+		t.Errorf("earlier activity should sort before later")
+	}
+	// nil (never active) sorts oldest, so it comes before any real timestamp
+	// under the ascending comparator; dirLess flips this to newest-first.
+	if !orgActivityLess(n, a) || orgActivityLess(a, n) {
+		t.Errorf("nil LastActivity should sort before any real timestamp")
+	}
+	if orgActivityLess(n, orgRow{}) {
+		t.Errorf("nil vs nil should not sort strictly-before")
 	}
 }
 
@@ -4213,6 +5465,118 @@ func TestScanShowSkillLink(t *testing.T) {
 	}
 	if !strings.Contains(body, "security-deep-dive") {
 		t.Errorf("scan show page missing skill name")
+	}
+}
+
+func TestScanShowRendersDiffCoverage(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "u", Name: "n"}
+	s.DB.Create(&repo)
+	scan := db.Scan{
+		RepositoryID:   repo.ID,
+		Kind:           "skill",
+		Status:         db.ScanDone,
+		SkillName:      "security-deep-dive",
+		RescanMode:     db.ScanRescanModeDiff,
+		Commit:         "def456def456def456",
+		DiffBaseCommit: "abc123abc123abc123",
+		Coverage:       `{"requested_mode":"diff","actual_mode":"diff"}`,
+		DiffStats: `{"base_commit":"abc123abc123abc123","head_commit":"def456def456def456","changed_files":3,"patch_bytes":2048,` +
+			`"files":[{"status":"M","path":"lib/xmlparse.c"},{"status":"R100","path":"lib/xmlrole.c","old":"lib/oldrole.c"},{"status":"D","path":"lib/gone.c"}]}`,
+	}
+	s.DB.Create(&scan)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/scans/%d", scan.ID)))
+	if w.Code != 200 {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"3 files changed",
+		"2.0 KB patch",
+		"modified",
+		"renamed",
+		"deleted",
+		"lib/oldrole.c",
+		fmt.Sprintf("/repositories/%d/blob/def456def456def456/lib/xmlparse.c", repo.ID),
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scan show diff coverage missing %q", want)
+		}
+	}
+	if strings.Contains(body, fmt.Sprintf("/blob/%s/lib/gone.c", scan.Commit)) {
+		t.Errorf("deleted file should not link to head-commit blob")
+	}
+	if strings.Contains(body, `"requested_mode"`) {
+		t.Errorf("scan show should not dump raw Coverage JSON")
+	}
+}
+
+func TestScanShowRendersDiffFallback(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "u", Name: "n"}
+	s.DB.Create(&repo)
+	scan := db.Scan{
+		RepositoryID: repo.ID,
+		Kind:         "skill",
+		Status:       db.ScanDone,
+		SkillName:    "security-deep-dive",
+		RescanMode:   db.ScanRescanModeFull,
+		Coverage:     `{"requested_mode":"diff","actual_mode":"full","fallback_reason":"no compatible baseline scan with a commit"}`,
+	}
+	s.DB.Create(&scan)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/scans/%d", scan.ID)))
+	if w.Code != 200 {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"ran as a full scan",
+		"no compatible baseline scan with a commit",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scan show fallback missing %q", want)
+		}
+	}
+	if strings.Contains(body, "files changed") {
+		t.Errorf("fallback should not render a changed-files header")
+	}
+}
+
+func TestParseScanDiffView(t *testing.T) {
+	if got := parseScanDiffView(db.Scan{}); got != nil {
+		t.Errorf("empty scan = %+v, want nil", got)
+	}
+	v := parseScanDiffView(db.Scan{
+		Coverage:  `{"requested_mode":"diff","actual_mode":"diff"}`,
+		DiffStats: `{"changed_files":1,"patch_bytes":10,"files":[{"status":"A","path":"x"}]}`,
+	})
+	if v == nil || v.ActualMode != "diff" || v.ChangedFiles != 1 || v.PatchBytes != 10 || len(v.Files) != 1 {
+		t.Fatalf("parsed = %+v", v)
+	}
+	if v.Files[0].StatusName() != "added" || !v.Files[0].Linkable() {
+		t.Errorf("added file: name=%q linkable=%v", v.Files[0].StatusName(), v.Files[0].Linkable())
+	}
+	if got := (scanDiffFile{Status: "D"}).Linkable(); got {
+		t.Errorf("deleted file linkable = %v, want false", got)
+	}
+	if got := (scanDiffFile{Status: "R100"}).StatusName(); got != "renamed" {
+		t.Errorf("R100 status name = %q, want renamed", got)
+	}
+	if got := (scanDiffFile{Status: "X"}).StatusName(); got != "X" {
+		t.Errorf("unknown status name = %q, want passthrough", got)
+	}
+	// Malformed JSON in one blob should not lose the other.
+	v = parseScanDiffView(db.Scan{Coverage: `{bad`, DiffStats: `{"changed_files":2}`})
+	if v == nil || v.ChangedFiles != 2 || v.ActualMode != "" {
+		t.Errorf("partial parse = %+v", v)
 	}
 }
 
@@ -4444,5 +5808,71 @@ func TestRepoCreate_existingRepoWithoutBranchDoesNotEnqueue(t *testing.T) {
 	s.DB.Model(&db.Scan{}).Count(&count)
 	if count != 0 {
 		t.Errorf("expected no scan for plain re-add, got %d", count)
+	}
+}
+
+// The workflow card must say which actions enqueue a model job and which only
+// record a decision, so a regression to the ambiguous Verify and Triage labels
+// fails here rather than on an operator's token bill.
+func TestFindingShow_workflowActionsStateTheirEffect(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	lib := db.Repository{URL: "https://github.com/foo/lib", Name: "lib"}
+	app := db.Repository{URL: "https://github.com/foo/app", Name: "app"}
+	for _, repo := range []*db.Repository{&lib, &app} {
+		s.DB.Create(repo)
+	}
+	s.DB.Create(&db.Dependent{RepositoryID: lib.ID, Name: "downstream", Ecosystem: "npm"})
+
+	triagedCost := "Draft disclosure, Reassess viability, Propose patch and Draft mitigation each start a model job and use tokens"
+	cases := []struct {
+		name    string
+		repo    db.Repository
+		status  db.FindingLifecycle
+		actions []string
+		want    []string
+		gone    []string
+	}{
+		{"new", app, db.FindingNew, []string{"verify", "status"},
+			[]string{"Run verification", "Mark triaged", "starts a model job to check this finding and uses tokens", "mark it triaged to save your review decision"},
+			[]string{"Skip to triage"}},
+		{"enriched", app, db.FindingEnriched, []string{"critic", "status"},
+			[]string{"Mark triaged", "Assess viability", "Mark triaged saves your review decision", "Assess viability starts a model job and uses tokens"},
+			[]string{"</i> Triage\n"}},
+		{"triaged with dependents", lib, db.FindingTriaged, []string{"disclose", "critic", "patch", "mitigate"},
+			[]string{"Draft disclosure", "Review and edit the generated draft", triagedCost},
+			nil},
+		{"triaged without dependents", app, db.FindingTriaged, []string{"disclose", "critic", "patch", "mitigate"},
+			[]string{"Draft disclosure", "patch or mitigation", triagedCost},
+			nil},
+	}
+	for _, tc := range cases {
+		scan := db.Scan{RepositoryID: tc.repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+		s.DB.Create(&scan)
+		f := db.Finding{ScanID: scan.ID, RepositoryID: tc.repo.ID, Title: tc.name + " finding", Severity: "High", Status: tc.status}
+		s.DB.Create(&f)
+
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, localReq("GET", fmt.Sprintf("/findings/%d", f.ID)))
+		body := w.Body.String()
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status %d: %s", tc.name, w.Code, body)
+		}
+		for _, action := range tc.actions {
+			if target := fmt.Sprintf(`hx-post="/findings/%d/%s"`, f.ID, action); !strings.Contains(body, target) {
+				t.Errorf("%s finding page missing action %s", tc.name, target)
+			}
+		}
+		for _, want := range tc.want {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s finding page missing workflow text %q", tc.name, want)
+			}
+		}
+		for _, gone := range tc.gone {
+			if strings.Contains(body, gone) {
+				t.Errorf("%s finding page still renders retired label %q", tc.name, gone)
+			}
+		}
 	}
 }

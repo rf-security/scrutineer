@@ -48,6 +48,7 @@
           <li><a href="/"{{if eq $nav "repos"}} aria-current="page"{{end}}><i data-lucide="folder-git-2"></i><span>Repositories</span></a></li>
           <li><a href="/orgs"{{if eq $nav "orgs"}} aria-current="page"{{end}}><i data-lucide="building"></i><span>Organizations</span></a></li>
           <li><a href="/findings"{{if eq $nav "findings"}} aria-current="page"{{end}}><i data-lucide="bug"></i><span>Findings</span></a></li>
+          <li><a href="/benchmark"{{if eq $nav "benchmark"}} aria-current="page"{{end}}><i data-lucide="gauge"></i><span>Benchmark</span></a></li>
           <li><a href="/packages"{{if eq $nav "packages"}} aria-current="page"{{end}}><i data-lucide="package"></i><span>Packages</span></a></li>
           <li><a href="/sboms"{{if eq $nav "sboms"}} aria-current="page"{{end}}><i data-lucide="file-box"></i><span>SBOMs</span></a></li>
           <li><a href="/advisories"{{if eq $nav "advisories"}} aria-current="page"{{end}}><i data-lucide="shield-alert"></i><span>Advisories</span></a></li>
@@ -56,6 +57,7 @@
           <li><a href="/audit"{{if eq $nav "audit"}} aria-current="page"{{end}}><i data-lucide="clipboard-check"></i><span>Audit</span></a></li>
           <li><a href="/skills"{{if eq $nav "skills"}} aria-current="page"{{end}}><i data-lucide="sparkles"></i><span>Skills</span></a></li>
           <li><a href="/usage"{{if eq $nav "usage"}} aria-current="page"{{end}}><i data-lucide="coins"></i><span>Usage</span></a></li>
+          <li><a href="/reporting"{{if eq $nav "reporting"}} aria-current="page"{{end}}><i data-lucide="file-chart-column"></i><span>Reporting</span></a></li>
         </ul>
       </div>
     </section>
@@ -306,6 +308,7 @@
   {{if eq . "done"}}<span class="badge-secondary"><i data-lucide="check"></i> complete</span>
   {{else if eq . "failed"}}<span class="badge-destructive"><i data-lucide="x"></i> failed</span>
   {{else if eq . "cancelled"}}<span class="badge-outline"><i data-lucide="circle-slash"></i> cancelled</span>
+  {{else if eq . "skipped"}}<span class="badge-outline"><i data-lucide="skip-forward"></i> skipped</span>
   {{else if eq . "paused"}}<span class="badge-outline"><i data-lucide="pause"></i> paused</span>
   {{else if eq . "running"}}<span class="badge-primary"><i data-lucide="loader-circle" class="animate-spin"></i> running</span>
   {{else if eq . "active"}}<span class="badge-secondary"><i data-lucide="circle-check"></i> active</span>

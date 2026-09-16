@@ -29,11 +29,13 @@ func TestFindingFields(t *testing.T) {
 	path := fmt.Sprintf("/findings/%d/fields", f.ID)
 
 	w := postForm(t, s, path, url.Values{
-		"severity":   {"Critical"},
-		"cve_id":     {" CVE-2026-12345 "},
-		"affected":   {">=1.0.0 <2.0.0"},
-		"ignored":    {"x"}, // not in analystFields, dropped
-		"resolution": {""},  // present but unchanged, no-op
+		"severity":             {"Critical"},
+		"cve_id":               {" CVE-2026-12345 "},
+		"affected":             {">=1.0.0 <2.0.0"},
+		"disclosure_title":     {"Analyst-set advisory summary"},
+		"suggested_recipients": {"@alice (CODEOWNERS: crypto/*)"},
+		"ignored":              {"x"}, // not in analystFields, dropped
+		"resolution":           {""},  // present but unchanged, no-op
 	})
 	if w.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d, want 303; body=%s", w.Code, w.Body)
@@ -44,13 +46,16 @@ func TestFindingFields(t *testing.T) {
 
 	var got db.Finding
 	s.DB.First(&got, f.ID)
-	if got.Severity != "Critical" || got.CVEID != "CVE-2026-12345" || got.Affected != ">=1.0.0 <2.0.0" {
-		t.Errorf("after edit: severity=%q cve=%q affected=%q", got.Severity, got.CVEID, got.Affected)
+	if got.Severity != "Critical" || got.CVEID != "CVE-2026-12345" || got.Affected != ">=1.0.0 <2.0.0" ||
+		got.DisclosureTitle != "Analyst-set advisory summary" ||
+		got.SuggestedRecipients != "@alice (CODEOWNERS: crypto/*)" {
+		t.Errorf("after edit: severity=%q cve=%q affected=%q disclosure_title=%q recipients=%q",
+			got.Severity, got.CVEID, got.Affected, got.DisclosureTitle, got.SuggestedRecipients)
 	}
 	var hist []db.FindingHistory
 	s.DB.Where("finding_id = ?", f.ID).Find(&hist)
-	if len(hist) != 3 {
-		t.Errorf("history rows = %d, want 3 (severity, cve_id, affected)", len(hist))
+	if len(hist) != 5 {
+		t.Errorf("history rows = %d, want 5 (severity, cve_id, affected, disclosure_title, suggested_recipients)", len(hist))
 	}
 	for _, h := range hist {
 		if h.Source != db.SourceAnalyst {
@@ -68,12 +73,136 @@ func TestFindingFields(t *testing.T) {
 		t.Errorf("GHSAID = %q, want empty (rejected value should not be stored)", got.GHSAID)
 	}
 	s.DB.Where("finding_id = ?", f.ID).Find(&hist)
-	if len(hist) != 3 {
-		t.Errorf("history rows after rejected write = %d, want still 3", len(hist))
+	if len(hist) != 5 {
+		t.Errorf("history rows after rejected write = %d, want still 5", len(hist))
 	}
 
 	if w := postForm(t, s, "/findings/999999/fields", url.Values{"severity": {"Low"}}); w.Code != http.StatusNotFound {
 		t.Errorf("missing finding: status = %d, want 404", w.Code)
+	}
+}
+
+func TestFindingDisclosureDraftSavePersistsEditedMarkdown(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := seedFindingForForm(t, s)
+	const draft = "## Summary\n\nEdited text with `inline code`.\n\n- one\n  - two\n\n```ruby\nputs :ok\n```"
+
+	w := postForm(t, s, fmt.Sprintf("/findings/%d/disclosure-draft", f.ID), url.Values{
+		"disclosure_draft": {draft},
+	})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body=%s", w.Code, w.Body)
+	}
+	if got := w.Header().Get("Location"); got != fmt.Sprintf("/findings/%d#disclosure", f.ID) {
+		t.Errorf("Location = %q, want disclosure anchor", got)
+	}
+
+	var got db.Finding
+	s.DB.First(&got, f.ID)
+	if got.DisclosureDraft != draft {
+		t.Errorf("saved disclosure draft changed\nwant:\n%s\ngot:\n%s", draft, got.DisclosureDraft)
+	}
+	var history db.FindingHistory
+	if err := s.DB.Where("finding_id = ? AND field = ?", f.ID, "disclosure_draft").First(&history).Error; err != nil {
+		t.Fatalf("load disclosure history: %v", err)
+	}
+	if history.Source != db.SourceAnalyst || history.NewValue != draft {
+		t.Errorf("history = %+v, want analyst edit with saved markdown", history)
+	}
+
+	if w := postForm(t, s, "/findings/999999/disclosure-draft", url.Values{
+		"disclosure_draft": {draft},
+	}); w.Code != http.StatusNotFound {
+		t.Errorf("missing finding status = %d, want 404", w.Code)
+	}
+}
+
+func TestFindingDisclosureDraftSaveNormalizesBrowserNewlines(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := seedFindingForForm(t, s)
+	const saved = "first line\nsecond line"
+	if err := s.DB.Model(&f).Update("disclosure_draft", saved).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	w := postForm(t, s, fmt.Sprintf("/findings/%d/disclosure-draft", f.ID), url.Values{
+		"disclosure_draft": {"first line\r\nsecond line"},
+	})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body=%s", w.Code, w.Body)
+	}
+
+	var got db.Finding
+	s.DB.First(&got, f.ID)
+	if got.DisclosureDraft != saved {
+		t.Errorf("saved disclosure newlines = %q, want %q", got.DisclosureDraft, saved)
+	}
+	var historyCount int64
+	s.DB.Model(&db.FindingHistory{}).
+		Where("finding_id = ? AND field = ?", f.ID, "disclosure_draft").
+		Count(&historyCount)
+	if historyCount != 0 {
+		t.Errorf("history rows = %d, want 0 for an unchanged browser submission", historyCount)
+	}
+}
+
+func TestFindingFieldsAtomicRollback(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := seedFindingForForm(t, s)
+	path := fmt.Sprintf("/findings/%d/fields", f.ID)
+
+	w := postForm(t, s, path, url.Values{
+		"cve_id":  {"CVE-2026-12345"},
+		"ghsa_id": {"not-a-ghsa"},
+	})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422; body=%s", w.Code, w.Body)
+	}
+
+	var got db.Finding
+	s.DB.First(&got, f.ID)
+	if got.CVEID != "" || got.GHSAID != "" {
+		t.Fatalf("finding fields committed despite failed form: cve=%q ghsa=%q", got.CVEID, got.GHSAID)
+	}
+	var hist []db.FindingHistory
+	s.DB.Where("finding_id = ?", f.ID).Find(&hist)
+	if len(hist) != 0 {
+		t.Fatalf("history rows = %d, want 0 after rollback: %+v", len(hist), hist)
+	}
+}
+
+func TestFindingFieldsCVSSSyncsInsideTransaction(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := seedFindingForForm(t, s)
+	path := fmt.Sprintf("/findings/%d/fields", f.ID)
+	const vec = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+
+	w := postForm(t, s, path, url.Values{
+		"cvss_vector": {vec},
+		"severity":    {"Critical"},
+	})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body=%s", w.Code, w.Body)
+	}
+
+	var got db.Finding
+	s.DB.First(&got, f.ID)
+	if got.CVSSVector != vec || got.CVSSScore != 9.8 || got.Severity != "Critical" {
+		t.Fatalf("finding after form: vector=%q score=%v severity=%q", got.CVSSVector, got.CVSSScore, got.Severity)
+	}
+	var hist []db.FindingHistory
+	s.DB.Where("finding_id = ?", f.ID).Order("field").Find(&hist)
+	fields := make([]string, 0, len(hist))
+	for _, h := range hist {
+		fields = append(fields, h.Field)
+	}
+	want := []string{"cvss_score", "cvss_vector", "severity"}
+	if fmt.Sprint(fields) != fmt.Sprint(want) {
+		t.Fatalf("history fields = %v, want %v", fields, want)
 	}
 }
 

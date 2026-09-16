@@ -1,0 +1,311 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":disableDependencyDashboard"],
+  "enabledManagers": [
+    "gomod",
+    "github-actions",
+    "dockerfile",
+    "custom.regex"
+  ],
+  "customDatasources": {
+    "codex-linux-amd64": {
+      "description": "Read Codex x86_64 package-asset digests from GitHub metadata without downloading the assets",
+      "defaultRegistryUrlTemplate": "https://api.github.com/repos/openai/codex/releases?per_page=50",
+      "transformTemplates": [
+        "{\"releases\": $append([], $map($[draft = false and assets[name = \"codex-package-x86_64-unknown-linux-musl.tar.gz\"].digest], function($release) {($asset := $release.assets[name = \"codex-package-x86_64-unknown-linux-musl.tar.gz\"][0]; {\"version\": $release.tag_name, \"releaseTimestamp\": $release.published_at, \"digest\": $substringAfter($asset.digest, \"sha256:\"), \"isStable\": $not($release.prerelease)})})), \"sourceUrl\": \"https://github.com/openai/codex\"}"
+      ]
+    },
+    "codex-linux-arm64": {
+      "description": "Read Codex aarch64 package-asset digests from GitHub metadata without downloading the assets",
+      "defaultRegistryUrlTemplate": "https://api.github.com/repos/openai/codex/releases?per_page=50",
+      "transformTemplates": [
+        "{\"releases\": $append([], $map($[draft = false and assets[name = \"codex-package-aarch64-unknown-linux-musl.tar.gz\"].digest], function($release) {($asset := $release.assets[name = \"codex-package-aarch64-unknown-linux-musl.tar.gz\"][0]; {\"version\": $release.tag_name, \"releaseTimestamp\": $release.published_at, \"digest\": $substringAfter($asset.digest, \"sha256:\"), \"isStable\": $not($release.prerelease)})})), \"sourceUrl\": \"https://github.com/openai/codex\"}"
+      ]
+    }
+  },
+  "automerge": false,
+  "internalChecksFilter": "strict",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update Claude Code release assets and SHA-256 pins",
+      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "matchStrings": [
+        "ARG CLAUDE_(?:AMD64|ARM64)_LOCK=(?<currentValue>v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
+      ],
+      "packageNameTemplate": "anthropics/claude-code",
+      "depNameTemplate": "anthropics/claude-code",
+      "datasourceTemplate": "github-release-attachments",
+      "versioningTemplate": "semver-coerced"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the Codex CLI x86_64 release asset and SHA-256 pin",
+      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "matchStrings": [
+        "ARG CODEX_AMD64_LOCK=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
+      ],
+      "packageNameTemplate": "openai/codex",
+      "depNameTemplate": "openai/codex",
+      "datasourceTemplate": "custom.codex-linux-amd64",
+      "versioningTemplate": "regex:^rust-v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-(?<prerelease>.+))?$"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the Codex CLI aarch64 release asset and SHA-256 pin",
+      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "matchStrings": [
+        "ARG CODEX_ARM64_LOCK=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
+      ],
+      "packageNameTemplate": "openai/codex",
+      "depNameTemplate": "openai/codex",
+      "datasourceTemplate": "custom.codex-linux-arm64",
+      "versioningTemplate": "regex:^rust-v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-(?<prerelease>.+))?$"
+    },
+    {
+      "customType": "regex",
+      "description": "Update OpenCode CLI release assets and SHA-256 pins",
+      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "matchStrings": [
+        "ARG OPENCODE_(?:AMD64|ARM64)_LOCK=(?<currentValue>v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
+      ],
+      "packageNameTemplate": "anomalyco/opencode",
+      "depNameTemplate": "anomalyco/opencode",
+      "datasourceTemplate": "github-release-attachments",
+      "versioningTemplate": "semver-coerced"
+    },
+    {
+      "customType": "regex",
+      "description": "Update GitHub Copilot CLI release assets and SHA-256 pins",
+      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "matchStrings": [
+        "ARG COPILOT_(?:AMD64|ARM64)_LOCK=(?<currentValue>v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
+      ],
+      "packageNameTemplate": "github/copilot-cli",
+      "depNameTemplate": "github/copilot-cli",
+      "datasourceTemplate": "github-release-attachments",
+      "versioningTemplate": "semver-coerced"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the Claude Code image version from GitHub releases",
+      "managerFilePatterns": ["/^Dockerfile$/"],
+      "matchStrings": [
+        "@anthropic-ai/claude-code@(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "anthropics/claude-code",
+      "depNameTemplate": "anthropics/claude-code",
+      "datasourceTemplate": "github-release-attachments",
+      "versioningTemplate": "semver-coerced",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the govulncheck workflow and Go profile pins",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/tests\\.yml$/",
+        "/^docker/profiles/go/Dockerfile$/"
+      ],
+      "matchStrings": [
+        "go install golang\\.org/x/vuln/cmd/govulncheck@(?<currentValue>v\\d+\\.\\d+\\.\\d+)",
+        "ARG GOVULNCHECK_VERSION=(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "golang.org/x/vuln",
+      "depNameTemplate": "govulncheck",
+      "datasourceTemplate": "go",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the zizmor workflow pin",
+      "managerFilePatterns": ["/^\\.github/workflows/tests\\.yml$/"],
+      "matchStrings": [
+        "pipx install zizmor==(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "zizmor",
+      "depNameTemplate": "zizmor",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the semgrep container-image pins",
+      "managerFilePatterns": [
+        "/^Dockerfile$/",
+        "/^Dockerfile\\.runner$/"
+      ],
+      "matchStrings": [
+        "ARG SEMGREP_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "semgrep",
+      "depNameTemplate": "semgrep",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the bandit container-image pins",
+      "managerFilePatterns": [
+        "/^Dockerfile$/",
+        "/^Dockerfile\\.runner$/"
+      ],
+      "matchStrings": [
+        "ARG BANDIT_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "bandit",
+      "depNameTemplate": "bandit",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the zizmor container-image pins",
+      "managerFilePatterns": [
+        "/^Dockerfile$/",
+        "/^Dockerfile\\.runner$/"
+      ],
+      "matchStrings": [
+        "cargo install --locked --root /out zizmor@(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "zizmor",
+      "depNameTemplate": "zizmor",
+      "datasourceTemplate": "crate",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Update Go CLI tool pins in container images",
+      "managerFilePatterns": [
+        "/^Dockerfile$/",
+        "/^Dockerfile\\.runner$/"
+      ],
+      "matchStrings": [
+        "go install (?<depName>github\\.com/(?:git-pkgs/git-pkgs|git-pkgs/brief|andrew/VID))(?:/cmd/(?:brief|vid))?@(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "{{{depName}}}",
+      "datasourceTemplate": "go",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["gomod"],
+      "groupName": "Go modules",
+      "minimumReleaseAge": "7 days",
+      "constraintsFiltering": "strict",
+      "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"]
+    },
+    {
+      "description": "Raising the go directive raises the minimum Go version for every consumer",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["go"],
+      "groupName": "Go language version"
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "enabled": true
+    },
+    {
+      "description": "An indirect dependency's major version is decided by whatever requires it, never here",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "matchManagers": ["dockerfile"],
+      "groupName": "Docker images",
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "Update Go builder image versions before Go modules can require the newer toolchain",
+      "matchManagers": ["dockerfile"],
+      "matchPackageNames": ["golang"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "groupName": "Go Docker images",
+      "minimumGroupSize": 5,
+      "minimumReleaseAge": "0 days"
+    },
+    {
+      "description": "Keep the Rust builder images synchronized",
+      "matchManagers": ["dockerfile"],
+      "matchPackageNames": ["rust"],
+      "groupName": "Rust Docker images",
+      "minimumGroupSize": 2
+    },
+    {
+      "description": "Keep both container-image bandit pins synchronized",
+      "matchPackageNames": ["bandit"],
+      "groupName": "bandit",
+      "minimumGroupSize": 2
+    },
+    {
+      "description": "Keep both container-image semgrep pins synchronized",
+      "matchPackageNames": ["semgrep"],
+      "groupName": "semgrep",
+      "minimumGroupSize": 2
+    },
+    {
+      "description": "Keep the workflow and container-image zizmor pins synchronized",
+      "matchPackageNames": ["zizmor"],
+      "groupName": "zizmor",
+      "minimumGroupSize": 3
+    },
+    {
+      "description": "Keep all three Claude Code pins on one GitHub release",
+      "matchPackageNames": ["anthropics/claude-code"],
+      "groupName": "Claude Code",
+      "minimumGroupSize": 3,
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "Keep both Codex CLI assets on one release; digests come from GitHub release metadata",
+      "matchPackageNames": ["openai/codex"],
+      "groupName": "Codex CLI",
+      "minimumGroupSize": 2
+    },
+    {
+      "description": "Keep both OpenCode CLI release assets on one GitHub release",
+      "matchPackageNames": ["anomalyco/opencode"],
+      "groupName": "OpenCode CLI",
+      "minimumGroupSize": 2
+    },
+    {
+      "description": "Keep both GitHub Copilot CLI release assets on one GitHub release",
+      "matchPackageNames": ["github/copilot-cli"],
+      "groupName": "GitHub Copilot CLI",
+      "minimumGroupSize": 2
+    },
+    {
+      "description": "Keep both container-image git-pkgs pins synchronized",
+      "matchPackageNames": ["github.com/git-pkgs/git-pkgs"],
+      "groupName": "git-pkgs",
+      "minimumGroupSize": 2
+    },
+    {
+      "description": "Keep both container-image brief pins synchronized",
+      "matchPackageNames": ["github.com/git-pkgs/brief"],
+      "groupName": "brief",
+      "minimumGroupSize": 2
+    },
+    {
+      "description": "Keep security evaluation fixtures deterministic",
+      "matchFileNames": ["evals/fixtures/**"],
+      "enabled": false
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "automerge": false
+  }
+}

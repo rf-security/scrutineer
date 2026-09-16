@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"path/filepath"
+	"strings"
 
 	"gorm.io/gorm"
 
@@ -13,19 +14,41 @@ import (
 
 const maxWalkDepth = 6
 
+// SourceBundled is the Source value for skills shipped inside the binary.
+const SourceBundled = "bundled"
+
+// LoadResult reports both the number of skills upserted and their parsed
+// names. Startup uses Names to keep the bundled fallback from temporarily
+// overwriting a same-named local or remote override on every restart.
+type LoadResult struct {
+	Count int
+	Names map[string]bool
+}
+
 // LoadDirectory walks root looking for */SKILL.md files, parses each, and
 // upserts into the DB. Returns the number of skills seen and any hard errors
 // encountered; soft warnings are logged per-skill.
 //
 // The source string is stored on each upserted row so UI and tests can tell
-// local/remote/ui skills apart. Pass "local" for a user-supplied directory
-// and "remote" for a cloned git repo.
+// bundled/local/remote/ui skills apart. Pass SourceBundled for the embedded
+// tree, "local" for a user-supplied directory, and "remote" for a cloned git
+// repo.
 func LoadDirectory(gdb *gorm.DB, log *slog.Logger, root, source string) (int, error) {
+	result, err := LoadDirectoryExcept(gdb, log, root, source, nil)
+	return result.Count, err
+}
+
+// LoadDirectoryExcept is LoadDirectory with a parsed-name exclusion set. The
+// result includes every name actually upserted. Exclusions are checked after
+// parsing rather than against directory names because the agentskills.io
+// loader deliberately tolerates a frontmatter name that differs from its
+// containing directory.
+func LoadDirectoryExcept(gdb *gorm.DB, log *slog.Logger, root, source string, skip map[string]bool) (LoadResult, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {
-		return 0, err
+		return LoadResult{}, err
 	}
-	n := 0
+	result := LoadResult{Names: make(map[string]bool)}
 	err = filepath.WalkDir(abs, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return nil // ignore unreadable dirs, continue
@@ -42,9 +65,12 @@ func LoadDirectory(gdb *gorm.DB, log *slog.Logger, root, source string) (int, er
 		if d.Name() != skillFile {
 			return nil
 		}
-		p, perr := ParseFile(path)
+		p, perr := parseFileWithin(path, abs)
 		if perr != nil {
 			return perr
+		}
+		if skip[p.Name] {
+			return nil
 		}
 		for _, w := range p.Warnings {
 			log.Warn("skill warning", "name", p.Name, "path", path, "warn", w)
@@ -53,13 +79,14 @@ func LoadDirectory(gdb *gorm.DB, log *slog.Logger, root, source string) (int, er
 			log.Warn("skill upsert failed", "name", p.Name, "err", err)
 			return nil
 		}
-		n++
+		result.Count++
+		result.Names[p.Name] = true
 		return nil
 	})
 	if err != nil {
-		return n, fmt.Errorf("walk %s: %w", abs, err)
+		return result, fmt.Errorf("walk %s: %w", abs, err)
 	}
-	return n, nil
+	return result, nil
 }
 
 func depth(root, path string) int {
@@ -84,6 +111,9 @@ func splitSep(p string) []string {
 }
 
 func shouldSkipDir(name string) bool {
+	if strings.HasPrefix(name, "_") {
+		return true
+	}
 	switch name {
 	case ".git", "node_modules", ".venv", "__pycache__", "vendor":
 		return true

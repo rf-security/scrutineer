@@ -1,12 +1,15 @@
 package web
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
 )
@@ -79,7 +82,7 @@ func TestFindingOSV_validatesAgainstOfficialSchema(t *testing.T) {
 }
 
 // A CVSS:3.0 vector must validate under the same CVSS_V3 severity type as a
-// 3.1 vector; this is where any go-cvss / OSV-regex misalignment would surface.
+// 3.1 vector; this is where any CVSS parser / OSV-regex misalignment would surface.
 func TestFindingOSV_cvss30Validates(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -148,7 +151,7 @@ func TestFindingOSV_emitsOnlyV4WhenV3Absent(t *testing.T) {
 	doc := decodeCSAF(t, w.Body.Bytes())
 	raw, ok := doc["severity"]
 	if !ok {
-		t.Fatalf("severity key missing in OSV doc keys=%v", mapKeys(doc))
+		t.Fatalf("severity key missing in OSV doc keys=%v", keys(doc))
 	}
 	sevs, ok := raw.([]any)
 	if !ok || len(sevs) != 1 {
@@ -157,14 +160,6 @@ func TestFindingOSV_emitsOnlyV4WhenV3Absent(t *testing.T) {
 	if sevs[0].(map[string]any)["type"] != "CVSS_V4" {
 		t.Errorf("severity[0].type = %v", sevs[0])
 	}
-}
-
-func mapKeys(m map[string]any) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
 }
 
 func TestFindingOSV_packageWithPURLBecomesAffectedPackage(t *testing.T) {
@@ -453,6 +448,59 @@ func TestFindingOSV_404ForMissingFinding(t *testing.T) {
 	}
 }
 
+func TestFindingOSV_handlesRepositoryLookupErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{name: "missing", err: gorm.ErrRecordNotFound, wantStatus: http.StatusNotFound},
+		{name: "database failure", err: errors.New("database unavailable"), wantStatus: http.StatusInternalServerError},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+
+			f := seedCSAFFinding(t, s, nil)
+			if err := s.DB.Callback().Query().Before("gorm:query").Register("test:fail_repository_lookup", func(tx *gorm.DB) {
+				if tx.Statement.Table == "repositories" {
+					_ = tx.AddError(tt.err)
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			w := getOSV(t, s, f.ID)
+			if w.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d; body=%s", w.Code, tt.wantStatus, w.Body)
+			}
+		})
+	}
+}
+
+func TestFindingOSV_handlesChildLookupErrors(t *testing.T) {
+	for _, table := range []string{"finding_references", "packages"} {
+		t.Run(table, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+
+			f := seedCSAFFinding(t, s, nil)
+			if err := s.DB.Callback().Query().Before("gorm:query").Register("test:fail_osv_child_lookup", func(tx *gorm.DB) {
+				if tx.Statement.Table == table {
+					_ = tx.AddError(errors.New("database unavailable"))
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			w := getOSV(t, s, f.ID)
+			if w.Code != http.StatusInternalServerError {
+				t.Errorf("status = %d, want 500; body=%s", w.Code, w.Body)
+			}
+		})
+	}
+}
+
 func TestOSVReferenceType(t *testing.T) {
 	cases := []struct {
 		tags string
@@ -634,5 +682,35 @@ func TestFindingOSV_packageHasSemverRangeFromFixVersion(t *testing.T) {
 	}
 	if events[1].(map[string]any)["fixed"] != "2.3.1" {
 		t.Errorf("fixed event = %v, want 2.3.1", events[1])
+	}
+}
+
+func TestOSVSeverityList_trimsCVSSVectors(t *testing.T) {
+	// The OSV schema anchors CVSS score patterns, so a vector stored with
+	// surrounding whitespace must be trimmed before emission or the export
+	// fails schema validation. vulns.ParseCVSS trims internally so the
+	// gate accepts padded input; the emitted Score must match.
+	f := db.Finding{
+		CVSSVector:   "  CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H\t",
+		CVSSv4Vector: " CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N ",
+	}
+	got := osvSeverityList(f)
+	if len(got) != 2 {
+		t.Fatalf("severity entries = %d, want 2", len(got))
+	}
+	for _, s := range got {
+		if s.Score != strings.TrimSpace(s.Score) {
+			t.Errorf("emitted %s score %q has surrounding whitespace", s.Type, s.Score)
+		}
+	}
+	if got[0].Type != "CVSS_V4" || got[1].Type != "CVSS_V3" {
+		t.Errorf("order = %s, %s; want CVSS_V4 then CVSS_V3", got[0].Type, got[1].Type)
+	}
+}
+
+func TestOSVSeverityList_dropsUnparseableVectors(t *testing.T) {
+	f := db.Finding{CVSSVector: "not-a-vector", CVSSv4Vector: "  "}
+	if got := osvSeverityList(f); len(got) != 0 {
+		t.Errorf("severity entries = %v, want none", got)
 	}
 }

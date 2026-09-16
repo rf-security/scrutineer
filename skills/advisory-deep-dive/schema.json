@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "advisory-deep-dive audit report",
+  "description": "One verdict per re-audited advisory (fixed, bypass, variant, regressed) plus any findings the non-fixed verdicts opened. Findings share the vuln-scan and security-deep-dive shape and each cites the advisory it descends from under references.",
+  "type": "object",
+  "required": ["audits", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "audits": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/audit" }
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    }
+  },
+  "$defs": {
+    "audit": {
+      "type": "object",
+      "required": ["advisory_uuid", "status", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "advisory_uuid": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "enum": ["fixed", "bypass", "variant", "regressed"] },
+        "evidence": { "type": "string", "minLength": 1 },
+        "finding_ids": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^F[0-9]+$" }
+        }
+      }
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["Critical", "High", "Medium", "Low"]
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["high", "medium", "low"]
+    },
+    "cwe": {
+      "type": "string",
+      "pattern": "^(CWE-[0-9]+)?$"
+    },
+    "reachability": {
+      "type": "string",
+      "enum": ["reachable", "harness_only", "unclear"]
+    },
+    "quality_tier": {
+      "type": "string",
+      "enum": ["high", "low"]
+    },
+    "location": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^:]+:[0-9]+$"
+    },
+    "markdown": {
+      "type": "string",
+      "minLength": 1,
+      "contentMediaType": "text/markdown"
+    },
+    "reference": {
+      "type": "object",
+      "required": ["url"],
+      "additionalProperties": false,
+      "properties": {
+        "url": { "type": "string", "format": "uri" },
+        "summary": { "type": "string" },
+        "tags": { "type": "string" }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": [
+        "id",
+        "title",
+        "severity",
+        "confidence",
+        "cwe",
+        "location",
+        "reachability",
+        "quality_tier",
+        "trace",
+        "boundary",
+        "validation",
+        "rating"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^F[0-9]+$" },
+        "sinks": { "type": "array", "items": { "type": "string" } },
+        "title": { "type": "string", "minLength": 1 },
+        "severity": { "$ref": "#/$defs/severity" },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "cwe": { "$ref": "#/$defs/cwe" },
+        "location": { "$ref": "#/$defs/location" },
+        "locations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/location" }
+        },
+        "affected": { "type": "string" },
+        "reachability": { "$ref": "#/$defs/reachability" },
+        "quality_tier": { "$ref": "#/$defs/quality_tier" },
+        "reach_checked": { "type": "integer", "minimum": 0 },
+        "reach_exposed": { "type": "integer", "minimum": 0 },
+        "references": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/reference" }
+        },
+        "trace": { "$ref": "#/$defs/markdown" },
+        "boundary": { "$ref": "#/$defs/markdown" },
+        "validation": { "$ref": "#/$defs/markdown" },
+        "prior_art": { "$ref": "#/$defs/markdown" },
+        "discovered_via": { "type": "string", "enum": ["source", "issue-tracker", "advisory", "documentation"], "description": "How this finding was first identified. Folded into prior_art on ingest." },
+        "reach": { "$ref": "#/$defs/markdown" },
+        "rating": { "$ref": "#/$defs/markdown" }
+      }
+    }
+  }
+}

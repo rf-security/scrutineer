@@ -11,8 +11,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -24,6 +26,10 @@ import (
 
 const apiPrefix = "/api"
 
+// maxAgentAPIOpenScansPerRepository bounds model-backed work a compromised
+// scan token can enqueue. Normal orchestration stays well below this ceiling.
+const maxAgentAPIOpenScansPerRepository = 16
+
 // NewAPIToken returns a 32-byte hex token suitable for bearer auth.
 func NewAPIToken() string {
 	var b [32]byte
@@ -32,6 +38,24 @@ func NewAPIToken() string {
 }
 
 type apiCtxKey struct{}
+
+// scanBlobColumns are the wide columns on a scan row. A running scan's log
+// grows for the length of the run, so endpoints serving only a scan's identity
+// or summary omit them; apiGetScan, which returns the report and log, does not.
+var scanBlobColumns = []string{"Log", "Prompt", "Report", "RefusalAudit", "ImportPayload"}
+
+// authScanOmitColumns additionally drops the scoping blobs, which nothing
+// reachable from scanFromRequest reads.
+var authScanOmitColumns = slices.Concat(scanBlobColumns,
+	[]string{"FocusArea", "DiffStats", "Coverage"})
+
+// repositoryBlobColumns are the wide columns on a repository row, dominated by
+// the cached ecosyste.ms payloads.
+var repositoryBlobColumns = []string{
+	"Metadata", "ThreatModel", "ScanConfig",
+	"EcosystemsRepoData", "EcosystemsPackagesData", "EcosystemsAdvisoriesData",
+	"EcosystemsCommitsData", "EcosystemsIssuesData", "EcosystemsDependentsData",
+}
 
 // apiAuth validates bearer tokens against the currently running scan rows
 // and puts the scan on the request context so handlers can apply the
@@ -44,13 +68,18 @@ func (s *Server) apiAuth(next http.Handler) http.Handler {
 			return
 		}
 		var scan db.Scan
-		if err := s.DB.Where("api_token = ? AND status = ?", token, db.ScanRunning).
+		if err := s.DB.Omit(authScanOmitColumns...).
+			Where("api_token = ? AND status = ?", token, db.ScanRunning).
 			First(&scan).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				writeAPIError(w, http.StatusUnauthorized, "token invalid or scan not running")
 				return
 			}
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if scan.ExplorationMode != "" && (r.Method != http.MethodPost || r.URL.Path != fmt.Sprintf("/scans/%d/validate-report", scan.ID)) {
+			writeAPIError(w, http.StatusForbidden, "exploratory audits may only validate their own report")
 			return
 		}
 		ctx := context.WithValue(r.Context(), apiCtxKey{}, &scan)
@@ -60,6 +89,27 @@ func (s *Server) apiAuth(next http.Handler) http.Handler {
 }
 
 const apiMaxBody = 1 << 20
+
+//nolint:ireturn // T is a concrete struct at every call site, not an interface
+func decodeAPIBody[T any](w http.ResponseWriter, r *http.Request, errorMessage string) (T, bool) {
+	var body T
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, errorMessage)
+		return body, false
+	}
+	return body, true
+}
+
+func decodeOptionalAPIBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		if errors.Is(err, io.EOF) {
+			return true
+		}
+		writeAPIError(w, http.StatusBadRequest, "invalid JSON request body")
+		return false
+	}
+	return true
+}
 
 func bearer(h string) string {
 	const prefix = "Bearer "
@@ -91,11 +141,14 @@ func (s *Server) apiHandler() http.Handler {
 	mux.HandleFunc("GET /repositories/{id}/scans", s.apiListScans)
 	mux.HandleFunc("GET /repositories/{id}/maintainers", s.apiListMaintainers)
 	mux.HandleFunc("GET /repositories/{id}/packages", s.apiListPackages)
+	mux.HandleFunc("GET /repositories/{id}/alternatives", s.apiListPackageAlternatives)
 	mux.HandleFunc("GET /repositories/{id}/advisories", s.apiListAdvisories)
 	mux.HandleFunc("GET /repositories/{id}/dependents", s.apiListDependents)
 	mux.HandleFunc("GET /repositories/{id}/ecosystems/{source}/raw", s.apiGetEcosystemsRaw)
+	mux.HandleFunc("GET /repositories/{id}/expected", s.apiListExpectedFindings)
 	mux.HandleFunc("GET /repositories/{id}/dependencies", s.apiListDependencies)
 	mux.HandleFunc("GET /repositories/{id}/findings", s.apiListFindings)
+	mux.HandleFunc("POST /repositories/{id}/findings", s.apiStreamFinding)
 	mux.HandleFunc("GET /repositories/{id}/dependency-findings", s.apiListDependencyFindings)
 	mux.HandleFunc("POST /repositories/{id}/skills/{name}/run", s.apiRunSkill)
 	mux.HandleFunc("POST /findings/{id}/skills/{name}/run", s.apiRunFindingSkill)
@@ -106,7 +159,6 @@ func (s *Server) apiHandler() http.Handler {
 	mux.HandleFunc("GET /findings/{id}/notes", s.apiListFindingNotes)
 	mux.HandleFunc("POST /findings/{id}/notes", s.apiAddFindingNote)
 	mux.HandleFunc("GET /findings/{id}/reviews", s.apiListFindingReviews)
-	mux.HandleFunc("POST /findings/{id}/reviews", s.apiAddFindingReview)
 	// /audit/queue and /audit/metrics are intentionally on the host-only
 	// /api/v1 export mux, not here: they return findings across every
 	// repository on the instance, so a scan token issued for one repo
@@ -129,7 +181,7 @@ func (s *Server) apiGetRepository(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var repo db.Repository
-	if err := s.DB.First(&repo, id).Error; err != nil {
+	if err := s.DB.Omit(repositoryBlobColumns...).First(&repo, id).Error; err != nil {
 		writeAPIError(w, http.StatusNotFound, "repository not found")
 		return
 	}
@@ -148,6 +200,7 @@ func (s *Server) apiGetRepository(w http.ResponseWriter, r *http.Request) {
 		"fork":            repo.Fork,
 		"posture":         repo.Posture,
 		"posture_summary": repo.PostureSummary,
+		"health":          repo.Health,
 	})
 }
 
@@ -165,7 +218,9 @@ var ecosystemsRawColumns = map[string]string{
 // apiGetEcosystemsRaw returns the verbatim cached ecosyste.ms payload for one
 // source: an operator/debug escape hatch, and a skill fallback when a
 // digested endpoint does not cover an edge case. 404 when nothing is cached
-// (the skill then falls back to WebFetch); 400 for an unknown source.
+// (the skill then falls back to WebFetch, which is also the steady state under
+// `ecosystems_enrichment: false`, where no source is ever cached); 400 for an
+// unknown source.
 func (s *Server) apiGetEcosystemsRaw(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.PathValue("id"))
 	if !s.scanOwnsRepo(r, uint(id)) {
@@ -199,11 +254,10 @@ func (s *Server) apiPatchRepository(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusForbidden, "scan may only edit its own repository")
 		return
 	}
-	var body struct {
+	body, ok := decodeAPIBody[struct {
 		Fork *string `json:"fork"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "body must be JSON")
+	}](w, r, "body must be JSON")
+	if !ok {
 		return
 	}
 	if body.Fork == nil {
@@ -231,7 +285,7 @@ func (s *Server) apiListScans(w http.ResponseWriter, r *http.Request) {
 		q = q.Where("skill_name = ?", skill)
 	}
 	var rows []db.Scan
-	q.Find(&rows)
+	q.Omit(scanBlobColumns...).Find(&rows)
 	out := make([]map[string]any, 0, len(rows))
 	for _, sc := range rows {
 		out = append(out, scanSummary(sc))
@@ -252,6 +306,7 @@ func (s *Server) apiGetScan(w http.ResponseWriter, r *http.Request) {
 	}
 	summary := scanSummary(sc)
 	summary["report"] = sc.Report
+	summary["refusal_audit"] = sc.RefusalAudit
 	summary["log"] = sc.Log
 	writeJSON(w, http.StatusOK, summary)
 }
@@ -260,7 +315,7 @@ func (s *Server) apiGetScan(w http.ResponseWriter, r *http.Request) {
 // its skill's schema without installing a JSON Schema library inside the runner
 // container. The request body is the candidate report; the response is
 // {"valid":true} or {"valid":false,"errors":"..."} using the exact same
-// validator (worker.ValidateReportSchema) the harness runs after the scan, so
+// validator (worker.ValidateSkillReport) the harness runs after the scan, so
 // an in-container pass guarantees the harness will not send a repair prompt.
 //
 // The body is already capped at apiMaxBody (1 MB) by apiAuth's MaxBytesReader;
@@ -290,7 +345,7 @@ func (s *Server) apiValidateReport(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusRequestEntityTooLarge, "could not read body (max 1 MB)")
 		return
 	}
-	if detail := worker.ValidateReportSchema(skill.SchemaJSON, string(body)); detail != "" {
+	if detail := worker.ValidateSkillReport(skill.Name, skill.SchemaJSON, string(body)); detail != "" {
 		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "errors": detail})
 		return
 	}
@@ -310,23 +365,57 @@ func (s *Server) apiRunSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Model   string `json:"model"`
-		Ref     string `json:"ref"`
-		Profile string `json:"profile"`
+		Model          string `json:"model"`
+		Ref            string `json:"ref"`
+		Profile        string `json:"profile"`
+		RescanMode     string `json:"rescan_mode"`
+		SubPath        string `json:"sub_path"`
+		BaselineScanID *uint  `json:"baseline_scan_id"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if !decodeOptionalAPIBody(w, r, &body) {
+		return
+	}
 	if body.Profile != "" && !worker.KnownProfile(body.Profile) {
 		writeAPIError(w, http.StatusBadRequest, "unknown profile")
 		return
 	}
+	// sub_path scopes this run to a monorepo sub-package; triage forwards it to
+	// each pipeline child so the whole scan set stays scoped. Validated here so
+	// a traversal attempt is rejected before it can reach workspace staging.
+	subPath, err := worker.CleanSubPath(body.SubPath)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.agentEnqueueMu.Lock()
+	defer s.agentEnqueueMu.Unlock()
+	if s.hasOpenRepoScopedScan(uint(id), skill.ID, subPath) {
+		writeAPIError(w, http.StatusConflict, "equivalent scan already queued or running")
+		return
+	}
+	if !s.agentAPIRepoHasCapacity(w, uint(id)) {
+		return
+	}
+	var triageID *uint
+	if caller := scanFromRequest(r); caller != nil && caller.SkillName == "triage" {
+		triageID = &caller.ID
+	}
 	scanID, err := s.enqueueSkillWith(r.Context(), uint(id), skill.ID, ScanOpts{
-		Model:   body.Model,
-		Ref:     body.Ref,
-		Profile: body.Profile,
+		TriageScanID:   triageID,
+		Model:          body.Model,
+		Ref:            body.Ref,
+		Profile:        body.Profile,
+		RescanMode:     body.RescanMode,
+		SubPath:        subPath,
+		DiffBaseScanID: body.BaselineScanID,
 	})
 	if err != nil {
 		if errors.Is(err, ErrSkillRequiresRemote) {
 			writeAPIError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, ErrRepoFederationOptOut) {
+			writeAPIError(w, http.StatusConflict, err.Error())
 			return
 		}
 		if errors.Is(err, ErrSkillProfileMismatch) {
@@ -334,6 +423,10 @@ func (s *Server) apiRunSkill(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, ErrInvalidRef) {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errors.Is(err, ErrInvalidRescanMode) {
 			writeAPIError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -346,7 +439,7 @@ func (s *Server) apiRunSkill(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiRunFindingSkill enqueues a finding-scoped skill (verify, patch,
-// disclose). The authenticated scan must be on the same repository that
+// reattack, disclose). The authenticated scan must be on the same repository that
 // owns the finding.
 func (s *Server) apiRunFindingSkill(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.PathValue("id"))
@@ -368,11 +461,38 @@ func (s *Server) apiRunFindingSkill(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Model string `json:"model"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	scanID, err := s.enqueueSkillScoped(r.Context(), repoID, skill.ID, new(uint(id)), body.Model)
+	if !decodeOptionalAPIBody(w, r, &body) {
+		return
+	}
+	s.agentEnqueueMu.Lock()
+	defer s.agentEnqueueMu.Unlock()
+	opts, err := s.findingSkillScanOpts(uint(id), name, body.Model)
+	if err != nil {
+		writeAPIError(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
+	if opts.RemediationAttemptID == nil && s.hasOpenFindingScopedScan(uint(id), skill.ID) {
+		writeAPIError(w, http.StatusConflict, "equivalent scan already queued or running")
+		return
+	}
+	if opts.RemediationAttemptID != nil && s.hasOpenScan(
+		"finding_id = ? AND skill_id = ? AND remediation_attempt_id = ?",
+		uint(id), skill.ID, *opts.RemediationAttemptID) {
+		writeAPIError(w, http.StatusConflict, "equivalent scan already queued or running")
+		return
+	}
+	if !s.agentAPIRepoHasCapacity(w, repoID) {
+		return
+	}
+	opts.FindingID = new(uint(id))
+	scanID, err := s.enqueueSkillWith(r.Context(), repoID, skill.ID, opts)
 	if err != nil {
 		if errors.Is(err, ErrSkillRequiresRemote) {
 			writeAPIError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, ErrRepoFederationOptOut) || errors.Is(err, ErrFederationClaimPending) {
+			writeAPIError(w, http.StatusConflict, err.Error())
 			return
 		}
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
@@ -381,6 +501,23 @@ func (s *Server) apiRunFindingSkill(w http.ResponseWriter, r *http.Request) {
 	var sc db.Scan
 	s.DB.First(&sc, scanID)
 	writeJSON(w, http.StatusCreated, scanSummary(sc))
+}
+
+// agentAPIRepoHasCapacity rejects scan-token enqueue requests once the target
+// repository already has the maximum number of queued or running scans.
+func (s *Server) agentAPIRepoHasCapacity(w http.ResponseWriter, repoID uint) bool {
+	var open int64
+	if err := s.DB.Model(&db.Scan{}).
+		Where("repository_id = ? AND status IN ?", repoID, []db.ScanStatus{db.ScanQueued, db.ScanRunning}).
+		Count(&open).Error; err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return false
+	}
+	if open >= maxAgentAPIOpenScansPerRepository {
+		writeAPIError(w, http.StatusTooManyRequests, "repository has too many queued or running scans")
+		return false
+	}
+	return true
 }
 
 // findingRepoID reads the denormalized Finding.RepositoryID column. Used
@@ -429,7 +566,14 @@ func (s *Server) apiListCNAs(w http.ResponseWriter, r *http.Request) {
 func (s *Server) apiListSkills(w http.ResponseWriter, r *http.Request) {
 	q := s.DB.Order("name")
 	if v := r.URL.Query().Get("active"); v != "" {
-		active, _ := strconv.ParseBool(v)
+		// A malformed value is a 400 rather than a silent fall-back to false,
+		// so ?active=yes never quietly returns the inactive skills instead.
+		active, err := strconv.ParseBool(v)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest,
+				fmt.Sprintf("active: must be true or false, got %q", v))
+			return
+		}
 		q = q.Where("active = ?", active)
 	}
 	var rows []db.Skill
@@ -453,21 +597,57 @@ func (s *Server) apiListSkills(w http.ResponseWriter, r *http.Request) {
 
 func scanSummary(sc db.Scan) map[string]any {
 	m := map[string]any{
-		"id":            sc.ID,
-		"repository_id": sc.RepositoryID,
-		"kind":          sc.Kind,
-		statusKey:       string(sc.Status),
-		"model":         sc.Model,
-		"commit":        sc.Commit,
-		"skill_name":    sc.SkillName,
-		"skill_version": sc.SkillVersion,
-		"started_at":    sc.StartedAt,
-		"finished_at":   sc.FinishedAt,
-		"max_turns_hit": sc.MaxTurnsHit,
-		errorKey:        sc.Error,
+		"id":                   sc.ID,
+		"repository_id":        sc.RepositoryID,
+		"kind":                 sc.Kind,
+		statusKey:              string(sc.Status),
+		"model":                sc.Model,
+		"commit":               sc.Commit,
+		"skill_name":           sc.SkillName,
+		"skill_version":        sc.SkillVersion,
+		"skill_schema_version": sc.SkillSchemaVersion,
+		"started_at":           sc.StartedAt,
+		"finished_at":          sc.FinishedAt,
+		"max_turns_hit":        sc.MaxTurnsHit,
+		errorKey:               sc.Error,
+	}
+	m["refusal_audit_warning"] = sc.RefusalAuditWarning
+	if sc.VerificationFeedback != "" {
+		m["verification_feedback"] = sc.VerificationFeedback
+	}
+	if sc.ExplorationMode != "" {
+		m["exploration_mode"] = sc.ExplorationMode
+		m["exploration_path"] = sc.ExplorationPath
+	}
+	if sc.TriageScanID != nil {
+		m["triage_scan_id"] = *sc.TriageScanID
 	}
 	if sc.Ref != "" {
 		m["ref"] = sc.Ref
+	}
+	if sc.SubPath != "" {
+		m["sub_path"] = sc.SubPath
+	}
+	if sc.RescanMode != "" {
+		m["rescan_mode"] = sc.RescanMode
+	}
+	if sc.DiffBaseScanID != nil {
+		m["diff_base_scan_id"] = *sc.DiffBaseScanID
+	}
+	if sc.RemediationAttemptID != nil {
+		m["remediation_attempt_id"] = *sc.RemediationAttemptID
+	}
+	if sc.DiffBaseCommit != "" {
+		m["diff_base_commit"] = sc.DiffBaseCommit
+	}
+	if sc.DiffThreatModelScanID != nil {
+		m["diff_threat_model_scan_id"] = *sc.DiffThreatModelScanID
+	}
+	if sc.DiffStats != "" {
+		m["diff_stats"] = sc.DiffStats
+	}
+	if sc.Coverage != "" {
+		m["coverage"] = sc.Coverage
 	}
 	return m
 }

@@ -10,11 +10,12 @@
     {{if .SkillName}}{{if .SkillID}}<a href="/skills/{{.SkillID}}">{{.SkillName}}</a>{{else}}{{.SkillName}}{{end}}{{else}}{{.Kind}}{{end}} / scan #{{.ID}}
     {{template "status-badge" (status .Status)}}
     {{if .MaxTurnsHit}}<span class="badge-outline"><i data-lucide="timer-off"></i> max turns</span>{{end}}
+    {{if .RefusalAuditWarning}}<span class="badge-outline"><i data-lucide="triangle-alert"></i> analysis incomplete</span>{{end}}
   </h2>
   {{if and (eq .Kind "skill") .SkillID}}
     <div class="flex items-center gap-2">
-      {{if .HasExportableReport}}
-      <a href="/scans/{{.ID}}/report.md" class="btn-outline" download>
+      {{if $.CanExportReport}}
+      <a href="/scans/{{.ID}}/report.md" class="btn-outline" download="{{scanReportFilename .}}">
         <i data-lucide="download"></i> Export as markdown
       </a>
       {{end}}
@@ -35,12 +36,19 @@
       </form>
       {{end}}
     </div>
-  {{else if .HasExportableReport}}
-    <a href="/scans/{{.ID}}/report.md" class="btn-outline" download>
+  {{else if $.CanExportReport}}
+    <a href="/scans/{{.ID}}/report.md" class="btn-outline" download="{{scanReportFilename .}}">
       <i data-lucide="download"></i> Export as markdown
     </a>
   {{end}}
 </div>
+
+{{with .VerificationFeedback}}
+<section class="border-b py-4 mb-4">
+  <h3 class="text-sm font-medium mb-2">Verification feedback</h3>
+  <pre class="text-sm whitespace-pre-wrap break-words font-sans">{{.}}</pre>
+</section>
+{{end}}
 
 <dl class="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-6 text-sm">
   <div>
@@ -50,6 +58,14 @@
   {{if .Ref}}<div>
     <dt class="text-muted-foreground">Ref</dt>
     <dd>{{.Ref}}</dd>
+  </div>{{end}}
+  {{if eq .RescanMode "diff"}}<div>
+    <dt class="text-muted-foreground">Mode</dt>
+    <dd>diff rescan</dd>
+  </div>{{end}}
+  {{if .DiffBaseCommit}}<div>
+    <dt class="text-muted-foreground">Diff base</dt>
+    <dd><code>{{short .DiffBaseCommit}}</code></dd>
   </div>{{end}}
   <div>
     <dt class="text-muted-foreground">Commit</dt>
@@ -107,10 +123,68 @@
   </div>
 {{end}}
 
+{{with $.Diff}}
+  {{if .FallbackReason}}
+    <div class="alert mb-6">
+      <i data-lucide="info"></i>
+      <section>Diff rescan requested; ran as a full scan. {{.FallbackReason}}.</section>
+    </div>
+  {{else if eq .ActualMode "diff"}}
+    {{$scan := $.Scan}}
+    <div class="mb-6 rounded border">
+      <div class="flex items-center justify-between gap-4 px-3 py-2 text-sm">
+        <div class="flex items-center gap-2">
+          <i data-lucide="diff"></i>
+          <span>Diff rescan · {{.ChangedFiles}} file{{if ne .ChangedFiles 1}}s{{end}} changed · {{bytes .PatchBytes}} patch</span>
+        </div>
+        <span class="text-muted-foreground text-xs">
+          <code>{{short $scan.DiffBaseCommit}}</code> → <code>{{short $scan.Commit}}</code>
+        </span>
+      </div>
+      {{if .Files}}
+        <details>
+          <summary class="cursor-pointer px-3 py-2 text-xs text-muted-foreground hover:underline border-t">Changed files</summary>
+          <table class="table w-full text-xs">
+            <tbody>
+              {{range .Files}}
+                <tr>
+                  <td class="text-muted-foreground w-24">{{.StatusName}}</td>
+                  <td class="font-mono">
+                    {{if .Old}}<span class="text-muted-foreground">{{.Old}} → </span>{{end}}
+                    {{if and .Linkable $scan.Commit}}<a class="hover:underline" href="/repositories/{{$scan.RepositoryID}}/blob/{{$scan.Commit}}/{{.Path}}">{{.Path}}</a>{{else}}{{.Path}}{{end}}
+                  </td>
+                </tr>
+              {{end}}
+            </tbody>
+          </table>
+        </details>
+      {{end}}
+    </div>
+  {{end}}
+{{end}}
+
 {{if .MaxTurnsHit}}
   <div class="alert mb-6">
     <i data-lucide="timer-off"></i>
     <section>This scan hit the max turns cap after producing partial output. Retry will resume the saved Claude session.</section>
+  </div>
+{{end}}
+
+{{if .RefusalAuditWarning}}
+  <div class="alert mb-6">
+    <i data-lucide="triangle-alert"></i>
+    <section>The deep-dive reported refused or skipped analysis. Review the refusal audit before treating coverage as complete.</section>
+  </div>
+{{end}}
+
+{{with $.DisclosureReviewID}}
+  <div class="alert mb-6">
+    <i data-lucide="circle-check"></i>
+    <section>
+      <strong>Disclosure draft generated</strong>
+      <p>The saved draft is ready for analyst review and editing.</p>
+      <a href="/findings/{{.}}#disclosure" class="btn-sm mt-1">Review disclosure</a>
+    </section>
   </div>
 {{end}}
 
@@ -176,6 +250,13 @@
   <div role="tabpanel" id="p3" aria-labelledby="t3" hidden>
     <pre class="log" tabindex="0" role="region" aria-label="Scan prompt">{{.Prompt}}</pre>
   </div>
+  {{end}}
+
+  {{if .RefusalAudit}}
+  <details class="mt-4">
+    <summary class="cursor-pointer text-sm text-muted-foreground">Refusal audit</summary>
+    <pre class="log mt-2" tabindex="0" role="region" aria-label="Refusal audit JSON">{{prettyjson .RefusalAudit}}</pre>
+  </details>
   {{end}}
 </div>
 {{end}}

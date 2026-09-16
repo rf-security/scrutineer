@@ -2,8 +2,10 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -46,335 +48,234 @@ func TestProfileByName(t *testing.T) {
 	}
 }
 
-const configM4Body = `dnl Minimal extension config
-PHP_ARG_ENABLE([example], [whether to enable example], [--enable-example])
-if test "$PHP_EXAMPLE" != "no"; then
-  PHP_NEW_EXTENSION(example, example.c, $ext_shared)
-fi
-`
-
-const configM4WithoutPHPArg = `dnl just a stray autoconf file
-AC_INIT([thing], [1.0])
-`
-
-func writeConfigM4(t *testing.T, dir, contents string) {
-	t.Helper()
-	const configM4FileMode = 0o644
-	path := filepath.Join(dir, "config.m4")
-	if err := os.WriteFile(path, []byte(contents), configM4FileMode); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+// briefJSON builds a minimal brief output for TestMatchProfile. Each entry
+// is "category:name"; briefPackageManager and briefLanguage go into the
+// top-level arrays, everything else under tools[category].
+func briefJSON(entries ...string) string {
+	type det struct {
+		Name string `json:"name"`
 	}
-}
-
-const setupPyWithExtension = `from setuptools import setup, Extension
-setup(ext_modules=[Extension("pkg._speedups", ["src/speedups.c"])])
-`
-
-const setupPyPurePython = `from setuptools import setup
-setup(name="pkg", version="1.0", packages=["pkg"])
-`
-
-func writeSetupPy(t *testing.T, dir, contents string) {
-	t.Helper()
-	const setupPyFileMode = 0o644
-	path := filepath.Join(dir, "setup.py")
-	if err := os.WriteFile(path, []byte(contents), setupPyFileMode); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+	var out struct {
+		PackageManagers []det            `json:"package_managers"`
+		Languages       []det            `json:"languages"`
+		Tools           map[string][]det `json:"tools"`
 	}
-}
-
-func writeMarkerFile(t *testing.T, dir, name string) {
-	t.Helper()
-	const markerFileMode = 0o644
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte("x\n"), markerFileMode); err != nil {
-		t.Fatalf("write %s: %v", path, err)
+	out.Tools = map[string][]det{}
+	for _, e := range entries {
+		cat, name, _ := strings.Cut(e, ":")
+		switch cat {
+		case briefPackageManager:
+			out.PackageManagers = append(out.PackageManagers, det{name})
+		case briefLanguage:
+			out.Languages = append(out.Languages, det{name})
+		default:
+			out.Tools[cat] = append(out.Tools[cat], det{name})
+		}
 	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }
 
 func TestMatchProfile(t *testing.T) {
 	tests := []struct {
-		name    string
-		json    string
-		setup   func(t *testing.T, dir string)
-		want    string
-		noSrcOK bool // if true, srcDir is "" for this case
+		name string
+		json string
+		want string
 	}{
+		// package_manager routes
+		{"composer matches php", briefJSON("package_manager:Composer"), "php"},
+		{"composer case-insensitive", briefJSON("package_manager:composer"), "php"},
+		{"bundler matches ruby", briefJSON("package_manager:Bundler"), "ruby"},
+		{"bundler case-insensitive", briefJSON("package_manager:bundler"), "ruby"},
+		{"npm matches node", briefJSON("package_manager:npm"), "node"},
+		{"pnpm matches node", briefJSON("package_manager:pnpm"), "node"},
+		{"yarn matches node", briefJSON("package_manager:Yarn"), "node"},
+		{"bun matches node", briefJSON("package_manager:Bun"), "node"},
+		{"npm case-insensitive", briefJSON("package_manager:NPM"), "node"},
+		{"pip matches python", briefJSON("package_manager:pip"), "python"},
+		{"poetry matches python", briefJSON("package_manager:Poetry"), "python"},
+		{"uv matches python case-insensitive", briefJSON("package_manager:UV"), "python"},
+		{"pdm matches python", briefJSON("package_manager:PDM"), "python"},
+		{"setuptools matches python", briefJSON("package_manager:setuptools"), "python"},
+		{"go modules matches go", briefJSON("package_manager:Go Modules"), "go"},
+		{"go modules case-insensitive", briefJSON("package_manager:go modules"), "go"},
+		{"sbt matches scala", briefJSON("package_manager:sbt"), "scala"},
+		{"maven matches java", briefJSON("package_manager:Maven"), "java"},
+		{"gradle matches java", briefJSON("package_manager:Gradle"), "java"},
+		{"gradle case-insensitive", briefJSON("package_manager:gradle"), "java"},
+		{"nuget matches dotnet", briefJSON("package_manager:NuGet"), "dotnet"},
+		{"dotnet CLI matches dotnet", briefJSON("package_manager:dotnet CLI"), "dotnet"},
+		{"nuget case-insensitive", briefJSON("package_manager:nuget"), "dotnet"},
+		{"mix matches beam", briefJSON("package_manager:Mix"), "beam"},
+		{"rebar3 matches beam", briefJSON("package_manager:rebar3"), "beam"},
+		{"mix case-insensitive", briefJSON("package_manager:mix"), "beam"},
+		{"cargo matches rust", briefJSON("package_manager:Cargo"), "rust"},
+		// rust is registered before the c-cpp fallback, so a Cargo crate that
+		// also ships a Makefile (common for -sys crates) still routes to rust.
+		{"cargo + Make picks rust over c-cpp (registry order)", briefJSON("package_manager:Cargo", "build:Make"), "rust"},
+		{"SwiftPM matches swift", briefJSON("package_manager:Swift Package Manager"), "swift"},
+		{"opam matches ocaml", briefJSON("package_manager:opam"), "ocaml"},
+		{"cpanm matches perl", briefJSON("package_manager:cpanm"), "perl"},
+
+		// registry order: first match in builtinProfiles wins, not brief order
+		{"composer + bundler picks php (registry order)", briefJSON("package_manager:Composer", "package_manager:Bundler"), "php"},
+		{"bundler + composer still picks php (registry order, not brief order)", briefJSON("package_manager:Bundler", "package_manager:Composer"), "php"},
+		{"composer before node when both present", briefJSON("package_manager:npm", "package_manager:Composer"), "php"},
+
+		// native_extension category (from brief v0.9.3)
+		{"phpize selects php-ext", briefJSON("native_extension:phpize"), "php-ext"},
+		{"phpize wins over composer (registry order)", briefJSON("package_manager:Composer", "native_extension:phpize"), "php-ext"},
+		{"mkmf selects ruby-ext", briefJSON("native_extension:mkmf"), "ruby-ext"},
+		{"mkmf wins over bundler (registry order)", briefJSON("package_manager:Bundler", "native_extension:mkmf"), "ruby-ext"},
+		{"setuptools Extension selects python-ext", briefJSON("native_extension:setuptools Extension"), "python-ext"},
+		{"setuptools Extension wins over pip", briefJSON("package_manager:pip", "native_extension:setuptools Extension"), "python-ext"},
+		{"setuptools Extension case-insensitive", briefJSON("native_extension:SETUPTOOLS EXTENSION"), "python-ext"},
+		// node-gyp is detected by brief but there is no node-ext profile yet;
+		// falls through to node via the package manager.
+		{"node-gyp with npm falls through to node", briefJSON("package_manager:npm", "native_extension:node-gyp"), "node"},
+
+		// build category
+		{"Rails selects ruby-rails", briefJSON("package_manager:Bundler", "build:Rails"), "ruby-rails"},
+		{"Rails without bundler still selects ruby-rails", briefJSON("build:Rails"), "ruby-rails"},
 		{
-			name: "composer matches php",
-			json: `{"package_managers":[{"name":"Composer"}]}`,
-			want: "php",
+			// A Rails app that also ships a native extension matches both
+			// ruby-rails and ruby-ext; ruby-ext wins on registry order, and
+			// since ruby-ext also carries Brakeman (a superset of ruby-rails)
+			// that no longer drops Rails SAST.
+			"ruby-ext beats ruby-rails when both match (registry order)",
+			briefJSON("package_manager:Bundler", "build:Rails", "native_extension:mkmf"),
+			"ruby-ext",
+		},
+		{"Rake alone does not select ruby-rails", briefJSON("package_manager:Bundler", "build:Rake"), "ruby"},
+		{"Dune selects ocaml", briefJSON("build:Dune"), "ocaml"},
+		{"CMake selects c-cpp", briefJSON("build:CMake"), "c-cpp"},
+		{"Make selects c-cpp", briefJSON("build:Make"), "c-cpp"},
+		{"Autotools selects c-cpp", briefJSON("build:Autotools"), "c-cpp"},
+		{"Meson selects c-cpp", briefJSON("build:Meson"), "c-cpp"},
+
+		// language fallbacks
+		{"Scala language matches scala (belt-and-braces for a *.scala-only checkout)", briefJSON("language:Scala"), "scala"},
+		{"Perl language matches perl (belt-and-braces for a *.pl-only dist)", briefJSON("language:Perl"), "perl"},
+		{"C language matches c-cpp", briefJSON("language:C"), "c-cpp"},
+		{"C++ language matches c-cpp", briefJSON("language:C++"), "c-cpp"},
+		{"Swift language matches swift (Xcode-project-only checkout)", briefJSON("language:Swift"), "swift"},
+		{"OCaml language matches ocaml (belt-and-braces for a *.ml-only checkout)", briefJSON("language:OCaml"), "ocaml"},
+		{
+			// An opam package that ships a compat Makefile (many do; it just
+			// calls dune) must not fall through to c-cpp.
+			"opam + Make picks ocaml over c-cpp (registry order)",
+			briefJSON("package_manager:opam", "build:Make", "build:Dune", "language:OCaml"),
+			"ocaml",
 		},
 		{
-			name: "composer case-insensitive",
-			json: `{"package_managers":[{"name":"composer"}]}`,
-			want: "php",
+			// A Swift package that vendors C sources or a Makefile must
+			// still route to swift, not c-cpp.
+			"SwiftPM + Make + C picks swift over c-cpp",
+			briefJSON("package_manager:Swift Package Manager", "build:Make", "language:C"),
+			"swift",
 		},
 		{
-			name: "bundler matches ruby",
-			json: `{"package_managers":[{"name":"Bundler"}]}`,
-			want: "ruby",
+			// A CPAN dist that also commits a generated Makefile must still
+			// route to perl, not c-cpp: registry order and the cpanm/Perl
+			// selectors both come first.
+			"cpanm + Make picks perl over c-cpp (registry order)",
+			briefJSON("package_manager:cpanm", "language:Perl", "build:Make"),
+			"perl",
 		},
 		{
-			name: "bundler case-insensitive",
-			json: `{"package_managers":[{"name":"bundler"}]}`,
-			want: "ruby",
+			// Regression for #884: curl is ~85% C but ships hundreds of
+			// tests/*.pl. brief sorts languages by source-file count, so only the
+			// dominant language may participate in matching; the perl
+			// language selector must not fire on a secondary language.
+			"C-dominant repo with Perl test harness picks c-cpp (#884)",
+			`{"languages":[{"name":"C","category":"language"},{"name":"Perl","category":"language"}],"tools":{"build":[{"name":"Autotools"}]}}`,
+			"c-cpp",
 		},
 		{
-			name: "first composer match wins",
-			json: `{"package_managers":[{"name":"Composer"},{"name":"npm"}]}`,
-			want: "php",
+			// Same repo shape after a focus-area prune that dropped
+			// configure.ac/CMakeLists.txt: no build tool, but C is still
+			// the dominant language and must still win.
+			"C-dominant repo without build tool still picks c-cpp (#884)",
+			`{"languages":[{"name":"C","category":"language"},{"name":"Perl","category":"language"}]}`,
+			"c-cpp",
 		},
 		{
-			name: "composer present even if not first",
-			json: `{"package_managers":[{"name":"npm"},{"name":"Composer"}]}`,
-			want: "php",
+			// Data/markup/prose entries in brief's languages array are
+			// skipped; the first *programming* language is the dominant one.
+			"non-language category is skipped when picking dominant language",
+			`{"languages":[{"name":"YAML","category":"data"},{"name":"Perl","category":"language"}]}`,
+			"perl",
 		},
 		{
-			name: "composer + bundler picks php (registry order)",
-			json: `{"package_managers":[{"name":"Composer"},{"name":"Bundler"}]}`,
-			want: "php",
+			"empty language name is skipped when picking dominant language",
+			`{"languages":[{"name":"","category":"language"},{"name":"C","category":"language"}]}`,
+			"c-cpp",
 		},
 		{
-			name: "bundler + composer still picks php (registry order, not brief order)",
-			json: `{"package_managers":[{"name":"Bundler"},{"name":"Composer"}]}`,
-			want: "php",
+			// A Bundler repo that also has a Makefile (common for gem
+			// build tasks) must not fall through to c-cpp.
+			"bundler + Make picks ruby over c-cpp",
+			briefJSON("package_manager:Bundler", "build:Make", "language:Ruby"),
+			"ruby",
 		},
 		{
-			name: "npm matches node",
-			json: `{"package_managers":[{"name":"npm"}]}`,
-			want: "node",
+			// An sbt repo that also ships a Makefile (many do; it just
+			// wraps `sbt compile`) must not fall through to c-cpp.
+			"sbt + Make picks scala over c-cpp (registry order)",
+			briefJSON("package_manager:sbt", "build:Make", "language:Scala"),
+			"scala",
 		},
 		{
-			name: "npm case-insensitive",
-			json: `{"package_managers":[{"name":"NPM"}]}`,
-			want: "node",
+			// A Scala-on-Gradle build reports both Gradle and Scala. scala
+			// is a superset of java (BaseProfile), so the Scala language
+			// selector routing here loses nothing and gains the sbt
+			// launcher plus Scala-specific reproducer guidance.
+			"Gradle + Scala language picks scala over java",
+			briefJSON("package_manager:Gradle", "language:Scala"),
+			"scala",
 		},
-		{
-			name: "composer before node when both present (registry order)",
-			json: `{"package_managers":[{"name":"npm"},{"name":"Composer"}]}`,
-			want: "php",
-		},
-		{
-			name: "pip matches python",
-			json: `{"package_managers":[{"name":"pip"}]}`,
-			want: "python",
-		},
-		{
-			name: "poetry matches python (secondary ecosystem)",
-			json: `{"package_managers":[{"name":"Poetry"}]}`,
-			want: "python",
-		},
-		{
-			name: "uv matches python case-insensitive",
-			json: `{"package_managers":[{"name":"UV"}]}`,
-			want: "python",
-		},
-		{
-			name: "pdm matches python",
-			json: `{"package_managers":[{"name":"PDM"}]}`,
-			want: "python",
-		},
-		{
-			name: "setup.py with Extension selects python-ext",
-			json: `{"package_managers":[{"name":"pip"}]}`,
-			setup: func(t *testing.T, dir string) {
-				writeSetupPy(t, dir, setupPyWithExtension)
-			},
-			want: "python-ext",
-		},
-		{
-			name: "setup.py with Extension matches python-ext even without a manager",
-			json: `{"package_managers":[]}`,
-			setup: func(t *testing.T, dir string) {
-				writeSetupPy(t, dir, setupPyWithExtension)
-			},
-			want: "python-ext",
-		},
-		{
-			name: "pure-python setup.py does not match python-ext, pip picks python",
-			json: `{"package_managers":[{"name":"pip"}]}`,
-			setup: func(t *testing.T, dir string) {
-				writeSetupPy(t, dir, setupPyPurePython)
-			},
-			want: "python",
-		},
-		{
-			name: "go modules matches go",
-			json: `{"package_managers":[{"name":"Go Modules"}]}`,
-			want: "go",
-		},
-		{
-			name: "go modules case-insensitive",
-			json: `{"package_managers":[{"name":"go modules"}]}`,
-			want: "go",
-		},
-		{
-			name: "maven matches java",
-			json: `{"package_managers":[{"name":"Maven"}]}`,
-			want: "java",
-		},
-		{
-			name: "gradle matches java (secondary ecosystem)",
-			json: `{"package_managers":[{"name":"Gradle"}]}`,
-			want: "java",
-		},
-		{
-			name: "gradle case-insensitive",
-			json: `{"package_managers":[{"name":"gradle"}]}`,
-			want: "java",
-		},
-		{
-			name: "nuget matches dotnet",
-			json: `{"package_managers":[{"name":"NuGet"}]}`,
-			want: "dotnet",
-		},
-		{
-			name: "nuget case-insensitive",
-			json: `{"package_managers":[{"name":"nuget"}]}`,
-			want: "dotnet",
-		},
-		{
-			name: "mix matches beam",
-			json: `{"package_managers":[{"name":"Mix"}]}`,
-			want: "beam",
-		},
-		{
-			name: "rebar3 matches beam (secondary ecosystem)",
-			json: `{"package_managers":[{"name":"rebar3"}]}`,
-			want: "beam",
-		},
-		{
-			name: "mix case-insensitive",
-			json: `{"package_managers":[{"name":"mix"}]}`,
-			want: "beam",
-		},
-		{
-			name: "CMakeLists.txt selects c-cpp (no package manager)",
-			json: `{"package_managers":[]}`,
-			setup: func(t *testing.T, dir string) {
-				writeMarkerFile(t, dir, "CMakeLists.txt")
-			},
-			want: "c-cpp",
-		},
-		{
-			name: "Makefile selects c-cpp",
-			json: `{"package_managers":[]}`,
-			setup: func(t *testing.T, dir string) {
-				writeMarkerFile(t, dir, "Makefile")
-			},
-			want: "c-cpp",
-		},
-		{
-			name: "meson.build selects c-cpp",
-			json: `{"package_managers":[]}`,
-			setup: func(t *testing.T, dir string) {
-				writeMarkerFile(t, dir, "meson.build")
-			},
-			want: "c-cpp",
-		},
-		{
-			name: "language ecosystem wins over a c-cpp build file",
-			json: `{"package_managers":[{"name":"Composer"}]}`,
-			setup: func(t *testing.T, dir string) {
-				writeMarkerFile(t, dir, "Makefile")
-			},
-			want: "php",
-		},
-		{
-			// rust is registered before the c-cpp fallback, so a Cargo
-			// crate that also ships a Makefile (common for -sys crates and
-			// build.rs-driven C builds) still routes to the rust profile.
-			name: "cargo wins over a c-cpp build file",
-			json: `{"package_managers":[{"name":"Cargo"}]}`,
-			setup: func(t *testing.T, dir string) {
-				writeMarkerFile(t, dir, "Makefile")
-			},
-			want: "rust",
-		},
-		{
-			name: "cargo matches rust",
-			json: `{"package_managers":[{"name":"Cargo"}]}`,
-			want: "rust",
-		},
-		{
-			name: "cargo case-insensitive",
-			json: `{"package_managers":[{"name":"cargo"}]}`,
-			want: "rust",
-		},
-		{
-			name: "truly unknown manager falls back",
-			json: `{"package_managers":[{"name":"Conan"}]}`,
-			want: "",
-		},
-		{
-			name: "empty manager list falls back",
-			json: `{"package_managers":[]}`,
-			want: "",
-		},
-		{
-			name: "missing field falls back",
-			json: `{}`,
-			want: "",
-		},
-		{
-			name: "invalid json falls back",
-			json: `not json`,
-			want: "",
-		},
-		{
-			name: "config.m4 with PHP_ARG selects php-ext",
-			json: `{"package_managers":[]}`,
-			setup: func(t *testing.T, dir string) {
-				writeConfigM4(t, dir, configM4Body)
-			},
-			want: "php-ext",
-		},
-		{
-			name: "php-ext wins over php when both signals present",
-			json: `{"package_managers":[{"name":"Composer"}]}`,
-			setup: func(t *testing.T, dir string) {
-				writeConfigM4(t, dir, configM4Body)
-			},
-			want: "php-ext",
-		},
-		{
-			name: "config.m4 without PHP_ARG does not match php-ext",
-			json: `{"package_managers":[{"name":"Composer"}]}`,
-			setup: func(t *testing.T, dir string) {
-				writeConfigM4(t, dir, configM4WithoutPHPArg)
-			},
-			want: "php", // composer marker still picks php
-		},
-		{
-			name: "config.m4 without PHP_ARG and no composer falls back",
-			json: `{"package_managers":[]}`,
-			setup: func(t *testing.T, dir string) {
-				writeConfigM4(t, dir, configM4WithoutPHPArg)
-			},
-			want: "",
-		},
-		{
-			name:    "marker profile cannot match without srcDir",
-			json:    `{"package_managers":[]}`,
-			noSrcOK: true,
-			want:    "",
-		},
+
+		// no-match cases
+		{"unknown ecosystem falls back to default", briefJSON("package_manager:CocoaPods"), ""},
+		{"empty brief output falls back to default", briefJSON(), ""},
+		{"unrelated tool category is ignored", briefJSON("test:RSpec"), ""},
+
+		// malformed / degraded input
+		{"invalid json is tolerated", `not json`, ""},
+		{"null package_managers is tolerated (perl via language)", `{"package_managers":null,"languages":[{"name":"Perl"}]}`, "perl"},
+		{"null tools is tolerated", `{"package_managers":[{"name":"Bundler"}],"tools":null}`, "ruby"},
+		{"nil brief output falls back to default", "", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := ""
-			if !tt.noSrcOK {
-				dir = t.TempDir()
-			}
-			if tt.setup != nil {
-				tt.setup(t, dir)
-			}
-			got := matchProfile([]byte(tt.json), dir)
+			got := matchProfile([]byte(tt.json))
 			if got.Name != tt.want {
-				t.Errorf("matchProfile = %q, want %q", got.Name, tt.want)
+				t.Errorf("matchProfile = %q, want %q (json=%s)", got.Name, tt.want, tt.json)
 			}
 		})
+	}
+}
+
+// TestMatchProfile_everyProfileReachable derives one positive case per
+// registered profile from its own Detect entry, so a new profile is
+// exercised without a hand-added table row.
+func TestMatchProfile_everyProfileReachable(t *testing.T) {
+	for _, p := range builtinProfiles {
+		if len(p.Detect) == 0 || len(p.Detect[0].Names) == 0 {
+			t.Fatalf("profile %q has empty Detect (registrySanity should have caught this)", p.Name)
+		}
+		d := p.Detect[0]
+		got := matchProfile([]byte(briefJSON(d.Category + ":" + d.Names[0])))
+		// The match may be a more-specific earlier profile (e.g. asking for
+		// package_manager:Bundler when ruby-ext precedes ruby is impossible
+		// since ruby-ext keys on native_extension), so this asserts the
+		// input reaches p or something before it, never the default.
+		if got.Name == "" {
+			t.Errorf("profile %q: %s:%s matched nothing", p.Name, d.Category, d.Names[0])
+		}
 	}
 }
 
@@ -412,16 +313,16 @@ func TestImageTag_contentAddressed(t *testing.T) {
 }
 
 func TestResolveBaseDigest_fallsBackToEmpty(t *testing.T) {
-	// An empty ref short-circuits without shelling out to docker.
-	if got := resolveBaseDigest(context.Background(), ""); got != "" {
+	// An empty ref short-circuits without shelling out to the runtime.
+	if got := resolveBaseDigest(context.Background(), ContainerRuntime{}, ""); got != "" {
 		t.Errorf("empty ref: got %q, want empty", got)
 	}
-	// A cancelled context aborts the docker call before it runs, standing in
+	// A cancelled context aborts the runtime call before it runs, standing in
 	// for any resolution failure (offline, local-only ref, buildx missing);
 	// the function must fall back to "" so imageTag keys on the ref alone.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if got := resolveBaseDigest(ctx, "ghcr.io/example/runner:latest"); got != "" {
+	if got := resolveBaseDigest(ctx, ContainerRuntime{}, "ghcr.io/example/runner:latest"); got != "" {
 		t.Errorf("cancelled ctx: got %q, want empty", got)
 	}
 }
@@ -441,7 +342,7 @@ func TestLockForTag_sameTagSameMutex(t *testing.T) {
 
 func TestEnsureImage_defaultReturnsRunnerImage(t *testing.T) {
 	var emitted int
-	img, err := Profile{}.EnsureImage(context.Background(), "", "default-runner:latest", func(Event) { emitted++ })
+	img, err := Profile{}.EnsureImage(context.Background(), ContainerRuntime{}, "", "default-runner:latest", func(Event) { emitted++ })
 	if err != nil {
 		t.Fatalf("default profile: %v", err)
 	}
@@ -455,7 +356,7 @@ func TestEnsureImage_defaultReturnsRunnerImage(t *testing.T) {
 
 func TestEnsureImage_noProfilesDir(t *testing.T) {
 	var emitted int
-	_, err := Profile{Name: "php"}.EnsureImage(context.Background(), "", "default:latest", func(Event) { emitted++ })
+	_, err := Profile{Name: "php"}.EnsureImage(context.Background(), ContainerRuntime{}, "", "default:latest", func(Event) { emitted++ })
 	if err == nil {
 		t.Fatal("expected ErrNoProfilesDir, got nil")
 	}
@@ -467,7 +368,7 @@ func TestEnsureImage_noProfilesDir(t *testing.T) {
 func TestEnsureImage_missingDockerfile(t *testing.T) {
 	dir := t.TempDir()
 	var emitted int
-	_, err := Profile{Name: "php"}.EnsureImage(context.Background(), dir, "default:latest", func(Event) { emitted++ })
+	_, err := Profile{Name: "php"}.EnsureImage(context.Background(), ContainerRuntime{}, dir, "default:latest", func(Event) { emitted++ })
 	if err == nil {
 		t.Fatal("expected error for missing dockerfile, got nil")
 	}
@@ -476,36 +377,125 @@ func TestEnsureImage_missingDockerfile(t *testing.T) {
 	}
 }
 
+func TestEnsureImage_unknownBaseProfile(t *testing.T) {
+	dir := t.TempDir()
+	var emitted int
+	// A BaseProfile that names no registered profile is a registry bug, not a
+	// runtime one: EnsureImage errors out before touching the runtime (there is
+	// no base image to build FROM). TestBuiltinProfiles_registrySanity guards
+	// the real registry against this; here we lock the runtime behaviour.
+	_, err := Profile{Name: "ruby-rails", BaseProfile: "nope"}.EnsureImage(
+		context.Background(), ContainerRuntime{}, dir, "runner:latest", func(Event) { emitted++ })
+	if err == nil {
+		t.Fatal("expected error for unknown base profile, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown base profile") {
+		t.Errorf("error = %v, want it to mention the unknown base profile", err)
+	}
+	if emitted != 0 {
+		t.Errorf("unknown-base path emitted %d events, want 0", emitted)
+	}
+}
+
 // TestBuiltinProfiles_registrySanity guards the invariants matchProfile
-// and the validators rely on: every entry must have a name and either an
-// Ecosystem or at least one Marker, names must be unique, and ecosystems
-// must be unique case-insensitively (a duplicate would silently make
-// auto-detection resolve the wrong profile, with no other test failing).
-// Marker-only profiles legitimately have no Ecosystem and are excluded
-// from the ecosystem-uniqueness check. A profile that matches several
-// ecosystems (e.g. python, java) lists them via Ecosystems; every one is
-// checked for uniqueness against every other profile's.
+// and the validators rely on: every entry has a Name and a non-empty
+// Detect (an empty Detect would never match, making the profile dead
+// code), Names are unique, and no (category, name) selector appears in
+// two profiles where the later one could never win. BaseProfile /
+// FallbackProfile chains must resolve and be acyclic.
 func TestBuiltinProfiles_registrySanity(t *testing.T) {
 	names := map[string]bool{}
-	ecosystems := map[string]bool{}
 	for _, p := range builtinProfiles {
 		if p.Name == "" {
 			t.Error("profile with empty Name")
 		}
-		ecos := p.allEcosystems()
-		if len(ecos) == 0 && len(p.Markers) == 0 && len(p.AnyMarkers) == 0 {
-			t.Errorf("profile %q has no Ecosystem, Markers, or AnyMarkers", p.Name)
+		if len(p.Detect) == 0 {
+			t.Errorf("profile %q has empty Detect", p.Name)
 		}
 		if names[p.Name] {
 			t.Errorf("duplicate profile Name %q", p.Name)
 		}
 		names[p.Name] = true
-		for _, e := range ecos {
-			eco := strings.ToLower(e)
-			if ecosystems[eco] {
-				t.Errorf("duplicate profile Ecosystem %q (case-insensitive)", e)
+	}
+	assertProfileSelectorsUnique(t)
+	// Every BaseProfile must name another registered profile, so the FROM
+	// chain in EnsureImage resolves; a typo would otherwise silently build
+	// FROM the runner via ProfileByName's default fallback.
+	for _, p := range builtinProfiles {
+		if p.BaseProfile == "" {
+			continue
+		}
+		if p.BaseProfile == p.Name {
+			t.Errorf("profile %q lists itself as BaseProfile", p.Name)
+		}
+		if !names[p.BaseProfile] {
+			t.Errorf("profile %q has unknown BaseProfile %q", p.Name, p.BaseProfile)
+		}
+	}
+	// Every FallbackProfile must name another registered profile, so the
+	// degrade chain in resolveProfile resolves instead of silently dropping to
+	// the guide-less default runner.
+	for _, p := range builtinProfiles {
+		if p.FallbackProfile == "" {
+			continue
+		}
+		if p.FallbackProfile == p.Name {
+			t.Errorf("profile %q lists itself as FallbackProfile", p.Name)
+		}
+		if !names[p.FallbackProfile] {
+			t.Errorf("profile %q has unknown FallbackProfile %q", p.Name, p.FallbackProfile)
+		}
+	}
+	// Neither chain may cycle. The self-checks above catch the direct A->A case;
+	// assertProfileChainAcyclic walks the whole chain so a multi-hop A->B->A can't
+	// slip through.
+	assertProfileChainAcyclic(t, "BaseProfile", func(p Profile) string { return p.BaseProfile })
+	assertProfileChainAcyclic(t, "FallbackProfile", func(p Profile) string { return p.FallbackProfile })
+}
+
+// assertProfileSelectorsUnique checks every BriefMatch is well-formed and no
+// (category, name) selector is claimed by more than one profile: a later
+// profile listing a selector an earlier one already owns can never win on
+// that selector alone (first-match-wins), so a duplicate is either a typo or
+// dead code. Kept out of TestBuiltinProfiles_registrySanity so its cognitive
+// complexity stays under the linter's cap.
+func assertProfileSelectorsUnique(t *testing.T) {
+	t.Helper()
+	selectors := map[[2]string]string{}
+	for _, p := range builtinProfiles {
+		for _, m := range p.Detect {
+			if m.Category == "" || len(m.Names) == 0 {
+				t.Errorf("profile %q has a BriefMatch with empty Category or Names", p.Name)
 			}
-			ecosystems[eco] = true
+			for _, n := range m.Names {
+				key := [2]string{m.Category, strings.ToLower(n)}
+				if prev, ok := selectors[key]; ok {
+					t.Errorf("profile %q: selector %s:%s already claimed by %q (later profile unreachable via this selector)", p.Name, m.Category, n, prev)
+				}
+				selectors[key] = p.Name
+			}
+		}
+	}
+}
+
+// assertProfileChainAcyclic walks the chain reached by next() from every
+// registered profile and fails if a name repeats. A FallbackProfile cycle would
+// spin resolveProfile's degrade loop (which also breaks on a repeat at runtime)
+// and a BaseProfile cycle would recurse EnsureImage into a stack overflow, so an
+// acyclic registry is the invariant both rely on. Kept out of the registry
+// sanity test body so its cognitive complexity stays under the linter's cap.
+func assertProfileChainAcyclic(t *testing.T, kind string, next func(Profile) string) {
+	t.Helper()
+	for _, start := range builtinProfiles {
+		seen := map[string]bool{start.Name: true}
+		for cur := start; next(cur) != ""; {
+			n := next(cur)
+			if seen[n] {
+				t.Errorf("profile %q: %s chain cycles at %q", start.Name, kind, n)
+				break
+			}
+			seen[n] = true
+			cur = ProfileByName(n)
 		}
 	}
 }
@@ -537,4 +527,104 @@ func TestProfileGuidesShip(t *testing.T) {
 			t.Errorf("expected %s profile PROFILE.md to exist: %v", p.Name, err)
 		}
 	}
+}
+
+// TestProfileBuildArgs pins the runner-vs-chained build-arg wiring EnsureImage
+// relies on, without a container runtime: a runner profile --pull's (only with
+// a resolved digest) and passes RUNNER_IMAGE; a chained profile passes
+// BASE_IMAGE (the base tag), never RUNNER_IMAGE, and never --pull's a
+// locally-built base.
+func TestProfileBuildArgs(t *testing.T) {
+	join := func(a []string) string { return strings.Join(a, " ") }
+	runner := Profile{Name: "ruby"}
+	chained := Profile{Name: "ruby-rails", BaseProfile: "ruby"}
+
+	a := join(profileBuildArgs(runner, "tag:1", "df", "ctx", "runner:latest", "deadbeef"))
+	if !strings.Contains(a, "--pull") || !strings.Contains(a, "--build-arg RUNNER_IMAGE=runner:latest") {
+		t.Errorf("runner+digest should --pull and pass RUNNER_IMAGE: %s", a)
+	}
+	b := join(profileBuildArgs(runner, "tag:1", "df", "ctx", "runner:latest", ""))
+	if strings.Contains(b, "--pull") {
+		t.Errorf("runner without a resolved digest must not --pull: %s", b)
+	}
+	c := join(profileBuildArgs(chained, "tag:2", "df", "ctx", "scrutineer-profile-ruby:abc", ""))
+	if strings.Contains(c, "--pull") {
+		t.Errorf("chained must not --pull a local base: %s", c)
+	}
+	if !strings.Contains(c, "--build-arg BASE_IMAGE=scrutineer-profile-ruby:abc") {
+		t.Errorf("chained should pass BASE_IMAGE: %s", c)
+	}
+	if strings.Contains(c, "RUNNER_IMAGE=") {
+		t.Errorf("chained must not pass RUNNER_IMAGE: %s", c)
+	}
+}
+
+// TestBrakemanVersionParity keeps ruby-ext's Brakeman pin in lockstep with
+// ruby-rails's. ruby-ext installs Brakeman too (it precedes ruby-rails in
+// detection and must stay a superset), so the two ARG pins are the one bit of
+// duplication the FROM-chain leaves; this catches silent drift.
+func TestBrakemanVersionParity(t *testing.T) {
+	wd, _ := os.Getwd()
+	repoRoot := filepath.Join(wd, "..", "..")
+	rails := brakemanVersion(t, filepath.Join(repoRoot, "docker", "profiles", "ruby-rails", "Dockerfile"))
+	ext := brakemanVersion(t, filepath.Join(repoRoot, "docker", "profiles", "ruby-ext", "Dockerfile"))
+	if rails == "" || ext == "" {
+		t.Fatalf("BRAKEMAN_VERSION pin not found: ruby-rails=%q ruby-ext=%q", rails, ext)
+	}
+	if rails != ext {
+		t.Errorf("BRAKEMAN_VERSION drift: ruby-rails=%q ruby-ext=%q (keep them in lockstep)", rails, ext)
+	}
+}
+
+// TestChainedProfilesInCIWorkflow keeps .github/workflows/profile-images.yml
+// in sync with builtinProfiles' BaseProfile entries. That workflow special-
+// cases chained profiles (it must build the base image first and pass it as
+// BASE_IMAGE); a new BaseProfile entry that is not listed there would build
+// FROM the runner in CI and pass, then fail at the worker's on-demand build
+// because the Dockerfile's ARG BASE_IMAGE never resolved to a java/ruby image.
+func TestChainedProfilesInCIWorkflow(t *testing.T) {
+	wd, _ := os.Getwd()
+	wf := filepath.Join(wd, "..", "..", ".github", "workflows", "profile-images.yml")
+	b, err := os.ReadFile(wf)
+	if err != nil {
+		t.Fatalf("read workflow: %v", err)
+	}
+	// Match `<profile>) base=<base> ;;` lines inside the case block.
+	re := regexp.MustCompile(`(?m)^\s+(\S+)\)\s+base=(\S+)\s+;;`)
+	got := map[string]string{}
+	for _, m := range re.FindAllStringSubmatch(string(b), -1) {
+		if m[1] != "*" {
+			got[m[1]] = m[2]
+		}
+	}
+	want := map[string]string{}
+	for _, p := range builtinProfiles {
+		if p.BaseProfile != "" {
+			want[p.Name] = p.BaseProfile
+		}
+	}
+	for name, base := range want {
+		if got[name] != base {
+			t.Errorf("workflow case for %q maps to base %q, want %q (add `%s) base=%s ;;` to %s)",
+				name, got[name], base, name, base, wf)
+		}
+	}
+	for name := range got {
+		if _, ok := want[name]; !ok {
+			t.Errorf("workflow case for %q has no matching BaseProfile in builtinProfiles (stale entry?)", name)
+		}
+	}
+}
+
+func brakemanVersion(t *testing.T, dockerfile string) string {
+	t.Helper()
+	b, err := os.ReadFile(dockerfile)
+	if err != nil {
+		t.Fatalf("read %s: %v", dockerfile, err)
+	}
+	m := regexp.MustCompile(`(?m)^ARG BRAKEMAN_VERSION=(\S+)`).FindSubmatch(b)
+	if m == nil {
+		return ""
+	}
+	return string(m[1])
 }

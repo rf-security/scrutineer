@@ -1,6 +1,8 @@
 package web
 
 import (
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -9,6 +11,7 @@ import (
 	"testing"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/skills"
 	"scrutineer/internal/worker"
 )
 
@@ -63,6 +66,152 @@ func TestSkillsCreateAndShow(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "hello") {
 		t.Error("show page missing name")
+	}
+}
+
+func TestSkillUpdate_rejectsBlankDescriptionWithoutChangingSkill(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	skill := db.Skill{
+		Name:        "hello",
+		Description: "original description",
+		Body:        "original body",
+		OutputKind:  "freeform",
+		Version:     1,
+		Active:      true,
+		Source:      "ui",
+	}
+	if err := s.DB.Create(&skill).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	w := postForm(t, s, "/skills/"+strconv.Itoa(int(skill.ID)), url.Values{
+		"name":        {"hello"},
+		"description": {"   "},
+		"body":        {"changed body"},
+		"output_kind": {"freeform"},
+		"active":      {"on"},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body)
+	}
+
+	var got db.Skill
+	if err := s.DB.First(&got, skill.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Description != "original description" || got.Body != "original body" || got.Version != 1 {
+		t.Fatalf("rejected update changed skill: description=%q body=%q version=%d",
+			got.Description, got.Body, got.Version)
+	}
+}
+
+func TestSkillCreate_rejectsInvalidSchemaJSON(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	w := postForm(t, s, "/skills", url.Values{
+		"name":        {"hello"},
+		"description": {"Say hi"},
+		"body":        {"# hello"},
+		"output_kind": {"freeform"},
+		"schema_json": {`{"type":`},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body)
+	}
+	var count int64
+	if err := s.DB.Model(&db.Skill{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("created %d skills from invalid schema, want 0", count)
+	}
+}
+
+func TestSkillUpdate_rejectsInvalidSchemaJSONWithoutChangingSkill(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	skill := db.Skill{
+		Name:        "hello",
+		Description: "original description",
+		Body:        "original body",
+		SchemaJSON:  `{"type":"object"}`,
+		OutputKind:  "freeform",
+		Version:     1,
+		Active:      true,
+		Source:      "ui",
+	}
+	if err := s.DB.Create(&skill).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	w := postForm(t, s, "/skills/"+strconv.Itoa(int(skill.ID)), url.Values{
+		"name":        {"hello"},
+		"description": {"changed description"},
+		"body":        {"changed body"},
+		"output_kind": {"freeform"},
+		"schema_json": {`{"type":`},
+		"active":      {"on"},
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body)
+	}
+
+	var got db.Skill
+	if err := s.DB.First(&got, skill.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Description != "original description" || got.Body != "original body" ||
+		got.SchemaJSON != `{"type":"object"}` || got.Version != 1 {
+		t.Fatalf("rejected update changed skill: description=%q body=%q schema=%q version=%d",
+			got.Description, got.Body, got.SchemaJSON, got.Version)
+	}
+}
+
+func TestSkillUpdate_appliesValidForm(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	skill := db.Skill{
+		Name:        "hello",
+		Description: "original description",
+		Body:        "original body",
+		OutputFile:  "old.json",
+		OutputKind:  "freeform",
+		MaxTurns:    1,
+		SchemaJSON:  `{"type":"object"}`,
+		Version:     1,
+		Active:      true,
+		Source:      "ui",
+	}
+	if err := s.DB.Create(&skill).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	w := postForm(t, s, "/skills/"+strconv.Itoa(int(skill.ID)), url.Values{
+		"name":        {"hello-updated"},
+		"description": {"new description"},
+		"body":        {"new body"},
+		"output_file": {"report.json"},
+		"output_kind": {"findings"},
+		"max_turns":   {"42"},
+		"model":       {"claude-sonnet-5"},
+		"schema_json": {`  {"type":"array"}  `},
+	})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body=%s", w.Code, w.Body)
+	}
+
+	var got db.Skill
+	if err := s.DB.First(&got, skill.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != "hello-updated" || got.Description != "new description" ||
+		got.Body != "new body" || got.OutputFile != "report.json" ||
+		got.OutputKind != "findings" || got.MaxTurns != 42 ||
+		got.Model != "claude-sonnet-5" || got.SchemaJSON != `{"type":"array"}` ||
+		got.Active || got.Version != 2 || got.Source != "ui" {
+		t.Fatalf("updated skill = %+v", got)
 	}
 }
 
@@ -164,8 +313,8 @@ func TestParseSkillModel(t *testing.T) {
 		{"   ", ""},
 		{"garbage", ""},
 		{ModelTierHigh, ModelTierHigh},
-		{"claude-sonnet-4-6", "claude-sonnet-4-6"},
-		{" claude-opus-4-7 ", "claude-opus-4-7"},
+		{"claude-sonnet-5", "claude-sonnet-5"},
+		{" claude-opus-4-8 ", "claude-opus-4-8"},
 	}
 	for _, tc := range tests {
 		got := parseSkillModel(tc.input)
@@ -235,5 +384,55 @@ func TestSkillRetry_preservesSkillID(t *testing.T) {
 	}
 	if *retried.SkillID != skill.ID {
 		t.Errorf("retried SkillID = %d, want %d", *retried.SkillID, skill.ID)
+	}
+}
+
+// TestSkillsUI_bundledAdvisoryDeepDive loads the real bundled skills and
+// renders the /skills list and the advisory-deep-dive detail page. It guards
+// render paths a UI-created skill (freeform, no schema) never exercises: the
+// schema.json section, which runs the prettyjson filter over a real schema.
+// An unknown id must 404, not 500.
+func TestSkillsUI_bundledAdvisoryDeepDive(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	h := s.Handler()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if _, err := skills.LoadDirectory(s.DB, log, "../../skills", "local"); err != nil {
+		t.Fatalf("load bundled skills: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, localReq("GET", "/skills"))
+	if w.Code != 200 {
+		t.Fatalf("list status %d: %s", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), "advisory-deep-dive") {
+		t.Error("list page missing advisory-deep-dive row")
+	}
+
+	var row db.Skill
+	if err := s.DB.Where("name = ?", "advisory-deep-dive").First(&row).Error; err != nil {
+		t.Fatalf("advisory-deep-dive not loaded: %v", err)
+	}
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, localReq("GET", "/skills/"+strconv.FormatUint(uint64(row.ID), 10)))
+	if w.Code != 200 {
+		t.Fatalf("show status %d: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	for _, want := range []string{
+		"schema.json",                     // the {{if .SchemaJSON}} section rendered
+		"advisory-deep-dive audit report", // schema title, proving prettyjson ran over it
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("show page missing %q", want)
+		}
+	}
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, localReq("GET", "/skills/999999"))
+	if w.Code != http.StatusNotFound {
+		t.Errorf("unknown skill id: status %d, want 404", w.Code)
 	}
 }

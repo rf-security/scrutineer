@@ -1,297 +1,293 @@
 package worker
 
 import (
-	"crypto/tls"
+	"bufio"
 	"encoding/base64"
-	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
-func quietLog() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
-}
-
-func TestHardenedEgressAllow_minimalSurface(t *testing.T) {
-	// HardenedEgressAllow must allow Anthropic and the host skill API,
-	// and reject every host that DefaultEgressAllow opens up. Adding a
-	// new entry here is a deliberate widening of the hardened surface
-	// and should not happen accidentally.
-	allow := HardenedEgressAllow
-	if !HostAllowed(allow, "api.anthropic.com") {
-		t.Errorf("hardened blocked api.anthropic.com")
-	}
-	if !HostAllowed(allow, HostGatewayAlias) {
-		t.Errorf("hardened blocked %s", HostGatewayAlias)
-	}
-	for _, host := range []string{
-		"packages.ecosyste.ms",
-		"github.com",
-		"registry.npmjs.org",
-		"pypi.org",
-		"osv.dev",
-	} {
-		if HostAllowed(allow, host) {
-			t.Errorf("hardened allowed %s, must not", host)
-		}
-	}
-}
-
-func TestHostAllowed(t *testing.T) {
-	allow := []string{
-		"api.anthropic.com",
-		"*.ecosyste.ms",
-		"GitHub.com",
-		HostGatewayAlias,
-	}
-	cases := []struct {
-		host string
-		want bool
-	}{
-		{"api.anthropic.com", true},
-		{"API.Anthropic.com", true},
-		{"anthropic.com", false},
-		{"packages.ecosyste.ms", true},
-		{"repos.ecosyste.ms", true},
-		{"ecosyste.ms", false},
-		{"evil.ecosyste.ms.attacker.net", false},
-		{"github.com", true},
-		{"gist.github.com", false},
-		{"host.docker.internal", true},
-		{"example.org", false},
-	}
-	for _, tc := range cases {
-		if got := HostAllowed(allow, tc.host); got != tc.want {
-			t.Errorf("HostAllowed(%q) = %v, want %v", tc.host, got, tc.want)
-		}
-	}
-}
-
-func TestSplitTargetDefaultsPort(t *testing.T) {
-	h, p := splitTarget("example.com")
-	if h != "example.com" || p != "443" {
-		t.Errorf("got %q %q", h, p)
-	}
-	h, p = splitTarget("example.com:8443")
-	if h != "example.com" || p != "8443" {
-		t.Errorf("got %q %q", h, p)
-	}
-}
-
-func TestDialTargetRewritesGatewayAlias(t *testing.T) {
-	if got := dialTarget(HostGatewayAlias, "8080"); got != "127.0.0.1:8080" {
-		t.Errorf("got %q", got)
-	}
-	if got := dialTarget("Host.Docker.Internal", "9090"); got != "127.0.0.1:9090" {
-		t.Errorf("case-insensitive rewrite failed: %q", got)
-	}
-	if got := dialTarget("api.anthropic.com", "443"); got != "api.anthropic.com:443" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestEgressProxy_RequiresAuth(t *testing.T) {
-	p := &EgressProxy{Allow: []string{"example.com"}, Token: "sekrit", Log: quietLog()}
-	r := httptest.NewRequest(http.MethodConnect, "example.com:443", nil)
-	w := httptest.NewRecorder()
-	p.ServeHTTP(w, r)
-	if w.Code != http.StatusProxyAuthRequired {
-		t.Fatalf("no auth: got %d, want 407", w.Code)
-	}
-
-	r = httptest.NewRequest(http.MethodConnect, "example.com:443", nil)
-	r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("x:wrong")))
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, r)
-	if w.Code != http.StatusProxyAuthRequired {
-		t.Fatalf("wrong token: got %d, want 407", w.Code)
-	}
-}
-
-func TestEgressProxy_ForwardDenied(t *testing.T) {
-	p := &EgressProxy{Allow: []string{"allowed.test"}, Log: quietLog()}
-	r := httptest.NewRequest("GET", "http://denied.test/foo", nil)
-	w := httptest.NewRecorder()
-	p.ServeHTTP(w, r)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("got %d, want 403", w.Code)
-	}
-}
-
-func TestEgressProxy_ForwardAllowedRewritesGateway(t *testing.T) {
-	// Upstream stands in for the local scrutineer API on 127.0.0.1.
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Upstream", "yes")
-		_, _ = io.WriteString(w, "hello "+r.URL.Path)
-	}))
-	defer upstream.Close()
-	_, port, _ := net.SplitHostPort(upstream.Listener.Addr().String())
-
-	p := &EgressProxy{Allow: []string{HostGatewayAlias}, Log: quietLog()}
-	target := "http://" + net.JoinHostPort(HostGatewayAlias, port) + "/api/ping"
-	r := httptest.NewRequest("GET", target, nil)
-	w := httptest.NewRecorder()
-	p.ServeHTTP(w, r)
-	if w.Code != http.StatusOK {
-		t.Fatalf("got %d: %s", w.Code, w.Body)
-	}
-	if w.Header().Get("X-Upstream") != "yes" {
-		t.Errorf("upstream header not copied through")
-	}
-	if !strings.Contains(w.Body.String(), "/api/ping") {
-		t.Errorf("body = %q", w.Body.String())
-	}
-}
-
-// TestEgressProxy_ConnectEndToEnd exercises the full path the docker
-// runner uses: a real listener, Proxy-Authorization in the proxy URL,
-// CONNECT tunnel, then a TLS request over it. The upstream is a local
-// httptest TLS server allowlisted as 127.0.0.1.
-func TestEgressProxy_ConnectEndToEnd(t *testing.T) {
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, "tunnelled")
-	}))
-	defer upstream.Close()
-
-	token := "tok"
-	p := &EgressProxy{Allow: []string{"127.0.0.1"}, Token: token, Log: quietLog()}
-	proxySrv := httptest.NewServer(p)
-	defer proxySrv.Close()
-
-	pu, _ := url.Parse(proxySrv.URL)
-	pu.User = url.UserPassword("scrutineer", token)
-	tr := &http.Transport{
-		Proxy:           http.ProxyURL(pu),
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-	client := &http.Client{Transport: tr}
-
-	resp, err := client.Get(upstream.URL)
+func TestStartScopedEgressProxyClosesListener(t *testing.T) {
+	port, cleanup, err := StartScopedEgressProxy(&EgressProxy{
+		Allow: []string{"example.com"},
+		Token: "scan-token",
+	})
 	if err != nil {
-		t.Fatalf("get via proxy: %v", err)
+		t.Fatal(err)
+	}
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		cleanup()
+		t.Fatalf("dial scoped proxy: %v", err)
+	}
+	_ = conn.Close()
+	cleanup()
+	if conn, err = net.DialTimeout("tcp", addr, 100*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("scoped proxy listener remains open after cleanup")
+	}
+}
+
+func TestEgressProxyRejectsAPIPortCONNECT(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamHost, apiPort, err := net.SplitHostPort(upstream.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type starter func(*EgressProxy) (string, func(), error)
+	starters := map[string]starter{
+		"process-wide": func(p *EgressProxy) (string, func(), error) {
+			port, err := StartEgressProxy(p)
+			return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), func() {}, err
+		},
+		"scoped": func(p *EgressProxy) (string, func(), error) {
+			port, cleanup, err := StartScopedEgressProxy(p)
+			return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), cleanup, err
+		},
+		"sidecar": func(p *EgressProxy) (string, func(), error) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				return "", func() {}, err
+			}
+			addr := ln.Addr().String()
+			if err := ln.Close(); err != nil {
+				return "", func() {}, err
+			}
+			go func() { _ = ServeEgressProxy(p, addr) }()
+			return addr, func() {}, nil
+		},
+	}
+	forms := []struct {
+		name          string
+		requestTarget string
+		host          string
+	}{
+		{name: "authority-form", requestTarget: net.JoinHostPort(HostGatewayAlias, apiPort), host: net.JoinHostPort(HostGatewayAlias, apiPort)},
+		{name: "path-form", requestTarget: "/x", host: net.JoinHostPort(HostGatewayAlias, apiPort)},
+	}
+
+	for starterName, start := range starters {
+		t.Run(starterName, func(t *testing.T) {
+			const token = "scan-token"
+			proxyAddr, cleanup, err := start(&EgressProxy{
+				Allow:           []string{HostGatewayAlias},
+				Token:           token,
+				APIPort:         apiPort,
+				GatewayDialHost: upstreamHost,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cleanup()
+
+			for _, form := range forms {
+				t.Run(form.name, func(t *testing.T) {
+					resp, conn := connectThroughProxy(t, proxyAddr, token, form.requestTarget, form.host)
+					defer func() { _ = conn.Close() }()
+					defer func() { _ = resp.Body.Close() }()
+					if resp.StatusCode != http.StatusForbidden {
+						t.Fatalf("authenticated CONNECT to host API: got %d, want 403", resp.StatusCode)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestAPIConnectGuardMatchesConfiguredHostCaseInsensitively(t *testing.T) {
+	const token = "scan-token"
+	p := &EgressProxy{Token: token, APIPort: "8080", APIHosts: []string{"192.168.64.1"}}
+	for _, host := range []string{"192.168.64.1:8080", "HOST.DOCKER.INTERNAL:8080"} {
+		if strings.HasPrefix(host, "HOST.") {
+			p.APIHosts = nil
+		}
+		r := httptest.NewRequest(http.MethodConnect, host, nil)
+		r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("harness:"+token)))
+		w := httptest.NewRecorder()
+		apiConnectGuard(p).ServeHTTP(w, r)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("CONNECT %s: got %d, want 403", host, w.Code)
+		}
+	}
+}
+
+func TestAPIConnectGuardPreservesProxyAuthentication(t *testing.T) {
+	p := &EgressProxy{Token: "scan-token", APIPort: "8080", Allow: []string{HostGatewayAlias}}
+	for _, auth := range []string{"", "Basic " + base64.StdEncoding.EncodeToString([]byte("harness:wrong"))} {
+		r := httptest.NewRequest(http.MethodConnect, HostGatewayAlias+":8080", nil)
+		r.Header.Set("Proxy-Authorization", auth)
+		w := httptest.NewRecorder()
+		apiConnectGuard(p).ServeHTTP(w, r)
+		if w.Code != http.StatusProxyAuthRequired {
+			t.Errorf("authorization %q: got %d, want 407", auth, w.Code)
+		}
+		if got, want := w.Header().Get("Proxy-Authenticate"), `Basic realm="harness"`; got != want {
+			t.Errorf("authorization %q: Proxy-Authenticate = %q, want %q", auth, got, want)
+		}
+	}
+}
+
+func TestEgressProxyPreservesInspectedAPIRequest(t *testing.T) {
+	const scanToken = "bearer-token"
+	var gotHost, spoofedHost string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/ping":
+			gotHost = r.Host
+		case "/api/v1/findings":
+			spoofedHost = r.Host
+			if strings.HasPrefix(r.Host, "localhost:") {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			http.Error(w, "forbidden: invalid host", http.StatusForbidden)
+			return
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+scanToken {
+			http.Error(w, "bad API request", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamHost, apiPort, err := net.SplitHostPort(upstream.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const proxyToken = "scan-proxy-token"
+	proxyPort, cleanup, err := StartScopedEgressProxy(&EgressProxy{
+		Allow:           []string{HostGatewayAlias},
+		Token:           proxyToken,
+		APIPort:         apiPort,
+		GatewayDialHost: upstreamHost,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	proxyURL, err := url.Parse(ProxyURLForHost(proxyToken, "127.0.0.1", proxyPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}, Timeout: time.Second}
+	target := "http://" + net.JoinHostPort(HostGatewayAlias, apiPort) + "/api/ping"
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+scanToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("forward request to host API: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 || string(body) != "tunnelled" {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("forward request to host API: got %d, want 204", resp.StatusCode)
+	}
+	if want := net.JoinHostPort(HostGatewayAlias, apiPort); gotHost != want {
+		t.Fatalf("forward request Host = %q, want %q", gotHost, want)
 	}
 
-	// And a host not on the allowlist must be refused at CONNECT time.
-	// Drop the pooled tunnel from the allowed request first so the
-	// transport actually re-CONNECTs.
-	tr.CloseIdleConnections()
-	p.Allow = []string{"somewhere.else"}
-	_, err = client.Get(upstream.URL)
-	if err == nil {
-		t.Fatalf("expected CONNECT to be refused for non-allowlisted host")
+	// A contradictory Host header on an absolute-form proxy request does not
+	// recreate the CONNECT bypass: net/http derives the proxy request's Host
+	// from the absolute target before the inspected forward path sees it.
+	conn, err := net.DialTimeout("tcp", proxyURL.Host, time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy for conflicting Host request: %v", err)
 	}
-}
-
-func TestEgressProxy_DeniesGatewayOnWrongPort(t *testing.T) {
-	p := &EgressProxy{
-		Allow:   []string{HostGatewayAlias},
-		APIPort: "8080",
-		Log:     quietLog(),
+	defer func() { _ = conn.Close() }()
+	auth := base64.StdEncoding.EncodeToString([]byte("harness:" + proxyToken))
+	if _, err := conn.Write([]byte("GET http://" + net.JoinHostPort(HostGatewayAlias, apiPort) +
+		"/api/v1/findings HTTP/1.1\r\nHost: " + net.JoinHostPort("localhost", apiPort) +
+		"\r\nProxy-Authorization: Basic " + auth + "\r\nConnection: close\r\n\r\n")); err != nil {
+		t.Fatalf("write conflicting Host request: %v", err)
 	}
-
-	// CONNECT to allowed port should work (as far as allowlist goes)
-	r := httptest.NewRequest(http.MethodConnect, HostGatewayAlias+":8080", nil)
-	w := httptest.NewRecorder()
-	p.ServeHTTP(w, r)
-	// Will fail with 502 (no upstream listener) but NOT 403
-	if w.Code == http.StatusForbidden {
-		t.Fatalf("CONNECT to API port should not be forbidden: %s", w.Body)
+	spoofResp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read conflicting Host response: %v", err)
 	}
-
-	// CONNECT to a different port should be denied
-	r = httptest.NewRequest(http.MethodConnect, HostGatewayAlias+":9090", nil)
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, r)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("CONNECT to non-API port: got %d, want 403", w.Code)
+	defer func() { _ = spoofResp.Body.Close() }()
+	if spoofResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("forward request with conflicting Host: got %d, want 403", spoofResp.StatusCode)
 	}
-
-	// Forward (non-CONNECT) to a different port should also be denied
-	r = httptest.NewRequest("GET", "http://"+HostGatewayAlias+":9090/secrets", nil)
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, r)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("forward to non-API port: got %d, want 403", w.Code)
+	if want := net.JoinHostPort(HostGatewayAlias, apiPort); spoofedHost != want {
+		t.Fatalf("forward request with conflicting Host reached upstream as %q, want %q", spoofedHost, want)
 	}
 }
 
-func TestEgressProxy_NoPortRestrictionForOtherHosts(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, "ok")
+func TestEgressProxyPreservesConfiguredHostPortCONNECT(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
-	_, port, _ := net.SplitHostPort(upstream.Listener.Addr().String())
-
-	p := &EgressProxy{
-		Allow:   []string{"127.0.0.1"},
-		APIPort: "8080",
-		Log:     quietLog(),
+	upstreamHost, modelPort, err := net.SplitHostPort(upstream.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
 	}
-	r := httptest.NewRequest("GET", "http://127.0.0.1:"+port+"/foo", nil)
-	w := httptest.NewRecorder()
-	p.ServeHTTP(w, r)
-	if w.Code != http.StatusOK {
-		t.Fatalf("non-gateway host on any port should be allowed: got %d", w.Code)
+
+	const token = "scan-token"
+	proxyPort, cleanup, err := StartScopedEgressProxy(&EgressProxy{
+		Allow:           []string{HostGatewayAlias},
+		Token:           token,
+		APIPort:         "1",
+		HostPorts:       []string{modelPort},
+		GatewayDialHost: upstreamHost,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	proxyAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort))
+	resp, conn := connectThroughProxy(t, proxyAddr, token, net.JoinHostPort(HostGatewayAlias, modelPort), net.JoinHostPort(HostGatewayAlias, modelPort))
+	defer func() { _ = conn.Close() }()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated CONNECT to configured host port: got %d, want 200", resp.StatusCode)
 	}
 }
 
-func TestProxyURLShape(t *testing.T) {
-	got := ProxyURL("abc", 1234)
-	want := "http://scrutineer:abc@host.docker.internal:1234"
-	if got != want {
-		t.Errorf("got %q want %q", got, want)
-	}
-}
-
-func TestDefaultEgressAllowCoversSkillHosts(t *testing.T) {
-	for _, h := range []string{
-		"api.anthropic.com",
-		"packages.ecosyste.ms",
-		"repos.ecosyste.ms",
-		"advisories.ecosyste.ms",
-		"commits.ecosyste.ms",
-		"issues.ecosyste.ms",
-		"github.com",
-		"gitlab.com",
-		"registry.npmjs.org",
-		"api.npmjs.org",
-		"www.npmjs.com",
-		"pypi.org",
-		"pypistats.org",
-		"rubygems.org",
-		"crates.io",
-		"pkg.go.dev",
-		"packagist.org",
-		"hex.pm",
-		"api.nuget.org",
-		"www.nuget.org",
-		"repo.maven.apache.org",
-		"central.sonatype.com",
-		"anaconda.org",
-		"trunk.cocoapods.org",
-		"metacpan.org",
-		"cran.r-project.org",
-		"formulae.brew.sh",
-		"pub.dev",
-		"center.conan.io",
-		"semgrep.dev",
-		HostGatewayAlias,
-	} {
-		if !HostAllowed(DefaultEgressAllow, h) {
-			t.Errorf("default allowlist missing %q", h)
+func connectThroughProxy(t *testing.T, proxyAddr, token, requestTarget, host string) (*http.Response, net.Conn) {
+	t.Helper()
+	var conn net.Conn
+	var err error
+	deadline := time.Now().Add(time.Second)
+	for {
+		conn, err = net.DialTimeout("tcp", proxyAddr, 50*time.Millisecond)
+		if err == nil {
+			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial proxy: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if HostAllowed(DefaultEgressAllow, "evil.example.net") {
-		t.Errorf("default allowlist should not match arbitrary hosts")
+	auth := base64.StdEncoding.EncodeToString([]byte("harness:" + token))
+	if _, err := conn.Write([]byte("CONNECT " + requestTarget + " HTTP/1.1\r\nHost: " + host +
+		"\r\nProxy-Authorization: Basic " + auth + "\r\n\r\n")); err != nil {
+		_ = conn.Close()
+		t.Fatalf("write CONNECT: %v", err)
 	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	return resp, conn
 }

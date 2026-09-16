@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -65,7 +66,7 @@ func setUpBundleFinding(t *testing.T, s *Server, withPatch bool) *db.Finding {
 	return &f
 }
 
-func seedBundleDependent(t *testing.T, s *Server, repoID uint) {
+func seedBundleDependent(t *testing.T, s *Server, repoID uint) db.Dependent {
 	t.Helper()
 	dep := db.Dependent{
 		RepositoryID:   repoID,
@@ -76,6 +77,7 @@ func seedBundleDependent(t *testing.T, s *Server, repoID uint) {
 		DependentRepos: 10,
 	}
 	s.DB.Create(&dep)
+	return dep
 }
 
 func TestFindingBundle_containsManifestAndExports(t *testing.T) {
@@ -234,4 +236,22 @@ func keys[V any](m map[string]V) []string {
 var _ = func(s *Server, w http.ResponseWriter, r *http.Request) {
 	s.findingBundleDownload(w, r)
 	_ = strings.TrimSpace("")
+}
+
+func TestFindingBundle_failsOnDependentLookupError(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := setUpBundleFinding(t, s, false)
+	dep := seedBundleDependent(t, s, f.RepositoryID)
+	s.DB.Create(&db.FindingDependent{FindingID: f.ID, DependentID: dep.ID, Status: db.ExposureKnownAffected})
+	failQueries(t, s, dependentRowsQuery, errors.New("database unavailable"))
+
+	r := httptest.NewRequest(http.MethodGet,
+		"/findings/"+strconv.Itoa(int(f.ID))+"/bundle.tar.gz", nil)
+	r.Host = "127.0.0.1:8080"
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "load dependents:") {
+		t.Fatalf("status = %d, want 500 with a dependents error; body=%q", w.Code, w.Body)
+	}
 }

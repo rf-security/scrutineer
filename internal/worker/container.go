@@ -9,12 +9,16 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -48,19 +52,17 @@ type ContainerRunner struct {
 	// no-new-privileges is set on the container where the runtime supports it
 	// (Apple's CLI does not expose it, so its per-container VM substitutes), and
 	// the runner creates a per-scan --internal network so the only egress path
-	// is the host proxy and concurrent scans cannot reach each other.
+	// is the selected proxy and concurrent scans cannot reach each other.
 	// Profile images must work with a read-only rootfs when this is
 	// enabled (writable paths beyond /work and /tmp will fail).
 	Hardened bool
 	// HardenedRuntimeOnly applies the non-network half of --hardened -- a
 	// read-only rootfs, no-new-privileges, and the post-clone workspace cap --
-	// WITHOUT the per-scan --internal network. Those are all independent of the
-	// network, so unlike full --hardened they work under rootless podman (whose
-	// --internal network cannot route to the host egress proxy; see
-	// docs/podman.md). The always-on baseline (--cap-drop ALL, non-root --user,
-	// the /tmp tmpfs) applies regardless of this field. --hardened already
-	// implies all of these, so this is the rootless stand-in for them, not an
-	// addition on top (setting both is harmless). The read-only rootfs can break
+	// WITHOUT the per-scan --internal network. This is the fallback when a host
+	// cannot support the sidecar needed for full --hardened. The always-on
+	// baseline (--cap-drop ALL, non-root --user, the /tmp tmpfs) applies
+	// regardless of this field. --hardened already implies all of these. The
+	// read-only rootfs can break
 	// custom profile images that write outside /work and /tmp.
 	HardenedRuntimeOnly bool
 	// Runtime selects the OCI engine (docker, podman, or Apple's container) and
@@ -72,25 +74,34 @@ type ContainerRunner struct {
 	// on an SELinux-enabled host. Without it, container_t is denied the host
 	// labels and every scan fails with EACCES on the clone and output. Resolved
 	// once at startup from the --selinux switch (auto/on/off); see bindMount for
-	// the ":z" vs ":Z" rationale and ResolveSELinuxRelabel for the gating. The
-	// zero value is false, so docker on a non-SELinux host stays byte-for-byte
-	// unchanged.
+	// the ":z" vs ":Z" rationale and container.ResolveSELinuxRelabel for the
+	// gating. The zero value is false, so docker on a non-SELinux host stays
+	// byte-for-byte unchanged.
 	SELinuxRelabel bool
 	// Egress, when set, routes a hardened scan's egress through a proxy sidecar
-	// container instead of the in-process host proxy. setupRunner populates it
-	// only for rootless podman under --hardened -- the one configuration where
-	// the host proxy is unreachable across the per-scan --internal network. The
-	// zero value keeps the host-proxy path (docker, rootful podman, and all
-	// non-hardened scans). See usesEgressSidecar.
+	// container instead of the in-process host proxy. The zero value keeps the
+	// host-proxy path. See usesEgressSidecar.
 	Egress EgressSidecarConfig
+	// ProviderProxy contains the base allowlist and host endpoint used to start
+	// a short-lived in-process proxy for one configured OpenCode provider. The
+	// process-wide proxy never receives provider-specific hosts.
+	ProviderProxy ScopedEgressProxyConfig
+	// OpencodeProviders contains provider-scoped images, credentials, state,
+	// config, and egress resolved from the operator's YAML configuration.
+	OpencodeProviders map[string]OpencodeProviderConfig
+	// OpencodeReadiness caches successful provider/model catalog probes.
+	OpencodeReadiness *OpencodeReadinessCache
+	// CodexAccountAuth is a file-backed ChatGPT login shared by Codex scans.
+	// Its semaphore serializes Codex execution because the CLI can rotate
+	// auth.json.
+	CodexAccountAuth *CodexAccountAuth
 	// detectProfile lets tests stub profile auto-detection without a container
 	// runtime. nil means DetectProfile.
 	detectProfile func(ctx context.Context, rt ContainerRuntime, runnerImage, srcDir string, relabel bool) Profile
 }
 
 // EgressSidecarConfig carries what setupHardenedNetwork needs to launch the
-// egress proxy as a sidecar container under rootless --hardened. The zero value
-// disables the sidecar.
+// egress proxy as a sidecar container. The zero value disables the sidecar.
 type EgressSidecarConfig struct {
 	// Token is the Proxy-Authorization secret; the same value is embedded in the
 	// scan's HTTPS_PROXY URL so the scan can authenticate to the sidecar.
@@ -101,10 +112,25 @@ type EgressSidecarConfig struct {
 	// APIPort is the host skill API port; the sidecar restricts the host alias
 	// to it, matching the host proxy's APIPort.
 	APIPort string
+	// HostPorts are additional ports on the host alias the sidecar permits.
+	// configureOpencodeProviderEgress fills it from a provider's host_port so
+	// a host-local model server on the host loopback is reachable.
+	HostPorts []string
 	// GatewayIP is the default-network host-gateway IPv4 the sidecar dials to
 	// reach the host skill API. Required: an empty value means the sidecar
 	// cannot reach the host, so setupHardenedNetwork fails the scan closed.
 	GatewayIP string
+}
+
+// ScopedEgressProxyConfig is the non-secret startup information needed to
+// create a provider-scoped host proxy. Each scan gets a fresh token and
+// listener, which are closed when the scan finishes.
+type ScopedEgressProxyConfig struct {
+	Allow         []string
+	APIPort       string
+	APIHosts      []string
+	ContainerHost string
+	Log           *slog.Logger
 }
 
 // hardenedNetworkPrefix is the common prefix used to name the per-scan
@@ -149,16 +175,12 @@ func proxySidecarName(key string) string {
 }
 
 // usesEgressSidecar reports whether this scan routes egress through a proxy
-// sidecar container instead of the in-process host proxy. True only for rootless
-// podman under --hardened: there the per-scan --internal network cannot reach
-// the host proxy across the pasta/slirp4netns boundary (see docs/podman.md), so
-// the proxy must live on the network with the scan. docker and
-// rootful podman keep the host-proxy path unchanged, and so does Apple's
-// container -- its CLI has neither `--network podman` nor `network connect`, so it
-// must not take the sidecar path even though it still needs the per-scan
-// --internal verification (see needsEgressSidecar vs needsHardenedNetVerify).
+// sidecar container instead of the in-process host proxy. Docker Desktop and
+// rootless podman cannot reach the host proxy across an internal network, so
+// the proxy must run on the scan's network. Docker Engine, rootful podman, and
+// Apple keep the host-proxy path.
 func (d ContainerRunner) usesEgressSidecar() bool {
-	return d.Hardened && d.Runtime.needsEgressSidecar()
+	return d.Hardened && d.Runtime.NeedsEgressSidecar()
 }
 
 func (d ContainerRunner) image() string {
@@ -209,12 +231,56 @@ func proxyURLWithHost(proxyURL, host string) string {
 // legitimate repos.
 const HardenedWorkspaceCapBytes int64 = 2 << 30
 
+type containerRunErrorState struct {
+	accountText  string
+	providerText string
+	rateLimit    *RateLimitInfo
+}
+
+func (s *containerRunErrorState) observe(event Event, h Harness, opencodeProviderID string) {
+	s.accountText = preferAccountErrText(s.accountText, h.AccountErrorText(event.Text))
+	if opencodeProviderID != "" && event.Kind == KindError && event.Text != "hit max turns" {
+		s.providerText = event.Text
+	}
+	if event.Kind == KindRateLimit && event.RateLimit != nil {
+		s.rateLimit = preferRateLimitReset(s.rateLimit, event.RateLimit)
+	}
+}
+
+// resumeRetryable gates the "session gone, restart fresh" fallback. Only an
+// account error (auth/quota) blocks it: a configured-provider error event may
+// be the harness reporting the missing session itself, which is exactly the
+// condition the fallback exists for.
+func (s containerRunErrorState) resumeRetryable() bool {
+	return s.accountText == ""
+}
+
+func (s containerRunErrorState) failure(provider opencodeProvider, runtimeName string, waitErr error) error {
+	if s.accountText != "" {
+		return &AccountError{Detail: s.accountText, ResetAt: resumableReset(s.accountText, s.rateLimit)}
+	}
+	if s.providerText != "" {
+		return classifyOpencodeProviderRunError(provider, s.providerText, waitErr)
+	}
+	return fmt.Errorf("%s exited: %w", runtimeName, waitErr)
+}
+
 // RunSkill runs a skill inside an ephemeral container. The whole workspace
 // (clone + staged .claude/skills + context.json + output) is mounted at
 // /work read-write so claude can read the skill files and write its output.
 // Egress is routed through scrutineer's allowlisting proxy on the host;
 // see EgressProxy. tmpfs/cap-drop rules mirror the local runner's intent.
 func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Event)) (SkillResult, error) {
+	if HarnessName(d.harness()) == "codex" && d.CodexAccountAuth != nil && sj.StateDir == "" {
+		return SkillResult{}, errors.New("codex account auth requires a per-job state directory")
+	}
+
+	d, provider, result, cleanupProviderProxy, err := d.prepareOpencodeExecution(ctx, sj.Model)
+	if err != nil {
+		return result, err
+	}
+	defer cleanupProviderProxy()
+
 	var src string
 	if sj.SrcReady {
 		src = filepath.Join(sj.WorkRoot, "src")
@@ -222,30 +288,31 @@ func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Ev
 		var err error
 		src, err = ensureClone(ctx, sj.Repo, sj.WorkRoot, d.FullClone, sj.Ref, emit)
 		if err != nil {
-			return SkillResult{}, err
+			return result, err
 		}
 	}
 	if err := d.checkHardenedWorkspace(sj.WorkRoot); err != nil {
-		return SkillResult{}, err
+		return result, err
 	}
 	commit := gitHead(src)
+	result.Commit = commit
 	work := sj.WorkRoot
 	absWork, _ := filepath.Abs(work)
 
 	profile, image := d.resolveProfile(ctx, sj.Profile, src, sj.SubPath, emit)
-	backend := HarnessName(d.harness())
+	result.Profile = profile
 	if sj.RequiresProfile != "" && profile != sj.RequiresProfile {
 		got := profile
 		if got == "" {
 			got = "default"
 		}
-		return SkillResult{Commit: commit, Profile: profile, Backend: backend}, fmt.Errorf("skill %q requires profile %q, resolved %q", sj.Name, sj.RequiresProfile, got)
+		return result, fmt.Errorf("skill %q requires profile %q, resolved %q", sj.Name, sj.RequiresProfile, got)
 	}
 	d.injectProfileGuide(profile, absWork, emit)
 
 	hnet, cleanupNetwork, err := d.setupHardenedNetwork(sj, image)
 	if err != nil {
-		return SkillResult{Commit: commit, Profile: profile, Backend: backend}, err
+		return result, err
 	}
 	// Capture the sidecar's egress decisions (allowlist denials) into the scan
 	// record before teardown removes the ephemeral sidecar.
@@ -257,42 +324,42 @@ func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Ev
 		_ = os.Remove(outPath)
 	}
 
-	// the runtime treats a non-absolute -v source as a named volume (which
-	// rejects '/'), so the config dir must be absolutised like absWork.
-	var absConfig string
-	if sj.StateDir != "" {
-		absConfig, _ = filepath.Abs(sj.StateDir)
-		if err := os.MkdirAll(absConfig, dirPerm); err != nil {
-			return SkillResult{Commit: commit, Profile: profile, Backend: backend}, fmt.Errorf("create harness state dir: %w", err)
+	absConfig, digest, err := d.prepareHarnessState(ctx, sj.StateDir, provider, absWork, image, hnet)
+	result.RunnerImageDigest = digest
+	if err != nil {
+		return result, err
+	}
+	runBase := d.buildRunArgsForProvider(absWork, image, hnet, absConfig, provider, "/work")
+	h := d.harness()
+	unlockCodexAuth := func() {}
+	if HarnessName(h) == "codex" {
+		unlockCodexAuth, err = d.CodexAccountAuth.acquire(ctx)
+		if err != nil {
+			return result, fmt.Errorf("acquire codex account credential: %w", err)
 		}
 	}
-	runBase := d.buildRunArgs(absWork, image, hnet, absConfig)
+	defer unlockCodexAuth()
 
-	logLine := "$ " + d.Runtime.bin() + " run --rm " + image + " <skill:" + sj.Name + ">"
+	logLine := "$ " + runtimeBin(d.Runtime) + " run --rm " + image + " <skill:" + sj.Name + ">"
 	if d.ModelBaseURL != "" {
 		logLine += " [MODEL_BASE_URL=" + redactURLUserinfo(d.ModelBaseURL) + "]"
 	}
 	emit(Event{Kind: KindText, Text: logLine})
 
-	h := d.harness()
-	accountErrText := ""
-	var rateLimitReset *RateLimitInfo
+	runErrors := containerRunErrorState{}
 	wrappedEmit := func(e Event) {
-		accountErrText = preferAccountErrText(accountErrText, h.AccountErrorText(e.Text))
-		if e.Kind == KindRateLimit && e.RateLimit != nil {
-			rateLimitReset = preferRateLimitReset(rateLimitReset, e.RateLimit)
-		}
+		runErrors.observe(e, h, provider.ID)
 		emit(e)
 	}
-	hitMaxTurns, sessionID, waitErr := d.runContainerOnce(ctx, runBase, sj, wrappedEmit)
+	hitMaxTurns, sessionID, waitErr := d.runContainerOnce(ctx, runBase, sj, provider.Env, wrappedEmit)
 
-	if waitErr != nil && sj.ResumeSessionID != "" && sessionID == "" && accountErrText == "" {
+	if waitErr != nil && sj.ResumeSessionID != "" && sessionID == "" && runErrors.resumeRetryable() {
 		if sj.ResumePrompt != "" && sj.Prompt == "" {
 			// A bare resume prompt is a corrective nudge ("rewrite the invalid
 			// report.json") that means nothing to a fresh agent, and there is
 			// no fresh framing to fall back on.
 			emit(Event{Kind: KindText, Text: "resume of session " + sj.ResumeSessionID + " failed; " + resumePromptNoFreshFallbackText})
-			return SkillResult{Commit: commit, Profile: profile, Backend: backend}, fmt.Errorf("%s exited: %w", d.Runtime.bin(), waitErr)
+			return result, runErrors.failure(provider, runtimeBin(d.Runtime), waitErr)
 		}
 		// The resume produced no session event, so claude could not load the
 		// saved conversation (gone from the mounted store). Restart fresh in
@@ -301,10 +368,11 @@ func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Ev
 		emit(Event{Kind: KindText, Text: "resume of session " + sj.ResumeSessionID + " failed; restarting fresh"})
 		fresh := sj
 		fresh.ResumeSessionID = ""
-		hitMaxTurns, sessionID, waitErr = d.runContainerOnce(ctx, runBase, fresh, wrappedEmit)
+		hitMaxTurns, sessionID, waitErr = d.runContainerOnce(ctx, runBase, fresh, provider.Env, wrappedEmit)
 	}
 
-	res := SkillResult{Commit: commit, Profile: profile, Backend: backend, SessionID: sessionID}
+	res := result
+	res.SessionID = sessionID
 	if outPath != "" {
 		res.Report = readCappedReport(outPath, emit)
 	}
@@ -312,10 +380,7 @@ func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Ev
 		if hitMaxTurns {
 			return res, &MaxTurnsReachedError{}
 		}
-		if accountErrText != "" {
-			return res, &AccountError{Detail: accountErrText, ResetAt: resumableReset(accountErrText, rateLimitReset)}
-		}
-		return res, fmt.Errorf("%s exited: %w", d.Runtime.bin(), waitErr)
+		return res, runErrors.failure(provider, runtimeBin(d.Runtime), waitErr)
 	}
 	return res, nil
 }
@@ -325,14 +390,13 @@ func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Ev
 // through emit, and reporting the wait error, whether the run hit the
 // max-turns cap, and the session id from the init event (empty when no init
 // event arrived, e.g. a --resume that could not find the conversation).
-func (d ContainerRunner) runContainerOnce(ctx context.Context, runBase []string, sj SkillJob, emit func(Event)) (hitMaxTurns bool, sessionID string, waitErr error) {
+func (d ContainerRunner) runContainerOnce(ctx context.Context, runBase []string, sj SkillJob, processEnv map[string]string, emit func(Event)) (hitMaxTurns bool, sessionID string, waitErr error) {
 	h := d.harness()
-	harnessArgs := append([]string{h.Binary()}, h.Args(sj.toJob(d.Effort, d.MaxTurns, d.ModelBaseURL))...)
-	runArgs := append(append([]string{}, runBase...), harnessArgs...)
+	runArgs := append(append([]string{}, runBase...), d.harnessArgv(sj)...)
 
-	cmd := exec.CommandContext(ctx, d.Runtime.bin(), runArgs...)
+	cmd := exec.CommandContext(ctx, runtimeBin(d.Runtime), runArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = os.Environ()
+	cmd.Env = environmentWith(os.Environ(), processEnv)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -360,12 +424,12 @@ func (d ContainerRunner) runContainerOnce(ctx context.Context, runBase []string,
 	return hitMaxTurns, sessionID, waitErr
 }
 
-// buildRunArgs assembles the container run flags for a skill invocation.
+// buildRunArgsForProvider assembles the container run flags for a skill invocation.
 // Returns the args up to and including the image name; the caller appends
 // the in-container command. Split out of RunSkill to keep its cognitive
 // complexity manageable as new toggles (hardened mode, proxy, profiles)
 // accumulate.
-func (d ContainerRunner) buildRunArgs(absWork, image string, hnet hardenedNet, harnessStateDir string) []string {
+func (d ContainerRunner) buildRunArgsForProvider(absWork, image string, hnet hardenedNet, harnessStateDir string, provider opencodeProvider, workdir string) []string {
 	gwTarget := "host-gateway"
 	if d.Hardened {
 		// setupHardenedNetwork resolved the gateway once against this per-scan
@@ -378,7 +442,7 @@ func (d ContainerRunner) buildRunArgs(absWork, image string, hnet hardenedNet, h
 	} else if d.HostGatewayIP != "" {
 		gwTarget = d.HostGatewayIP
 	}
-	args := d.Runtime.runArgs(
+	args := runtimeRunArgs(d.Runtime,
 		"--rm",
 		"--cap-drop", "ALL",
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
@@ -386,17 +450,28 @@ func (d ContainerRunner) buildRunArgs(absWork, image string, hnet hardenedNet, h
 		"-e", "SEMGREP_SEND_METRICS=off",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
 		"-v", bindMount(absWork, "/work", d.SELinuxRelabel),
-		"-w", "/work",
+		"-w", workdir,
 	)
 	// Harness-specific env: model-API credential, base URL, and the
 	// harness's own telemetry / autoupdate suppressors.
 	for _, e := range d.harness().Env(d.ModelBaseURL) {
+		if provider.Configured && opencodeInheritedCredential(e) {
+			continue
+		}
 		args = append(args, "-e", e)
 	}
-	if d.Runtime.supportsHostGatewayAddHost() {
+	keys := make([]string, 0, len(provider.Env))
+	for key := range provider.Env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, "-e", key)
+	}
+	if supportsHostGatewayAddHost(d.Runtime) {
 		args = append(args, "--add-host", HostGatewayAlias+":"+gwTarget)
 	}
-	if d.Runtime.needsKeepID() {
+	if d.Runtime.NeedsKeepID() {
 		// Rootless podman remaps --user uid:gid through /etc/subuid, so writes
 		// to the bind mounts (/work output and the /harness-state resume store)
 		// would land owned by a subordinate uid. keep-id maps the container
@@ -414,30 +489,30 @@ func (d ContainerRunner) buildRunArgs(absWork, image string, hnet hardenedNet, h
 		for _, e := range d.harness().StateEnv("/harness-state") {
 			args = append(args, "-e", e)
 		}
+		args = d.appendCodexAccountAuthArgs(args)
+	}
+	if HarnessName(d.harness()) == "opencode" {
+		args = d.appendOpencodeStateArgs(args, harnessStateDir, provider)
 	}
 	if d.Hardened || d.HardenedRuntimeOnly {
 		// Read-only rootfs + no-new-privileges close the residual paths a
 		// hostile skill could use to escalate inside the container. /work
 		// stays writable (skill output) and /tmp is the tmpfs declared above
-		// with HOME=/tmp redirecting claude session storage. These are pure
-		// container options with no network dependency, so --hardened-rootless-
-		// runtime applies them under the default network -- unlike the
-		// --internal network below, which rootless podman can't route to the
-		// host proxy. --cap-drop ALL and the non-root --user are already set
-		// unconditionally above, in every mode.
+		// with HOME=/tmp redirecting claude session storage. These options have
+		// no network dependency, so --hardened-runtime-only can apply them
+		// without the verified network path. --cap-drop ALL and the non-root
+		// --user are already set in every mode.
 		args = append(args,
 			"--read-only",
 		)
-		if d.Runtime.supportsNoNewPrivileges() {
+		if supportsNoNewPrivileges(d.Runtime) {
 			args = append(args, "--security-opt", "no-new-privileges")
 		}
 	}
 	if d.Hardened {
 		// The per-scan --internal network is the egress-enforcement half of
-		// --hardened, kept separate from the container hardening above because
-		// it does not work under rootless podman (the startup verification
-		// fails closed when it can't reach the host proxy here; see
-		// docs/podman.md). --hardened-runtime-only deliberately omits it.
+		// --hardened. --hardened-runtime-only deliberately omits it for hosts
+		// where the verified network path is unavailable.
 		args = append(args, "--network", hnet.name)
 	}
 	// In sidecar mode the proxy is a per-scan container reached by name on the
@@ -457,16 +532,44 @@ func (d ContainerRunner) buildRunArgs(absWork, image string, hnet hardenedNet, h
 		proxyURL = proxyURLWithHost(d.ProxyURL, hnet.gatewayIP)
 	}
 	if proxyURL != "" {
-		args = append(args,
-			"-e", "HTTPS_PROXY="+proxyURL,
-			"-e", "HTTP_PROXY="+proxyURL,
-			"-e", "ALL_PROXY="+proxyURL,
-			"-e", "NO_PROXY=",
-		)
+		// Set both cases. Podman normally inherits both variants from its
+		// host, and curl prefers lowercase https_proxy over HTTPS_PROXY.
+		// runtimeRunArgs disables that Podman inheritance, while these explicit
+		// assignments also override image-provided proxy variables on every
+		// supported runtime.
+		for _, key := range []string{
+			"HTTPS_PROXY", "https_proxy",
+			"HTTP_PROXY", "http_proxy",
+			"ALL_PROXY", "all_proxy",
+		} {
+			args = append(args, "-e", key+"="+proxyURL)
+		}
+		args = append(args, "-e", "NO_PROXY=", "-e", "no_proxy=")
 	} else if !d.Hardened {
 		args = append(args, "--network", "none")
 	}
 	return append(args, "--", image)
+}
+
+func (d ContainerRunner) appendCodexAccountAuthArgs(args []string) []string {
+	if HarnessName(d.harness()) != "codex" || d.CodexAccountAuth == nil {
+		return args
+	}
+	// Mount only the rotating account credential into this scan's private
+	// CODEX_HOME. The pinned Codex release rewrites auth.json in place, so a
+	// read-write mount preserves refreshes without exposing one scan's sessions
+	// or history to another scan.
+	return append(args, "-v", bindMount(d.CodexAccountAuth.Path, "/harness-state/auth.json", d.SELinuxRelabel))
+}
+
+func opencodeInheritedCredential(env string) bool {
+	key, _, _ := strings.Cut(env, "=")
+	switch key {
+	case "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENCODE_CONFIG_CONTENT", "OPENCODE_AUTH_CONTENT":
+		return true
+	default:
+		return false
+	}
 }
 
 // resolveProfile picks the runner image for this scan. When requested
@@ -490,9 +593,10 @@ func (d ContainerRunner) resolveProfile(ctx context.Context, requested, src, sub
 			return "", defaultImg
 		}
 	} else {
-		srcDir := src
-		if subPath != "" {
-			srcDir = filepath.Join(src, subPath)
+		srcDir, err := detectionSrcDir(src, subPath)
+		if err != nil {
+			emit(Event{Kind: KindText, Text: "profile: " + err.Error() + "; using default"})
+			return "", defaultImg
 		}
 		detect := d.detectProfile
 		if detect == nil {
@@ -535,11 +639,49 @@ func (d ContainerRunner) resolveProfile(ctx context.Context, requested, src, sub
 	return p.Name, img
 }
 
-// profileGuideFileMode is the mode used when copying a profile's
-// PROFILE.md into the workspace as CLAUDE.md. The workspace already
-// belongs to the host user (the container runner mounts it as that uid),
-// so a plain 0644 keeps it readable by the agent without surprises.
-const profileGuideFileMode os.FileMode = 0o644
+// detectionSrcDir returns the directory profile detection bind-mounts for
+// src/subPath, refusing one that a symlink would carry outside the workspace.
+// The container runtime resolves the host side of a bind mount itself, so a
+// repository link at the sub-path (a soft-scoped scan prunes nothing and
+// checks nothing there) or one the agent planted in the checkout before a
+// repair or audit run in the same workspace would otherwise mount an
+// arbitrary host directory into the detection container. Links are checked
+// through a root opened at the workspace, which follows them only while they
+// stay inside it; a dangling link is refused the same way rather than handed
+// to the runtime, which creates a missing bind source. A sub-path that plainly
+// does not exist is passed on unchanged so detection degrades to the default
+// profile as before.
+func detectionSrcDir(src, subPath string) (string, error) {
+	workspace := filepath.Dir(src)
+	rel := filepath.Base(src)
+	if subPath != "" {
+		rel = filepath.Join(rel, subPath)
+	}
+	srcDir := filepath.Join(workspace, rel)
+	root, err := os.OpenRoot(workspace)
+	if err != nil {
+		return "", fmt.Errorf("open workspace for profile detection: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	cur := ""
+	for part := range strings.SplitSeq(filepath.ToSlash(rel), "/") {
+		cur = filepath.Join(cur, part)
+		info, err := root.Lstat(cur)
+		if errors.Is(err, fs.ErrNotExist) {
+			return srcDir, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("detection path %s: %w", srcDir, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		if info, err = root.Stat(cur); err != nil || !info.IsDir() {
+			return "", fmt.Errorf("detection path %s: link %s does not resolve inside the workspace", srcDir, cur)
+		}
+	}
+	return srcDir, nil
+}
 
 // checkHardenedWorkspace returns an error when a hardening mode is on and the
 // cloned workspace exceeds HardenedWorkspaceCapBytes. It applies under both
@@ -577,7 +719,7 @@ func (d ContainerRunner) injectProfileGuide(profile, absWork string, emit func(E
 		emit(Event{Kind: KindText, Text: "profile guide: read " + guide + ": " + err.Error()})
 		return
 	}
-	if err := os.WriteFile(target, data, profileGuideFileMode); err != nil {
+	if err := replaceWorkspaceFile(absWork, name, data); err != nil {
 		emit(Event{Kind: KindText, Text: "profile guide: write " + target + ": " + err.Error()})
 		return
 	}
@@ -600,6 +742,15 @@ func (d ContainerRunner) harness() Harness { //nolint:ireturn // nil-default acc
 		return d.Harness
 	}
 	return ClaudeHarness{}
+}
+
+// harnessArgv builds the in-container agent command: the backend binary plus
+// the args its module derives from the resolved job.
+func (d ContainerRunner) harnessArgv(sj SkillJob) []string {
+	h := d.harness()
+	job := sj.toJob(d.Effort, d.MaxTurns, d.ModelBaseURL)
+	job.Effort = CappedEffort(h, job.Effort)
+	return append([]string{h.Binary()}, h.Args(job)...)
 }
 
 // profileGuidePath returns the profile's on-disk PROFILE.md if present.
@@ -635,12 +786,12 @@ func ResolveHostGatewayIPv4(rt ContainerRuntime, image, network string) string {
 	if rt.Bin == runtimeApple {
 		return resolveAppleHostGatewayIPv4(rt, image, network)
 	}
-	args := rt.runArgs("--rm", "--add-host", "hgw:host-gateway")
+	args := runtimeRunArgs(rt, "--rm", "--add-host", "hgw:host-gateway")
 	if network != "" {
 		args = append(args, "--network", network)
 	}
 	args = append(args, "--entrypoint", "grep", "--", image, "hgw", "/etc/hosts")
-	out, err := exec.Command(rt.bin(), args...).Output()
+	out, err := exec.Command(runtimeBin(rt), args...).Output()
 	if err != nil {
 		return ""
 	}
@@ -662,12 +813,12 @@ func resolveAppleHostGatewayIPv4(rt ContainerRuntime, image, network string) str
 		return ""
 	}
 	const script = `awk '$2 == "00000000" { print $3; exit }' /proc/net/route`
-	args := rt.runArgs("--rm")
+	args := runtimeRunArgs(rt, "--rm")
 	if network != "" {
 		args = append(args, "--network", network)
 	}
 	args = append(args, "--entrypoint", "sh", "--", image, "-c", script)
-	out, err := exec.Command(rt.bin(), args...).Output()
+	out, err := exec.Command(runtimeBin(rt), args...).Output()
 	if err != nil {
 		return ""
 	}
@@ -717,14 +868,15 @@ func dirSize(root string) (int64, error) {
 	return total, err
 }
 
-// hardenedNetworkCreateArgs builds the `network create` args for the per-scan
-// --internal network. --disable-dns is load-bearing: a sidecar later connected to
-// this network must not inherit its aardvark resolver, which on an --internal
-// network cannot forward external lookups and answers NXDOMAIN first, shadowing
-// the sidecar's working bridge resolver. The scan dials the sidecar by IP, so the
-// network needs no name resolution of its own.
-func hardenedNetworkCreateArgs(name string) []string {
-	return []string{"network", "create", "--internal", "--disable-dns", "--", name}
+// hardenedNetworkCreateArgs builds the per-scan internal network. Rootless
+// Podman disables DNS so its internal resolver cannot shadow the sidecar's
+// egress resolver. Docker has no --disable-dns flag.
+func hardenedNetworkCreateArgs(rt ContainerRuntime, name string) []string {
+	args := []string{"network", "create", "--internal"}
+	if rt.Bin == runtimePodman && rt.Rootless {
+		args = append(args, "--disable-dns")
+	}
+	return append(args, "--", name)
 }
 
 // EnsureHardenedNetwork creates an internal container network with the
@@ -735,19 +887,19 @@ func hardenedNetworkCreateArgs(name string) []string {
 // after the network was created (but before the post-scan rm ran) will
 // reuse the existing network instead of failing.
 func EnsureHardenedNetwork(rt ContainerRuntime, name string) error {
-	if out, err := exec.Command(rt.bin(), "network", "inspect", "--", name).Output(); err == nil && len(out) > 0 {
+	if out, err := exec.Command(runtimeBin(rt), "network", "inspect", "--", name).Output(); err == nil && len(out) > 0 {
 		return nil
 	}
-	cmd := exec.Command(rt.bin(), hardenedNetworkCreateArgs(name)...)
+	cmd := exec.Command(runtimeBin(rt), hardenedNetworkCreateArgs(rt, name)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%s network create --internal %s: %w: %s", rt.bin(), name, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s network create --internal %s: %w: %s", runtimeBin(rt), name, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
 // hardenedNet bundles a per-scan --internal network name with the host-gateway
 // IPv4 resolved against it. setupHardenedNetwork resolves the gateway once and
-// threads it through both verifyHardenedNetwork and buildRunArgs, so a
+// threads it through both verifyHardenedNetwork and buildRunArgsForProvider, so a
 // hardened scan probes for it a single time instead of once per consumer. The
 // zero value (both fields "") is the non-hardened case.
 type hardenedNet struct {
@@ -755,8 +907,8 @@ type hardenedNet struct {
 	gatewayIP string // host-gateway IPv4 for that network; "" if unresolved
 	// proxyEndpoint is the IP:port the scan reaches the egress proxy sidecar at
 	// (the sidecar's address on the --internal network, e.g. 10.89.1.2:3128). The
-	// scan dials it by IP because the --internal network runs no DNS (see
-	// EnsureHardenedNetwork). "" when there is no sidecar -- the host-proxy path --
+	// scan dials it by IP without depending on internal DNS. "" when there is no
+	// sidecar -- the host-proxy path --
 	// in which case egress goes through d.ProxyURL via the gateway.
 	proxyEndpoint string
 	// proxyName is the sidecar's container name, used for status and log lookups
@@ -765,12 +917,9 @@ type hardenedNet struct {
 }
 
 // setupHardenedNetwork creates the per-scan --internal network for a hardened
-// scan, resolves its host-gateway once, and (on rootless podman) verifies it
-// actually isolates egress before the scan runs (fail closed). It returns the
-// network + resolved gateway and a cleanup func the caller must defer to remove
-// the network. Outside hardened mode it is a no-op with a zero hardenedNet and a
-// no-op cleanup. On any error the network it created (if any) is already torn
-// down, so the returned cleanup is always safe to defer.
+// scan, resolves its host-gateway once, and verifies it where required.
+// It returns the network, resolved gateway, and a cleanup function. Errors tear
+// down any network or sidecar created before the failure.
 func (d ContainerRunner) setupHardenedNetwork(sj SkillJob, image string) (hardenedNet, func(), error) {
 	noop := func() {}
 	if !d.Hardened {
@@ -783,11 +932,11 @@ func (d ContainerRunner) setupHardenedNetwork(sj SkillJob, image string) (harden
 	if err := EnsureHardenedNetwork(d.Runtime, network); err != nil {
 		return hardenedNet{}, noop, fmt.Errorf("create hardened network: %w", err)
 	}
-	cleanup := func() { _ = exec.Command(d.Runtime.bin(), "network", "rm", "--", network).Run() }
-	// Resolve the host-gateway once against the network just created; reused by
-	// both the verification probe and the real run (for docker/podman an empty
-	// result falls through to the literal host-gateway alias downstream).
-	hn := hardenedNet{name: network, gatewayIP: ResolveHostGatewayIPv4(d.Runtime, image, network)}
+	cleanup := func() { _ = exec.Command(runtimeBin(d.Runtime), "network", "rm", "--", network).Run() }
+	// Resolve the gateway used by the scan. Docker Desktop reaches the host
+	// through the sidecar's default bridge leg, so its probe uses that network.
+	probeNetwork := hostGatewayProbeNetwork(d.Runtime, network)
+	hn := hardenedNet{name: network, gatewayIP: ResolveHostGatewayIPv4(d.Runtime, image, probeNetwork)}
 
 	// Apple has no host-gateway alias to fall back on: the per-scan --internal
 	// network has its own gateway and the proxy env must name its IP, so an
@@ -798,10 +947,8 @@ func (d ContainerRunner) setupHardenedNetwork(sj SkillJob, image string) (harden
 		return hardenedNet{}, noop, fmt.Errorf("hardened mode: could not resolve the Apple --internal network gateway for %q; cannot route to the egress proxy", network)
 	}
 
-	// Under rootless podman the scan cannot reach the host proxy across the
-	// --internal boundary, so the proxy runs as a sidecar on this network. Start
-	// it before verification; the sidecar must be torn down before the network
-	// (a network with an attached container will not delete).
+	// Start the sidecar before verification. It must be torn down before the
+	// network because an attached container prevents network deletion.
 	if d.usesEgressSidecar() {
 		endpoint, sidecarCleanup, err := d.startProxySidecar(sj, network)
 		if err != nil {
@@ -817,10 +964,10 @@ func (d ContainerRunner) setupHardenedNetwork(sj SkillJob, image string) (harden
 		hn.proxyName = proxySidecarName(sj.isolationKey())
 	}
 
-	// docker's bridge --internal is trusted, and so is rootful podman's (netavark
-	// + a bridge in the host netns, gateway on the host -- docker's model).
-	// Rootless podman and Apple need per-scan proof; see needsHardenedNetVerify.
-	if d.Runtime.needsHardenedNetVerify() {
+	// Docker Engine's bridge --internal is trusted, as is rootful podman's bridge
+	// in the host network namespace. Docker Desktop, rootless podman, and Apple
+	// need per-scan proof; see NeedsHardenedNetVerify.
+	if d.Runtime.NeedsHardenedNetVerify() {
 		if err := d.verifyHardenedNetwork(hn, image); err != nil {
 			cleanup()
 			return hardenedNet{}, noop, fmt.Errorf("hardened network verification: %w", err)
@@ -846,28 +993,27 @@ func (d ContainerRunner) startProxySidecar(sj SkillJob, network string) (endpoin
 	if d.Egress.GatewayIP == "" {
 		// Without the host-gateway IPv4 the sidecar cannot reach the host skill
 		// API; refuse rather than start a sidecar that would 502 every API call.
-		return "", noop, fmt.Errorf("no host-gateway IPv4 resolved for the egress sidecar (podman >= 4.7 and a working rootless network backend are required)")
+		return "", noop, fmt.Errorf("no host-gateway IPv4 resolved for the %s egress sidecar", runtimeBin(d.Runtime))
 	}
 	name := proxySidecarName(sj.isolationKey())
-	rmName := func() { _ = exec.Command(d.Runtime.bin(), "rm", "-f", "--", name).Run() }
+	rmName := func() { _ = exec.Command(runtimeBin(d.Runtime), "rm", "-f", "--", name).Run() }
 	// A residual sidecar from a crashed scan with this id would clash on the name
 	// and pin the network; remove it first (no-op when absent).
 	rmName()
 
-	if out, e := exec.Command(d.Runtime.bin(), d.proxySidecarRunArgs(name, network)...).CombinedOutput(); e != nil {
+	if out, e := exec.Command(runtimeBin(d.Runtime), d.proxySidecarRunArgs(name, network)...).CombinedOutput(); e != nil {
 		rmName() // a failed `run -d` can still leave a created container behind
-		return "", noop, fmt.Errorf("%s run sidecar: %w: %s", d.Runtime.bin(), e, strings.TrimSpace(string(out)))
+		return "", noop, fmt.Errorf("%s run sidecar: %w: %s", runtimeBin(d.Runtime), e, strings.TrimSpace(string(out)))
 	}
 
-	// The egress leg. `network connect` only works on netavark bridges, so pin
-	// the named default bridge rather than the rootless default (pasta), which
-	// rejects it ("pasta is not supported: invalid network mode").
-	if out, e := exec.Command(d.Runtime.bin(), "network", "connect", "--", "podman", name).CombinedOutput(); e != nil {
+	// The egress leg uses the runtime's named default bridge. Rootless podman's
+	// default pasta network cannot be connected to an existing container.
+	egressNetwork := sidecarEgressNetwork(d.Runtime)
+	if out, e := exec.Command(runtimeBin(d.Runtime), "network", "connect", "--", egressNetwork, name).CombinedOutput(); e != nil {
 		rmName()
-		return "", noop, fmt.Errorf("%s network connect podman: %w: %s", d.Runtime.bin(), e, strings.TrimSpace(string(out)))
+		return "", noop, fmt.Errorf("%s network connect %s: %w: %s", runtimeBin(d.Runtime), egressNetwork, e, strings.TrimSpace(string(out)))
 	}
-	// The --internal network runs no DNS, so the scan must reach the sidecar by
-	// its address on that network rather than by name.
+	// Reach the sidecar by address so this path does not depend on internal DNS.
 	ip, e := d.sidecarNetworkIP(name, network)
 	if e != nil {
 		rmName()
@@ -877,14 +1023,12 @@ func (d ContainerRunner) startProxySidecar(sj SkillJob, network string) (endpoin
 }
 
 // sidecarNetworkIP returns the sidecar's IP on the per-scan --internal network.
-// The scan addresses the sidecar by this IP because that network is created with
-// --disable-dns (its aardvark resolver would otherwise NXDOMAIN the sidecar's own
-// external lookups), so a container name would not resolve there.
+// The scan uses the address directly so it does not depend on that network's DNS.
 func (d ContainerRunner) sidecarNetworkIP(name, network string) (string, error) {
 	format := fmt.Sprintf(`{{(index .NetworkSettings.Networks %q).IPAddress}}`, network)
-	out, err := exec.Command(d.Runtime.bin(), "inspect", "--format", format, "--", name).Output()
+	out, err := exec.Command(runtimeBin(d.Runtime), "inspect", "--format", format, "--", name).Output()
 	if err != nil {
-		return "", fmt.Errorf("%s inspect %s: %w", d.Runtime.bin(), name, err)
+		return "", fmt.Errorf("%s inspect %s: %w", runtimeBin(d.Runtime), name, err)
 	}
 	ip := strings.TrimSpace(string(out))
 	if ip == "" {
@@ -903,24 +1047,26 @@ func (d ContainerRunner) sidecarNetworkIP(name, network string) (string, error) 
 // listen keyword binds to; startProxySidecar connects the default (egress)
 // bridge afterwards, so the listener never faces it. It deliberately runs the
 // DEFAULT runner image (d.image()), which is guaranteed to carry the scrutineer
-// binary, not the per-scan profile image. No --rm, so a sidecar that exits on
-// an unreachable host API lingers long enough for verifyHardenedNetwork to
-// capture its logs.
+// binary, not the per-scan profile image. The required-capability flag makes a
+// stale binary fail closed instead of serving without the host-API CONNECT
+// guard. No --rm, so a sidecar that exits on an unreachable host API lingers
+// long enough for verifyHardenedNetwork to capture its logs.
 func (d ContainerRunner) proxySidecarRunArgs(name, network string) []string {
-	args := []string{
-		"run", "-d",
+	args := runtimeRunArgs(d.Runtime,
+		"-d",
 		"--name", name,
 		"--network", network,
 		"--cap-drop", "ALL",
 		"--security-opt", "no-new-privileges",
 		"--read-only",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=16m",
-		"--add-host", HostGatewayAlias + ":" + d.Egress.GatewayIP,
-	}
+		"--add-host", HostGatewayAlias+":"+d.Egress.GatewayIP,
+	)
 	for _, e := range EgressSidecarEnv(d.Egress, SidecarListenFirstIface+":"+proxySidecarPort) {
 		args = append(args, "-e", e)
 	}
-	return append(args, "--", d.image(), "scrutineer", "proxy")
+	return append(args, "--", d.image(), "scrutineer", "proxy",
+		"--require-capability="+ProxyCapabilityDenyAPIConnect)
 }
 
 // EgressSidecarEnv returns the SCRUTINEER_PROXY_* environment assignments the
@@ -937,6 +1083,7 @@ func EgressSidecarEnv(cfg EgressSidecarConfig, listen string) []string {
 		"SCRUTINEER_PROXY_ALLOW=" + strings.Join(cfg.Allow, ","),
 		"SCRUTINEER_PROXY_API_HOST=" + cfg.GatewayIP,
 		"SCRUTINEER_PROXY_API_PORT=" + cfg.APIPort,
+		"SCRUTINEER_PROXY_HOST_PORTS=" + strings.Join(cfg.HostPorts, ","),
 		"SCRUTINEER_PROXY_LISTEN=" + listen,
 	}
 }
@@ -958,7 +1105,7 @@ func (d ContainerRunner) teardownHardenedScan(sj SkillJob, hnet hardenedNet, cle
 // exists) and forwards the noteworthy lines into the scan's event stream.
 // Best-effort: an already-gone sidecar or a logs failure yields nothing.
 func (d ContainerRunner) emitSidecarLogs(name string, emit func(Event)) {
-	out, err := exec.Command(d.Runtime.bin(), "logs", "--", name).CombinedOutput()
+	out, err := exec.Command(runtimeBin(d.Runtime), "logs", "--", name).CombinedOutput()
 	if err != nil {
 		return
 	}
@@ -984,26 +1131,31 @@ func noteworthyProxyLogLine(line string) bool {
 	return strings.Contains(line, "level=WARN") || strings.Contains(line, "level=ERROR")
 }
 
-// VerifyProxyBinary smoke-tests that the runner image carries the scrutineer
-// binary the egress proxy sidecar runs (`scrutineer proxy`). A runner image
-// without it -- an old cached image, or a custom --runner-image not built from
-// Dockerfile.runner -- would otherwise make every rootless --hardened scan fail
-// with a cryptic per-scan exec error; this turns that into one clear startup
-// failure. It is a no-op when the image is not present locally yet (the first
-// scan pulls it and would surface the same issue then), matching VerifyKeepID.
-// Only meaningful on the sidecar path; the caller gates on rootless --hardened.
+// VerifyProxyBinary smoke-tests that the runner image's `scrutineer proxy`
+// supports the host-required API CONNECT policy. A missing or stale binary
+// would otherwise fail later with a cryptic per-scan exec error; this turns
+// that into one clear startup failure. It is a no-op when the image is not
+// present locally yet (the first scan pulls it and the actual sidecar command
+// enforces the same capability), matching container.VerifyKeepID.
+// Only meaningful on the sidecar path; the caller checks the runtime trait.
 func VerifyProxyBinary(ctx context.Context, rt ContainerRuntime, image string) error {
 	if image == "" || !imageExistsLocally(ctx, rt, image) {
 		return nil
 	}
-	out, err := exec.CommandContext(ctx, rt.bin(), "run", "--rm", "--pull", "never",
-		"--", image, "scrutineer", "proxy", "-h").CombinedOutput()
+	args := proxyBinaryCheckArgs(rt, image)
+	out, err := exec.CommandContext(ctx, runtimeBin(rt), args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("runner image %q is missing the scrutineer binary required for the "+
-			"rootless --hardened egress proxy sidecar (rebuild it from Dockerfile.runner): %w: %s",
+		return fmt.Errorf("runner image %q does not support the hardened egress proxy policy "+
+			"required by this scrutineer binary (update it or rebuild it from Dockerfile.runner): %w: %s",
 			image, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func proxyBinaryCheckArgs(rt ContainerRuntime, image string) []string {
+	return runtimeRunArgs(rt, "--rm", "--pull", "never",
+		"--", image, "scrutineer", "proxy",
+		"--require-capability="+ProxyCapabilityDenyAPIConnect, "-h")
 }
 
 // verifyHardenedNetwork fails closed when the per-scan --internal network does
@@ -1024,7 +1176,7 @@ func VerifyProxyBinary(ctx context.Context, rt ContainerRuntime, image string) e
 func (d ContainerRunner) verifyHardenedNetwork(hn hardenedNet, image string) error {
 	network := hn.name
 
-	out, err := exec.Command(d.Runtime.bin(), d.Runtime.hardenedEgressBlockArgs(network, image)...).CombinedOutput()
+	out, err := exec.Command(runtimeBin(d.Runtime), hardenedEgressBlockArgs(d.Runtime, network, image)...).CombinedOutput()
 	s := strings.TrimSpace(string(out))
 	if err != nil {
 		return fmt.Errorf("egress-block probe could not run on network %q: %w: %s", network, err, s)
@@ -1044,9 +1196,8 @@ func (d ContainerRunner) verifyHardenedNetwork(hn hardenedNet, image string) err
 
 // verifyHostProxyReachable runs probe (b) for the host-proxy path: a throwaway
 // container on the --internal network, wiring the gateway alias exactly as the
-// real run does, must reach the host egress proxy. This is the path docker and
-// rootful podman use; under rootless --hardened the sidecar path is used instead
-// (verifyProxySidecarReachable).
+// real run does, must reach the host egress proxy. Docker Engine, rootful podman,
+// and Apple use this path; other hardened runtimes use the sidecar path.
 func (d ContainerRunner) verifyHostProxyReachable(hn hardenedNet, image string) error {
 	gwTarget := "host-gateway"
 	if hn.gatewayIP != "" {
@@ -1056,7 +1207,7 @@ func (d ContainerRunner) verifyHostProxyReachable(hn hardenedNet, image string) 
 	if err != nil {
 		return fmt.Errorf("parse proxy url: %w", err)
 	}
-	out, err := exec.Command(d.Runtime.bin(), d.Runtime.hardenedProxyReachArgs(hn.name, gwTarget, port, image)...).CombinedOutput()
+	out, err := exec.Command(runtimeBin(d.Runtime), hardenedProxyReachArgs(d.Runtime, hn.name, gwTarget, port, image)...).CombinedOutput()
 	s := strings.TrimSpace(string(out))
 	if err != nil {
 		return fmt.Errorf("proxy-reach probe could not run on network %q: %w: %s", hn.name, err, s)
@@ -1081,7 +1232,7 @@ func (d ContainerRunner) verifyProxySidecarReachable(hn hardenedNet, image strin
 	deadline := time.Now().Add(proxySidecarReadyTimeout)
 	var last string
 	for {
-		out, err := exec.Command(d.Runtime.bin(), sidecarReachArgs(hn.name, hn.proxyEndpoint, image)...).CombinedOutput()
+		out, err := exec.Command(runtimeBin(d.Runtime), sidecarReachArgs(d.Runtime, hn.name, hn.proxyEndpoint, image)...).CombinedOutput()
 		last = strings.TrimSpace(string(out))
 		if err == nil && strings.Contains(last, "REACHED") {
 			return nil
@@ -1102,13 +1253,13 @@ func (d ContainerRunner) verifyProxySidecarReachable(hn hardenedNet, image strin
 // A non-running sidecar during verification means it gave up reaching the host
 // skill API and exited, so verification should fail fast with its logs.
 func (d ContainerRunner) sidecarRunning(name string) bool {
-	out, err := exec.Command(d.Runtime.bin(), "inspect", "--format", "{{.State.Running}}", "--", name).Output()
+	out, err := exec.Command(runtimeBin(d.Runtime), "inspect", "--format", "{{.State.Running}}", "--", name).Output()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 
 // sidecarLogTail returns the tail of the sidecar's logs for error enrichment.
 func (d ContainerRunner) sidecarLogTail(name string) string {
-	out, _ := exec.Command(d.Runtime.bin(), "logs", "--tail", "20", "--", name).CombinedOutput()
+	out, _ := exec.Command(runtimeBin(d.Runtime), "logs", "--tail", "20", "--", name).CombinedOutput()
 	s := strings.TrimSpace(string(out))
 	if s == "" {
 		return "(no logs)"
@@ -1120,12 +1271,12 @@ func (d ContainerRunner) sidecarLogTail(name string) string {
 // the per-scan --internal network, no proxy env, that must fail to reach a
 // routable public IP. A literal IP avoids a false pass from blocked DNS. curl
 // absence is reported as NOCURL so the caller can fail closed rather than read
-// the curl-not-found exit as "egress blocked". runArgs keeps Apple's
+// the curl-not-found exit as "egress blocked". runtimeRunArgs keeps Apple's
 // --progress none out of the probe output.
-func (rt ContainerRuntime) hardenedEgressBlockArgs(network, image string) []string {
+func hardenedEgressBlockArgs(rt ContainerRuntime, network, image string) []string {
 	const script = `command -v curl >/dev/null 2>&1 || { echo NOCURL; exit 0; }
 curl -s -m 5 -o /dev/null http://1.1.1.1 && echo REACHED || echo BLOCKED`
-	return rt.runArgs("--rm", "--cap-drop", "ALL", "--network", network,
+	return runtimeRunArgs(rt, "--rm", "--cap-drop", "ALL", "--network", network,
 		"--entrypoint", "sh", "--", image, "-c", script)
 }
 
@@ -1134,12 +1285,12 @@ curl -s -m 5 -o /dev/null http://1.1.1.1 && echo REACHED || echo BLOCKED`
 // (the proxy answers, e.g. 407 without auth) means the TCP path to the host is
 // open. docker/podman wire the host-gateway alias with --add-host exactly as the
 // real run does; Apple's CLI has no --add-host, so the probe targets the
-// resolved gateway IP directly -- the same address buildRunArgs points the proxy
+// resolved gateway IP directly -- the same address buildRunArgsForProvider points the proxy
 // env at for an Apple hardened scan.
-func (rt ContainerRuntime) hardenedProxyReachArgs(network, gatewayIP, proxyPort, image string) []string {
-	args := rt.runArgs("--rm", "--cap-drop", "ALL", "--network", network)
+func hardenedProxyReachArgs(rt ContainerRuntime, network, gatewayIP, proxyPort, image string) []string {
+	args := runtimeRunArgs(rt, "--rm", "--cap-drop", "ALL", "--network", network)
 	var target string
-	if rt.supportsHostGatewayAddHost() {
+	if supportsHostGatewayAddHost(rt) {
 		args = append(args, "--add-host", HostGatewayAlias+":"+gatewayIP)
 		target = "http://" + HostGatewayAlias + ":" + proxyPort + "/"
 	} else {
@@ -1151,18 +1302,18 @@ func (rt ContainerRuntime) hardenedProxyReachArgs(network, gatewayIP, proxyPort,
 
 // sidecarReachArgs builds the `run` args for the sidecar variant of probe (b): a
 // throwaway container on the per-scan --internal network that must reach the
-// egress proxy sidecar at endpoint (its IP:port on that network; the network runs
-// no DNS, so no name resolution or --add-host is needed). curl exit 0 (the proxy
+// egress proxy sidecar at endpoint (its IP:port on that network, so no name
+// resolution or --add-host is needed). curl exit 0 (the proxy
 // answers, e.g. 407 without auth) means the in-network path to the sidecar is
 // open, which by the sidecar's readiness gate also means the host API is
 // reachable through it.
-func sidecarReachArgs(network, endpoint, image string) []string {
+func sidecarReachArgs(rt ContainerRuntime, network, endpoint, image string) []string {
 	target := "http://" + endpoint + "/"
 	script := "curl -s -m 5 -o /dev/null " + target + " && echo REACHED || echo UNREACHABLE"
-	return []string{
-		"run", "--rm", "--cap-drop", "ALL", "--network", network,
+	return runtimeRunArgs(rt,
+		"--rm", "--cap-drop", "ALL", "--network", network,
 		"--entrypoint", "sh", "--", image, "-c", script,
-	}
+	)
 }
 
 // proxyPortFromURL extracts the port from a proxy URL of the shape ProxyURL
@@ -1186,13 +1337,13 @@ func proxyPortFromURL(proxyURL string) (string, error) {
 // networks actually removed; rm failures are intentionally swallowed
 // since a busy network is exactly what we want to leave alone.
 func SweepOrphanHardenedNetworks(rt ContainerRuntime) (int, error) {
-	out, err := exec.Command(rt.bin(), networkListNamesArgs(rt)...).Output()
+	out, err := exec.Command(runtimeBin(rt), networkListNamesArgs(rt)...).Output()
 	if err != nil {
-		return 0, fmt.Errorf("%s network list: %w", rt.bin(), err)
+		return 0, fmt.Errorf("%s network list: %w", runtimeBin(rt), err)
 	}
 	removed := 0
 	for _, n := range parseHardenedNetworkNames(out) {
-		if err := exec.Command(rt.bin(), "network", "rm", "--", n).Run(); err == nil {
+		if err := exec.Command(runtimeBin(rt), "network", "rm", "--", n).Run(); err == nil {
 			removed++
 		}
 	}
@@ -1239,15 +1390,15 @@ func parseHardenedNetworkNames(out []byte) []string {
 // makes). Returns the number removed; rm failures are swallowed (a container
 // already exiting is fine to skip).
 func SweepOrphanProxySidecars(rt ContainerRuntime) (int, error) {
-	out, err := exec.Command(rt.bin(), "ps", "-a",
+	out, err := exec.Command(runtimeBin(rt), "ps", "-a",
 		"--filter", "name="+proxySidecarPrefix,
 		"--format", "{{.Names}}").Output()
 	if err != nil {
-		return 0, fmt.Errorf("%s ps: %w", rt.bin(), err)
+		return 0, fmt.Errorf("%s ps: %w", runtimeBin(rt), err)
 	}
 	removed := 0
 	for _, n := range parseProxySidecarNames(out) {
-		if err := exec.Command(rt.bin(), "rm", "-f", "--", n).Run(); err == nil {
+		if err := exec.Command(runtimeBin(rt), "rm", "-f", "--", n).Run(); err == nil {
 			removed++
 		}
 	}

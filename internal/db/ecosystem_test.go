@@ -102,6 +102,27 @@ func TestEcosystemKeyPURL(t *testing.T) {
 	}
 }
 
+// TestEcosystemKeySwiftRegistryFallback guards purl.MakePURL rejecting Swift
+// registry identities that cannot be represented as Swift source-coordinate
+// PURLs. They still need a stable key for matching imported package rows.
+func TestEcosystemKeySwiftRegistryFallback(t *testing.T) {
+	cases := []struct {
+		label, name, wantNamespace, wantPackage string
+	}{
+		{"registry identity without separator", "apple.swift-argument-parser", "", "apple.swift-argument-parser"},
+		{"registry identity with separator", "apple/swift-argument-parser", "apple", "swift-argument-parser"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			eco, namespace, pkg := ecosystemKey("", "swift", tc.name)
+			if eco != "swift" || namespace != tc.wantNamespace || pkg != tc.wantPackage {
+				t.Errorf("got (%q, %q, %q), want (swift, %q, %q)",
+					eco, namespace, pkg, tc.wantNamespace, tc.wantPackage)
+			}
+		})
+	}
+}
+
 // TestDependencyFindingsPURLJoin exercises the primary path end to end: a
 // Dependency and a Package both carrying a namespaced golang PURL join through
 // the parsed PURL, and it guards the packages.p_url column→field mapping.
@@ -124,7 +145,7 @@ func TestDependencyFindingsPURLJoin(t *testing.T) {
 
 	scan := Scan{RepositoryID: lib.ID, Kind: "skill", Status: ScanDone}
 	gdb.Create(&scan)
-	gdb.Create(&Finding{ScanID: scan.ID, RepositoryID: lib.ID, Title: "path traversal", Severity: "High", Status: FindingNew})
+	gdb.Create(&Finding{ScanID: scan.ID, RepositoryID: lib.ID, Title: "path traversal", Severity: "High", Status: FindingReported})
 
 	rows, err := DependencyFindings(gdb, app.ID)
 	if err != nil {
@@ -156,7 +177,7 @@ func TestDependencyFindingsIncludesNonRuntimeDependencies(t *testing.T) {
 
 	scan := Scan{RepositoryID: lib.ID, Kind: "skill", Status: ScanDone}
 	gdb.Create(&scan)
-	gdb.Create(&Finding{ScanID: scan.ID, RepositoryID: lib.ID, Title: "dev-only bug", Severity: "High", Status: FindingNew})
+	gdb.Create(&Finding{ScanID: scan.ID, RepositoryID: lib.ID, Title: "dev-only bug", Severity: "High", Status: FindingReported})
 
 	rows, err := DependencyFindings(gdb, app.ID)
 	if err != nil {
@@ -247,7 +268,7 @@ func TestDependencyFindingsMixedPURL(t *testing.T) {
 
 		scan := Scan{RepositoryID: lib.ID, Kind: "skill", Status: ScanDone}
 		gdb.Create(&scan)
-		gdb.Create(&Finding{ScanID: scan.ID, RepositoryID: lib.ID, Title: "x", Severity: "High", Status: FindingNew})
+		gdb.Create(&Finding{ScanID: scan.ID, RepositoryID: lib.ID, Title: "x", Severity: "High", Status: FindingReported})
 
 		rows, err := DependencyFindings(gdb, app.ID)
 		if err != nil {

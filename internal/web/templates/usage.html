@@ -17,6 +17,7 @@
   <div class="flex items-center gap-1 shrink-0 ml-4">
     <a href="/usage?view=skill" class="{{if eq .View "skill"}}btn-outline{{else}}btn-sm-ghost{{end}}">By skill</a>
     <a href="/usage?view=day" class="{{if eq .View "day"}}btn-outline{{else}}btn-sm-ghost{{end}}">By day</a>
+    <a href="/usage?view=drivers" class="{{if eq .View "drivers"}}btn-outline{{else}}btn-sm-ghost{{end}}">Cost drivers</a>
   </div>
 </div>
 
@@ -50,7 +51,75 @@
 </div>
 {{end}}
 
-{{if eq .View "day"}}
+{{if eq .View "drivers"}}
+  <h3 class="text-lg font-semibold mb-3">Cost correlations</h3>
+  {{if .DriverCorrelations}}
+    <div class="overflow-x-auto mb-8">
+      <table class="table w-full">
+        <thead><tr>
+          <th>Skill</th>
+          <th>Driver</th>
+          <th class="text-right">Matched runs</th>
+          <th class="text-right">Pearson r</th>
+          <th>Relationship</th>
+        </tr></thead>
+        <tbody>
+        {{range .DriverCorrelations}}
+          <tr>
+            <td class="font-medium">{{.Skill}}</td>
+            <td>{{.Driver}}</td>
+            <td class="text-right text-muted-foreground">{{.Samples}}</td>
+            <td class="text-right font-medium">{{printf "%.2f" .R}}</td>
+            <td class="text-muted-foreground">{{.Summary}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </div>
+  {{else}}
+    {{template "empty" (dict "Icon" "chart-scatter" "Title" "Not enough matched runs" "Body" "A correlation appears after three positive-cost runs of one skill have a relevant measurement, with variation in both cost and measurement.")}}
+  {{end}}
+
+  <h3 class="text-lg font-semibold mt-8 mb-3">Cost outliers</h3>
+  {{if .Outliers}}
+    <div class="overflow-x-auto">
+      <table class="table w-full">
+        <thead><tr>
+          <th>Scan</th>
+          <th>Repository</th>
+          <th>Skill</th>
+          <th>Model / profile</th>
+          <th class="text-right">Cost</th>
+          <th class="text-right">Skill median</th>
+          <th class="text-right">vs median</th>
+          <th class="text-right">Turns</th>
+          <th class="text-right">SLOC</th>
+          <th class="text-right">Manifests</th>
+          <th class="text-right">Sinks</th>
+        </tr></thead>
+        <tbody>
+        {{range .Outliers}}
+          <tr>
+            <td><a href="/scans/{{.ScanID}}" class="link">#{{.ScanID}}</a></td>
+            <td><a href="/repositories/{{.RepositoryID}}" class="link">{{.Repository}}</a></td>
+            <td class="font-medium">{{.Skill}}</td>
+            <td class="text-muted-foreground">{{if .Model}}{{.Model}}{{if .Profile}} / {{.Profile}}{{end}}{{else if .Profile}}{{.Profile}}{{else}}—{{end}}</td>
+            <td class="text-right font-medium">{{usd .Cost}}</td>
+            <td class="text-right text-muted-foreground">{{usd .Median}}</td>
+            <td class="text-right">{{printf "%.1f×" .Multiple}}</td>
+            <td class="text-right text-muted-foreground">{{.Turns}}</td>
+            <td class="text-right text-muted-foreground">{{if .SLOC}}{{.SLOC}}{{else}}—{{end}}</td>
+            <td class="text-right text-muted-foreground">{{if .Manifests}}{{.Manifests}}{{else}}—{{end}}</td>
+            <td class="text-right text-muted-foreground">{{if .Sinks}}{{.Sinks}}{{else}}—{{end}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </div>
+  {{else}}
+    {{template "empty" (dict "Icon" "circle-check" "Title" "No 10× cost outliers" "Body" "No positive-cost run is at least ten times its skill median.")}}
+  {{end}}
+{{else if eq .View "day"}}
   {{if .DayRows}}
     <table class="table w-full">
       <thead><tr>

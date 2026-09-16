@@ -26,11 +26,12 @@ const proxyReadinessTimeout = 20 * time.Second
 
 // proxyConfig is the resolved configuration for the egress-proxy sidecar.
 type proxyConfig struct {
-	listen  string   // listen address inside the sidecar container
-	token   string   // Proxy-Authorization token clients must present
-	apiHost string   // host-gateway IPv4 the sidecar dials for the host skill API
-	apiPort string   // host skill API port; the only port allowed for the host alias
-	allow   []string // egress allowlist
+	listen    string   // listen address inside the sidecar container
+	token     string   // Proxy-Authorization token clients must present
+	apiHost   string   // host-gateway IPv4 the sidecar dials for the host skill API
+	apiPort   string   // host skill API port allowed on the host alias
+	hostPorts []string // additional host-alias ports (host-local model server)
+	allow     []string // egress allowlist
 }
 
 // parseProxyConfig resolves the sidecar configuration from flags layered over
@@ -40,21 +41,31 @@ type proxyConfig struct {
 // process environment.
 func parseProxyConfig(args []string, getenv func(string) string) (proxyConfig, error) {
 	fset := flag.NewFlagSet("proxy", flag.ContinueOnError)
-	var listen, token, apiHost, apiPort, allow string
+	var listen, token, apiHost, apiPort, hostPorts, allow, requireCapability string
 	fset.StringVar(&listen, "listen", envOr(getenv, "SCRUTINEER_PROXY_LISTEN", ":3128"), "listen address")
 	fset.StringVar(&token, "token", getenv("SCRUTINEER_PROXY_TOKEN"), "Proxy-Authorization token clients must present")
 	fset.StringVar(&apiHost, "api-host", getenv("SCRUTINEER_PROXY_API_HOST"), "host-gateway IPv4 to dial for the host skill API")
-	fset.StringVar(&apiPort, "api-port", getenv("SCRUTINEER_PROXY_API_PORT"), "host skill API port (only port allowed for the host alias)")
+	fset.StringVar(&apiPort, "api-port", getenv("SCRUTINEER_PROXY_API_PORT"), "host skill API port allowed on the host alias")
+	fset.StringVar(&hostPorts, "host-ports", getenv("SCRUTINEER_PROXY_HOST_PORTS"), "comma-separated additional ports allowed on the host alias")
 	fset.StringVar(&allow, "allow", getenv("SCRUTINEER_PROXY_ALLOW"), "comma-separated egress allowlist")
-	if err := fset.Parse(args); err != nil {
-		return proxyConfig{}, err
+	fset.StringVar(&requireCapability, "require-capability", "", "host-required proxy security capability")
+	parseErr := fset.Parse(args)
+	// Validate a capability parsed before -h even though flag.Parse reports
+	// ErrHelp. The host's smoke check deliberately uses that ordering so it
+	// proves the image supports this exact policy, not merely the flag name.
+	if (parseErr == nil || errors.Is(parseErr, flag.ErrHelp)) && requireCapability != "" && requireCapability != worker.ProxyCapabilityDenyAPIConnect {
+		return proxyConfig{}, fmt.Errorf("proxy: unsupported required capability %q", requireCapability)
+	}
+	if parseErr != nil {
+		return proxyConfig{}, parseErr
 	}
 	cfg := proxyConfig{
-		listen:  listen,
-		token:   token,
-		apiHost: apiHost,
-		apiPort: apiPort,
-		allow:   splitAllow(allow),
+		listen:    listen,
+		token:     token,
+		apiHost:   apiHost,
+		apiPort:   apiPort,
+		hostPorts: splitAllow(hostPorts),
+		allow:     splitAllow(allow),
 	}
 	if cfg.token == "" {
 		return proxyConfig{}, errors.New("proxy: empty token (set -token or SCRUTINEER_PROXY_TOKEN)")
@@ -104,9 +115,9 @@ func resolveListen(listen string, firstIfaceIPv4 func() (string, error)) (string
 }
 
 // runProxy is the entrypoint for `scrutineer proxy`: the egress-proxy sidecar
-// the container runner attaches to a hardened scan's --internal network under
-// rootless podman. The scan container points HTTPS_PROXY at this
-// process; it enforces the same allowlist as the in-process host proxy and
+// attached to a hardened scan's --internal network under Docker Desktop or
+// rootless Podman. The scan container points HTTPS_PROXY at this process,
+// which enforces the same allowlist as the in-process host proxy and
 // forwards out its egress leg. It refuses to start serving until it has
 // confirmed it can reach the host skill API, so a network backend that cannot
 // forward host-gateway to the host loopback fails the scan closed instead of
@@ -143,6 +154,7 @@ func runProxy(args []string) error {
 		Allow:           cfg.allow,
 		Token:           cfg.token,
 		APIPort:         cfg.apiPort,
+		HostPorts:       cfg.hostPorts,
 		GatewayDialHost: cfg.apiHost,
 		Log:             log,
 	}

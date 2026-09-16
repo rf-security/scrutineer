@@ -31,6 +31,7 @@ Read `./context.json`, then `GET {api_base}/repositories/{repository_id}` and `G
 - `repository.url` host is not `github.com`
 - `gh auth status` fails — the runner has no GitHub credentials
 - the finding's `status` is `reported`, `acknowledged`, `fixed`, `published`, `rejected`, or `duplicate` — already past the reporting step or closed
+- the finding's `production_viability` is `NON_VIABLE` — refuse with `{"error": "latest critic assessment is NON_VIABLE; disclosure, public issue filing, and upstream reporting are blocked"}`; the latest assessment proved the vulnerable component cannot enter a supported release, so reassess it before reporting if new build evidence exists
 - `GET {api_base}/findings/{finding_id}/notes` returns any note whose body starts with `finding-dedup: subsumed by finding #` — this finding is only reachable through the parent named after the `#`, and any correct fix for the parent closes it; file the parent instead
 - the finding's `disclosure_draft` is empty — run `disclose` first
 - the finding already has a reference tagged `ghsa-upstream` (`GET {api_base}/findings/{finding_id}/references`) — a previous run of this skill already filed it

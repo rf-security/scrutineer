@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"scrutineer/internal/coverage"
 	"scrutineer/internal/db"
 	"scrutineer/internal/worker"
 
@@ -19,11 +20,15 @@ import (
 )
 
 func (s *Server) jobs(w http.ResponseWriter, r *http.Request) {
-	q := s.DB.Model(&db.Scan{})
-	skillName := r.URL.Query().Get("skill")
-	if skillName != "" {
-		q = q.Where("skill_name = ?", skillName)
+	completeness, err := parseScanCompletenessFilter(r.URL.Query().Get("completeness"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
+	skillFilter := parseScanSkillFilter(r.URL.Query().Get("skill"))
+	r = requestWithScanSkillFilter(r, skillFilter.value())
+	q := skillFilter.apply(s.DB.Model(&db.Scan{}))
+	q = applyScanCompletenessFilter(q, completeness)
 	status := r.URL.Query().Get(statusKey)
 	if status != "" {
 		q = q.Where("status = ?", status)
@@ -71,14 +76,107 @@ func (s *Server) jobs(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	s.render(w, r, "jobs.html", map[string]any{
+	data := map[string]any{
 		"Scans": scans, "Page": page,
-		"Skill": skillName, "Status": status, "Sort": sort, "Skills": skillNames,
-		"AnySubPath": anySubPath, "QueuedCount": stats.QueuedCount, "PausedCount": stats.PausedCount,
+		"Skill": skillFilter.value(), "SkillLabel": skillFilter.label(),
+		"Status": status, "Sort": sort, "Skills": skillNames,
+		"Completeness": completeness,
+		"AnySubPath":   anySubPath, "QueuedCount": stats.QueuedCount, "PausedCount": stats.PausedCount,
 		"AccountPausedCount": stats.AccountPausedCount,
 		"NextAccountResume":  stats.NextAccountResume,
 		"ModelDowngraded":    s.Worker.ShouldDowngradeModel(),
-	})
+	}
+	// The page's own SSE listener re-requests this URL when a scan changes, so
+	// an htmx request gets the table alone and keeps the operator's scroll,
+	// filters and sort instead of reloading the whole page.
+	if isHX(r) {
+		s.render(w, r, "job_list.html", data)
+		return
+	}
+	s.render(w, r, "jobs.html", data)
+}
+
+func parseScanCompletenessFilter(raw string) (string, error) {
+	switch raw {
+	case "", coverage.CompletenessComplete, coverage.CompletenessPartial, coverage.CompletenessUnknown:
+		return raw, nil
+	default:
+		return "", errors.New("invalid completeness filter: expected complete, partial or unknown")
+	}
+}
+
+func applyScanCompletenessFilter(q *gorm.DB, value string) *gorm.DB {
+	switch value {
+	case "":
+		return q
+	case coverage.CompletenessUnknown:
+		// Older scans have no indexed verdict; they make no completeness claim.
+		return q.Where("(scans.completeness IN ? OR scans.completeness IS NULL)", []string{value, ""})
+	default:
+		return q.Where("scans.completeness = ?", value)
+	}
+}
+
+type scanSkillFilter struct {
+	names []string
+}
+
+func parseScanSkillFilter(raw string) scanSkillFilter {
+	seen := make(map[string]struct{})
+	names := make([]string, 0)
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return scanSkillFilter{names: names}
+}
+
+func (f scanSkillFilter) apply(q *gorm.DB) *gorm.DB {
+	switch len(f.names) {
+	case 0:
+		return q
+	case 1:
+		return q.Where("skill_name = ?", f.names[0])
+	default:
+		return q.Where("skill_name IN ?", f.names)
+	}
+}
+
+func (f scanSkillFilter) value() string {
+	return strings.Join(f.names, ",")
+}
+
+func (f scanSkillFilter) label() string {
+	if len(f.names) == 1 {
+		return f.names[0]
+	}
+	if len(f.names) > 1 {
+		return fmt.Sprintf("%d skills", len(f.names))
+	}
+	return ""
+}
+
+// requestWithScanSkillFilter gives pagination and sortable headers the same
+// canonical filter used by the SQL query. Clone before rewriting RawQuery so
+// middleware and callers retaining the original request do not observe a
+// handler-local normalization.
+func requestWithScanSkillFilter(r *http.Request, value string) *http.Request {
+	r = r.Clone(r.Context())
+	query := r.URL.Query()
+	if value == "" {
+		query.Del("skill")
+	} else {
+		query.Set("skill", value)
+	}
+	r.URL.RawQuery = query.Encode()
+	return r
 }
 
 type scanListStats struct {
@@ -90,7 +188,11 @@ type scanListStats struct {
 
 func (s *Server) scanListStats() scanListStats {
 	var stats scanListStats
+	// All three counts are over queued+paused rows only, so bound the
+	// aggregate to those two statuses and let the status index skip the
+	// terminal history (#694).
 	s.DB.Model(&db.Scan{}).
+		Where("status IN (?, ?)", db.ScanQueued, db.ScanPaused).
 		Select(
 			"COUNT(CASE WHEN status = ? THEN 1 END) AS queued_count, "+
 				"COUNT(CASE WHEN status = ? THEN 1 END) AS paused_count, "+
@@ -138,10 +240,24 @@ func (s *Server) scanShow(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	skill := loadScanReportSkill(s.DB, &scan)
 	s.render(w, r, "scan_show.html", map[string]any{
-		"Scan": scan,
-		"Diff": parseScanDiffView(scan),
+		"Scan":               scan,
+		"Diff":               parseScanDiffView(scan),
+		"DisclosureReviewID": s.disclosureReviewFindingID(scan),
+		"CanExportReport":    hasExportableScanReport(s.DB, &scan, skill),
 	})
+}
+
+func (s *Server) disclosureReviewFindingID(scan db.Scan) uint {
+	if scan.Status != db.ScanDone || !discloseScanGeneratedDraft(scan) {
+		return 0
+	}
+	var finding db.Finding
+	if err := s.DB.Select("id", "disclosure_draft").First(&finding, *scan.FindingID).Error; err != nil || strings.TrimSpace(finding.DisclosureDraft) == "" {
+		return 0
+	}
+	return finding.ID
 }
 
 // scanDiffView is the parsed diff-rescan metadata for the scan page,
@@ -152,9 +268,13 @@ type scanDiffView struct {
 	RequestedMode  string
 	ActualMode     string
 	FallbackReason string
-	ChangedFiles   int
-	PatchBytes     int64
-	Files          []scanDiffFile
+	// Completeness and CompletenessReason come from the same coverage
+	// record and say how much of the intended scope the scan reached.
+	Completeness       string
+	CompletenessReason string
+	ChangedFiles       int
+	PatchBytes         int64
+	Files              []scanDiffFile
 }
 
 type scanDiffFile struct {
@@ -200,17 +320,12 @@ func parseScanDiffView(scan db.Scan) *scanDiffView {
 		return nil
 	}
 	var v scanDiffView
-	if scan.Coverage != "" {
-		var cov struct {
-			RequestedMode  string `json:"requested_mode"`
-			ActualMode     string `json:"actual_mode"`
-			FallbackReason string `json:"fallback_reason"`
-		}
-		if json.Unmarshal([]byte(scan.Coverage), &cov) == nil {
-			v.RequestedMode = cov.RequestedMode
-			v.ActualMode = cov.ActualMode
-			v.FallbackReason = cov.FallbackReason
-		}
+	if rec, ok := coverage.Parse(scan.Coverage); ok {
+		v.RequestedMode = rec.RequestedMode
+		v.ActualMode = rec.ActualMode
+		v.FallbackReason = rec.FallbackReason
+		v.Completeness = rec.Completeness
+		v.CompletenessReason = rec.Reason
 	}
 	if scan.DiffStats != "" {
 		var stats struct {
@@ -238,24 +353,35 @@ func (s *Server) scanRetry(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionID, resumeOf := s.resumeOpts(scan)
 	newID, err := s.enqueueSkillWith(r.Context(), scan.RepositoryID, *scan.SkillID, ScanOpts{
-		Model:             scan.Model,
-		Effort:            scan.Effort,
-		FindingID:         scan.FindingID,
-		SubPath:           scan.SubPath,
-		Ref:               scan.Ref,
-		Profile:           scan.Profile,
-		RescanMode:        scan.RescanMode,
-		DiffBaseScanID:    scan.DiffBaseScanID,
-		ScanGroup:         scan.ScanGroup,
-		FocusArea:         scan.FocusArea,
-		SessionID:         sessionID,
-		ResumedFromScanID: resumeOf,
+		Model:                scan.Model,
+		Effort:               scan.Effort,
+		FindingID:            scan.FindingID,
+		RemediationAttemptID: scan.RemediationAttemptID,
+		SubPath:              scan.SubPath,
+		ScopeMode:            scan.ScopeMode,
+		Ref:                  scan.Ref,
+		Profile:              scan.Profile,
+		RescanMode:           scan.RescanMode,
+		DiffBaseScanID:       scan.DiffBaseScanID,
+		ScanGroup:            scan.ScanGroup,
+		FocusArea:            scan.FocusArea,
+		TriageScanID:         scan.TriageScanID,
+		ExplorationMode:      scan.ExplorationMode,
+		ExplorationPath:      scan.ExplorationPath,
+		SessionID:            sessionID,
+		ResumedFromScanID:    resumeOf,
+		ParentScanID:         &scan.ID,
+		VerificationFeedback: scan.VerificationFeedback,
 		// An ingest scan's input is the uploaded payload, not ./src;
 		// without it the retry stages no import/report and the model
 		// runs against a missing file.
 		ImportPayload: scan.ImportPayload,
 	})
 	if err != nil {
+		if errors.Is(err, db.ErrFindingNonViable) {
+			http.Error(w, err.Error(), http.StatusPreconditionFailed)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -277,8 +403,7 @@ func (s *Server) scanRetry(w http.ResponseWriter, r *http.Request) {
 // since claude was the only backend before the column existed and the local
 // runner is claude-only.
 func (s *Server) resumeOpts(scan db.Scan) (sessionID string, resumeOf *uint) {
-	resumableStatus := scan.Status == db.ScanFailed || (scan.Status == db.ScanDone && scan.MaxTurnsHit)
-	if !resumableStatus || scan.SessionID == "" {
+	if !scan.Resumable() {
 		return "", nil
 	}
 	scanBackend := scan.Backend
@@ -299,13 +424,16 @@ func (s *Server) resumeOpts(scan db.Scan) (sessionID string, resumeOf *uint) {
 }
 
 func (s *Server) scansRetryFailed(w http.ResponseWriter, r *http.Request) {
-	skillName := r.URL.Query().Get("skill")
-	repoID, _ := strconv.Atoi(r.URL.Query().Get("repository"))
-	q := s.DB.Model(&db.Scan{}).
-		Where("status = ? AND kind = ? AND skill_id IS NOT NULL", db.ScanFailed, worker.JobSkill)
-	if skillName != "" {
-		q = q.Where("skill_name = ?", skillName)
+	completeness, err := parseScanCompletenessFilter(r.URL.Query().Get("completeness"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
+	skillFilter := parseScanSkillFilter(r.URL.Query().Get("skill"))
+	repoID, _ := strconv.Atoi(r.URL.Query().Get("repository"))
+	q := skillFilter.apply(s.DB.Model(&db.Scan{}).
+		Where("status = ? AND kind = ? AND skill_id IS NOT NULL", db.ScanFailed, worker.JobSkill))
+	q = applyScanCompletenessFilter(q, completeness)
 	if repoID > 0 {
 		q = q.Where("repository_id = ?", repoID)
 	}
@@ -320,7 +448,7 @@ func (s *Server) scansRetryFailed(w http.ResponseWriter, r *http.Request) {
 	// deliberately absent: a user-cancelled newer run shouldn't block
 	// retrying an older genuine failure.
 	var scans []db.Scan
-	err := q.Select("id, repository_id, skill_id, model, effort, finding_id, sub_path, ref, profile, rescan_mode, diff_base_scan_id, scan_group, focus_area, backend, status, session_id, resumed_from_scan_id, import_payload").
+	err = q.Select("id, repository_id, skill_id, model, effort, finding_id, remediation_attempt_id, sub_path, scope_mode, ref, profile, rescan_mode, diff_base_scan_id, scan_group, focus_area, triage_scan_id, exploration_mode, exploration_path, backend, status, session_id, resumed_from_scan_id, import_payload, verification_feedback").
 		Where(`NOT EXISTS (
 			SELECT 1 FROM scans n
 			WHERE n.id > scans.id
@@ -340,21 +468,32 @@ func (s *Server) scansRetryFailed(w http.ResponseWriter, r *http.Request) {
 	var retried, errored int
 	for _, sc := range scans {
 		sessionID, resumeOf := s.resumeOpts(sc)
+		parent := sc.ID
 		if _, err := s.enqueueSkillWith(r.Context(), sc.RepositoryID, *sc.SkillID, ScanOpts{
-			Model:             sc.Model,
-			Effort:            sc.Effort,
-			FindingID:         sc.FindingID,
-			SubPath:           sc.SubPath,
-			Ref:               sc.Ref,
-			Profile:           sc.Profile,
-			RescanMode:        sc.RescanMode,
-			DiffBaseScanID:    sc.DiffBaseScanID,
-			ScanGroup:         sc.ScanGroup,
-			FocusArea:         sc.FocusArea,
-			SessionID:         sessionID,
-			ResumedFromScanID: resumeOf,
-			ImportPayload:     sc.ImportPayload,
+			Model:                sc.Model,
+			Effort:               sc.Effort,
+			FindingID:            sc.FindingID,
+			RemediationAttemptID: sc.RemediationAttemptID,
+			SubPath:              sc.SubPath,
+			ScopeMode:            sc.ScopeMode,
+			Ref:                  sc.Ref,
+			Profile:              sc.Profile,
+			RescanMode:           sc.RescanMode,
+			DiffBaseScanID:       sc.DiffBaseScanID,
+			ScanGroup:            sc.ScanGroup,
+			FocusArea:            sc.FocusArea,
+			TriageScanID:         sc.TriageScanID,
+			ExplorationMode:      sc.ExplorationMode,
+			ExplorationPath:      sc.ExplorationPath,
+			SessionID:            sessionID,
+			ResumedFromScanID:    resumeOf,
+			ParentScanID:         &parent,
+			VerificationFeedback: sc.VerificationFeedback,
+			ImportPayload:        sc.ImportPayload,
 		}); err != nil {
+			if errors.Is(err, db.ErrFindingNonViable) {
+				continue
+			}
 			errored++
 			continue
 		}
@@ -369,14 +508,27 @@ func (s *Server) scansRetryFailed(w http.ResponseWriter, r *http.Request) {
 	target := "/scans?status=failed"
 	if repoID > 0 {
 		target = fmt.Sprintf("/repositories/%d#rt3", repoID)
-	} else if skillName != "" {
-		target += "&skill=" + url.QueryEscape(skillName)
+	} else if skillFilter.value() != "" {
+		target += "&skill=" + url.QueryEscape(skillFilter.value())
+	}
+	if repoID <= 0 && completeness != "" {
+		target += "&completeness=" + url.QueryEscape(completeness)
 	}
 	s.redirect(w, r, target)
 }
 
 func (s *Server) scansPauseQueued(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
+	// Read the owning repositories before the update, while the rows are still
+	// queued: a page scoped to a repository filters on the event's RepoID, so an
+	// instance-wide push alone would leave its Scans tab reading "queued". A
+	// failure here only costs liveness, so it is logged and falls back to the
+	// unscoped push below rather than aborting the pause.
+	var repoIDs []uint
+	if err := s.DB.Model(&db.Scan{}).Where("status = ?", db.ScanQueued).
+		Distinct().Pluck("repository_id", &repoIDs).Error; err != nil {
+		s.Log.Warn("pause-queued: list affected repositories", "err", err)
+	}
 	res := s.DB.Model(&db.Scan{}).Where("status = ?", db.ScanQueued).Updates(scanStatusUpdates(
 		db.ScanPaused,
 		"paused by user",
@@ -386,6 +538,17 @@ func (s *Server) scansPauseQueued(w http.ResponseWriter, r *http.Request) {
 	if res.Error != nil {
 		http.Error(w, res.Error.Error(), http.StatusInternalServerError)
 		return
+	}
+	if res.RowsAffected > 0 {
+		// A repository-scoped event still reaches the unscoped list pages (they
+		// filter on nothing), so publishing per repository covers both and the
+		// instance-wide push is only the fallback for an unknown repository set.
+		if len(repoIDs) == 0 {
+			s.publishScanList(0)
+		}
+		for _, id := range repoIDs {
+			s.publishScanList(id)
+		}
 	}
 	setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("%d queued scans paused", res.RowsAffected)})
 	s.redirect(w, r, "/scans?status=paused")
@@ -408,7 +571,7 @@ func (s *Server) bulkResumePaused(base *gorm.DB) ([]db.Scan, error) {
 		// Opted-out repositories are excluded from both the read and the claim:
 		// recording an opt-out cancels the paused scans it finds, but a scan the
 		// worker pauses while that sweep runs would otherwise stay resumable.
-		if err := tx.Select("id", "kind", "finding_id", "error", "paused_until").
+		if err := tx.Select("id", "repository_id", "kind", "finding_id", "error", "paused_until").
 			Where("status = ?", db.ScanPaused).
 			Where("repository_id NOT IN (?)", s.optedOutRepoIDs()).
 			Find(&paused).Error; err != nil {
@@ -461,6 +624,7 @@ func (s *Server) enqueueResumedScan(ctx context.Context, scan db.Scan) error {
 	if err := s.Queue.Enqueue(ctx, scan.Kind, scan.ID, priority); err != nil {
 		return errors.Join(err, s.restorePausedAfterResumeEnqueueFailure(scan, err))
 	}
+	s.publishScanRow(&scan)
 	return nil
 }
 
@@ -527,20 +691,15 @@ func (s *Server) resumeScan(ctx context.Context, scan *db.Scan) error {
 	if optedOut {
 		return ErrRepoFederationOptOut
 	}
-	priority := worker.PrioScan
-	if scan.FindingID != nil {
-		priority = worker.PrioFinding
+	res := s.DB.Model(&db.Scan{}).Where("id = ? AND status = ?", scan.ID, db.ScanPaused).
+		Updates(scanStatusUpdates(db.ScanQueued, "", nil, nil))
+	if res.Error != nil {
+		return res.Error
 	}
-	if err := s.Queue.Enqueue(ctx, scan.Kind, scan.ID, priority); err != nil {
-		return err
+	if res.RowsAffected != 1 {
+		return fmt.Errorf("scan %d is no longer paused", scan.ID)
 	}
-	return s.DB.Model(&db.Scan{}).Where("id = ? AND status = ?", scan.ID, db.ScanPaused).Updates(map[string]any{
-		statusKey:         db.ScanQueued,
-		"status_priority": db.StatusPriorityFor(db.ScanQueued),
-		errorKey:          "",
-		"finished_at":     nil,
-		"paused_until":    nil,
-	}).Error
+	return s.enqueueResumedScan(ctx, *scan)
 }
 
 func retryFailedToast(retried, skipped, errored int) Flash {
@@ -581,7 +740,7 @@ func (s *Server) scanCancel(w http.ResponseWriter, r *http.Request) {
 		// A queued scan isn't in flight, so the worker never publishes a
 		// scan-status event for it; push one ourselves so the repo Scans tab
 		// and the scan page reflect the cancellation live.
-		s.Broker.Publish(Event{Name: "scan-status", ScanID: scan.ID, RepoID: scan.RepositoryID})
+		s.publishScanRow(&scan)
 	}
 	// Deliberately no redirect: cancelling from a list (repo Scans tab, jobs)
 	// should leave the operator on that list so they can cancel the next one,
@@ -641,7 +800,58 @@ func (s *Server) cancelScan(scan *db.Scan, reason string) (flippedQueued bool) {
 			errorKey:          reason,
 			"finished_at":     &now,
 		})
+	if res.RowsAffected > 0 {
+		s.settleCancelledScanGroups(scan.ID)
+	}
 	return res.RowsAffected > 0
+}
+
+// settleCancelledScanGroups fires the worker's cohort-settled hook for scans
+// this package flipped straight to a terminal state. A queued scan is not in
+// flight, so cancelling it never reaches Worker.finalizeScan and the hook that
+// tells a batch it has drained would never fire: a cohort whose last
+// outstanding sibling is cancelled this way leaves every earlier sibling
+// already suppressed on its account and nothing left to trigger the work.
+//
+// Only rows this call actually flipped are settled — the status is re-read
+// rather than assumed, so a scan the worker claimed between the caller's read
+// and its write is left to the worker. One member per scan_group is enough:
+// the handler answers for the whole cohort, not for the sibling that happened
+// to arrive last.
+func (s *Server) settleCancelledScanGroups(ids ...uint) {
+	if len(ids) == 0 || s.Worker == nil {
+		return
+	}
+	var settled []db.Scan
+	if err := s.DB.
+		Where("id IN ? AND status = ? AND scan_group <> ''", ids, db.ScanCancelled).
+		Find(&settled).Error; err != nil {
+		s.Log.Warn("settle cancelled scan groups", "err", err)
+		return
+	}
+	seen := make(map[string]bool, len(settled))
+	for i := range settled {
+		if seen[settled[i].ScanGroup] {
+			continue
+		}
+		seen[settled[i].ScanGroup] = true
+		s.Worker.SettleScanGroup(&settled[i])
+	}
+}
+
+// groupedScanIDs returns the ids of the scans matching a condition that were
+// launched as part of a batch. Ungrouped scans are dropped here rather than
+// downstream so a bulk cancel of ordinary scans costs no extra work.
+func (s *Server) groupedScanIDs(query string, args ...any) []uint {
+	var ids []uint
+	if err := s.DB.Model(&db.Scan{}).
+		Where(query, args...).
+		Where("scan_group <> ''").
+		Pluck("id", &ids).Error; err != nil {
+		s.Log.Warn("collect grouped scan ids", "err", err)
+		return nil
+	}
+	return ids
 }
 
 // scansCancelAll cancels every queued or running scan on a repository — the
@@ -654,6 +864,10 @@ func (s *Server) scansCancelAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	// Read the batched queued rows before the bulk flip: afterwards their
+	// status no longer identifies them, and they are the ones whose cohort has
+	// to be told the sibling is gone.
+	grouped := s.groupedScanIDs("repository_id = ? AND status = ?", repoID, db.ScanQueued)
 	queued := s.DB.Model(&db.Scan{}).
 		Where("repository_id = ? AND status = ?", repoID, db.ScanQueued).
 		Updates(scanStatusUpdates(db.ScanCancelled, worker.CancelledByUser, &now, nil))
@@ -661,6 +875,7 @@ func (s *Server) scansCancelAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, queued.Error.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.settleCancelledScanGroups(grouped...)
 	var scans []db.Scan
 	if err := s.DB.Where("repository_id = ? AND status IN ?",
 		repoID, []db.ScanStatus{db.ScanRunning}).Find(&scans).Error; err != nil {
@@ -672,9 +887,13 @@ func (s *Server) scansCancelAll(w http.ResponseWriter, r *http.Request) {
 		s.cancelScan(&scans[i], worker.CancelledByUser)
 		cancelled++
 	}
+	if cancelled > 0 {
+		s.publishScanList(uint(repoID))
+	}
 	setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("%d scan(s) cancelled", cancelled)})
 	// Back to the Scans tab: the redirect re-renders the table with fresh DB
 	// state, so every flipped row shows "cancelled" without per-scan SSE pushes.
+	// The push above is for the other pages left open on those rows.
 	s.redirect(w, r, fmt.Sprintf("/repositories/%d#rt3", repoID))
 }
 

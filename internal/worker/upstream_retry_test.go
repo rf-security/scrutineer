@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResolveRemoteHeadRetriesTransientFailure(t *testing.T) {
@@ -38,7 +39,7 @@ func TestSyncUpstreamRetriesRemoteCloneAndFetch(t *testing.T) {
 			retry.run = git.run
 			worker := &Worker{DataDir: t.TempDir()}
 
-			if err := worker.syncUpstream(context.Background(), retry, git.repoURL, git.upstreamURL); err != nil {
+			if err := worker.syncUpstream(context.Background(), retry, git.repoURL, git.upstreamURL, 0); err != nil {
 				t.Fatalf("syncUpstream: %v", err)
 			}
 			if failOperation == "clone" && (git.cloneCalls != 2 || !git.cloneResetObserved) {
@@ -54,6 +55,37 @@ func TestSyncUpstreamRetriesRemoteCloneAndFetch(t *testing.T) {
 	}
 }
 
+func TestSyncUpstreamHeadTimeoutDoesNotBoundMirrorOperations(t *testing.T) {
+	git := newUpstreamScript()
+	retry := fastRetry()
+	var headProbesWithDeadline int
+	var mirrorOperationWithDeadline bool
+	retry.run = func(ctx context.Context, dir string, env []string, args ...string) (string, error) {
+		_, hasDeadline := ctx.Deadline()
+		if len(args) > 0 && args[0] == "ls-remote" && (len(args) < 2 || args[1] != "--refs") {
+			if hasDeadline {
+				headProbesWithDeadline++
+			}
+		} else if len(args) > 0 {
+			mirrorOperationWithDeadline = mirrorOperationWithDeadline || hasDeadline
+		}
+		return git.run(ctx, dir, env, args...)
+	}
+	worker := &Worker{DataDir: t.TempDir()}
+
+	if err := worker.syncUpstream(
+		context.Background(), retry, git.repoURL, git.upstreamURL, time.Second,
+	); err != nil {
+		t.Fatalf("syncUpstream: %v", err)
+	}
+	if headProbesWithDeadline != 2 {
+		t.Fatalf("HEAD probes with deadline = %d, want 2", headProbesWithDeadline)
+	}
+	if mirrorOperationWithDeadline {
+		t.Fatal("clone/fetch/push inherited the remote HEAD deadline")
+	}
+}
+
 func TestSyncUpstreamCancelledCloneCleansMirrorForNextInvocation(t *testing.T) {
 	git := newUpstreamScript()
 	git.failOperation = "clone-cancel"
@@ -63,7 +95,7 @@ func TestSyncUpstreamCancelledCloneCleansMirrorForNextInvocation(t *testing.T) {
 	retry.run = git.run
 	worker := &Worker{DataDir: t.TempDir()}
 
-	err := worker.syncUpstream(ctx, retry, git.repoURL, git.upstreamURL)
+	err := worker.syncUpstream(ctx, retry, git.repoURL, git.upstreamURL, 0)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("syncUpstream error = %v, want context.Canceled", err)
 	}
@@ -75,7 +107,7 @@ func TestSyncUpstreamCancelledCloneCleansMirrorForNextInvocation(t *testing.T) {
 	fresh := newUpstreamScript()
 	freshRetry := fastRetry()
 	freshRetry.run = fresh.run
-	if err := worker.syncUpstream(context.Background(), freshRetry, fresh.repoURL, fresh.upstreamURL); err != nil {
+	if err := worker.syncUpstream(context.Background(), freshRetry, fresh.repoURL, fresh.upstreamURL, 0); err != nil {
 		t.Fatalf("fresh sync after cancellation: %v", err)
 	}
 	if fresh.cloneCalls != 1 || fresh.remoteSHA != fresh.desiredSHA {
@@ -93,7 +125,7 @@ func TestSyncUpstreamReconcilesAmbiguousPush(t *testing.T) {
 			retry.run = git.run
 			worker := &Worker{DataDir: t.TempDir()}
 
-			if err := worker.syncUpstream(context.Background(), retry, git.repoURL, git.upstreamURL); err != nil {
+			if err := worker.syncUpstream(context.Background(), retry, git.repoURL, git.upstreamURL, 0); err != nil {
 				t.Fatalf("syncUpstream: %v", err)
 			}
 			wantPushes := 1

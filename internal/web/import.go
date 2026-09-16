@@ -8,12 +8,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"filippo.io/age"
 	"filippo.io/age/armor"
+	"filippo.io/age/plugin"
 	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
@@ -70,7 +72,7 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	repoOverride := r.URL.Query().Get("repo")
-	out, err := s.importResults(results, repoOverride, revalidate)
+	out, err := s.importResults(results, format, repoOverride, revalidate)
 	if err != nil {
 		writeAPIError(w, http.StatusUnprocessableEntity, err.Error())
 		return
@@ -191,16 +193,22 @@ type importedResult struct {
 	tool     string
 	created  []db.Finding
 	observed int
+	caps     importCapStats
 }
 
-func (s *Server) importResults(results []ingest.Result, repoOverride string, revalidate bool) ([]map[string]any, error) {
+func (s *Server) importResults(results []ingest.Result, format ingest.Format, repoOverride string, revalidate bool) ([]map[string]any, error) {
 	imported := make([]importedResult, 0, len(results))
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
 		for _, res := range results {
-			outcome, err := s.importResultWith(tx, res, repoOverride)
+			bounded, caps := res, uncappedImportStats(res)
+			if capsApplyTo(format) {
+				bounded, caps = capScannerResult(res)
+			}
+			outcome, err := s.importResultWith(tx, bounded, repoOverride)
 			if err != nil {
 				return err
 			}
+			outcome.caps = caps
 			imported = append(imported, outcome)
 		}
 		return nil
@@ -230,19 +238,31 @@ func (s *Server) importResults(results []ingest.Result, repoOverride string, rev
 		s.Log.Info("import",
 			"repo", result.repo.URL, "tool", result.tool, "scan", result.scan.ID,
 			"created", len(result.created), "observed", result.observed)
+		if result.caps.truncated() {
+			s.Log.Warn("import: scanner result truncated by import caps",
+				"repo", result.repo.URL, "tool", result.tool, "scan", result.scan.ID,
+				"received", result.caps.Received, "accepted", result.caps.Accepted,
+				"dropped_per_rule", result.caps.DroppedPerRule,
+				"dropped_total_cap", result.caps.DroppedTotal,
+				"per_rule_cap", importPerRuleCap, "result_cap", importResultCap)
+		}
 
 		ids := make([]uint, len(result.created))
 		for i, finding := range result.created {
 			ids[i] = finding.ID
 		}
 		out = append(out, map[string]any{
-			"repository_id": result.repo.ID,
-			"repository":    result.repo.URL,
-			"scan_id":       result.scan.ID,
-			"tool":          result.tool,
-			"created":       len(result.created),
-			"observed":      result.observed,
-			"finding_ids":   ids,
+			"repository_id":     result.repo.ID,
+			"repository":        result.repo.URL,
+			"scan_id":           result.scan.ID,
+			"tool":              result.tool,
+			"created":           len(result.created),
+			"observed":          result.observed,
+			"received":          result.caps.Received,
+			"accepted":          result.caps.Accepted,
+			"dropped_per_rule":  result.caps.DroppedPerRule,
+			"dropped_total_cap": result.caps.DroppedTotal,
+			"finding_ids":       ids,
 		})
 	}
 	return out, nil
@@ -423,8 +443,8 @@ func attachFindingRelations(tx *gorm.DB, findingID uint, rels importFindingRelat
 		return nil
 	}
 	notes, comms, refs := rels.Notes, rels.Communications, rels.References
+	var have importFindingRelations
 	if dedup {
-		var have importFindingRelations
 		if err := tx.Where("finding_id = ?", findingID).Find(&have.Notes).Error; err != nil {
 			return fmt.Errorf("load existing notes: %w", err)
 		}
@@ -436,8 +456,12 @@ func attachFindingRelations(tx *gorm.DB, findingID uint, rels importFindingRelat
 		}
 		notes = dedupBy(notes, have.Notes, noteKey)
 		comms = dedupBy(comms, have.Communications, commKey)
-		refs = dedupBy(refs, have.References, refKey)
 	}
+	// References dedup on every path, not just the re-import one: (finding_id,
+	// url) is unique in the schema, so two carried references sharing a URL are
+	// one row even on a finding this instance has never seen. have.References is
+	// empty without dedup, which leaves the in-batch collapse.
+	refs = dedupBy(refs, have.References, refKey)
 	for i := range notes {
 		notes[i].ID, notes[i].FindingID = 0, findingID
 	}
@@ -484,7 +508,7 @@ func dedupBy[T any](incoming, existing []T, key func(T) string) []T {
 	return out
 }
 
-// noteKey/commKey/refKey identify a child record by its content for idempotent
+// noteKey/commKey identify a child record by its content for idempotent
 // re-import. Timestamps are part of the key: scrutineer's own bundle preserves
 // them across the round-trip, so the same note keys identically on re-import.
 func noteKey(n db.FindingNote) string {
@@ -495,8 +519,21 @@ func commKey(c db.FindingCommunication) string {
 	return strings.Join([]string{c.Channel, c.Direction, c.Actor, c.Body, c.At.UTC().Format(time.RFC3339Nano)}, "\x00")
 }
 
+// refKey is the URL alone, unlike its siblings. A reference is identified by
+// where it points: (finding_id, url) is unique in the schema, so a re-import
+// carrying the same URL under different tags is the same row, and keying on the
+// metadata too would let it through to an insert the database then rejects.
+//
+// The first spelling of a URL wins, so a bundle cannot rewrite a reference's
+// metadata by re-importing it. That is deliberately the opposite of
+// db.AddFindingReference, where the last non-empty write wins. A bundle is a
+// snapshot of another instance at one moment rather than an enrichment source,
+// and import treats every child record the same way: notes and communications
+// dedupe on their content too, without updating what is already stored. Routing
+// references alone through the helper would make them the one child record an
+// import can rewrite, which is a sharper inconsistency than the one it fixes.
 func refKey(r db.FindingReference) string {
-	return strings.Join([]string{r.URL, r.Tags, r.Summary}, "\x00")
+	return r.URL
 }
 
 // buildImportFindings maps ingest.Finding rows onto db.Finding and
@@ -512,9 +549,16 @@ func buildImportFindings(scan *db.Scan, res ingest.Result) ([]db.Finding, []impo
 		// all the other formats supply.
 		commit := firstNonEmpty(in.Commit, scan.Commit)
 		f := db.Finding{
-			ScanID:         scan.ID,
-			RepositoryID:   scan.RepositoryID,
-			Commit:         commit,
+			ScanID:       scan.ID,
+			RepositoryID: scan.RepositoryID,
+			Commit:       commit,
+			// A scrutineer bundle carries the exporting instance's producing
+			// model; every other format leaves it empty, and this synchronous
+			// import scan records no model of its own, so those findings stay
+			// unattributed. (The queued LLM ingest fallback never reaches
+			// here: its report goes through the worker's skill parser, which
+			// stamps that scan's resolved model.)
+			Model:          firstNonEmpty(in.Model, scan.Model),
 			SubPath:        in.SubPath,
 			Title:          in.Title,
 			Severity:       in.Severity,
@@ -550,6 +594,7 @@ func buildImportFindings(scan *db.Scan, res ingest.Result) ([]db.Finding, []impo
 		f.BreakingChangeRationale = in.BreakingChangeRationale
 		f.DupCheck = in.DupCheck
 		f.DisclosureDraft = in.DisclosureDraft
+		f.DisclosureTitle = in.DisclosureTitle
 		f.SuggestedRecipients = in.SuggestedRecipients
 		f.ExploitedInWild = in.ExploitedInWild
 		f.ExploitedInWildEvidence = in.ExploitedInWildEvidence
@@ -611,10 +656,18 @@ func importRelationsFrom(in ingest.Finding) importFindingRelations {
 		})
 	}
 	for _, ref := range in.References {
+		// Trimmed to match db.AddFindingReference, so a carried reference keys
+		// against a stored one the same way every other writer's would. A
+		// reference with no URL points nowhere and is dropped rather than
+		// stored: it would collide with the next one under the unique index.
+		url := strings.TrimSpace(ref.URL)
+		if url == "" {
+			continue
+		}
 		rel.References = append(rel.References, db.FindingReference{
-			URL:       ref.URL,
-			Tags:      ref.Tags,
-			Summary:   ref.Summary,
+			URL:       url,
+			Tags:      strings.TrimSpace(ref.Tags),
+			Summary:   strings.TrimSpace(ref.Summary),
 			CreatedAt: ref.CreatedAt,
 		})
 	}
@@ -670,10 +723,16 @@ func (s *Server) maybeDecrypt(body []byte) ([]byte, error) {
 		return body, nil // not encrypted — pass straight through
 	}
 	if len(s.EncIdentities) == 0 {
-		return nil, errors.New("encrypted import received but no identity configured (-identity-file)")
+		return nil, errors.New("encrypted import received but no identity configured (-identity-file or -identity-plugin)")
 	}
-	r, err := age.Decrypt(src, s.EncIdentities...)
+	r, err := age.Decrypt(src, slices.Clone(s.EncIdentities)...)
 	if err != nil {
+		var notFound *plugin.NotFoundError
+		if errors.As(err, &notFound) {
+			return nil, fmt.Errorf(
+				"decrypt: configured identity plugin %q is unavailable; expected age-plugin-%s in PATH",
+				notFound.Name, notFound.Name)
+		}
 		return nil, fmt.Errorf("decrypt: %w", err)
 	}
 	return io.ReadAll(r)

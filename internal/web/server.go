@@ -75,7 +75,7 @@ var ErrInvalidRef = errors.New("invalid git ref")
 // API layer maps it to a 400 instead of reporting an internal server failure.
 var ErrInvalidRescanMode = errors.New("invalid rescan mode")
 
-//go:embed templates/*.html
+//go:embed templates/*.html templates/sharing/*.html
 var tmplFS embed.FS
 
 //go:embed static
@@ -337,7 +337,28 @@ func defaultResolveRemoteHead(ctx context.Context, repo db.Repository) (string, 
 	return worker.ResolveRemoteHead(ctx, url)
 }
 
-func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *worker.Worker) (*Server, error) {
+// Option customizes a Server built by New.
+type Option func(*serverOpts)
+
+type serverOpts struct {
+	// tmplGlob is the embedded glob the server parses its templates from.
+	// Defaults to the main UI's templates; the sharing portal points it at its
+	// own templates/sharing/ set so portal-specific markup stays fully separate.
+	tmplGlob string
+}
+
+// WithTemplateGlob makes the server render the embedded templates matching glob
+// instead of the default main-UI set. Used by cmd/sharing so the portal renders
+// templates/sharing/*.html.
+func WithTemplateGlob(glob string) Option {
+	return func(o *serverOpts) { o.tmplGlob = glob }
+}
+
+func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *worker.Worker, opts ...Option) (*Server, error) {
+	cfg := serverOpts{tmplGlob: "templates/*.html"}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	funcs := template.FuncMap{
 		"since": tmplSince,
 		"until": func(t *time.Time) string {
@@ -444,7 +465,7 @@ func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *work
 			return findingDisclosureMarkdownFilename(&repo, &f)
 		},
 	}
-	t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, "templates/*.html")
+	t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, cfg.tmplGlob)
 	if err != nil {
 		return nil, err
 	}
@@ -657,6 +678,10 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 	if !isHX(r) {
 		data["Flash"] = popFlash(w, r)
 	}
+	// Sharing gates admin nav and mutating controls in the shared templates
+	// when the request runs under a read-only view scope (the sharing portal).
+	// Unset for the local operator, so every page renders as before.
+	data["Sharing"] = isReadOnly(r)
 	// Seed the sorter with the handler's EFFECTIVE sort (data["Sort"]) rather
 	// than the raw ?sort param. That token is already the sanitized, defaulted
 	// sort the ORDER BY actually used, so folding it in makes a default or
@@ -775,6 +800,17 @@ func (s *Server) redirect(w http.ResponseWriter, r *http.Request, path string) {
 	http.Redirect(w, r, path, http.StatusSeeOther)
 }
 
+// portalRepoStatusOrderExpr ranks repositories by their latest scan's status so
+// the sharing portal's default repository listing surfaces completed repos
+// first, then queued, then failed, then anything else, with never-scanned repos
+// last. It is applied only under a read-only (portal) scope; the local operator
+// keeps the recency default. Built from the db status constants so it stays in
+// lockstep with them.
+var portalRepoStatusOrderExpr = fmt.Sprintf(
+	`COALESCE((SELECT CASE s.status WHEN '%s' THEN 0 WHEN '%s' THEN 1 WHEN '%s' THEN 2 ELSE 3 END `+
+		`FROM scans s WHERE s.repository_id = repositories.id ORDER BY s.id DESC LIMIT 1), 4)`,
+	db.ScanDone, db.ScanQueued, db.ScanFailed)
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	s.repoList(w, r)
 }
@@ -872,9 +908,14 @@ type repoRow struct {
 // written by the metadata/repo-overview parsers, so the dropdown has to
 // split it rather than DISTINCT the column, otherwise every combination
 // (and ordering) of languages becomes its own filter option.
-func distinctLanguages(gdb *gorm.DB) []string {
+func distinctLanguages(gdb *gorm.DB, r *http.Request) []string {
 	var raw []string
-	gdb.Model(&db.Repository{}).Where("languages != ''").Distinct("languages").Pluck("languages", &raw)
+	q := gdb.Model(&db.Repository{}).Where("languages != ''")
+	// Restrict the facet to the request's allow-listed repositories (the
+	// sharing portal) so it does not reveal languages across repos the visitor
+	// cannot see; a no-op for the local operator.
+	q = applyRepoScope(q, r, "id")
+	q.Distinct("languages").Pluck("languages", &raw)
 	seen := map[string]struct{}{}
 	for _, joined := range raw {
 		for l := range strings.SplitSeq(joined, ",") {
@@ -893,6 +934,9 @@ func distinctLanguages(gdb *gorm.DB) []string {
 
 func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 	q := s.DB.Model(&db.Repository{})
+	// Restrict to the request's allow-listed repositories when a view scope is
+	// set (the sharing portal); a no-op for the local operator.
+	q = applyRepoScope(q, r, "id")
 	lang := r.URL.Query().Get("language")
 	if lang != "" {
 		// languages is a ", "-joined list; wrapping both sides lets one
@@ -939,6 +983,12 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 		q = q.Order(orderByExpr("COALESCE((SELECT MIN(status_priority) FROM scans WHERE scans.repository_id = repositories.id), 99)", dir, false)).Order("updated_at desc")
 	default:
 		sortCol, dir = defaultSort, ""
+		// The sharing portal lands committers on completed repositories first
+		// (then queued, then failed); the local operator keeps the recency
+		// default. updated_at stays the tiebreaker in both.
+		if isReadOnly(r) {
+			q = q.Order(portalRepoStatusOrderExpr)
+		}
 		q = q.Order("updated_at desc")
 	}
 	sort := joinSort(sortCol, dir)
@@ -1050,7 +1100,7 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 			Branches:       branchesByRepo[repo.ID],
 		})
 	}
-	languages := distinctLanguages(s.DB)
+	languages := distinctLanguages(s.DB, r)
 
 	data := map[string]any{
 		"Rows": rows, "Page": page, "Language": lang, "Sort": sort, "Languages": languages,
@@ -1306,6 +1356,9 @@ func (s *Server) findingsIndexQuery(r *http.Request, includeScanners, includeMis
 		q = q.Where("title LIKE ? OR location LIKE ? OR cwe LIKE ? OR cve_id LIKE ? OR ghsa_id LIKE ? OR affected LIKE ?",
 			like, like, like, like, like, like)
 	}
+	// Restrict to the request's allow-listed repositories when a view scope is
+	// set (the sharing portal); a no-op for the local operator.
+	q = applyRepoScope(q, r, "repository_id")
 	return q
 }
 
@@ -1385,7 +1438,27 @@ func findingIndexWhereSQL(r *http.Request, includeScanners, includeMissed bool) 
 		where = append(where, "(title LIKE ? OR location LIKE ? OR cwe LIKE ? OR cve_id LIKE ? OR ghsa_id LIKE ? OR affected LIKE ?)")
 		args = append(args, like, like, like, like, like, like)
 	}
+	// Restrict to the request's allow-listed repositories when a view scope is
+	// set (the sharing portal), mirroring applyRepoScope for this raw-SQL count
+	// path so the toggle badges do not count findings across unscoped repos.
+	if clause, scopeArgs := repoScopeSQL(r); clause != "" {
+		where = append(where, clause)
+		args = append(args, scopeArgs...)
+	}
 	return where, args
+}
+
+// repoScopeSQL returns a raw WHERE fragment and its bind args restricting a
+// findings query to the request's view scope, or ("", nil) when no scope is
+// set. It mirrors applyRepoScope for code paths that build SQL by hand instead
+// of chaining a *gorm.DB. An empty scope yields "repository_id IN (NULL)",
+// matching nothing — the correct behaviour for a maintainer with no repos.
+func repoScopeSQL(r *http.Request) (string, []any) {
+	sc, ok := viewScopeFrom(r)
+	if !ok {
+		return "", nil
+	}
+	return "repository_id IN ?", []any{sc.scopeIDs()}
 }
 
 func applyFindingStatusFilter(q *gorm.DB, status string) *gorm.DB {
@@ -1589,6 +1662,9 @@ func (s *Server) addRepoAndScan(w http.ResponseWriter, r *http.Request, repoURL 
 }
 
 func (s *Server) findingStatus(w http.ResponseWriter, r *http.Request) {
+	if denyReadOnly(w, r) {
+		return
+	}
 	f, ok := loadByID[db.Finding](s, w, r)
 	if !ok {
 		return
@@ -1856,6 +1932,9 @@ func verifyAllToast(queued, skipped, errored int) Flash {
 }
 
 func (s *Server) findingNotes(w http.ResponseWriter, r *http.Request) {
+	if denyReadOnly(w, r) {
+		return
+	}
 	f, ok := loadByID[db.Finding](s, w, r)
 	if !ok {
 		return
@@ -1991,6 +2070,10 @@ type findingWorkflowData struct {
 	HasDependents      bool
 	HasDisclosureDraft bool
 	DisclosureBlocked  bool
+	// Sharing mirrors the top-level template flag: the workflow partial is
+	// rendered with this struct as its dot, so it carries its own copy to gate
+	// the skill-enqueue buttons for read-only sharing requests.
+	Sharing bool
 }
 
 func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
@@ -2111,6 +2194,7 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 			HasDependents:      hasDependents,
 			HasDisclosureDraft: strings.TrimSpace(f.DisclosureDraft) != "",
 			DisclosureBlocked:  db.FindingDisclosureBlocked(f),
+			Sharing:            isReadOnly(r),
 		},
 		"Exposures":     exposures,
 		"HasDependents": hasDependents,

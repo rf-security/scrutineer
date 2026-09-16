@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,8 +18,11 @@ import (
 
 	"filippo.io/age"
 	"filippo.io/age/armor"
+	"filippo.io/age/plugin"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/ingest"
+	"scrutineer/internal/worker"
 )
 
 const sevHigh = "High"
@@ -38,6 +43,22 @@ func seedFindings(t *testing.T, s *Server) db.Repository {
 	s.DB.Create(&db.Finding{ScanID: scanA.ID, RepositoryID: repoA.ID, Title: "F2", Severity: "Low", Status: db.FindingNew})
 	s.DB.Create(&db.Finding{ScanID: scanB.ID, RepositoryID: repoB.ID, Title: "G1", Severity: sevHigh, Status: db.FindingNew})
 	return repoA
+}
+
+// seedScopedFindings seeds one repository with a deep-dive scan and a semgrep
+// scan, one High finding on each; the semgrep row is triaged under sub-path
+// "pkg" so status and sub_path filters keep a scanner row for scope to drop.
+func seedScopedFindings(t *testing.T, s *Server) db.Repository {
+	t.Helper()
+	repo := db.Repository{URL: "https://example.com/scoped", Name: "scoped"}
+	s.DB.Create(&repo)
+	dd := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	sg := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "semgrep"}
+	s.DB.Create(&dd)
+	s.DB.Create(&sg)
+	s.DB.Create(&db.Finding{ScanID: dd.ID, RepositoryID: repo.ID, Title: "audit finding", Severity: sevHigh})
+	s.DB.Create(&db.Finding{ScanID: sg.ID, RepositoryID: repo.ID, Title: "semgrep noise", Severity: sevHigh, Status: db.FindingTriaged, SubPath: "pkg"})
+	return repo
 }
 
 func readJSONL(t *testing.T, body string) []map[string]any {
@@ -82,7 +103,7 @@ func TestExportRepoFindings(t *testing.T) {
 		if row["repository_id"] != float64(repoA.ID) {
 			t.Errorf("row has repository_id %v, want %d", row["repository_id"], repoA.ID)
 		}
-		for _, k := range []string{"missed_count", "last_missed_scan_id"} {
+		for _, k := range []string{"missed_count", "last_missed_scan_id", "model"} {
 			if _, ok := row[k]; !ok {
 				t.Errorf("export row missing %q", k)
 			}
@@ -95,7 +116,7 @@ func TestStreamJSONLRowsErrorReturns500(t *testing.T) {
 	defer done()
 
 	w := httptest.NewRecorder()
-	streamJSONL[db.Finding](w, s.DB.Raw("SELECT * FROM missing_export_table"), findingExport)
+	streamJSONL[db.Finding](w, s.DB.Raw("SELECT * FROM missing_export_table"), s.Log, findingExport)
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status %d, want 500. body=%s", w.Code, w.Body)
@@ -110,6 +131,111 @@ func TestStreamJSONLRowsErrorReturns500(t *testing.T) {
 	if body[errorKey] == "" {
 		t.Fatalf("error response missing %q: %+v", errorKey, body)
 	}
+}
+
+func TestStreamJSONLRowsErrAbortsPartialResponse(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	type exportRow struct {
+		Value string
+	}
+	w := httptest.NewRecorder()
+	defer func() {
+		if got := recover(); got != http.ErrAbortHandler {
+			t.Fatalf("recover() = %v, want http.ErrAbortHandler", got)
+		}
+		rows := readJSONL(t, w.Body.String())
+		if len(rows) != 1 || rows[0]["value"] != "ok" {
+			t.Fatalf("streamed rows = %#v, want one successful row before abort", rows)
+		}
+	}()
+
+	q := s.DB.Raw(`WITH rows(value) AS (
+		VALUES ('ok'), (json_extract('not-json', '$'))
+	) SELECT value FROM rows`)
+	streamJSONL[exportRow](w, q, s.Log, func(row exportRow) map[string]any {
+		return map[string]any{"value": row.Value}
+	})
+}
+
+func TestStreamJSONLWriteErrorAfterPartialWriteAborts(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	type exportRow struct {
+		Value string
+	}
+	w := &failResponseWriter{writeBytes: 1}
+	defer func() {
+		if got := recover(); got != http.ErrAbortHandler {
+			t.Fatalf("recover() = %v, want http.ErrAbortHandler", got)
+		}
+		if strings.Contains(w.body.String(), errorKey) {
+			t.Fatalf("partial stream appended API error: %q", w.body.String())
+		}
+	}()
+
+	q := s.DB.Raw(`SELECT 'ok' AS value`)
+	streamJSONL[exportRow](w, q, s.Log, func(row exportRow) map[string]any {
+		return map[string]any{"value": row.Value}
+	})
+}
+
+func TestStreamJSONLWriteErrorAfterZeroByteWriteAborts(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	type exportRow struct {
+		Value string
+	}
+	w := &failResponseWriter{}
+	defer func() {
+		if got := recover(); got != http.ErrAbortHandler {
+			t.Fatalf("recover() = %v, want http.ErrAbortHandler", got)
+		}
+		if w.body.Len() != 0 {
+			t.Fatalf("zero-byte write unexpectedly wrote body: %q", w.body.String())
+		}
+	}()
+
+	q := s.DB.Raw(`SELECT 'ok' AS value`)
+	streamJSONL[exportRow](w, q, s.Log, func(row exportRow) map[string]any {
+		return map[string]any{"value": row.Value}
+	})
+}
+
+type failResponseWriter struct {
+	header     http.Header
+	body       bytes.Buffer
+	status     int
+	writeBytes int
+}
+
+type rejectingImportIdentity struct{}
+
+func (*rejectingImportIdentity) Unwrap([]*age.Stanza) ([]byte, error) {
+	return nil, age.ErrIncorrectIdentity
+}
+
+func (w *failResponseWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *failResponseWriter) Write(p []byte) (int, error) {
+	n := w.writeBytes
+	if n > len(p) {
+		n = len(p)
+	}
+	w.body.Write(p[:n])
+	return n, errors.New("write failed")
+}
+
+func (w *failResponseWriter) WriteHeader(status int) {
+	w.status = status
 }
 
 func TestExportRepoFindings_severityFilter(t *testing.T) {
@@ -131,6 +257,56 @@ func TestExportRepoFindings_severityFilter(t *testing.T) {
 	}
 }
 
+// TestExportRepoFindings_scopeFindings pins scope=findings on JSONL: both formats
+// drop scanner rows, keep audits and imports, and combine with the other filters.
+func TestExportRepoFindings_scopeFindings(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := seedScopedFindings(t, s)
+	imp := db.Scan{RepositoryID: repo.ID, Kind: "import", Status: db.ScanDone, SkillName: "trivy"}
+	s.DB.Create(&imp)
+	s.DB.Create(&db.Finding{ScanID: imp.ID, RepositoryID: repo.ID, Title: "imported finding", Severity: "Low", Status: db.FindingTriaged, SubPath: "pkg"})
+
+	titles := func(t *testing.T, qs string) []string {
+		t.Helper()
+		r := httptest.NewRequest("GET", "/api/v1/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/findings"+qs, nil)
+		r.Host = testHost
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		if w.Code != 200 {
+			t.Fatalf("GET %s: status %d: %s", qs, w.Code, w.Body)
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/x-ndjson; charset=utf-8" {
+			t.Fatalf("content-type %q, want application/x-ndjson", ct)
+		}
+		var out []string
+		for _, row := range readJSONL(t, w.Body.String()) {
+			out = append(out, row["title"].(string))
+		}
+		return out
+	}
+
+	cases := []struct {
+		name, qs string
+		want     []string
+	}{
+		{"no scope keeps scanner output", "", []string{"imported finding", "semgrep noise", "audit finding"}},
+		{"default format", "?scope=findings", []string{"imported finding", "audit finding"}},
+		{"explicit jsonl", "?format=jsonl&scope=findings", []string{"imported finding", "audit finding"}},
+		{"combined with severity", "?scope=findings&severity=High", []string{"audit finding"}},
+		{"combined with status", "?scope=findings&status=triaged", []string{"imported finding"}},
+		{"combined with sub_path", "?scope=findings&sub_path=pkg", []string{"imported finding"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := titles(t, tc.qs); !slices.Equal(got, tc.want) {
+				t.Errorf("titles = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestExportRepoFindings_unknownRepo(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -143,6 +319,251 @@ func TestExportRepoFindings_unknownRepo(t *testing.T) {
 	if w.Code != 404 {
 		t.Fatalf("status %d, want 404", w.Code)
 	}
+}
+
+func TestAPIv1DeleteRepository(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	s.Worker.DataDir = t.TempDir()
+
+	repo := db.Repository{URL: "https://github.com/acme/delete-me", Name: "delete-me"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&scan)
+	finding := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "doomed", Severity: sevHigh}
+	s.DB.Create(&finding)
+	s.DB.Create(&db.FindingReview{FindingID: finding.ID, Verdict: "true_positive", Reviewer: "analyst"})
+	s.DB.Create(&db.FindingNote{FindingID: finding.ID, Body: "note"})
+
+	r := httptest.NewRequest("DELETE", "/api/v1/repositories/"+strconv.FormatUint(uint64(repo.ID), 10), nil)
+	r.Host = testHost
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status %d, want 204. body=%s", w.Code, w.Body)
+	}
+	for name, n := range map[string]int64{
+		"repositories": countRows(t, s, &db.Repository{}, "id = ?", repo.ID),
+		"scans":        countRows(t, s, &db.Scan{}, "repository_id = ?", repo.ID),
+		"findings":     countRows(t, s, &db.Finding{}, "repository_id = ?", repo.ID),
+		"reviews":      countRows(t, s, &db.FindingReview{}, "finding_id = ?", finding.ID),
+		"notes":        countRows(t, s, &db.FindingNote{}, "finding_id = ?", finding.ID),
+	} {
+		if n != 0 {
+			t.Fatalf("%s rows survived repository delete: %d", name, n)
+		}
+	}
+}
+
+func TestAPIv1DeleteRepositoryRejectsInFlightScans(t *testing.T) {
+	for _, status := range []db.ScanStatus{db.ScanQueued, db.ScanRunning} {
+		t.Run(string(status), func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+
+			repo := db.Repository{URL: "https://github.com/acme/busy-repo", Name: "busy-repo"}
+			if err := s.DB.Create(&repo).Error; err != nil {
+				t.Fatal(err)
+			}
+			scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: status, SkillName: deepDiveSkillName}
+			if err := s.DB.Create(&scan).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			r := httptest.NewRequest("DELETE", "/api/v1/repositories/"+strconv.FormatUint(uint64(repo.ID), 10), nil)
+			r.Host = testHost
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, r)
+
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status %d, want 409. body=%s", w.Code, w.Body)
+			}
+			if !strings.Contains(w.Body.String(), "queued, running, or paused scans") {
+				t.Fatalf("body %q missing in-flight scan explanation", w.Body.String())
+			}
+			if n := countRows(t, s, &db.Repository{}, "id = ?", repo.ID); n != 1 {
+				t.Fatalf("repository count = %d, want 1 after rejected delete", n)
+			}
+			if n := countRows(t, s, &db.Scan{}, "id = ?", scan.ID); n != 1 {
+				t.Fatalf("scan count = %d, want 1 after rejected delete", n)
+			}
+		})
+	}
+}
+
+func TestAPIv1DeleteRepositoryRejectsInFlightFindingScopedScans(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/acme/busy-finding-repo", Name: "busy-finding-repo"}
+	if err := s.DB.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	if err := s.DB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	finding := db.Finding{RepositoryID: repo.ID, ScanID: scan.ID, Title: "busy finding", Severity: sevHigh}
+	if err := s.DB.Create(&finding).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherRepo := db.Repository{URL: "https://github.com/acme/worker-repo", Name: "worker-repo"}
+	if err := s.DB.Create(&otherRepo).Error; err != nil {
+		t.Fatal(err)
+	}
+	linked := db.Scan{RepositoryID: otherRepo.ID, FindingID: &finding.ID, Kind: "skill", Status: db.ScanPaused, SkillName: "verify"}
+	if err := s.DB.Create(&linked).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest("DELETE", "/api/v1/repositories/"+strconv.FormatUint(uint64(repo.ID), 10), nil)
+	r.Host = testHost
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status %d, want 409. body=%s", w.Code, w.Body)
+	}
+	if n := countRows(t, s, &db.Repository{}, "id = ?", repo.ID); n != 1 {
+		t.Fatalf("repository count = %d, want 1 after rejected delete", n)
+	}
+	if n := countRows(t, s, &db.Scan{}, "id = ?", linked.ID); n != 1 {
+		t.Fatalf("finding-scoped scan count = %d, want 1 after rejected delete", n)
+	}
+}
+
+func TestAPIv1DeleteFinding(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	s.Worker.DataDir = t.TempDir()
+
+	repo := db.Repository{URL: "https://github.com/acme/keep-repo", Name: "keep-repo"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&scan)
+	finding := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "delete finding", Severity: sevHigh}
+	s.DB.Create(&finding)
+	other := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "keep finding", Severity: "Low"}
+	s.DB.Create(&other)
+	findingScopedScan := db.Scan{RepositoryID: repo.ID, FindingID: &finding.ID, Kind: "skill", Status: db.ScanDone, SkillName: "verify"}
+	s.DB.Create(&findingScopedScan)
+
+	s.DB.Create(&db.FindingNote{FindingID: finding.ID, Body: "note"})
+	s.DB.Create(&db.FindingCommunication{FindingID: finding.ID, Channel: "email", Direction: "outbound"})
+	s.DB.Create(&db.FindingReference{FindingID: finding.ID, URL: "https://example.com/ref"})
+	s.DB.Create(&db.FindingHistory{FindingID: finding.ID, Field: "status", NewValue: "new"})
+	s.DB.Create(&db.FindingReview{FindingID: finding.ID, Verdict: "true_positive", Reviewer: "analyst"})
+	dependent := db.Dependent{RepositoryID: repo.ID, Name: "downstream", Ecosystem: "npm"}
+	s.DB.Create(&dependent)
+	s.DB.Create(&db.FindingDependent{FindingID: finding.ID, DependentID: dependent.ID, Status: db.ExposureKnownAffected})
+	label := db.FindingLabel{Name: "delete-me"}
+	s.DB.Create(&label)
+	if err := s.DB.Model(&finding).Association("Labels").Append(&label); err != nil {
+		t.Fatal(err)
+	}
+	conv := db.Conversation{RepositoryID: repo.ID, FindingID: &finding.ID, Title: "finding chat"}
+	s.DB.Create(&conv)
+	s.DB.Create(&db.ChatMessage{ConversationID: conv.ID, Role: db.ChatRoleUser, Content: "hello"})
+
+	r := httptest.NewRequest("DELETE", "/api/v1/findings/"+strconv.FormatUint(uint64(finding.ID), 10), nil)
+	r.Host = testHost
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status %d, want 204. body=%s", w.Code, w.Body)
+	}
+	for name, n := range map[string]int64{
+		"finding":      countRows(t, s, &db.Finding{}, "id = ?", finding.ID),
+		"notes":        countRows(t, s, &db.FindingNote{}, "finding_id = ?", finding.ID),
+		"comms":        countRows(t, s, &db.FindingCommunication{}, "finding_id = ?", finding.ID),
+		"refs":         countRows(t, s, &db.FindingReference{}, "finding_id = ?", finding.ID),
+		"history":      countRows(t, s, &db.FindingHistory{}, "finding_id = ?", finding.ID),
+		"reviews":      countRows(t, s, &db.FindingReview{}, "finding_id = ?", finding.ID),
+		"exposure":     countRows(t, s, &db.FindingDependent{}, "finding_id = ?", finding.ID),
+		"conversation": countRows(t, s, &db.Conversation{}, "finding_id = ?", finding.ID),
+		"messages":     countRows(t, s, &db.ChatMessage{}, "conversation_id = ?", conv.ID),
+	} {
+		if n != 0 {
+			t.Fatalf("%s rows survived finding delete: %d", name, n)
+		}
+	}
+	var labelLinks int64
+	s.DB.Raw("SELECT COUNT(*) FROM finding_labels_join WHERE finding_id = ?", finding.ID).Scan(&labelLinks)
+	if labelLinks != 0 {
+		t.Fatalf("label join rows survived finding delete: %d", labelLinks)
+	}
+	if n := countRows(t, s, &db.Repository{}, "id = ?", repo.ID); n != 1 {
+		t.Fatalf("repository count = %d, want 1", n)
+	}
+	if n := countRows(t, s, &db.Finding{}, "id = ?", other.ID); n != 1 {
+		t.Fatalf("unrelated finding count = %d, want 1", n)
+	}
+	var survivingScan db.Scan
+	if err := s.DB.First(&survivingScan, findingScopedScan.ID).Error; err != nil {
+		t.Fatalf("finding-scoped scan should survive: %v", err)
+	}
+	if survivingScan.FindingID != nil {
+		t.Fatalf("finding-scoped scan finding_id = %v, want nil", *survivingScan.FindingID)
+	}
+}
+
+func TestAPIv1DeleteFindingRejectsInFlightScans(t *testing.T) {
+	for _, status := range []db.ScanStatus{db.ScanQueued, db.ScanRunning} {
+		t.Run(string(status), func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+
+			repo := db.Repository{URL: "https://github.com/acme/busy", Name: "busy"}
+			if err := s.DB.Create(&repo).Error; err != nil {
+				t.Fatal(err)
+			}
+			scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+			if err := s.DB.Create(&scan).Error; err != nil {
+				t.Fatal(err)
+			}
+			finding := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "busy finding", Severity: sevHigh}
+			if err := s.DB.Create(&finding).Error; err != nil {
+				t.Fatal(err)
+			}
+			linked := db.Scan{RepositoryID: repo.ID, FindingID: &finding.ID, Kind: "skill", Status: status, SkillName: "verify"}
+			if err := s.DB.Create(&linked).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			r := httptest.NewRequest("DELETE", "/api/v1/findings/"+strconv.FormatUint(uint64(finding.ID), 10), nil)
+			r.Host = testHost
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, r)
+
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status %d, want 409. body=%s", w.Code, w.Body)
+			}
+			if !strings.Contains(w.Body.String(), "queued, running, or paused scans") {
+				t.Fatalf("body %q missing in-flight scan explanation", w.Body.String())
+			}
+			if n := countRows(t, s, &db.Finding{}, "id = ?", finding.ID); n != 1 {
+				t.Fatalf("finding count = %d, want 1 after rejected delete", n)
+			}
+			var got db.Scan
+			if err := s.DB.First(&got, linked.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if got.FindingID == nil || *got.FindingID != finding.ID {
+				t.Fatalf("linked scan finding_id = %v, want %d", got.FindingID, finding.ID)
+			}
+		})
+	}
+}
+
+func countRows(t *testing.T, s *Server, model any, where string, args ...any) int64 {
+	t.Helper()
+	var n int64
+	if err := s.DB.Model(model).Where(where, args...).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func TestExportFindings_acrossRepos(t *testing.T) {
@@ -631,6 +1052,101 @@ func TestExportBundleRoundTrip(t *testing.T) {
 	// A truly fresh import (different repo) would show created=1.
 }
 
+// TestExportBundleRoundTripPreservesModel pins the model provenance chain:
+// the bundle carries each finding's producing model, and importing the
+// bundle stores that model on the new finding rather than attributing it
+// to the receiving instance's ingest run.
+func TestExportBundleRoundTripPreservesModel(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/test/model-roundtrip", Name: "model-roundtrip"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "security-deep-dive", Commit: "aaa111", Model: "claude-fable-5-1[1m]"}
+	s.DB.Create(&scan)
+	s.DB.Create(&db.Finding{
+		ScanID: scan.ID, RepositoryID: repo.ID, Commit: "aaa111", Model: "claude-fable-5-1[1m]",
+		Title: "SQL Injection in login", Severity: sevHigh, Confidence: "high",
+		CWE: "CWE-89", Location: "auth/login.go:42",
+		Trace: "Unsanitised user input reaches the query builder.",
+	})
+
+	exportReq := httptest.NewRequest("GET", "/api/v1/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/findings?format=bundle", nil)
+	exportReq.Host = testHost
+	exportW := httptest.NewRecorder()
+	s.Handler().ServeHTTP(exportW, exportReq)
+	if exportW.Code != 200 {
+		t.Fatalf("export status %d: %s", exportW.Code, exportW.Body)
+	}
+	var bundle map[string]any
+	if err := json.Unmarshal(exportW.Body.Bytes(), &bundle); err != nil {
+		t.Fatalf("unmarshal bundle: %v", err)
+	}
+	findings, _ := bundle["findings"].([]any)
+	if len(findings) != 1 {
+		t.Fatalf("got %d bundle findings, want 1", len(findings))
+	}
+	if got := findings[0].(map[string]any)["model"]; got != "claude-fable-5-1[1m]" {
+		t.Fatalf("bundle finding model = %v, want claude-fable-5-1[1m]", got)
+	}
+
+	// Re-point the bundle at a fresh repository so the import creates a new
+	// finding instead of re-observing the exported one.
+	bundle["repository"] = "https://github.com/test/model-roundtrip-import"
+	body, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	importReq := httptest.NewRequest("POST", "/api/v1/import", strings.NewReader(string(body)))
+	importReq.Host = testHost
+	importW := httptest.NewRecorder()
+	s.Handler().ServeHTTP(importW, importReq)
+	if importW.Code != 201 {
+		t.Fatalf("import status %d: %s", importW.Code, importW.Body)
+	}
+
+	var imported db.Repository
+	if err := s.DB.Where("url = ?", "https://github.com/test/model-roundtrip-import").First(&imported).Error; err != nil {
+		t.Fatalf("imported repository: %v", err)
+	}
+	var f db.Finding
+	if err := s.DB.Where("repository_id = ?", imported.ID).First(&f).Error; err != nil {
+		t.Fatalf("imported finding: %v", err)
+	}
+	if f.Model != "claude-fable-5-1[1m]" {
+		t.Errorf("imported Finding.Model = %q, want claude-fable-5-1[1m] (the exporting instance's producer, not the ingest run)", f.Model)
+	}
+}
+
+// TestBundleImportPreservesBuiltinModelIDs locks the ingest model allowlist
+// to the ids scrutineer actually ships: every built-in id of every
+// registered backend must survive a bundle import unchanged, so a future
+// catalog entry with an unanticipated character (the [1m] suffix was the
+// first) fails here instead of silently importing findings unattributed.
+func TestBundleImportPreservesBuiltinModelIDs(t *testing.T) {
+	var checked int
+	for _, backend := range []string{"claude", "codex", "opencode", "copilot"} {
+		h, err := worker.HarnessByName(backend)
+		if err != nil {
+			continue // backend not registered in this build
+		}
+		for _, m := range worker.DefaultModelsFor(h) {
+			body := `{"repository":"https://x/y","findings":[{"title":"t","severity":"high","model":` + strconv.Quote(m.ID) + `}]}`
+			results, _, err := ingest.Parse([]byte(body))
+			if err != nil {
+				t.Fatalf("%s %s: %v", backend, m.ID, err)
+			}
+			checked++
+			if got := results[0].Findings[0].Model; got != m.ID {
+				t.Errorf("%s: built-in id %q imported as %q, want preserved", backend, m.ID, got)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no built-in model ids checked; is the harness registry empty?")
+	}
+}
+
 func TestExportBundleWithSeverityFilter(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -792,6 +1308,94 @@ func TestImportEncryptedNoIdentity(t *testing.T) {
 	}
 }
 
+func TestImportEncryptedMissingIdentityPlugin(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := []byte(`{"repository":"https://example.com/x","tool":"test","findings":[{"title":"t","severity":"High"}]}`)
+	ct, err := encryptBundle(plain, []age.Recipient{id.Recipient()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const name = "scrutineer-missing-test"
+	pluginID, err := plugin.NewIdentityWithoutData(name, &plugin.ClientUI{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+
+	s, done := newTestServer(t)
+	defer done()
+	s.EncIdentities = []age.Identity{pluginID}
+
+	r := httptest.NewRequest("POST", "/api/v1/import", bytes.NewReader(ct))
+	r.Host = testHost
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+
+	if w.Code != 422 {
+		t.Fatalf("status %d, want 422: %s", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), "age-plugin-"+name) ||
+		!strings.Contains(w.Body.String(), "unavailable") {
+		t.Fatalf("error does not identify the missing plugin executable: %s", w.Body)
+	}
+}
+
+func TestImportEncryptedIdentityNonMatchIsNotAPluginFailure(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := []byte(`{"repository":"https://example.com/x","tool":"test","findings":[{"title":"t","severity":"High"}]}`)
+	ct, err := encryptBundle(plain, []age.Recipient{id.Recipient()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, done := newTestServer(t)
+	defer done()
+	s.EncIdentities = []age.Identity{&rejectingImportIdentity{}}
+
+	r := httptest.NewRequest("POST", "/api/v1/import", bytes.NewReader(ct))
+	r.Host = testHost
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d, want 422: %s", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), "identity did not match any of the recipients") {
+		t.Fatalf("error does not describe an ordinary identity non-match: %s", w.Body)
+	}
+	if strings.Contains(w.Body.String(), "plugin") && strings.Contains(w.Body.String(), "failed") {
+		t.Fatalf("ordinary identity non-match was reported as a plugin failure: %s", w.Body)
+	}
+}
+
+func TestMaybeDecryptDoesNotReorderConfiguredIdentities(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct, err := encryptBundle([]byte(`{"repository":"https://example.com/x"}`), []age.Recipient{id.Recipient()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, done := newTestServer(t)
+	defer done()
+	reject := &rejectingImportIdentity{}
+	s.EncIdentities = []age.Identity{reject, id}
+	if _, err := s.maybeDecrypt(ct); err != nil {
+		t.Fatal(err)
+	}
+	if s.EncIdentities[0] != reject || s.EncIdentities[1] != id {
+		t.Fatalf("maybeDecrypt reordered the configured identities: %T, %T", s.EncIdentities[0], s.EncIdentities[1])
+	}
+}
+
 func TestImportCorruptedCiphertext(t *testing.T) {
 	id, _ := age.GenerateX25519Identity()
 	plain := []byte(`{"repository":"https://example.com/x","tool":"test","findings":[{"title":"t","severity":"High"}]}`)
@@ -892,7 +1496,8 @@ func TestExportFindings_carriesDBFields(t *testing.T) {
 	s.DB.Create(&db.Finding{
 		ScanID: scan.ID, RepositoryID: repo.ID, Commit: "abc123", SubPath: "core",
 		Fingerprint: "fp-1", LastSeenScanID: scan.ID, LastSeenCommit: "abc123", SeenCount: 3,
-		FindingID: "F1", Title: "boom", Severity: sevHigh, Status: db.FindingTriaged,
+		FindingID: "F1", Title: "boom", Severity: sevHigh, SeverityCaps: "authorization held",
+		SeverityCalibrationIncomplete: true, Status: db.FindingTriaged,
 		VID:   "VID-aaaa-bbbb-cccc-dddd-eeee-ffff",
 		Trace: "t", Boundary: "b", Validation: "v", PriorArt: "p", Reach: "r", Rating: "x",
 		DisclosureDraft: "d",
@@ -910,10 +1515,10 @@ func TestExportFindings_carriesDBFields(t *testing.T) {
 	want := []string{
 		"id", "scan_id", "repository_id", "commit", "sub_path",
 		"fingerprint", "last_seen_scan_id", "last_seen_commit", "seen_count", "vid",
-		"finding_id", "sinks", "title", "severity", "status", "cwe", "location", "affected",
+		"finding_id", "sinks", "title", "severity", "severity_caps", "severity_calibration_incomplete", "status", "cwe", "location", "affected",
 		"reachability", "quality_tier",
 		"cve_id", "cvss_vector", "cvss_score", "fix_version", "fix_commit",
-		"resolution", "disclosure_draft", "suggested_recipients", "assignee",
+		"resolution", "disclosure_draft", "disclosure_title", "suggested_recipients", "assignee",
 		"trace", "boundary", "validation", "prior_art", "reach", "rating",
 		"created_at", "updated_at",
 	}
@@ -921,6 +1526,12 @@ func TestExportFindings_carriesDBFields(t *testing.T) {
 		if _, ok := rows[0][k]; !ok {
 			t.Errorf("missing key %q in finding export", k)
 		}
+	}
+	if caps, ok := rows[0]["severity_caps"].([]any); !ok || len(caps) != 1 || caps[0] != "authorization held" {
+		t.Errorf("severity_caps = %#v, want one exported cap", rows[0]["severity_caps"])
+	}
+	if rows[0]["severity_calibration_incomplete"] != true {
+		t.Errorf("severity_calibration_incomplete = %#v, want true", rows[0]["severity_calibration_incomplete"])
 	}
 }
 
@@ -1024,6 +1635,7 @@ func seedRichFinding(t *testing.T, s *Server, url string) db.Repository {
 		BreakingChangeRationale: "no public API change",
 		DupCheck:                "distinct from F2: different sink",
 		DisclosureDraft:         "## Advisory\nPath traversal in download()",
+		DisclosureTitle:         "Path traversal in download()",
 		SuggestedRecipients:     "@alice (CODEOWNERS: crypto/*)",
 		ExploitedInWild:         "no",
 		ExploitedInWildEvidence: "no reports as of 2026-07",
@@ -1233,14 +1845,7 @@ func TestExportBundle_scopeFindingsCuratesScanners(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 
-	repo := db.Repository{URL: "https://example.com/scoped", Name: "scoped"}
-	s.DB.Create(&repo)
-	dd := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
-	s.DB.Create(&dd)
-	sg := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "semgrep"}
-	s.DB.Create(&sg)
-	s.DB.Create(&db.Finding{ScanID: dd.ID, RepositoryID: repo.ID, Title: "audit finding", Severity: sevHigh})
-	s.DB.Create(&db.Finding{ScanID: sg.ID, RepositoryID: repo.ID, Title: "semgrep noise", Severity: "Low"})
+	repo := seedScopedFindings(t, s)
 
 	bundleTitles := func(qs string) []string {
 		r := httptest.NewRequest("GET", "/api/v1/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/findings?format=bundle"+qs, nil)
@@ -1276,8 +1881,7 @@ func TestExportBundle_scopeFindingsCuratesScanners(t *testing.T) {
 }
 
 // assertExportRejects runs each GET path and asserts a 400 whose body mentions
-// keyword. Shared by the scope and include rejection tests, which validate the
-// same "bundle-only query param used elsewhere" guard.
+// keyword. Shared by the scope and include rejection tests.
 func assertExportRejects(t *testing.T, s *Server, keyword string, cases []struct{ name, path string }) {
 	t.Helper()
 	for _, tc := range cases {
@@ -1296,9 +1900,8 @@ func assertExportRejects(t *testing.T, s *Server, keyword string, cases []struct
 	}
 }
 
-// TestExportBundle_scopeRejected pins the validation: an unknown scope value, a
-// scope without format=bundle, and scope on the cross-repo endpoints all 400
-// rather than silently returning a wider set than the caller asked for.
+// TestExportBundle_scopeRejected pins the validation: an unknown scope value on
+// either per-repository format and scope on the cross-repo endpoints all 400.
 func TestExportBundle_scopeRejected(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -1306,8 +1909,8 @@ func TestExportBundle_scopeRejected(t *testing.T) {
 	id := strconv.FormatUint(uint64(repo.ID), 10)
 
 	assertExportRejects(t, s, "scope", []struct{ name, path string }{
-		{"unknown scope value", "/api/v1/repositories/" + id + "/findings?format=bundle&scope=bogus"},
-		{"scope without bundle", "/api/v1/repositories/" + id + "/findings?scope=findings"},
+		{"unknown scope value on bundle", "/api/v1/repositories/" + id + "/findings?format=bundle&scope=bogus"},
+		{"unknown scope value on jsonl", "/api/v1/repositories/" + id + "/findings?scope=bogus"},
 		{"scope on repositories", "/api/v1/repositories?scope=findings"},
 		{"scope on global findings", "/api/v1/findings?scope=findings"},
 		{"scope on global scans", "/api/v1/scans?scope=findings"},
@@ -1328,14 +1931,7 @@ func TestExportBundle_scopeFindingsCuratesEncrypted(t *testing.T) {
 	s.EncRecipients = []age.Recipient{id.Recipient()}
 	s.EncIdentities = []age.Identity{id}
 
-	repo := db.Repository{URL: "https://example.com/enc-scoped", Name: "enc-scoped"}
-	s.DB.Create(&repo)
-	dd := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
-	s.DB.Create(&dd)
-	sg := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: "semgrep"}
-	s.DB.Create(&sg)
-	s.DB.Create(&db.Finding{ScanID: dd.ID, RepositoryID: repo.ID, Title: "audit finding", Severity: sevHigh})
-	s.DB.Create(&db.Finding{ScanID: sg.ID, RepositoryID: repo.ID, Title: "semgrep noise", Severity: "Low"})
+	repo := seedScopedFindings(t, s)
 
 	r := httptest.NewRequest("GET", "/api/v1/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/findings?format=bundle&encrypt=1&scope=findings", nil)
 	r.Host = testHost
@@ -1404,7 +2000,8 @@ func TestExportBundle_includeAllCarriesArchival(t *testing.T) {
 		t.Errorf("default sinks = %q, want path.join,os.Open", def.Sinks)
 	}
 	if def.Snippet != "" || def.Affected != "" || def.CVEID != "" || def.CVSSVector != "" ||
-		def.DisclosureDraft != "" || def.SuggestedRecipients != "" || def.ExploitedInWild != "" || def.UpstreamFixCommit != "" {
+		def.DisclosureDraft != "" || def.DisclosureTitle != "" || def.SuggestedRecipients != "" ||
+		def.ExploitedInWild != "" || def.UpstreamFixCommit != "" {
 		t.Errorf("default bundle carried archival scalars: %+v", def)
 	}
 	if len(def.Notes) != 0 || len(def.Communications) != 0 || len(def.References) != 0 {
@@ -1428,6 +2025,7 @@ func TestExportBundle_includeAllCarriesArchival(t *testing.T) {
 		{"breaking_change_rationale", all.BreakingChangeRationale, "no public API change"},
 		{"dup_check", all.DupCheck, "distinct from F2: different sink"},
 		{"disclosure_draft", all.DisclosureDraft, "## Advisory\nPath traversal in download()"},
+		{"disclosure_title", all.DisclosureTitle, "Path traversal in download()"},
 		{"suggested_recipients", all.SuggestedRecipients, "@alice (CODEOWNERS: crypto/*)"},
 		{"exploited_in_wild", all.ExploitedInWild, "no"},
 		{"exploited_in_wild_evidence", all.ExploitedInWildEvidence, "no reports as of 2026-07"},
@@ -1503,6 +2101,7 @@ func TestExportBundleRoundTrip_includeAll(t *testing.T) {
 		{"breaking_change_rationale", got.BreakingChangeRationale, "no public API change"},
 		{"dup_check", got.DupCheck, "distinct from F2: different sink"},
 		{"disclosure_draft", got.DisclosureDraft, "## Advisory\nPath traversal in download()"},
+		{"disclosure_title", got.DisclosureTitle, "Path traversal in download()"},
 		{"suggested_recipients", got.SuggestedRecipients, "@alice (CODEOWNERS: crypto/*)"},
 		{"exploited_in_wild", got.ExploitedInWild, "no"},
 		{"exploited_in_wild_evidence", got.ExploitedInWildEvidence, "no reports as of 2026-07"},

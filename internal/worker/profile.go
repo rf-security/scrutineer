@@ -137,10 +137,34 @@ var builtinProfiles = []Profile{
 	},
 	{Name: "python", Detect: pm("pip", "Pipenv", "Poetry", "uv", "PDM", "setuptools")},
 	{Name: "go", Detect: pm("Go Modules")},
+	{
+		// Before java: an sbt project also matches nothing under java (Maven/
+		// Gradle), but a Scala-on-Gradle build reports both Gradle and Scala,
+		// and the scala profile is a superset of java (BaseProfile) that adds
+		// sbt plus Scala-specific reproducer guidance. The language selector is
+		// a belt-and-braces for a *.scala-only checkout with no build.sbt.
+		Name:            "scala",
+		BaseProfile:     "java",
+		FallbackProfile: "java",
+		Detect: []BriefMatch{
+			{briefPackageManager, []string{"sbt"}},
+			{briefLanguage, []string{"Scala"}},
+		},
+	},
 	{Name: "java", Detect: pm("Maven", "Gradle")},
 	{Name: "dotnet", Detect: pm("NuGet", "dotnet CLI")},
 	{Name: "beam", Detect: pm("Mix", "rebar3")},
 	{Name: "rust", Detect: pm("Cargo")},
+	{
+		// Before c-cpp so an opam package that also ships a compat Makefile
+		// (most do; it just calls dune) still routes here.
+		Name: "ocaml",
+		Detect: []BriefMatch{
+			{briefPackageManager, []string{"opam"}},
+			{briefBuild, []string{"Dune"}},
+			{briefLanguage, []string{"OCaml"}},
+		},
+	},
 	{
 		// Before c-cpp: a Swift package that vendors C sources or a Makefile
 		// still routes here on the SwiftPM manifest. The language match is a
@@ -216,14 +240,18 @@ func IsNamedProfile(name string) bool {
 }
 
 // briefDetections flattens brief's JSON output into category -> lower(name)
-// -> true. package_managers and languages become the briefPackageManager /
-// briefLanguage categories; every key under tools becomes its own category.
-// Unknown JSON is tolerated: an unmarshal error or an absent field yields an
-// empty (never nil) map so profile matching degrades to "no match" rather
-// than failing the scan.
+// -> true. package_managers becomes the briefPackageManager category; every
+// key under tools becomes its own category. Only the dominant programming
+// language enters briefLanguage: brief emits languages sorted by source-file
+// count descending, so a repo's test harness (Perl in curl, Python in many C
+// projects) can't outvote the actual codebase via registry order. Unknown JSON
+// is tolerated: an unmarshal error or an absent field yields an empty (never
+// nil) map so profile matching degrades to "no match" rather than failing the
+// scan.
 func briefDetections(out []byte) map[string]map[string]bool {
 	type detection struct {
-		Name string `json:"name"`
+		Name     string `json:"name"`
+		Category string `json:"category"`
 	}
 	var r struct {
 		PackageManagers []detection            `json:"package_managers"`
@@ -245,7 +273,14 @@ func briefDetections(out []byte) map[string]map[string]bool {
 		add(briefPackageManager, d.Name)
 	}
 	for _, d := range r.Languages {
+		// Skip data/markup/prose entries the same way parseRepoOverviewOutput
+		// does; an absent category means brief predates the field, so treat
+		// it as a programming language for compatibility.
+		if d.Name == "" || (d.Category != "" && d.Category != "language") {
+			continue
+		}
 		add(briefLanguage, d.Name)
+		break
 	}
 	for cat, ds := range r.Tools {
 		for _, d := range ds {
@@ -292,14 +327,14 @@ func DetectProfile(ctx context.Context, rt ContainerRuntime, runnerImage, srcDir
 	if err != nil {
 		return Profile{}
 	}
-	args := rt.runArgs("--rm",
+	args := runtimeRunArgs(rt, "--rm",
 		"--network", "none",
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"-v", bindMount(absSrc, "/src", relabel, "ro"),
 		"--entrypoint", "brief",
 		runnerImage, "/src",
 	)
-	cmd := exec.CommandContext(ctx, rt.bin(), args...)
+	cmd := exec.CommandContext(ctx, runtimeBin(rt), args...)
 	out, err := cmd.Output()
 	if err != nil {
 		// A brief failure degrades to the default runner image; the scan
@@ -462,16 +497,16 @@ func (p Profile) EnsureImage(ctx context.Context, rt ContainerRuntime, profilesD
 		if p.BaseProfile == "" && baseDigest == "" {
 			emit(Event{Kind: KindText, Text: "profile: reusing cached " + tag +
 				" but could not verify the runner base is current (" + runnerImage +
-				" digest unresolved); if it changed, `" + rt.bin() + " rmi " + tag + "` to force a rebuild"})
+				" digest unresolved); if it changed, `" + runtimeBin(rt) + " rmi " + tag + "` to force a rebuild"})
 		}
 		return tag, nil
 	}
 	emit(Event{Kind: KindText, Text: "profile: building " + tag + " (first build can take several minutes)"})
 	start := time.Now()
 	args := profileBuildArgs(p, tag, dockerfile, filepath.Join(profilesDir, p.Name), baseImage, baseDigest)
-	cmd := exec.CommandContext(ctx, rt.bin(), args...)
+	cmd := exec.CommandContext(ctx, runtimeBin(rt), args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("%s build %s: %w\n%s", rt.bin(), tag, err, out)
+		return "", fmt.Errorf("%s build %s: %w\n%s", runtimeBin(rt), tag, err, out)
 	}
 	emit(Event{Kind: KindText, Text: "profile: built " + tag + " in " + time.Since(start).Round(time.Second).String()})
 	return tag, nil
@@ -504,5 +539,5 @@ func profileBuildArgs(p Profile, tag, dockerfile, contextDir, baseImage, baseDig
 }
 
 func imageExistsLocally(ctx context.Context, rt ContainerRuntime, tag string) bool {
-	return exec.CommandContext(ctx, rt.bin(), "image", "inspect", tag).Run() == nil
+	return exec.CommandContext(ctx, runtimeBin(rt), "image", "inspect", tag).Run() == nil
 }

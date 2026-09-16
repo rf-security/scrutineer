@@ -1,7 +1,7 @@
 package web
 
 import (
-	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -12,10 +12,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// The handlers below let skills (and the browser UI) mutate a finding:
-// edit scoring fields, append notes, log communications, add references,
-// set labels, and read the full change history. Auth scoping holds: the
-// authenticated scan's repository must own the finding.
+// The handlers below let authenticated skills mutate a finding. Direct field
+// edits require the scan's finding scope; notes, communications, references,
+// labels, and history remain repository-scoped. Browser form edits use
+// separate routes.
 
 func (s *Server) apiPatchFinding(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.PathValue("id"))
@@ -28,12 +28,25 @@ func (s *Server) apiPatchFinding(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusForbidden, "scan may only edit findings on its own repository")
 		return
 	}
-	var body struct {
+	body, ok := decodeAPIBody[struct {
 		Fields map[string]string `json:"fields"`
 		By     string            `json:"by"`
+	}](w, r, "body must be JSON with a fields map")
+	if !ok {
+		return
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "body must be JSON with a fields map")
+	if status, changesStatus := body.Fields["status"]; changesStatus {
+		switch db.FindingLifecycle(status) {
+		case db.FindingRejected, db.FindingDuplicate:
+			writeAPIError(w, http.StatusForbidden,
+				"scan tokens may not set finding status to rejected or duplicate")
+			return
+		}
+	}
+	scan := scanFromRequest(r)
+	if scan == nil || scan.FindingID == nil || *scan.FindingID != uint(id) {
+		writeAPIError(w, http.StatusForbidden,
+			"scan may only edit its scoped finding")
 		return
 	}
 	source := sourceFromRequest(r)
@@ -42,7 +55,7 @@ func (s *Server) apiPatchFinding(w http.ResponseWriter, r *http.Request) {
 		fields = append(fields, field)
 	}
 	sort.Strings(fields)
-	if err := s.DB.Transaction(func(tx *gorm.DB) error {
+	if err := db.FindingWriteTransaction(s.DB.WithContext(r.Context()), uint(id), func(tx *gorm.DB) error {
 		for _, field := range fields {
 			if err := db.WriteFindingField(tx, uint(id), field, body.Fields[field], source, body.By); err != nil {
 				return err
@@ -50,7 +63,11 @@ func (s *Server) apiPatchFinding(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}); err != nil {
-		writeAPIError(w, http.StatusUnprocessableEntity, err.Error())
+		if errors.Is(err, db.ErrFindingNonViable) {
+			writeAPIError(w, http.StatusPreconditionFailed, err.Error())
+			return
+		}
+		writeAPIError(w, findingWriteErrorStatus(err, http.StatusUnprocessableEntity), err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -61,12 +78,11 @@ func (s *Server) apiAddFindingNote(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var body struct {
+	body, ok := decodeAPIBody[struct {
 		Body string `json:"body"`
 		By   string `json:"by"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "body must be JSON")
+	}](w, r, "body must be JSON")
+	if !ok {
 		return
 	}
 	n, err := db.AddFindingNote(s.DB, id, body.Body, body.By)
@@ -92,16 +108,15 @@ func (s *Server) apiAddFindingCommunication(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	var body struct {
+	body, ok := decodeAPIBody[struct {
 		Channel     string    `json:"channel"`
 		Direction   string    `json:"direction"`
 		Actor       string    `json:"actor"`
 		Body        string    `json:"body"`
 		OfferedHelp string    `json:"offered_help"`
 		At          time.Time `json:"at"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "body must be JSON")
+	}](w, r, "body must be JSON")
+	if !ok {
 		return
 	}
 	c, err := db.AddFindingCommunication(s.DB, id, body.Channel, body.Direction, body.Actor, body.Body, body.OfferedHelp, body.At)
@@ -127,13 +142,12 @@ func (s *Server) apiAddFindingReference(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	var body struct {
+	body, ok := decodeAPIBody[struct {
 		URL     string `json:"url"`
 		Tags    string `json:"tags"`
 		Summary string `json:"summary"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeAPIError(w, http.StatusBadRequest, "body must be JSON")
+	}](w, r, "body must be JSON")
+	if !ok {
 		return
 	}
 	ref, err := db.AddFindingReference(s.DB, id, body.URL, body.Tags, body.Summary)
@@ -159,10 +173,19 @@ func (s *Server) apiSetFindingLabels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var body struct {
+	body, ok := decodeAPIBody[struct {
 		Labels []string `json:"labels"`
+	}](w, r, "body must be JSON with a labels array")
+	if !ok {
+		return
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	// {} and {"labels": null} both decode to a nil slice, which
+	// SetFindingLabels would apply as an intentional replacement with the
+	// empty set: a malformed body would silently wipe analyst-set labels and
+	// still answer 204. Clearing stays available to callers that ask for it
+	// with a present array — an explicit [], or one whose names are all
+	// blank, since SetFindingLabels trims and skips blank names (#710).
+	if body.Labels == nil {
 		writeAPIError(w, http.StatusBadRequest, "body must be JSON with a labels array")
 		return
 	}

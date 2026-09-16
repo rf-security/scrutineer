@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,55 @@ func TestMaybeFireScanFailed(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("failure callbacks = %d, want 1", calls)
 	}
+}
+
+// Exactly one of the two hooks fires per scan. A batched scan that ends in a
+// state the finalized hook does not cover still has to reach a consumer
+// waiting for its cohort to drain, and one that does finalize must not be
+// announced twice.
+func TestMaybeFireScanFinalizedAndGroupSettled(t *testing.T) {
+	failOn := &FailOnThresholdError{}
+	cases := []struct {
+		name     string
+		scan     db.Scan
+		runErr   error
+		finalize bool
+		settle   bool
+	}{
+		{name: "done ungrouped", scan: db.Scan{Status: db.ScanDone}, finalize: true},
+		{name: "done batched", scan: db.Scan{Status: db.ScanDone, ScanGroup: "g"}, finalize: true},
+		{name: "fail_on batched", scan: db.Scan{Status: db.ScanFailed, ScanGroup: "g"}, runErr: failOn, finalize: true},
+		{name: "failed batched", scan: db.Scan{Status: db.ScanFailed, ScanGroup: "g"}, settle: true},
+		{name: "cancelled batched", scan: db.Scan{Status: db.ScanCancelled, ScanGroup: "g"}, settle: true},
+		{name: "failed ungrouped", scan: db.Scan{Status: db.ScanFailed}},
+		{name: "paused batched", scan: db.Scan{Status: db.ScanPaused, ScanGroup: "g"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var finalized, settled int
+			w := &Worker{
+				OnScanFinalized:    func(*db.Scan) { finalized++ },
+				OnScanGroupSettled: func(*db.Scan) { settled++ },
+			}
+			scan := tc.scan
+			if !w.maybeFireScanFinalized(&scan, tc.runErr) {
+				w.maybeFireScanGroupSettled(&scan)
+			}
+			if want := btoi(tc.finalize); finalized != want {
+				t.Errorf("finalized = %d, want %d", finalized, want)
+			}
+			if want := btoi(tc.settle); settled != want {
+				t.Errorf("settled = %d, want %d", settled, want)
+			}
+		})
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func TestMigrateLegacyState_renamesStateDir(t *testing.T) {
@@ -172,7 +222,7 @@ func TestWorker_CancelStopsRunningScan(t *testing.T) {
 	if midRun.Backend != "codex" {
 		t.Errorf("scan.Backend = %q while RunSkill in flight, want codex", midRun.Backend)
 	}
-	if !w.Cancel(scan.ID) {
+	if !w.Cancel(scan.ID, "") {
 		t.Fatal("Cancel reported scan not running")
 	}
 	select {
@@ -189,7 +239,10 @@ func TestWorker_CancelStopsRunningScan(t *testing.T) {
 	if got.Status != db.ScanCancelled {
 		t.Errorf("status = %s, want cancelled (err=%q)", got.Status, got.Error)
 	}
-	if w.Cancel(scan.ID) {
+	if got.Error != CancelledByUser {
+		t.Errorf("error = %q, want the default cancel reason %q", got.Error, CancelledByUser)
+	}
+	if w.Cancel(scan.ID, "") {
 		t.Error("Cancel returned true after job finished")
 	}
 }
@@ -1127,5 +1180,57 @@ func TestWorker_maxTurnsParseFailureLogged(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "parse partial skill output after max turns") {
 		t.Errorf("expected warn log about partial parse, got: %s", logBuf.String())
+	}
+}
+
+// Nothing publishes between the claim and finalizeScan, which is minutes away
+// for a real skill, so without a push here the list pages show a scan as queued
+// for its entire run.
+func TestWrap_publishesRunningOnClaim(t *testing.T) {
+	gdb, err := db.Open(filepath.Join(t.TempDir(), "start.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "https://example.com/x", Name: "x"}
+	gdb.Create(&repo)
+	skill := db.Skill{Name: "metadata", Description: "x", Body: "b", Active: true, Source: "ui", Version: 1}
+	gdb.Create(&skill)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: JobSkill, Status: db.ScanQueued, SkillID: &skill.ID}
+	gdb.Create(&scan)
+
+	var mu sync.Mutex
+	var statuses []string
+	w := &Worker{
+		DB:             gdb,
+		Log:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DataDir:        t.TempDir(),
+		Runner:         fakeRunner{skillRes: SkillResult{Report: `{}`}},
+		PrepareRepoSrc: stubPrepareRepoSrc,
+		OnEvent: func(scanID, repoID uint, name, data string) {
+			if name != "scan-status" {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if scanID != scan.ID || repoID != repo.ID {
+				t.Errorf("scan-status for scan=%d repo=%d, want scan=%d repo=%d",
+					scanID, repoID, scan.ID, repo.ID)
+			}
+			statuses = append(statuses, data)
+		},
+	}
+
+	body, _ := json.Marshal(queue.Payload{ScanID: scan.ID})
+	if err := w.wrap(w.doSkill)(context.Background(), body); err != nil {
+		t.Fatalf("wrap: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(statuses) < 2 || statuses[0] != string(db.ScanRunning) {
+		t.Fatalf("published statuses = %v, want running first then the outcome", statuses)
+	}
+	if last := statuses[len(statuses)-1]; last == string(db.ScanRunning) {
+		t.Errorf("published statuses = %v, want a terminal status last", statuses)
 	}
 }

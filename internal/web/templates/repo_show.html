@@ -40,10 +40,10 @@
       </div>
     </form>
     {{end}}
-    <a href="/repositories/{{.Repo.ID}}/report.md" class="btn-outline" download>
+    <a href="/repositories/{{.Repo.ID}}/report.md" class="btn-outline" download="{{repoReportFilename .Repo false}}">
       <i data-lucide="download"></i> Export report
     </a>
-    <a href="/repositories/{{.Repo.ID}}/report.md?audience=upstream" class="btn-outline" download
+    <a href="/repositories/{{.Repo.ID}}/report.md?audience=upstream" class="btn-outline" download="{{repoReportFilename .Repo true}}"
        data-tooltip="Trimmed report for an upstream maintainer: summary, threat model, findings and fixes only — no internal notes, communications, labels, or repo-wide inventory.">
       <i data-lucide="share-2"></i> Export for upstream
     </a>
@@ -181,6 +181,37 @@
 
     <div class="mb-4 max-w-3xl">
       <h3 class="text-sm font-medium flex items-center gap-2">
+        <i data-lucide="hand"></i>
+        Federation opt-out
+      </h3>
+      {{if .Repo.FederationOptOutAt}}
+        <p class="text-sm mt-2">Requested {{since .Repo.FederationOptOutAt}}. Scans in flight were stopped and new ones are refused, including scheduled runs, and this repository is withdrawn from the interchange feeds.</p>
+        {{if .Repo.FederationOptOutReason}}
+          <p class="text-sm mt-1 whitespace-pre-wrap">{{.Repo.FederationOptOutReason}}</p>
+        {{end}}
+      {{else}}
+        <p class="text-sm mt-2 italic text-muted-foreground">not requested</p>
+      {{end}}
+      <details class="mt-2">
+        <summary class="text-xs text-muted-foreground cursor-pointer hover:underline">Edit</summary>
+        <form method="post" action="/repositories/{{.Repo.ID}}/federation-opt-out" class="form mt-2">
+          <label class="text-xs flex items-center gap-2">
+            <input type="checkbox" name="opt_out" value="1" {{if .Repo.FederationOptOutAt}}checked{{end}}>
+            The maintainer asked not to be scanned or contacted
+          </label>
+          <div class="grid grid-cols-[1fr_auto] gap-2 mt-2">
+            <input class="input text-xs" type="text" name="reason"
+                   value="{{.Repo.FederationOptOutReason}}"
+                   placeholder="reason (optional, published with the opt-out)">
+            <button class="btn-sm" type="submit">Save</button>
+          </div>
+        </form>
+        <p class="text-xs text-muted-foreground mt-1">Cancels the scans queued, running and paused on this repository, then refuses every new one: a manual run, a scheduled one, and any automatic follow-up. Published on the public interchange feed, if this instance is configured with one, so other federated instances honour it too, and set here automatically when a peer feed carries an opt-out for this repository. See <code>docs/interchange.md</code>.</p>
+      </details>
+    </div>
+
+    <div class="mb-4 max-w-3xl">
+      <h3 class="text-sm font-medium flex items-center gap-2">
         <i data-lucide="calendar-clock"></i>
         Scheduled scans
       </h3>
@@ -239,7 +270,7 @@
         {{$counts := .SubScanCount}}
         {{range .Subprojects}}
           <tr>
-            <td><code class="text-xs">{{.Path}}</code>{{if and .Name (ne .Name .Path)}}<div class="text-xs text-muted-foreground">{{.Name}}</div>{{end}}</td>
+            <td><a class="hover:underline" href="/repositories/{{$repoID}}/subprojects/{{.ID}}"><code class="text-xs">{{.Path}}</code></a>{{if and .Name (ne .Name .Path)}}<div class="text-xs text-muted-foreground">{{.Name}}</div>{{end}}</td>
             <td>{{if .Kind}}<span class="badge-outline text-xs">{{.Kind}}</span>{{end}}</td>
             <td class="whitespace-normal text-sm text-muted-foreground">{{.Description}}</td>
             <td class="text-right text-sm text-muted-foreground">{{index $counts .Path}}</td>
@@ -684,51 +715,22 @@
   </div>
 
   <div role="tabpanel" id="rp3" aria-labelledby="rt3" hidden>
-    {{if or (gt .ActiveScans 0) (gt .PausedScans 0) (gt .FailedScans 0)}}
-      <div class="flex justify-end gap-2 mb-2">
-        {{if gt .ActiveScans 0}}
-        <form method="post" action="/scans/cancel-all?repository={{.Repo.ID}}"
-              hx-post="/scans/cancel-all?repository={{.Repo.ID}}" hx-swap="none"
-              hx-confirm="Cancel all {{.ActiveScans}} running or queued scan(s) on {{.Repo.Name}}? Any work in progress is discarded.">
-          <button type="submit" class="btn-outline">
-            <i data-lucide="x"></i> Cancel all ({{.ActiveScans}})
-          </button>
-        </form>
-        {{end}}
-        {{if gt .PausedScans 0}}
-        <form method="post" action="/scans/resume-paused?repository={{.Repo.ID}}"
-              hx-post="/scans/resume-paused?repository={{.Repo.ID}}" hx-swap="none"
-              hx-confirm="Resume all {{.PausedScans}} paused scan(s) on {{.Repo.Name}}?">
-          <button type="submit" class="btn-outline">
-            <i data-lucide="play"></i> Resume all ({{.PausedScans}})
-          </button>
-        </form>
-        {{end}}
-        {{if gt .FailedScans 0}}
-        <form method="post" action="/scans/retry-failed?repository={{.Repo.ID}}"
-              hx-post="/scans/retry-failed?repository={{.Repo.ID}}" hx-swap="none"
-              hx-confirm="Re-enqueue every failed scan on this repository?">
-          <button type="submit" class="btn-outline">
-            <i data-lucide="refresh-cw"></i> Retry failed ({{.FailedScans}})
-          </button>
-        </form>
-        {{end}}
-      </div>
-    {{end}}
-    <table class="table">
-      <thead>
-        <tr><th>#</th><th>Skill</th><th>Status</th><th>Findings</th><th>Model</th><th>Cost</th><th>Commit</th><th>Started</th><th>Duration</th><th class="w-12"></th></tr>
-      </thead>
-      {{template "scan_rows" .}}
-    </table>
+    {{template "repo_scans.html" .}}
   </div>
 
   <div role="tabpanel" id="rp15" aria-labelledby="rt15" hidden>
     {{template "chat-panel" (dict "Action" (printf "/repositories/%d/conversations" .Repo.ID) "Conversations" .Conversations "Placeholder" "Ask about this repository's code or findings...")}}
   </div>
 
-  <div hx-ext="sse" sse-connect="/events?repo={{.Repo.ID}}"
-       sse-swap="scan-status" hx-swap="none" hx-disinherit="*" hidden></div>
+  <div hx-ext="sse" sse-connect="/events?repo={{.Repo.ID}}&events=scan-status"
+       sse-swap="scan-status" hx-swap="none" hx-disinherit="*" hidden>
+    {{/* The payload above swaps the row of a scan already on screen and raises
+         its toast. That cannot show a scan queued after this page was rendered,
+         nor move the Cancel/Resume/Retry counts, so the same event also
+         re-requests the tab's own table. */}}
+    <div hx-get="/repositories/{{.Repo.ID}}/scans" hx-trigger="sse:scan-status delay:300ms"
+         hx-target="#repo-scans" hx-swap="outerHTML"></div>
+  </div>
 </div>
 
 {{template "foot" .}}
@@ -756,5 +758,5 @@
 
 {{define "scan-status-sse"}}
 {{template "scan-row" (dict "S" .Scan "OOB" true)}}
-<div hx-swap-oob="afterbegin:#toaster">{{template "toast" .Flash}}</div>
+{{if .Flash}}<div hx-swap-oob="afterbegin:#toaster">{{template "toast" .Flash}}</div>{{end}}
 {{end}}

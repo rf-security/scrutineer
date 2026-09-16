@@ -105,19 +105,18 @@ func TestModelTiers_explicitTierTags(t *testing.T) {
 	// list (e.g. the codex backend's) declares which entry each tier means
 	// so the tiers UI doesn't collapse to default_model in every slot.
 	withTestModels(t, []Model{
-		{Name: "GPT-5.3 Codex", ID: "gpt-5.3-codex", Tier: ModelTierHigh},
-		{Name: "GPT-5.4", ID: "gpt-5.4"},
-		{Name: "GPT-5.4 mini", ID: "gpt-5.4-mini", Tier: ModelTierMid},
-		{Name: "GPT-5.5", ID: "gpt-5.5", Tier: ModelTierMax},
+		{Name: "GPT-5.6 Sol", ID: "gpt-5.6-sol", Tier: ModelTierHigh},
+		{Name: "GPT-5.6 Luna", ID: "gpt-5.6-luna", Tier: ModelTierMid},
+		{Name: "GPT-6 Astra", ID: "gpt-6-astra", Tier: ModelTierMax},
 	})
-	if got := builtinModelForTier(ModelTierMid, "gpt-5.3-codex"); got != "gpt-5.4-mini" {
-		t.Errorf("mid = %q, want gpt-5.4-mini (tier: mid)", got)
+	if got := builtinModelForTier(ModelTierMid, "gpt-5.6-sol"); got != "gpt-5.6-luna" {
+		t.Errorf("mid = %q, want gpt-5.6-luna (tier: mid)", got)
 	}
-	if got := builtinModelForTier(ModelTierHigh, "gpt-5.3-codex"); got != "gpt-5.3-codex" {
-		t.Errorf("high = %q, want gpt-5.3-codex (tier: high)", got)
+	if got := builtinModelForTier(ModelTierHigh, "gpt-5.6-sol"); got != "gpt-5.6-sol" {
+		t.Errorf("high = %q, want gpt-5.6-sol (tier: high)", got)
 	}
-	if got := builtinModelForTier(ModelTierMax, "gpt-5.3-codex"); got != "gpt-5.5" {
-		t.Errorf("max = %q, want gpt-5.5 (tier: max)", got)
+	if got := builtinModelForTier(ModelTierMax, "gpt-5.6-sol"); got != "gpt-6-astra" {
+		t.Errorf("max = %q, want gpt-6-astra (tier: max)", got)
 	}
 }
 

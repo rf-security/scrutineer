@@ -3,89 +3,63 @@ package worker
 import (
 	"math"
 	"testing"
+
+	"github.com/alpha-omega-security/harness"
 )
 
-// TestPricingCoversEveryDefaultModel is the staleness tripwire: every
-// model any registered harness offers by default must have a price
-// entry, so a new harness (or a new model added to an existing one)
-// fails here until pricing.go is updated. That keeps CostFromUsage from
-// silently returning $0 for a model in the pick list.
-func TestPricingCoversEveryDefaultModel(t *testing.T) {
-	for name, h := range harnesses {
-		if name == "" {
-			continue
-		}
-		for _, m := range h.DefaultModels() {
-			if _, ok := modelPricing[normalizeModelID(m.ID)]; !ok {
-				t.Errorf("%s: DefaultModels() entry %q has no modelPricing row", name, m.ID)
-			}
-		}
-	}
-}
-
-func TestCostFromUsage(t *testing.T) {
-	// gpt-5.4: $2.50 in / $15 out / $0.25 cached, per 1M.
-	// 1M uncached in + 1M cached in + 1M out = 2.50 + 0.25 + 15.00.
-	got := CostFromUsage("gpt-5.4", Usage{
-		InputTokens:     2_000_000, // total, of which 1M cached
-		CacheReadTokens: 1_000_000,
-		OutputTokens:    1_000_000,
-	})
-	if want := 17.75; math.Abs(got-want) > 1e-9 {
-		t.Errorf("CostFromUsage = %.4f, want %.4f", got, want)
-	}
-}
-
-func TestCostFromUsage_anthropicCacheWrite(t *testing.T) {
-	// claude-sonnet-4-6: $3 in / $15 out / $0.30 cache read / $3.75 cache write, per 1M.
-	got := CostFromUsage("claude-sonnet-4-6", Usage{
-		InputTokens:      3_000_000, // 1M uncached, 1M cache read, 1M cache write
-		CacheReadTokens:  1_000_000,
-		CacheWriteTokens: 1_000_000,
+func TestCostFromUsage_gpt6Astra(t *testing.T) {
+	usage := Usage{
+		InputTokens:      1_000_000,
 		OutputTokens:     1_000_000,
-	})
-	if want := 22.05; math.Abs(got-want) > 1e-9 {
-		t.Errorf("CostFromUsage = %.4f, want %.4f", got, want)
+		CacheReadTokens:  100_000,
+		CacheWriteTokens: 200_000,
 	}
-}
-
-func TestCostFromUsage_haiku(t *testing.T) {
-	if got := CostFromUsage("claude-haiku-4-5", Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000}); got != 6 {
-		t.Errorf("CostFromUsage = %.4f, want 6", got)
-	}
-}
-
-func TestCostFromUsage_openAICacheWriteIsOrdinaryInput(t *testing.T) {
-	if got := CostFromUsage("gpt-5.4", Usage{InputTokens: 1_000_000, CacheWriteTokens: 1_000_000}); got != 2.5 {
-		t.Errorf("CostFromUsage = %.4f, want 2.5", got)
-	}
-}
-
-func TestCostFromUsage_unknownModelIsZero(t *testing.T) {
-	if got := CostFromUsage("no-such-model", Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000}); got != 0 {
-		t.Errorf("unknown model cost = %.4f, want 0", got)
-	}
-}
-
-func TestCostFromUsage_zeroUsageIsZero(t *testing.T) {
-	// A result event with no token usage (e.g. a claude run where the
-	// stream reported CostUSD elsewhere) must not synthesize a nonzero
-	// cost.
-	if got := CostFromUsage("gpt-5.4", Usage{}); got != 0 {
-		t.Errorf("zero-usage cost = %.4f, want 0", got)
-	}
-}
-
-func TestNormalizeModelID_stripsBracketSuffix(t *testing.T) {
-	for in, want := range map[string]string{
-		"claude-fable-5[1m]":           "claude-fable-5",
-		"claude-opus-4-8":              "claude-opus-4-8",
-		"anthropic/claude-opus-4-8":    "claude-opus-4-8",
-		"anthropic/claude-fable-5[1m]": "claude-fable-5",
-		"":                             "",
-	} {
-		if got := normalizeModelID(in); got != want {
-			t.Errorf("normalizeModelID(%q) = %q, want %q", in, got, want)
+	const want = 59.60
+	for _, model := range []string{modelGPT6AstraID, "openai/gpt-6-astra[1m]"} {
+		if got := CostFromUsage(model, usage); math.Abs(got-want) > 1e-9 {
+			t.Errorf("CostFromUsage(%q) = %v, want %v", model, got, want)
 		}
+	}
+}
+
+func TestCostFromUsage_gpt56SolAndDaybreakBasePricing(t *testing.T) {
+	tests := []struct {
+		name  string
+		usage Usage
+		want  float64
+	}{
+		{"uncached input", Usage{InputTokens: 100_000}, 0.40},
+		{"output", Usage{OutputTokens: 10_000}, 0.20},
+		{"cache reads", Usage{InputTokens: 100_000, CacheReadTokens: 100_000}, 0.04},
+		{"cache writes", Usage{InputTokens: 100_000, CacheWriteTokens: 100_000}, 0.50},
+		{"standard scan", Usage{InputTokens: 100_000, OutputTokens: 10_000}, 0.60},
+		{"mixed", Usage{InputTokens: 100_000, OutputTokens: 10_000, CacheReadTokens: 10_000, CacheWriteTokens: 20_000}, 0.584},
+	}
+	for _, model := range []struct{ name, id string }{
+		{"sol", modelGPT56SolID},
+		{"sol_normalized", "openai/gpt-5.6-sol[1m]"},
+		{"daybreak", modelDaybreakBlueID},
+		{"daybreak_normalized", "openai/gpt-daybreak-blue-latest[1m]"},
+	} {
+		t.Run(model.name, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					if got := CostFromUsage(model.id, tt.usage); math.Abs(got-tt.want) > 1e-9 {
+						t.Errorf("CostFromUsage(%q, %+v) = %v, want %v", model.id, tt.usage, got, tt.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCostFromUsage_delegatesOtherModels(t *testing.T) {
+	usage := Usage{InputTokens: 100_000, OutputTokens: 10_000, CacheReadTokens: 10_000, CacheWriteTokens: 20_000}
+	if got := CostFromUsage("unknown", usage); got != 0 {
+		t.Errorf("unknown model cost = %v, want 0", got)
+	}
+	const model = "anthropic/claude-sonnet-4-6[1m]"
+	if got, want := CostFromUsage(model, usage), harness.CostFromUsage(model, usage); got != want {
+		t.Errorf("CostFromUsage(%q) = %v, want Harness cost %v", model, got, want)
 	}
 }

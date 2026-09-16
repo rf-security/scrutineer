@@ -11,6 +11,7 @@ import (
 func TestParseToolVersions(t *testing.T) {
 	out := "zizmor=zizmor 1.26.1\n" +
 		"semgrep=1.167.0\n" +
+		"bandit=bandit 1.9.4\n" +
 		"harness=2.1.123 (Claude Code)\n"
 	got := parseToolVersions(out)
 	if got.Zizmor != "1.26.1" {
@@ -18,6 +19,23 @@ func TestParseToolVersions(t *testing.T) {
 	}
 	if got.Semgrep != "1.167.0" {
 		t.Errorf("Semgrep = %q, want 1.167.0", got.Semgrep)
+	}
+	if got.Bandit != "1.9.4" {
+		t.Errorf("Bandit = %q, want 1.9.4", got.Bandit)
+	}
+	if got.Harness != "2.1.123" {
+		t.Errorf("Harness = %q, want 2.1.123", got.Harness)
+	}
+}
+
+func TestParseToolVersions_banditInterpreterLine(t *testing.T) {
+	// `bandit --version` prints the interpreter it runs under on a second
+	// line that carries an "=" of its own. queryToolsScript keeps only the
+	// first line; this pins that the trailing line cannot displace a real
+	// key even if it reaches the parser.
+	got := parseToolVersions("bandit=bandit 1.9.4\n  python version = 3.12.9 (main)\nharness=2.1.123\n")
+	if got.Bandit != "1.9.4" {
+		t.Errorf("Bandit = %q, want 1.9.4", got.Bandit)
 	}
 	if got.Harness != "2.1.123" {
 		t.Errorf("Harness = %q, want 2.1.123", got.Harness)
@@ -38,7 +56,7 @@ func TestQueryToolsScript_usesHarnessBinary(t *testing.T) {
 
 func TestParseToolVersions_missingTools(t *testing.T) {
 	// A tool that is absent prints an empty value after the "=".
-	got := parseToolVersions("zizmor=\nsemgrep=\nharness=\n")
+	got := parseToolVersions("zizmor=\nsemgrep=\nbandit=\nharness=\n")
 	if got != (RunnerToolVersions{}) {
 		t.Errorf("expected zero value for empty versions, got %+v", got)
 	}
@@ -56,6 +74,29 @@ func TestRunnerImageName(t *testing.T) {
 	}
 	if got := RunnerImageName(nil); got != "" {
 		t.Errorf("RunnerImageName(nil) = %q, want empty", got)
+	}
+}
+
+// TestVersionReBanner covers the Apple `container --version` banners
+// RuntimeServerVersion feeds versionRe.
+func TestVersionReBanner(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"container-apiserver version 1.0.0 (build: release)", "1.0.0"},
+		{"container CLI version 1.2.3", "1.2.3"},
+		{"1.2", "1.2"},
+		{"container version (2.0.1)", "2.0.1"},
+		// No numeric minor, so nothing in the banner reads as a version.
+		{"container version 4", ""},
+		{"container-apiserver", ""},
+		{"", ""},
+	}
+	for _, tc := range tests {
+		if got := versionRe.FindString(tc.in); got != tc.want {
+			t.Errorf("versionRe.FindString(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 
@@ -85,7 +126,7 @@ func TestQueryRunnerToolVersions_AppleSkipsMissingImage(t *testing.T) {
 func TestQueryRunnerToolVersions_AppleRunsLocalImageWithoutPullNever(t *testing.T) {
 	logPath := fakeContainer(t)
 	got := QueryRunnerToolVersions(context.Background(), ContainerRuntime{Bin: "apple"}, "present:latest", "claude")
-	if got.Zizmor != "1.2.3" || got.Semgrep != "4.5.6" || got.Harness != "7.8.9" {
+	if got.Zizmor != "1.2.3" || got.Semgrep != "4.5.6" || got.Bandit != "0.1.2" || got.Harness != "7.8.9" {
 		t.Fatalf("QueryRunnerToolVersions(local image) = %+v", got)
 	}
 	log := readFakeContainerLog(t, logPath)
@@ -101,7 +142,7 @@ func fakeContainer(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "container.log")
-	appleBinary := ContainerRuntime{Bin: "apple"}.bin()
+	appleBinary := runtimeBin(ContainerRuntime{Bin: "apple"})
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$SCRUTINEER_FAKE_CONTAINER_LOG"
 if [ "$1" = "--version" ]; then
@@ -115,6 +156,7 @@ fi
 if [ "$1" = "run" ]; then
   echo "zizmor=zizmor 1.2.3"
   echo "semgrep=4.5.6"
+  echo "bandit=bandit 0.1.2"
   echo "harness=some-cli 7.8.9 (build abc)"
   exit 0
 fi

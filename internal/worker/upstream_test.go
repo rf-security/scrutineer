@@ -70,7 +70,7 @@ func TestSyncUpstream(t *testing.T) {
 	want := testGit(t, upstream, "rev-parse", "HEAD")
 
 	w := &Worker{DataDir: t.TempDir()}
-	if err := w.SyncUpstream(context.Background(), staging, upstream); err != nil {
+	if err := w.SyncUpstream(context.Background(), staging, upstream, 0); err != nil {
 		t.Fatalf("SyncUpstream: %v", err)
 	}
 	if got := testGit(t, staging, "rev-parse", "HEAD"); got != want {
@@ -89,7 +89,7 @@ func TestSyncUpstream_reusesMirrorAcrossSyncs(t *testing.T) {
 	for i, msg := range []string{"first upstream move", "second upstream move"} {
 		testGit(t, upstream, "commit", "-q", "--allow-empty", "-m", msg)
 		want := testGit(t, upstream, "rev-parse", "HEAD")
-		if err := w.SyncUpstream(context.Background(), staging, upstream); err != nil {
+		if err := w.SyncUpstream(context.Background(), staging, upstream, 0); err != nil {
 			t.Fatalf("sync %d: %v", i, err)
 		}
 		if got := testGit(t, staging, "rev-parse", "HEAD"); got != want {
@@ -110,7 +110,7 @@ func TestSyncUpstream_noopWhenAlreadyInSync(t *testing.T) {
 	testGit(t, "", "clone", "-q", "--bare", upstream, staging)
 
 	w := &Worker{DataDir: t.TempDir()}
-	if err := w.SyncUpstream(context.Background(), staging, upstream); err != nil {
+	if err := w.SyncUpstream(context.Background(), staging, upstream, 0); err != nil {
 		t.Fatalf("SyncUpstream: %v", err)
 	}
 	if got := testGit(t, staging, "rev-parse", "HEAD"); got != want {
@@ -130,7 +130,7 @@ func TestSyncUpstream_overwritesRewrittenHistory(t *testing.T) {
 	want := testGit(t, upstream, "rev-parse", "HEAD")
 
 	w := &Worker{DataDir: t.TempDir()}
-	if err := w.SyncUpstream(context.Background(), staging, upstream); err != nil {
+	if err := w.SyncUpstream(context.Background(), staging, upstream, 0); err != nil {
 		t.Fatalf("SyncUpstream: %v", err)
 	}
 	if got := testGit(t, staging, "rev-parse", "HEAD"); got != want {
@@ -143,7 +143,7 @@ func TestSyncUpstream_missingUpstream(t *testing.T) {
 	initTestRepo(t, staging)
 
 	w := &Worker{DataDir: t.TempDir()}
-	if err := w.SyncUpstream(context.Background(), staging, filepath.Join(t.TempDir(), "nope")); err == nil {
+	if err := w.SyncUpstream(context.Background(), staging, filepath.Join(t.TempDir(), "nope"), 0); err == nil {
 		t.Fatal("expected error for missing upstream")
 	}
 }

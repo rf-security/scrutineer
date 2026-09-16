@@ -192,6 +192,39 @@ func TestAPIListsTypedReads(t *testing.T) {
 	}
 }
 
+func TestAPIListPackages_subPathAttribution(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	repo, scan := seedRunningScan(t, s)
+	sub := db.Subproject{RepositoryID: repo.ID, Path: "activesupport", Name: "activesupport"}
+	s.DB.Create(&sub)
+	s.DB.Create(&db.Package{RepositoryID: repo.ID, Name: "activesupport", Ecosystem: "rubygems", SubprojectID: &sub.ID})
+	s.DB.Create(&db.Package{RepositoryID: repo.ID, Name: "railties", Ecosystem: "rubygems"}) // repo-level, unlinked
+
+	r := httptest.NewRequest("GET", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/packages", nil)
+	r.Host = testHost
+	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	var got []map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	subByName := map[string]any{}
+	for _, p := range got {
+		subByName[p["name"].(string)] = p["sub_path"]
+	}
+	if subByName["activesupport"] != "activesupport" {
+		t.Errorf("activesupport package sub_path = %v, want activesupport", subByName["activesupport"])
+	}
+	if v := subByName["railties"]; v != nil && v != "" {
+		t.Errorf("repo-level package should have no sub_path, got %v", v)
+	}
+}
+
 func TestAPIPatchRepositoryFork(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -255,6 +288,29 @@ func TestAPIPatchRepositoryRejectsEmptyBody(t *testing.T) {
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != 422 {
 		t.Fatalf("status %d, want 422", w.Code)
+	}
+}
+
+func TestAPIPatchRepositoryRejectsInvalidJSON(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	repo, scan := seedRunningScan(t, s)
+
+	r := httptest.NewRequest("PATCH", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10),
+		strings.NewReader(`not json`))
+	r.Host = testHost
+	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", w.Code)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if body[errorKey] != "body must be JSON" {
+		t.Fatalf("error = %q, want body must be JSON", body[errorKey])
 	}
 }
 
@@ -344,6 +400,19 @@ func TestAPIFindingReadsAndFilters(t *testing.T) {
 	if fid == nil {
 		t.Fatalf("severity=High response did not include F1: %+v", findings)
 	}
+	findingID := uint(fid.(float64))
+	score := 0.8
+	s.DB.Create(&db.FindingVerification{
+		FindingID: findingID, ScanID: scan.ID, Status: "inconclusive", Score: &score,
+		Report: `{"status":"inconclusive","notes":"flaky"}`,
+	})
+	s.DB.Model(&db.Finding{}).Where("id = ?", findingID).
+		Update("production_viability", db.ProductionViabilityNonViable)
+	s.DB.Create(&db.FindingAttackPath{
+		FindingID: findingID, ScanID: scan.ID,
+		ProductionViability: db.ProductionViabilityNonViable,
+		Report:              criticReportFixture,
+	})
 	r := httptest.NewRequest("GET", "/api/findings/"+toString(fid), nil)
 	r.Host = testHost
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
@@ -368,6 +437,14 @@ func TestAPIFindingReadsAndFilters(t *testing.T) {
 	if detail["sub_path"] != "services/api" {
 		t.Errorf("finding detail missing sub_path: %+v", detail)
 	}
+	verification, ok := detail["verification"].(map[string]any)
+	if !ok || verification["status"] != "inconclusive" || verification["score"] != 0.8 {
+		t.Errorf("finding detail missing latest verification: %+v", detail["verification"])
+	}
+	attackPath, ok := detail["attack_path"].(map[string]any)
+	if !ok || attackPath["production_viability"] != db.ProductionViabilityNonViable {
+		t.Errorf("finding detail missing latest attack path: %+v", detail["attack_path"])
+	}
 }
 
 func TestAPIListDependencyFindings(t *testing.T) {
@@ -386,9 +463,9 @@ func TestAPIListDependencyFindings(t *testing.T) {
 	s.DB.Create(&db.Package{RepositoryID: lib.ID, Name: "roo", Ecosystem: "rubygems"})
 	libScan := db.Scan{RepositoryID: lib.ID, Kind: worker.JobSkill, Status: db.ScanDone}
 	s.DB.Create(&libScan)
-	s.DB.Create(&db.Finding{ScanID: libScan.ID, RepositoryID: lib.ID, Title: "xlsx bomb", Severity: sevHigh, CWE: "CWE-770", Location: "lib/roo/excelx.rb:42", Status: db.FindingNew, Trace: "t", Boundary: "b"})
-	s.DB.Create(&db.Finding{ScanID: libScan.ID, RepositoryID: lib.ID, Title: "ods bomb", Severity: "Medium", CWE: "CWE-770", Status: db.FindingNew})
-	s.DB.Create(&db.Finding{ScanID: libScan.ID, RepositoryID: lib.ID, Title: "old", Severity: sevHigh, Status: db.FindingFixed})
+	s.DB.Create(&db.Finding{ScanID: libScan.ID, RepositoryID: lib.ID, Title: "xlsx bomb", Severity: sevHigh, CWE: "CWE-770", Location: "lib/roo/excelx.rb:42", Status: db.FindingReported, Trace: "t", Boundary: "b"})
+	s.DB.Create(&db.Finding{ScanID: libScan.ID, RepositoryID: lib.ID, Title: "ods bomb", Severity: "Medium", CWE: "CWE-770", Status: db.FindingAcknowledged})
+	s.DB.Create(&db.Finding{ScanID: libScan.ID, RepositoryID: lib.ID, Title: "rejected", Severity: sevHigh, Status: db.FindingRejected})
 
 	// Self-published package on the app repo must not match its own findings.
 	s.DB.Create(&db.Package{RepositoryID: app.ID, Name: "leftpad", Ecosystem: "npm"})
@@ -407,7 +484,7 @@ func TestAPIListDependencyFindings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(rows) != 2 {
-		t.Fatalf("rows=%d want=2 (live roo findings only): %+v", len(rows), rows)
+		t.Fatalf("rows=%d want=2 (notified roo findings only): %+v", len(rows), rows)
 	}
 	if rows[0].Severity != sevHigh || rows[0].Package != "roo" {
 		t.Errorf("first row should be the High roo finding, got %+v", rows[0])
@@ -429,6 +506,76 @@ func TestAPIListDependencyFindings(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&rows)
 	if len(rows) != 1 || rows[0].Title != "xlsx bomb" {
 		t.Errorf("severity filter: %+v", rows)
+	}
+}
+
+func TestDependencyFindings_excludesUnpublishedCrossRepo(t *testing.T) {
+	cases := []struct {
+		status db.FindingLifecycle
+		want   bool
+	}{
+		{db.FindingNew, false},
+		{db.FindingEnriched, false},
+		{db.FindingTriaged, false},
+		{db.FindingReady, false},
+		{db.FindingReported, true},
+		{db.FindingAcknowledged, true},
+		{db.FindingFixed, true},
+		{db.FindingPublished, true},
+		{db.FindingRejected, false},
+		{db.FindingDuplicate, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.status), func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+			app, scan := seedRunningScan(t, s)
+			pkg := "library-" + string(tc.status)
+			s.DB.Create(&db.Dependency{RepositoryID: app.ID, Name: pkg,
+				Ecosystem: "npm", ManifestPath: "package.json"})
+
+			libURL := "https://example.com/" + pkg
+			lib := db.Repository{URL: libURL, Name: pkg}
+			s.DB.Create(&lib)
+			s.DB.Create(&db.Package{RepositoryID: lib.ID, Name: pkg, Ecosystem: "npm"})
+			libScan := db.Scan{RepositoryID: lib.ID, Kind: worker.JobSkill, Status: db.ScanDone}
+			s.DB.Create(&libScan)
+			title := "cross-repository-" + string(tc.status)
+			f := db.Finding{ScanID: libScan.ID, RepositoryID: lib.ID, Title: title,
+				Severity: sevHigh, Status: tc.status, Trace: "private trace",
+				Boundary: "private boundary"}
+			s.DB.Create(&f)
+
+			path := "/api/repositories/" + strconv.FormatUint(uint64(app.ID), 10) +
+				"/dependency-findings"
+			r := httptest.NewRequest(http.MethodGet, path, nil)
+			r.Host = testHost
+			r.Header.Set("Authorization", "Bearer "+scan.APIToken)
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, r)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", w.Code, w.Body)
+			}
+			body := w.Body.String()
+			var rows []db.DependencyFinding
+			if err := json.NewDecoder(strings.NewReader(body)).Decode(&rows); err != nil {
+				t.Fatal(err)
+			}
+			if tc.want {
+				if len(rows) != 1 || rows[0].FindingID != f.ID || rows[0].Status != tc.status {
+					t.Fatalf("rows = %+v, want the %s finding", rows, tc.status)
+				}
+				return
+			}
+			if len(rows) != 0 {
+				t.Fatalf("rows = %+v, want no cross-repository data for %s", rows, tc.status)
+			}
+			for _, secret := range []string{title, libURL, "private trace", "private boundary"} {
+				if strings.Contains(body, secret) {
+					t.Errorf("response disclosed %q for %s: %s", secret, tc.status, body)
+				}
+			}
+		})
 	}
 }
 

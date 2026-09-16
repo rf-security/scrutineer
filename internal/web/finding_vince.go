@@ -134,34 +134,31 @@ func (s *Server) findingVINCESubmit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	generatedAt, err := time.Parse(time.RFC3339Nano, r.FormValue("attachment_generated_at"))
-	if err != nil {
-		addVINCEError(fieldErrors, "user_file", "attachment preview expired; review it again")
-		generatedAt = time.Now().UTC()
-	}
-	attachment, _, err := s.vinceAttachment(ctx, attachmentChoice, generatedAt)
-	if err != nil {
-		addVINCEError(fieldErrors, "user_file", err.Error())
-	}
-	if attachment != nil {
-		if len(attachment.Data) > vince.MaxAttachmentSize {
-			addVINCEError(fieldErrors, "user_file", fmt.Sprintf(
-				"attachment is %d bytes; VINCE permits at most %d",
-				len(attachment.Data), vince.MaxAttachmentSize))
-		}
-		gotHash := attachmentHash(attachment)
-		if expected := r.FormValue("attachment_sha256"); expected == "" || expected != gotHash {
-			addVINCEError(fieldErrors, "user_file", "attachment contents changed after the preview; review them again")
-		}
-	}
-	if attachmentChoice == vinceAttachmentNone && r.FormValue("attachment_sha256") != "" {
-		addVINCEError(fieldErrors, "user_file", "attachment selection changed after the preview; review it again")
-	}
+	attachment := s.vinceFormAttachment(r, ctx, attachmentChoice, fieldErrors)
 
 	if len(fieldErrors) > 0 {
 		page := s.vincePage(ctx, report, packageID, selectedRefs, attachmentChoice,
 			time.Now().UTC(), fieldErrors, confirmations)
 		w.WriteHeader(http.StatusUnprocessableEntity)
+		s.render(w, r, "finding_vince.html", map[string]any{"VINCE": page})
+		return
+	}
+
+	// Asked after the field errors, so an invalid form costs no peer round trip,
+	// and before the submission, because that request is the outreach the
+	// claim-check exists to deduplicate.
+	claims, err := s.claimPeerHold(r.Context(), ctx.Finding)
+	if err != nil {
+		s.Log.Error("claim-check out", "finding", ctx.Finding.ID, "err", err)
+		http.Error(w, "failed to check federation peers", http.StatusInternalServerError)
+		return
+	}
+	if claims != "" {
+		page := s.vincePage(ctx, report, packageID, selectedRefs, attachmentChoice,
+			time.Now().UTC(), nil, confirmations)
+		page.Error = "A federation peer already holds this finding: " + claims +
+			". Coordinate through that contact, then submit again to send it anyway."
+		w.WriteHeader(http.StatusConflict)
 		s.render(w, r, "finding_vince.html", map[string]any{"VINCE": page})
 		return
 	}
@@ -257,6 +254,9 @@ func (s *Server) loadVINCEFinding(w http.ResponseWriter, r *http.Request) (vince
 }
 
 func vinceEligibility(f db.Finding, notes []db.FindingNote, refs []db.FindingReference) error {
+	if db.FindingDisclosureBlocked(f) {
+		return db.ErrFindingNonViable
+	}
 	if strings.TrimSpace(f.DisclosureDraft) == "" {
 		return fmt.Errorf("a reviewed disclosure draft is required before VINCE submission")
 	}
@@ -616,6 +616,38 @@ func (s *Server) vinceAttachment(
 	}
 }
 
+// vinceFormAttachment rebuilds the attachment the submitted form previewed and
+// records every reason it may not be sent in fieldErrors: an expired preview
+// timestamp, a build failure, a size VINCE refuses, contents that changed since
+// the preview, or a selection that changed to none while a preview hash was
+// still posted. A returned attachment is only safe to send when fieldErrors
+// came back empty.
+func (s *Server) vinceFormAttachment(r *http.Request, ctx vinceFindingContext, choice string, fieldErrors vince.ValidationErrors) *vince.Attachment {
+	generatedAt, err := time.Parse(time.RFC3339Nano, r.FormValue("attachment_generated_at"))
+	if err != nil {
+		addVINCEError(fieldErrors, "user_file", "attachment preview expired; review it again")
+		generatedAt = time.Now().UTC()
+	}
+	attachment, _, err := s.vinceAttachment(ctx, choice, generatedAt)
+	if err != nil {
+		addVINCEError(fieldErrors, "user_file", err.Error())
+	}
+	if attachment != nil {
+		if len(attachment.Data) > vince.MaxAttachmentSize {
+			addVINCEError(fieldErrors, "user_file", fmt.Sprintf(
+				"attachment is %d bytes; VINCE permits at most %d",
+				len(attachment.Data), vince.MaxAttachmentSize))
+		}
+		if expected := r.FormValue("attachment_sha256"); expected == "" || expected != attachmentHash(attachment) {
+			addVINCEError(fieldErrors, "user_file", "attachment contents changed after the preview; review them again")
+		}
+	}
+	if choice == vinceAttachmentNone && r.FormValue("attachment_sha256") != "" {
+		addVINCEError(fieldErrors, "user_file", "attachment selection changed after the preview; review it again")
+	}
+	return attachment
+}
+
 func attachmentHash(attachment *vince.Attachment) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte(attachment.Name))
@@ -625,7 +657,7 @@ func attachmentHash(attachment *vince.Attachment) string {
 }
 
 func (s *Server) persistVINCESubmission(findingID uint, vrfID, reportsURL, attachmentName string) error {
-	return s.DB.Transaction(func(tx *gorm.DB) error {
+	return db.FindingWriteTransaction(s.DB, findingID, func(tx *gorm.DB) error {
 		var refs []db.FindingReference
 		if err := tx.Where("finding_id = ?", findingID).Find(&refs).Error; err != nil {
 			return err

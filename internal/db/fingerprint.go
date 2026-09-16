@@ -3,9 +3,12 @@ package db
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 
 	"gorm.io/gorm"
+
+	"scrutineer/internal/findingnorm"
 )
 
 // FingerprintFinding returns a stable hash for deduplicating the same
@@ -37,28 +40,17 @@ func FingerprintFinding(skillName, subPath, cwe, location, title string) string 
 	return hex.EncodeToString(h[:])
 }
 
-// normaliseLocation reduces "path/to/file.go:42:7" to "path/to/file.go".
-// A leading "./" is stripped so "./src/x.go" and "src/x.go" agree.
+// normaliseLocation strips line, line:column, and line-range suffixes from a
+// location. A leading "./" is stripped so "./src/x.go" and "src/x.go" agree.
 func normaliseLocation(loc string) string {
 	loc = strings.TrimSpace(loc)
 	loc = strings.TrimPrefix(loc, "./")
 	for {
 		i := strings.LastIndexByte(loc, ':')
-		if i <= 0 {
+		if i <= 0 || !findingnorm.IsPositionalSuffix(loc[i+1:]) {
 			break
 		}
-		isNum := true
-		for _, c := range loc[i+1:] {
-			if c < '0' || c > '9' {
-				isNum = false
-				break
-			}
-		}
-		if isNum && len(loc[i+1:]) > 0 {
-			loc = loc[:i]
-		} else {
-			break
-		}
+		loc = loc[:i]
 	}
 	return strings.ToLower(loc)
 }
@@ -66,8 +58,10 @@ func normaliseLocation(loc string) string {
 // BackfillFindingFingerprints fills Finding.Fingerprint for rows created
 // before the column existed, joining through Scan for skill_name. It does
 // not merge existing duplicates; it just sets the column so future scans
-// dedupe against them. Safe to call on every startup.
-func BackfillFindingFingerprints(gdb *gorm.DB) {
+// dedupe against them. Successful updates remain committed if a later row
+// fails, and the next startup retries only unfinished rows. Safe to call on
+// every startup.
+func BackfillFindingFingerprints(gdb *gorm.DB) error {
 	type row struct {
 		ID        uint
 		SubPath   string
@@ -77,19 +71,27 @@ func BackfillFindingFingerprints(gdb *gorm.DB) {
 		SkillName string
 	}
 	var rows []row
-	gdb.Raw(`
+	// Ordering is not required for correctness; it makes partial progress and
+	// the first reported failing row deterministic for operators and tests.
+	if err := gdb.Raw(`
 		SELECT f.id, f.sub_path, f.cwe, f.location, f.title, s.skill_name
 		FROM findings f JOIN scans s ON s.id = f.scan_id
 		WHERE f.fingerprint IS NULL OR f.fingerprint = ''
-	`).Scan(&rows)
+		ORDER BY f.id
+	`).Scan(&rows).Error; err != nil {
+		return fmt.Errorf("select findings for fingerprint backfill: %w", err)
+	}
 	for _, r := range rows {
 		fp := FingerprintFinding(r.SkillName, r.SubPath, r.CWE, r.Location, r.Title)
-		gdb.Model(&Finding{}).Where("id = ?", r.ID).
+		if err := gdb.Model(&Finding{}).Where("id = ?", r.ID).
 			Updates(map[string]any{
 				"fingerprint":       fp,
 				"last_seen_scan_id": gorm.Expr("COALESCE(NULLIF(last_seen_scan_id, 0), scan_id)"),
 				"last_seen_commit":  gorm.Expr(`COALESCE(NULLIF(last_seen_commit, ''), "commit")`),
 				"seen_count":        gorm.Expr("CASE WHEN seen_count = 0 THEN 1 ELSE seen_count END"),
-			})
+			}).Error; err != nil {
+			return fmt.Errorf("update fingerprint for finding %d: %w", r.ID, err)
+		}
 	}
+	return nil
 }

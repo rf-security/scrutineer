@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"scrutineer/internal/db"
 	"scrutineer/internal/worker"
@@ -70,10 +72,12 @@ func TestFindingShowMigrationGuideRendersAlternativesAndDependents(t *testing.T)
 		t.Fatal(err)
 	}
 	if err := s.DB.Create(&db.FindingDependent{
-		FindingID:   finding.ID,
-		DependentID: dep.ID,
-		Status:      db.ExposureKnownAffected,
-		Rationale:   "consumer reaches the vulnerable parser",
+		FindingID:      finding.ID,
+		DependentID:    dep.ID,
+		Status:         db.ExposureKnownAffected,
+		Rationale:      "consumer reaches the vulnerable parser",
+		CampaignStatus: db.CampaignNotified,
+		CampaignNote:   "issue opened with consumer",
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +133,25 @@ func TestFindingShowMigrationGuideRendersAlternativesAndDependents(t *testing.T)
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
+	trackedFixed := db.Dependent{
+		RepositoryID:   repo.ID,
+		Name:           "migrated-consumer",
+		Ecosystem:      "npm",
+		RepositoryURL:  "https://github.com/example/migrated-consumer",
+		DependentRepos: 600,
+	}
+	if err := s.DB.Create(&trackedFixed).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&db.FindingDependent{
+		FindingID:      finding.ID,
+		DependentID:    trackedFixed.ID,
+		Status:         db.ExposureFixed,
+		CampaignStatus: db.CampaignMigrated,
+		CampaignNote:   "released with the successor",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, localReq(http.MethodGet, fmt.Sprintf("/findings/%d", finding.ID)))
@@ -143,6 +166,11 @@ func TestFindingShowMigrationGuideRendersAlternativesAndDependents(t *testing.T)
 		"pkg:npm/zombie-next",
 		"Maintained successor",
 		"consumer reaches the vulnerable parser",
+		"issue opened with consumer",
+		`value="notified" selected`,
+		"migrated-consumer",
+		"released with the successor",
+		`value="migrated" selected`,
 		"needs-review",
 		db.ExposureUnderInvestigation,
 	} {
@@ -163,6 +191,126 @@ func TestFindingShowMigrationGuideRendersAlternativesAndDependents(t *testing.T)
 	}
 	if strings.Contains(guide, "fixed-consumer") {
 		t.Fatalf("fixed dependent should not be prioritized in migration guide:\n%s", guide)
+	}
+}
+
+func TestLoadMigrationGuideDependentsKeepsTrackedResolvedRowsOutsideLimit(t *testing.T) {
+	exposureRows := make([]db.FindingDependent, 0, migrationGuideRowLimit+2)
+	dependentsByID := make(map[uint]db.Dependent, migrationGuideRowLimit+2)
+	for i := range migrationGuideRowLimit + 1 {
+		id := uint(i + 1)
+		name := fmt.Sprintf("actionable-%02d", i)
+		dependentsByID[id] = db.Dependent{
+			ID:             id,
+			Name:           name,
+			DependentRepos: 1000 - i,
+		}
+		exposureRows = append(exposureRows, db.FindingDependent{
+			DependentID: id,
+			Status:      db.ExposureKnownAffected,
+		})
+	}
+
+	const trackedID = 100
+	dependentsByID[trackedID] = db.Dependent{
+		ID:             trackedID,
+		Name:           "tracked-fixed",
+		DependentRepos: 1,
+	}
+	exposureRows = append(exposureRows, db.FindingDependent{
+		DependentID:    trackedID,
+		Status:         db.ExposureFixed,
+		CampaignStatus: db.CampaignMigrated,
+		CampaignNote:   "migration complete",
+	})
+
+	var guide findingMigrationGuide
+	loadMigrationGuideDependents(exposureRows, dependentsByID, &guide)
+	if got, want := len(guide.PriorityDependents), migrationGuideRowLimit+1; got != want {
+		t.Fatalf("priority rows = %d, want %d", got, want)
+	}
+	if got := guide.PriorityDependents[len(guide.PriorityDependents)-1]; got.DependentID != trackedID || got.CampaignStatus != db.CampaignMigrated {
+		t.Fatalf("last priority row = %+v, want tracked resolved campaign", got)
+	}
+	for _, row := range guide.PriorityDependents {
+		if row.Name == "actionable-10" {
+			t.Fatal("actionable row beyond the top-10 cap was retained")
+		}
+	}
+}
+
+func TestFindingDependentCampaignUpdate(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://github.com/example/zombie", Health: db.RepositoryHealthZombie}
+	if err := s.DB.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{RepositoryID: repo.ID, Kind: worker.JobSkill, Status: db.ScanDone}
+	if err := s.DB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	finding := db.Finding{RepositoryID: repo.ID, ScanID: scan.ID, Title: "Bug", Status: db.FindingTriaged}
+	if err := s.DB.Create(&finding).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherFinding := db.Finding{RepositoryID: repo.ID, ScanID: scan.ID, Title: "Other bug", Status: db.FindingTriaged}
+	if err := s.DB.Create(&otherFinding).Error; err != nil {
+		t.Fatal(err)
+	}
+	dependent := db.Dependent{RepositoryID: repo.ID, Name: "consumer"}
+	if err := s.DB.Create(&dependent).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherDependent := db.Dependent{RepositoryID: repo.ID, Name: "other-consumer"}
+	if err := s.DB.Create(&otherDependent).Error; err != nil {
+		t.Fatal(err)
+	}
+	exposureAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	row := db.FindingDependent{
+		FindingID: finding.ID, DependentID: dependent.ID,
+		Status: db.ExposureKnownAffected, UpdatedAt: exposureAt,
+	}
+	if err := s.DB.Create(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Create(&db.FindingDependent{
+		FindingID: otherFinding.ID, DependentID: otherDependent.ID,
+		Status: db.ExposureKnownAffected,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	path := fmt.Sprintf("/findings/%d/dependents/%d/campaign", finding.ID, dependent.ID)
+	w := postForm(t, s, path, url.Values{
+		"status": {string(db.CampaignAcked)},
+		"note":   {"  maintainer confirmed migration plan  "},
+	})
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	var stored db.FindingDependent
+	if err := s.DB.First(&stored, row.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.CampaignStatus != db.CampaignAcked || stored.CampaignNote != "maintainer confirmed migration plan" || stored.CampaignUpdatedAt == nil {
+		t.Fatalf("stored campaign = %+v", stored)
+	}
+	if !stored.UpdatedAt.Equal(exposureAt) {
+		t.Errorf("campaign update changed exposure timestamp: got %v, want %v", stored.UpdatedAt, exposureAt)
+	}
+
+	w = postForm(t, s, path, url.Values{"status": {"invalid"}})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid status code = %d, want %d", w.Code, http.StatusUnprocessableEntity)
+	}
+	w = postForm(t, s,
+		fmt.Sprintf("/findings/%d/dependents/%d/campaign", finding.ID, otherDependent.ID),
+		url.Values{"status": {string(db.CampaignDeclined)}},
+	)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("cross-finding status code = %d, want %d", w.Code, http.StatusNotFound)
 	}
 }
 

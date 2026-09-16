@@ -14,8 +14,9 @@ const migrationGuideRowLimit = 10
 type findingMigrationGuide struct {
 	Health db.RepositoryHealth
 
-	Packages     []db.Package
-	Alternatives []db.PackageAlternative
+	Packages         []db.Package
+	Alternatives     []db.PackageAlternative
+	CampaignStatuses []db.DependentCampaignStatus
 
 	PriorityDependents []migrationDependentRow
 	KnownSafeCount     int
@@ -24,13 +25,17 @@ type findingMigrationGuide struct {
 }
 
 type migrationDependentRow struct {
-	Name           string
-	Ecosystem      string
-	RepositoryURL  string
-	DependentRepos int
-	Status         string
-	Rationale      string
-	UpdatedAt      time.Time
+	DependentID       uint
+	Name              string
+	Ecosystem         string
+	RepositoryURL     string
+	DependentRepos    int
+	Status            string
+	Rationale         string
+	UpdatedAt         time.Time
+	CampaignStatus    db.DependentCampaignStatus
+	CampaignNote      string
+	CampaignUpdatedAt *time.Time
 }
 
 func loadFindingMigrationGuide(
@@ -56,9 +61,10 @@ func loadFindingMigrationGuide(
 	}
 
 	guide := findingMigrationGuide{
-		Health:       repo.Health,
-		Packages:     packages,
-		Alternatives: alternatives,
+		Health:           repo.Health,
+		Packages:         packages,
+		Alternatives:     alternatives,
+		CampaignStatuses: db.DependentCampaignStatuses,
 	}
 	loadMigrationGuideDependents(exposureRows, dependentsByID, &guide)
 	return &guide, nil
@@ -74,41 +80,62 @@ func loadMigrationGuideDependents(
 		return
 	}
 
-	rows := make([]migrationDependentRow, 0, len(exposureRows))
+	actionableRows := make([]migrationDependentRow, 0, len(exposureRows))
+	trackedResolvedRows := make([]migrationDependentRow, 0)
 	for _, row := range exposureRows {
 		row.Status = migrationExposureStatus(row.Status)
+		actionable := true
 		if row.Status == db.ExposureKnownNotAffected {
 			guide.KnownSafeCount++
-			continue
+			actionable = false
 		}
 		if row.Status == db.ExposureFixed {
 			guide.FixedCount++
+			actionable = false
+		}
+		if !actionable && row.CampaignStatus == "" {
 			continue
 		}
 		dep, ok := dependentsByID[row.DependentID]
 		if !ok {
 			continue
 		}
-		rows = append(rows, migrationDependentRow{
-			Name:           dep.Name,
-			Ecosystem:      dep.Ecosystem,
-			RepositoryURL:  dep.RepositoryURL,
-			DependentRepos: dep.DependentRepos,
-			Status:         row.Status,
-			Rationale:      row.Rationale,
-			UpdatedAt:      row.UpdatedAt,
-		})
+		viewRow := migrationDependentRow{
+			DependentID:       dep.ID,
+			Name:              dep.Name,
+			Ecosystem:         dep.Ecosystem,
+			RepositoryURL:     dep.RepositoryURL,
+			DependentRepos:    dep.DependentRepos,
+			Status:            row.Status,
+			Rationale:         row.Rationale,
+			UpdatedAt:         row.UpdatedAt,
+			CampaignStatus:    row.CampaignStatus,
+			CampaignNote:      row.CampaignNote,
+			CampaignUpdatedAt: row.CampaignUpdatedAt,
+		}
+		if actionable {
+			actionableRows = append(actionableRows, viewRow)
+		} else {
+			trackedResolvedRows = append(trackedResolvedRows, viewRow)
+		}
 	}
+	sortMigrationDependentRows(actionableRows)
+	sortMigrationDependentRows(trackedResolvedRows)
+	if len(actionableRows) > migrationGuideRowLimit {
+		actionableRows = actionableRows[:migrationGuideRowLimit]
+	}
+	guide.PriorityDependents = make([]migrationDependentRow, 0, len(actionableRows)+len(trackedResolvedRows))
+	guide.PriorityDependents = append(guide.PriorityDependents, actionableRows...)
+	guide.PriorityDependents = append(guide.PriorityDependents, trackedResolvedRows...)
+}
+
+func sortMigrationDependentRows(rows []migrationDependentRow) {
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].DependentRepos != rows[j].DependentRepos {
 			return rows[i].DependentRepos > rows[j].DependentRepos
 		}
 		return rows[i].Name < rows[j].Name
 	})
-	if len(rows) > migrationGuideRowLimit {
-		rows = rows[:migrationGuideRowLimit]
-	}
-	guide.PriorityDependents = rows
 }
 
 func migrationExposureStatus(status string) string {

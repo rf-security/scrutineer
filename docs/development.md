@@ -14,11 +14,12 @@
 | `internal/skills/` | SKILL.md parser + loader for local dirs and remote git repos |
 | `internal/worker/` | one job kind (JobSkill) and the runner plumbing |
 | `internal/worker/claude.go` | LocalClaude runner (bare-metal) |
-| `internal/worker/runtime.go` | ContainerRuntime + DetectRuntime (docker / rootless podman selection) |
+| `internal/worker/harness.go` | backend registry aliases over the `harness` module, plus the per-backend effort cap |
+| `internal/worker/runtime.go` | ContainerRuntime alias over `harness/container`, engine traits and bind-mount spec |
 | `internal/worker/container.go` | ContainerRunner (ephemeral container per scan; docker or podman) |
 | `internal/worker/clone.go` | git clone/fetch helpers, URL validation |
 | `internal/worker/skill.go` | doSkill: stage skill + context, invoke claude, dispatch output to the right parser |
-| `internal/worker/skill_parsers.go` | one parser per output_kind: findings, maintainers, packages, advisories, dependencies, finding_dedup, repo_metadata, verify, revalidate, breaking_change, mitigation, release_watch, subprojects, repo_overview, posture, patch (plus `exposure` handled by `exposure.go`, and `threat_model` stored as-is for the threat-model tab) |
+| `internal/worker/skill_parsers.go` | one parser per output_kind: findings, maintainers, packages, advisories, dependencies, finding_dedup, repo_metadata, verify, revalidate, breaking_change, mitigation, release_watch, subprojects, repo_overview, posture, patch (plus `exposure` handled by `exposure.go`, `reattack` by `remediation.go`, and `threat_model` stored as-is for the threat-model tab) |
 | `internal/worker/stream.go` | claude stream-json line parser |
 | `internal/worker/findings.go` | structured report parser used by `output_kind=findings` |
 | `internal/worker/ecosystems.go` | ecosyste.ms cache refresh and dependent-package persistence |
@@ -31,7 +32,8 @@
 | `internal/web/api_reads.go` | typed read endpoints (maintainers, packages, advisories, dependents, dependencies, findings) |
 | `internal/web/api_finding_writes.go` | PATCH/POST/PUT for finding notes, communications, references, labels, field updates, history |
 | `internal/web/finding_forms.go` | browser-form analogues of the api finding writes |
-| `internal/web/finding_patch.go` | patch scan lookup and diff download |
+| `internal/web/finding_patch.go` | patch scan lookup, exact remediation-attempt enqueue selection, and diff download |
+| `internal/web/finding_remediation.go` | immutable patch-attempt and re-attack views plus API projection |
 | `internal/web/skills_handlers.go` | `/skills` UI routes |
 | `internal/web/repo_report.go` | markdown report export per repository |
 | `internal/web/org_report.go` | markdown report export per organisation |
@@ -86,16 +88,23 @@ Tailwind, basecoat, htmx, lucide and highlight.js are vendored under `internal/w
 
 ## SSE architecture
 
-The `Broker` in `sse.go` fans events from the worker to connected browsers. Clients subscribe via `GET /events?scan={id}&repo={id}` (both optional). The worker publishes two event types:
+The `Broker` in `sse.go` fans events from the worker and from the web handlers to connected browsers. Clients subscribe via `GET /events?scan={id}&repo={id}&conv={id}&events={names}` (all optional). The scope parameters filter by subject; `events` is a comma-separated list of event names, so a page that only reacts to job status is not sent the log line of every running scan on the instance. The event types are:
 
 - `scan-log`: each line from a running job, pushed immediately
-- `scan-status`: fires when a job finishes (done/failed)
+- `scan-status`: a job left `queued` for `running`, reached a terminal state, or was changed by an operator action (cancel, pause, resume, retry, enqueue)
+- `chat-activity` / `chat-done`: a conversation turn's progress and its completion
 
-Templates use `hx-ext="sse"` with `sse-connect` and `sse-swap` to append log lines and trigger page reloads on completion. Embedded newlines in log lines are emitted as multiple `data:` lines so the browser's EventSource parser reconstructs the original text.
+A `scan-status` carrying a scan ID renders the `scan-status-sse` fragment: an OOB row for the repo Scans tab, plus a toast once the scan finished. A bulk action or a fresh enqueue has no single row to swap, so it publishes the event with a zero scan ID and no payload — the list pages treat it as "re-fetch your table".
+
+Templates use `hx-ext="sse"` with `sse-connect` plus either `sse-swap` (append log lines, swap a row) or `hx-trigger="sse:scan-status"` with `hx-get`. Three tables use the second form and re-request a fragment of themselves, which keeps the operator's scroll, filters and sort: `/scans` swaps `#jobs`, `/` swaps `#repos` (both replay the current request URI, exposed as `.SelfURL`), and a repository's Scans tab swaps `#repo-scans` from `GET /repositories/{id}/scans`. That last one has its own route rather than an `isHX` branch on `repoShow`, which would re-run the findings, dependency, inventory and threat-model loads the table never reads. On `repo_show` the listener keeps its `sse-swap` as well, so a row already on screen still updates instantly and raises its toast; the fragment request is what shows a scan queued after the page was rendered and moves the Cancel/Resume/Retry counts. It is a child of the `sse-connect` element so it can declare its own `hx-swap`, the same shape `scan_show.html` uses for its log pane.
+
+A status event cannot keep an elapsed time honest, since it ages between two events. `since` therefore renders `<time datetime="…" data-elapsed>3m ago</time>` and `static/app.js` recounts every `time[data-elapsed]` once a second, so the value climbs with no request at all. The marker attribute is what keeps the recount off any other `<time>` — a future absolute date, or the `until` helper's "in 3h" — which it would otherwise rewrite as "3h ago". The JS mirrors `humanDuration`; keep the two in step or a value jumps whenever the server re-renders it.
+
+The Scans tab fragment reads a narrowed projection (`scanRowColumns`) rather than whole scan rows: it re-renders on every status event, and a scan's `log` and `report` are megabytes the table never shows. `TestRepoScansFragment_rowMatchesTheFullPage` compares one row rendered through both paths, so a column the projection forgets fails the build instead of silently rendering blank on refresh. Handlers serve those fragments on any htmx request, and deliberately leave the flash cookie alone there since a fragment carries no `#toaster`. Embedded newlines in log lines are emitted as multiple `data:` lines so the browser's EventSource parser reconstructs the original text.
 
 ## Skill HTTP API
 
-`/api` is a bearer-authenticated surface that running skills call back into. Each scan gets a random token on enqueue; the worker writes it into the workspace's `context.json`. Middleware (`apiAuth`) validates the token against the active scan row and enforces that a scan only touches resources on its own repository.
+`/api` is a bearer-authenticated surface that running skills call back into. Each scan gets a random token on enqueue; the worker writes it into the workspace's `context.json`. Middleware (`apiAuth`) validates the token against the active scan row and enforces that a scan only touches resources on its own repository. Direct finding-field PATCHes additionally require the scan's `FindingID` to match the target; finding child records remain repository-scoped for repository-wide skills.
 
 See `openapi.yaml` at the repo root for the full surface. The `triage` bundled skill is the reference example.
 

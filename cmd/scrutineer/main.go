@@ -15,12 +15,16 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"filippo.io/age"
 	"filippo.io/age/agessh"
+	"filippo.io/age/plugin"
+	"github.com/alpha-omega-security/harness/container"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 	"gorm.io/gorm"
@@ -66,10 +70,17 @@ type skillDirs []string
 func (s *skillDirs) String() string     { return strings.Join(*s, ",") }
 func (s *skillDirs) Set(v string) error { *s = append(*s, v); return nil }
 
+// pluginNames collects repeated -identity-plugin flags.
+type pluginNames []string
+
+func (p *pluginNames) String() string     { return strings.Join(*p, ",") }
+func (p *pluginNames) Set(v string) error { *p = append(*p, v); return nil }
+
 const (
-	dataPermSecure     = 0o700
-	shutdownTimeout    = 5 * time.Second
-	skillsCloneTimeout = 2 * time.Minute
+	dataPermSecure              = 0o700
+	shutdownTimeout             = 5 * time.Second
+	skillsCloneTimeout          = 2 * time.Minute
+	codexAccountAuthConcurrency = 1
 )
 
 func main() {
@@ -97,7 +108,9 @@ type flags struct {
 	effort                string
 	defaultModel          string
 	backend               string
+	codexAuthFile         string
 	noContainer           bool
+	hostSkills            []string
 	runtime               string
 	selinux               string
 	hardened              bool
@@ -105,6 +118,7 @@ type flags struct {
 	runnerImage           string
 	profilesDir           string
 	skillsRepo            string
+	skillsRepoToken       string
 	concurrency           int
 	cloneMode             string
 	scanTimeout           time.Duration
@@ -117,9 +131,17 @@ type flags struct {
 	downgradeOnOverage    bool
 	recipientsFile        string
 	identityFile          string
+	identityPlugins       pluginNames
 	autoRejectMissedCount int
+	ecosystemsEnrichment  bool
 	federationSalt        string
 	federationContact     string
+	federationPublicFeed  string
+	federationMembersFeed string
+	federationImportFeeds []string
+	federationPeers       []string
+	subprojectScope       string
+	monorepoAttribution   bool
 	skillLocal            skillDirs
 
 	// set records which flags were passed on the command line so merge
@@ -129,18 +151,98 @@ type flags struct {
 
 // validateFederation refuses a federation salt without a contact:
 // claim-check would confirm matches while giving peers no way to
-// coordinate, which is the endpoint's whole purpose.
-func validateFederation(salt, contact string) error {
-	if salt != "" && contact == "" {
+// coordinate, which is the endpoint's whole purpose. It also refuses the
+// configurations that would leak or misfire: a members feed without age
+// recipients would push non-clean certificates in the clear, and one without
+// an identity could not read back what it published and so would re-encrypt
+// the whole feed on every tick. It trims the feed remotes in f on the way
+// through, so a blank one reads as no feed everywhere downstream.
+func validateFederation(f *flags) error {
+	// Trimmed and emptied out here rather than only inside ValidateFeedRemote,
+	// which trims its own copy: a whitespace-only remote otherwise reads as
+	// configured for every != "" test below and for StartFederation, which
+	// would then clone a remote git cannot resolve, every tick.
+	f.federationPublicFeed = strings.TrimSpace(f.federationPublicFeed)
+	f.federationMembersFeed = strings.TrimSpace(f.federationMembersFeed)
+	var imports []string
+	for _, remote := range f.federationImportFeeds {
+		if remote = strings.TrimSpace(remote); remote != "" {
+			imports = append(imports, remote)
+		}
+	}
+	f.federationImportFeeds = imports
+	// Peers are trimmed in place for the same reason: ValidatePeerURL parses a
+	// trimmed copy, so an untrimmed entry would pass validation and then be
+	// joined with /claim-check into a URL no request can be built from.
+	var peers []string
+	for _, peer := range f.federationPeers {
+		if peer = strings.TrimSpace(peer); peer != "" {
+			peers = append(peers, peer)
+		}
+	}
+	f.federationPeers = peers
+	if f.federationSalt != "" && f.federationContact == "" {
 		return errors.New("federation: federation_contact is required when federation_salt is set")
 	}
+	if len(f.federationPeers) > 0 && f.federationSalt == "" {
+		return errors.New("federation: federation_salt is required when federation_peers is set")
+	}
+	for _, peer := range f.federationPeers {
+		if err := web.ValidatePeerURL(peer); err != nil {
+			return err
+		}
+	}
+	if f.federationMembersFeed != "" &&
+		(f.recipientsFile == "" || (f.identityFile == "" && len(f.identityPlugins) == 0)) {
+		return errors.New("federation: recipients_file and either identity_file or identity_plugins are required when federation_members_feed is set")
+	}
+	if f.federationPublicFeed != "" && f.federationPublicFeed == f.federationMembersFeed {
+		return errors.New("federation: the public and members feeds must not share a git remote; each tier prunes the records the other publishes")
+	}
+	for _, remote := range append([]string{f.federationPublicFeed, f.federationMembersFeed}, f.federationImportFeeds...) {
+		if remote == "" {
+			continue
+		}
+		if err := web.ValidateFeedRemote(remote); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// mergeFederation layers the federation block of the config file under the
+// flags, same precedence as merge itself. federation_salt has no flag so
+// config always applies, and the two remote lists are config-file only.
+func (f *flags) mergeFederation(cfg *config.Config) {
+	if cfg.FederationSalt != "" {
+		f.federationSalt = cfg.FederationSalt
+	}
+	if cfg.FederationContact != "" && !f.set["federation-contact"] {
+		f.federationContact = cfg.FederationContact
+	}
+	if cfg.FederationPublicFeed != "" && !f.set["federation-public-feed"] {
+		f.federationPublicFeed = cfg.FederationPublicFeed
+	}
+	if cfg.FederationMembersFeed != "" && !f.set["federation-members-feed"] {
+		f.federationMembersFeed = cfg.FederationMembersFeed
+	}
+	f.federationImportFeeds = cfg.FederationImportFeeds
+	f.federationPeers = cfg.FederationPeers
 }
 
 func parseFlags() *flags {
 	f := &flags{}
 	registerFlags(flag.CommandLine, f)
 	flag.Parse()
+	// Subcommands are consumed by dispatch() before we get here, so anything
+	// left is a stray argument. Refusing it catches the space-separated form
+	// of a boolean flag, which the flag package silently drops: `-flag false`
+	// leaves the flag at its default and parks "false" here, and for a flag
+	// that defaults to true that reads as the exact opposite of what was typed.
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q (booleans take the -flag=false form)\n", flag.Arg(0))
+		os.Exit(2) //nolint:mnd // matches flag.ExitOnError's usage-error exit code
+	}
 
 	f.set = make(map[string]bool)
 	flag.Visit(func(fl *flag.Flag) { f.set[fl.Name] = true })
@@ -161,9 +263,9 @@ func registerFlags(fs *flag.FlagSet, f *flags) {
 	fs.BoolVar(&f.noContainer, "no-container", false, "disable the containerised runner and run claude directly on the host (no isolation), even if a container runtime is available")
 	fs.BoolVar(&f.noContainer, "no-docker", false, "deprecated alias for --no-container")
 	fs.BoolVar(&f.hardened, "hardened", false, "strict sandbox mode: container runtime required (no --no-container fallback), egress restricted to the harness's model API + host skill API, read-only rootfs, internal network")
-	fs.BoolVar(&f.hardenedRuntimeOnly, "hardened-runtime-only", false, "the non-network half of --hardened (read-only rootfs + no-new-privileges + 2 GiB post-clone workspace cap) WITHOUT the per-scan --internal network, so it works under rootless podman where --hardened cannot; --cap-drop ALL + non-root user + tmpfs apply regardless. Implied by --hardened")
+	fs.BoolVar(&f.hardenedRuntimeOnly, "hardened-runtime-only", false, "the non-network half of --hardened (read-only rootfs + no-new-privileges + 2 GiB post-clone workspace cap) WITHOUT the per-scan --internal network; use it when the verified sidecar path is unavailable. --cap-drop ALL + non-root user + tmpfs apply regardless. Implied by --hardened")
 	fs.BoolVar(&f.hardenedRuntimeOnly, "hardened-rootless-runtime", false, "deprecated alias for --hardened-runtime-only")
-	fs.StringVar(&f.runnerImage, "runner-image", defaultRunnerImage, "container image for per-job containers (a custom image needs curl, and under rootless --hardened the scrutineer binary for the egress sidecar; build from Dockerfile.runner)")
+	fs.StringVar(&f.runnerImage, "runner-image", defaultRunnerImage, "container image for per-job containers (a custom image needs curl, and on hardened sidecar runtimes the scrutineer binary; build from Dockerfile.runner)")
 	fs.StringVar(&f.profilesDir, "profiles-dir", "docker/profiles", "directory containing per-ecosystem runner profiles (Dockerfile per profile); empty disables profiles")
 	fs.StringVar(&f.skillsRepo, "skills-repo", "", "clone skills on startup; owner/repo[@ref] or https://host/path[@ref]")
 	fs.IntVar(&f.concurrency, "concurrency", queue.DefaultWorkerConcurrency, "number of scans to run in parallel")
@@ -174,14 +276,23 @@ func registerFlags(fs *flag.FlagSet, f *flags) {
 	fs.StringVar(&f.modelBaseURL, "model-base-url", "", "custom HTTPS model API base URL for the active backend (HTTP allowed for local development; env fallback: ANTHROPIC_BASE_URL for claude)")
 	fs.StringVar(&f.modelBaseURL, "anthropic-base-url", "", "deprecated alias for -model-base-url")
 	fs.StringVar(&f.forkOrg, "fork-org", "", "GitHub org the fork skill forks into and files draft advisories against")
+	fs.StringVar(&f.subprojectScope, "subproject-scope", "hard", "how a subproject-scoped scan stages its workspace: \"hard\" (copy only the sub-folder so build+findings are confined to the sub-package) or \"soft\" (stage the whole clone, sub-path is an advisory hint)")
+	fs.BoolVar(&f.monorepoAttribution, "monorepo-attribution", true, "link packages, advisories, maintainers and disclosure channel to the sub-package they belong to (matched by manifest name) instead of rolling up flat under the repository")
 	fs.BoolVar(&f.schemaStrict, "schema-strict", false, "fail scans whose report.json does not validate against the skill's schema (default: warn and continue)")
 	fs.BoolVar(&f.downgradeOnOverage, "downgrade-on-overage", false, "on a subscription token, fall the model tier back from max/high to the mid tier for new scans while the account is on overage; restores when the window resets")
 	fs.StringVar(&f.recipientsFile, "recipients-file", "", "age recipients file (public keys) for encrypted export")
-	fs.StringVar(&f.identityFile, "identity-file", "", "age identity file or SSH private key for decrypting imports")
+	fs.StringVar(&f.identityFile, "identity-file", "", "age identity file or SSH private key for decrypting imports and federation feeds")
+	fs.Var(&f.identityPlugins, "identity-plugin", "data-less age identity plugin name for decrypting imports and federation feeds (repeatable)")
 	fs.IntVar(&f.autoRejectMissedCount, "auto-reject-missed-count", 0, "auto-reject findings after this many consecutive missed rescans (0 disables)")
+	fs.BoolVar(&f.ecosystemsEnrichment, "ecosystems-enrichment", true, "enrich repositories from ecosyste.ms (per-repository cache, warm on repo add, PURL-to-repository resolution); =false stops every lookup scrutineer's own process makes and leaves the dependents cache empty. Takes the -flag=false form")
 	// federation_salt has no flag on purpose: a secret in argv leaks via
 	// ps and shell history, so it is config-file only.
 	fs.StringVar(&f.federationContact, "federation-contact", "", "contact returned by the claim-check endpoint on a finding-hash match")
+	fs.StringVar(&f.federationPublicFeed, "federation-public-feed", "", "git remote the public interchange feed is pushed to")
+	fs.StringVar(&f.federationMembersFeed, "federation-members-feed", "", "git remote the age-encrypted members interchange feed is pushed to")
+	// federation_import_feeds is a list of remotes and is config-file only:
+	// a repeatable flag would duplicate what the config file already
+	// expresses as a YAML sequence.
 	fs.Var(&f.skillLocal, "skills", "additional directory to load SKILL.md files from, overriding bundled skills with the same name (repeatable)")
 }
 
@@ -190,7 +301,7 @@ func registerFlags(fs *flag.FlagSet, f *flags) {
 // list and theme into the web package; runtime defaults (model, effort)
 // are stored on flags here and applied to the Server after construction.
 //
-//nolint:gocognit,gocyclo // flat: one guarded assignment per config key
+//nolint:gocognit,gocyclo,maintidx // flat: one guarded assignment per config key
 func (f *flags) merge(cfg *config.Config) {
 	if cfg.Addr != "" && !f.set["addr"] {
 		f.addr = cfg.Addr
@@ -204,8 +315,13 @@ func (f *flags) merge(cfg *config.Config) {
 	if cfg.NoContainer != nil && !f.set["no-container"] && !f.set["no-docker"] {
 		f.noContainer = *cfg.NoContainer
 	}
+	f.hostSkills = cfg.HostSkills
 	if cfg.Backend != "" && !f.set["backend"] {
 		f.backend = cfg.Backend
+	}
+	// Config-only: auth.json contains rotating ChatGPT account credentials.
+	if cfg.Codex.AuthFile != "" {
+		f.codexAuthFile = cfg.Codex.AuthFile
 	}
 	if cfg.Runtime != "" && !f.set["runtime"] {
 		f.runtime = cfg.Runtime
@@ -233,6 +349,10 @@ func (f *flags) merge(cfg *config.Config) {
 	if cfg.SkillsRepo != "" && !f.set["skills-repo"] {
 		f.skillsRepo = cfg.SkillsRepo
 	}
+	// Config-only: a command-line token would be visible in process listings.
+	if cfg.SkillsRepoToken != "" {
+		f.skillsRepoToken = cfg.SkillsRepoToken
+	}
 	if len(cfg.Skills) > 0 && !f.set["skills"] {
 		f.skillLocal = append(f.skillLocal, cfg.Skills...)
 	}
@@ -254,6 +374,12 @@ func (f *flags) merge(cfg *config.Config) {
 	if cfg.ForkOrg != "" && !f.set["fork-org"] {
 		f.forkOrg = cfg.ForkOrg
 	}
+	if cfg.SubprojectScope != "" && !f.set["subproject-scope"] {
+		f.subprojectScope = cfg.SubprojectScope
+	}
+	if cfg.MonorepoAttribution != nil && !f.set["monorepo-attribution"] {
+		f.monorepoAttribution = *cfg.MonorepoAttribution
+	}
 	if cfg.MetadataDir != "" {
 		f.metadataDir = cfg.MetadataDir
 	}
@@ -269,15 +395,16 @@ func (f *flags) merge(cfg *config.Config) {
 	if cfg.IdentityFile != "" && !f.set["identity-file"] {
 		f.identityFile = cfg.IdentityFile
 	}
+	if len(cfg.IdentityPlugins) > 0 && !f.set["identity-plugin"] {
+		f.identityPlugins = append(pluginNames(nil), cfg.IdentityPlugins...)
+	}
 	if cfg.AutoRejectMissedCount > 0 && !f.set["auto-reject-missed-count"] {
 		f.autoRejectMissedCount = cfg.AutoRejectMissedCount
 	}
-	if cfg.FederationSalt != "" {
-		f.federationSalt = cfg.FederationSalt
+	if cfg.EcosystemsEnrichment != nil && !f.set["ecosystems-enrichment"] {
+		f.ecosystemsEnrichment = *cfg.EcosystemsEnrichment
 	}
-	if cfg.FederationContact != "" && !f.set["federation-contact"] {
-		f.federationContact = cfg.FederationContact
-	}
+	f.mergeFederation(cfg)
 
 	// Seed the model pick list from the active harness's own defaults,
 	// so a fresh install of any backend has a working list with correct
@@ -285,7 +412,7 @@ func (f *flags) merge(cfg *config.Config) {
 	// then overrides. An invalid backend name is caught later by
 	// validateFlags; until then, HarnessByName("") gives claude.
 	if h, err := worker.HarnessByName(f.backend); err == nil {
-		defs := h.DefaultModels()
+		defs := worker.DefaultModelsFor(h)
 		models := make([]web.Model, 0, len(defs))
 		for _, d := range defs {
 			models = append(models, web.Model{Name: d.Name, ID: d.ID, Tier: d.Tier})
@@ -307,22 +434,43 @@ func (f *flags) merge(cfg *config.Config) {
 	}
 }
 
+// applyServerDefaults installs the runtime default model and effort. It warns
+// when a configured default_model is not in the pick list: SetDefaultModel
+// ignores such an id silently, so the default would otherwise become the first
+// pick-list entry with nothing said about it.
+func applyServerDefaults(srv *web.Server, f *flags, log *slog.Logger) {
+	if f.defaultModel != "" && !web.ValidModel(f.defaultModel) {
+		log.Warn("configured default model is not in the pick list; falling back to the first entry",
+			"default_model", f.defaultModel, "model", srv.DefaultModel())
+	}
+	srv.SetDefaultModel(f.defaultModel)
+	srv.SetDefaultEffort(f.effort)
+}
+
 func (f *flags) fullClone() bool { return f.cloneMode == "full" }
 
 // normalizePaths expands a leading ~ in the host-filesystem paths scrutineer
 // opens or creates (data dir, local skill dirs, profiles dir, and the
 // recipients/identity key files), so config values like "data: ~/scrutineer"
 // work — the shell expands ~ for CLI flags but never for config-file values,
-// and Go's os package does no tilde expansion of its own. metadata_dir is
-// deliberately excluded (it names a path inside a staging git repo, not a host
-// path); skills_repo is a URL, not a path.
+// and Go's os package does no tilde expansion of its own. The Codex credential
+// path is also made absolute so validation and the runtime mount use one file.
+// metadata_dir is deliberately excluded (it names a path inside a staging git
+// repo, not a host path); skills_repo is a URL, not a path.
 func (f *flags) normalizePaths() error {
-	for _, p := range []*string{&f.dataDir, &f.profilesDir, &f.recipientsFile, &f.identityFile} {
+	for _, p := range []*string{&f.dataDir, &f.profilesDir, &f.recipientsFile, &f.identityFile, &f.codexAuthFile} {
 		expanded, err := expandHome(*p)
 		if err != nil {
 			return err
 		}
 		*p = expanded
+	}
+	if f.codexAuthFile != "" {
+		absolute, err := filepath.Abs(f.codexAuthFile)
+		if err != nil {
+			return fmt.Errorf("resolve codex.auth_file: %w", err)
+		}
+		f.codexAuthFile = absolute
 	}
 	for i, dir := range f.skillLocal {
 		expanded, err := expandHome(dir)
@@ -361,13 +509,33 @@ func validateFlags(f *flags) error {
 	if _, err := worker.HarnessByName(f.backend); err != nil {
 		return err
 	}
+	if f.codexAuthFile != "" {
+		if f.backend != "codex" {
+			return fmt.Errorf("codex.auth_file requires backend %q", "codex")
+		}
+		if os.Getenv("CODEX_API_KEY") != "" || os.Getenv("OPENAI_API_KEY") != "" {
+			return errors.New("codex.auth_file cannot be combined with CODEX_API_KEY or OPENAI_API_KEY; unset API keys to prevent accidental credit usage")
+		}
+		if err := worker.ValidateCodexAuthFile(f.codexAuthFile); err != nil {
+			return err
+		}
+	}
 	if err := config.ValidateRuntime(f.runtime); err != nil {
 		return err
 	}
 	if err := config.ValidateSELinux(f.selinux); err != nil {
 		return err
 	}
-	if err := validateFederation(f.federationSalt, f.federationContact); err != nil {
+	if err := config.ValidateSubprojectScope(f.subprojectScope); err != nil {
+		return err
+	}
+	if _, err := loadIdentityPlugins(f.identityPlugins, &plugin.ClientUI{}); err != nil {
+		return err
+	}
+	if len(f.identityPlugins) > 0 && os.Getenv("AGEDEBUG") == "plugin" {
+		return errors.New("identity plugins: AGEDEBUG=plugin is unsafe because it exposes raw plugin protocol traffic and may expose entered secrets")
+	}
+	if err := validateFederation(f); err != nil {
 		return err
 	}
 	return validateModelBaseURL(f.modelBaseURL)
@@ -457,7 +625,7 @@ func run(log *slog.Logger) error {
 	// enforcing host will get the :z relabel, or that --selinux=off on an
 	// enforcing host is about to break file passing).
 	if f.set["selinux"] {
-		log.Info("selinux", "flag", f.selinux, "state", worker.HostSELinuxState())
+		log.Info("selinux", "flag", f.selinux, "state", container.HostSELinuxState())
 	}
 	if err := os.MkdirAll(f.dataDir, dataPermSecure); err != nil {
 		return err
@@ -476,7 +644,9 @@ func run(log *slog.Logger) error {
 	}
 	db.BackfillFindings(gdb)
 	db.BackfillFindingRepository(gdb)
-	db.BackfillFindingFingerprints(gdb)
+	if err := db.BackfillFindingFingerprints(gdb); err != nil {
+		return fmt.Errorf("backfill finding fingerprints: %w", err)
+	}
 	db.BackfillStatusPriority(gdb)
 	worker.BackfillRepoDiskUsage(gdb, f.dataDir)
 	if err := db.SeedDefaultLabels(gdb); err != nil {
@@ -498,19 +668,24 @@ func run(log *slog.Logger) error {
 			f.concurrency = v
 		}
 	}
+	enforceCodexAccountAuthConcurrency(f, log)
 
 	q, err := queue.New(sqldb, log, f.concurrency)
 	if err != nil {
 		return fmt.Errorf("queue: %w", err)
 	}
+	if f.codexAuthFile != "" {
+		q.SetMaxConcurrency(codexAccountAuthConcurrency)
+	}
 
 	skills.ModelValidator = web.ValidModelPreference
 	skills.ProfileValidator = worker.IsNamedProfile
-	skillsRepoSHA, err := loadSkills(log, gdb, f.dataDir, f.skillLocal, f.skillsRepo, f.fullClone())
+	skillsRepoSHA, err := loadSkills(log, gdb, f.dataDir, f.skillLocal, f.skillsRepo, f.skillsRepoToken, f.fullClone())
 	if err != nil {
 		return err
 	}
 	retireRemovedSkills(log, gdb)
+	warnUnknownHostSkills(log, gdb, f.hostSkills)
 
 	go func() {
 		if n, err := worker.SyncCNAs(context.Background(), gdb, ""); err != nil {
@@ -539,12 +714,11 @@ func run(log *slog.Logger) error {
 		SchemaStrict:          f.schemaStrict,
 		DowngradeOnOverage:    f.downgradeOnOverage,
 		AutoRejectMissedCount: f.autoRejectMissedCount,
+		SubprojectScope:       f.subprojectScope,
+		MonorepoAttribution:   f.monorepoAttribution,
 		OnEvent: func(scanID, repoID uint, name, data string) {
 			broker.Publish(web.Event{Name: name, Data: data, ScanID: scanID, RepoID: repoID})
 		},
-	}
-	w.RefreshEcosystemsCache = func(ctx context.Context, repoID uint) error {
-		return worker.RefreshEcosystems(ctx, gdb, repoID, true, log)
 	}
 	w.Register(q)
 
@@ -554,30 +728,22 @@ func run(log *slog.Logger) error {
 	}
 	srv.SkillsRepoSHA = skillsRepoSHA
 	srv.Version = version
+	wireEcosystems(f.ecosystemsEnrichment, w, srv, gdb, log)
 	if h, err := worker.HarnessByName(f.backend); err == nil {
 		srv.Backend = worker.HarnessName(h)
 	}
-	srv.SetDefaultModel(f.defaultModel)
-	srv.SetDefaultEffort(f.effort)
+	applyServerDefaults(srv, f, log)
 	srv.FederationSalt = f.federationSalt
 	srv.FederationContact = f.federationContact
+	srv.MonorepoAttribution = f.monorepoAttribution
 	srv.VINCE = cfg.VINCE
+	srv.FederationPublicFeed = f.federationPublicFeed
+	srv.FederationMembersFeed = f.federationMembersFeed
+	srv.FederationImportFeeds = f.federationImportFeeds
+	srv.FederationPeers = f.federationPeers
 
-	if f.recipientsFile != "" {
-		recs, err := loadRecipients(f.recipientsFile)
-		if err != nil {
-			return fmt.Errorf("recipients: %w", err)
-		}
-		srv.EncRecipients = recs
-		log.Info("loaded recipients", "file", f.recipientsFile, "count", len(recs))
-	}
-	if f.identityFile != "" {
-		ids, err := loadIdentities(f.identityFile)
-		if err != nil {
-			return fmt.Errorf("identity: %w", err)
-		}
-		srv.EncIdentities = ids
-		log.Info("loaded identities", "file", f.identityFile, "count", len(ids))
+	if err := configureEncryption(srv, f, log); err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -586,6 +752,7 @@ func run(log *slog.Logger) error {
 	go q.Start(ctx)
 	go srv.StartScheduler(ctx)
 	go srv.StartRepositoryHealthScorer(ctx)
+	go srv.StartFederation(ctx)
 
 	httpSrv := &http.Server{Addr: f.addr, Handler: srv.Handler(), ReadHeaderTimeout: shutdownTimeout}
 	go func() {
@@ -606,6 +773,50 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	return nil
+}
+
+func configureEncryption(srv *web.Server, f *flags, log *slog.Logger) error {
+	if f.recipientsFile != "" {
+		recs, err := loadRecipients(f.recipientsFile)
+		if err != nil {
+			return fmt.Errorf("recipients: %w", err)
+		}
+		srv.EncRecipients = recs
+		log.Info("loaded recipients", "file", f.recipientsFile, "count", len(recs))
+	}
+	if f.identityFile != "" {
+		ids, err := loadIdentities(f.identityFile)
+		if err != nil {
+			return fmt.Errorf("identity: %w", err)
+		}
+		srv.EncIdentities = append(srv.EncIdentities, ids...)
+		log.Info("loaded identities", "file", f.identityFile, "count", len(ids))
+	}
+	if len(f.identityPlugins) > 0 {
+		ids, err := loadIdentityPlugins(f.identityPlugins, newIdentityPluginUI(log))
+		if err != nil {
+			return err
+		}
+		srv.EncIdentities = append(srv.EncIdentities, ids...)
+		log.Info("loaded identity plugins", "count", len(ids))
+	}
+	return nil
+}
+
+// wireEcosystems configures the worker's per-scan cache refresh and the
+// server's PURL/prefetch seams from a single enrichment setting. When off,
+// RefreshEcosystemsCache is left nil so a scan makes no ecosyste.ms call at
+// all rather than one that fails against a denied domain, and the server's
+// seams are neutered via DisableEcosystems. Called after both are constructed
+// but before q.Start, so nothing reads the field before it is set.
+func wireEcosystems(enabled bool, w *worker.Worker, srv *web.Server, gdb *gorm.DB, log *slog.Logger) {
+	if !enabled {
+		srv.DisableEcosystems()
+		return
+	}
+	w.RefreshEcosystemsCache = func(ctx context.Context, repoID uint) error {
+		return worker.RefreshEcosystems(ctx, gdb, repoID, true, log)
+	}
 }
 
 func retireRemovedSkills(log *slog.Logger, gdb *gorm.DB) {
@@ -645,7 +856,7 @@ func checkRunnerImage(srv *web.Server, runner worker.SkillRunner, log *slog.Logg
 // version on every restart. Returns the resolved commit SHA of the remote repo
 // (empty when no repo is set) so the caller can stamp it on each Scan for
 // reproducibility.
-func loadSkills(log *slog.Logger, gdb *gorm.DB, dataDir string, dirs skillDirs, repoSpec string, fullClone bool) (string, error) {
+func loadSkills(log *slog.Logger, gdb *gorm.DB, dataDir string, dirs skillDirs, repoSpec, repoToken string, fullClone bool) (string, error) {
 	bundleDir, bundleHash, err := bundledassets.Materialize(bundledskills.FS, dataDir, "bundled-skills")
 	if err != nil {
 		return "", fmt.Errorf("materialize bundled skills: %w", err)
@@ -667,12 +878,14 @@ func loadSkills(log *slog.Logger, gdb *gorm.DB, dataDir string, dirs skillDirs, 
 	if repoSpec != "" {
 		url, ref, err := skills.ParseRepoSpec(repoSpec)
 		if err != nil {
-			return "", fmt.Errorf("parse skills_repo %q: %w", repoSpec, err)
+			// repoSpec may come from an older credential-bearing configuration.
+			// The parser explains the validation failure without echoing the URL.
+			return "", fmt.Errorf("parse skills_repo: %w", err)
 		}
 		dst := filepath.Join(dataDir, "skills-cache", hashPath(repoSpec))
 		ctx, cancel := context.WithTimeout(context.Background(), skillsCloneTimeout)
 		defer cancel()
-		sha, err = skills.CloneOrPull(ctx, url, ref, dst, fullClone)
+		sha, err = skills.CloneOrPull(ctx, url, ref, dst, fullClone, repoToken)
 		if err != nil {
 			return "", fmt.Errorf("clone skills repo: %w", err)
 		}
@@ -746,7 +959,8 @@ const defaultRuntimeSmokeTimeout = 5 * time.Minute
 
 // setupRunner picks the SkillRunner implementation for the run loop:
 // ContainerRunner (docker, podman, or Apple's container) when a container runtime is in use,
-// LocalClaude otherwise. It also starts the egress proxy, sweeps stale hardened
+// LocalClaude otherwise, and a HostSplitRunner over both when host_skills sends
+// some skills to the host. It also starts the egress proxy, sweeps stale hardened
 // networks, runs the rootless keep-id smoke test, and returns the apiBase the
 // worker advertises to skills (the container path rewrites it to the selected
 // runtime's host endpoint so containers can reach the loopback-bound web
@@ -754,31 +968,35 @@ const defaultRuntimeSmokeTimeout = 5 * time.Minute
 //
 //nolint:ireturn // dispatched on f.noContainer; concrete types live in the worker pkg
 func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRunner, string, error) {
-	apiBase := "http://" + f.addr + "/api"
+	hostBase := hostAPIBase(f.addr)
 	// Already validated in run(); ignore the error here.
 	h, _ := worker.HarnessByName(f.backend)
 	_, isClaude := h.(worker.ClaudeHarness)
-	if f.hardened && f.noContainer {
-		return nil, "", fmt.Errorf("--hardened requires a container runtime; remove --no-container")
-	}
-	if !isClaude && f.noContainer {
-		return nil, "", fmt.Errorf("backend %q requires the containerised runner; remove --no-container", f.backend)
+	if err := checkHostRunFlags(f, isClaude); err != nil {
+		return nil, "", err
 	}
 	if f.hardenedRuntimeOnly && f.noContainer {
 		log.Warn("--hardened-runtime-only has no effect with --no-container (no container to harden)")
 	}
-	if f.noContainer {
-		log.Info("--no-container set, using local runner (no isolation)")
-		return worker.LocalClaude{Effort: f.effort, FullClone: f.fullClone(), MaxTurns: f.maxTurns}, apiBase, nil
+	if capped := worker.CappedEffort(h, f.effort); capped != f.effort {
+		log.Warn("backend caps the effort level", "backend", f.backend, "requested", f.effort, "using", capped)
 	}
-	rt, ok := worker.DetectRuntime(f.runtime)
+	local := worker.LocalClaude{Effort: f.effort, FullClone: f.fullClone(), MaxTurns: f.maxTurns}
+	if f.noContainer {
+		if len(f.hostSkills) > 0 {
+			log.Warn("host_skills has no effect with --no-container (every skill already runs on the host)")
+		}
+		log.Info("--no-container set, using local runner (no isolation)")
+		return local, hostBase, nil
+	}
+	rt, ok := container.DetectRuntime(f.runtime)
 	if !ok {
 		if f.hardened {
 			return nil, "", fmt.Errorf("%s not available: --hardened requires a container runtime, install and start it", f.runtime)
 		}
 		return nil, "", fmt.Errorf("%s not available: install and start it, or pass --no-container to run without containerisation (no isolation)", f.runtime)
 	}
-	if err := rt.HardeningSupportError(f.hardenedRuntimeOnly); err != nil {
+	if err := worker.HardeningSupportError(rt, f.hardenedRuntimeOnly); err != nil {
 		return nil, "", err
 	}
 	if rt.Bin == "apple" {
@@ -804,7 +1022,7 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 	}
 	smokeCtx, cancel := context.WithTimeout(context.Background(), f.smokeTimeout)
 	defer cancel()
-	if err := worker.VerifyKeepID(smokeCtx, rt, f.runnerImage); err != nil {
+	if err := container.VerifyKeepID(smokeCtx, rt, f.runnerImage); err != nil {
 		return nil, "", err
 	}
 	// SELinux bind-mount relabeling (--selinux auto/on/off). Resolve it once
@@ -812,25 +1030,45 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 	// so an SELinux denial fails at startup instead of on every scan's file
 	// passing. Both no-op on a non-SELinux host with relabeling off (the default
 	// there), keeping that path unchanged.
-	relabel := worker.ResolveSELinuxRelabel(f.selinux)
+	relabel := container.ResolveSELinuxRelabel(f.selinux)
 	selinuxCtx, cancelSE := context.WithTimeout(context.Background(), f.smokeTimeout)
 	defer cancelSE()
-	if err := worker.VerifySELinuxMount(selinuxCtx, rt, f.runnerImage, relabel); err != nil {
-		return nil, "", err
+	if err := container.VerifySELinuxMount(selinuxCtx, rt, f.runnerImage, relabel); err != nil {
+		// The module's message names an abstract relabel mode, not the flag.
+		return nil, "", fmt.Errorf("--selinux=%s: %w", f.selinux, err)
 	}
 	gwIP, apiHost, err := resolveScanNetworking(rt, f, log)
 	if err != nil {
 		return nil, "", err
 	}
 	var egress worker.EgressSidecarConfig
-	allow := buildEgressAllow(h.EgressHosts(), f.hardened, cfg, f.modelBaseURL, log)
+	var configuredProviders map[string]config.OpencodeProvider
+	if cfg != nil {
+		configuredProviders = cfg.Opencode.Providers
+	}
+	opencodeProviders, err := loadOpencodeProviders(h, configuredProviders, cfgPath(f.configPath))
+	if err != nil {
+		return nil, "", err
+	}
+	harnessHosts := h.EgressHosts()
+	if f.codexAuthFile != "" {
+		harnessHosts = append(harnessHosts, worker.CodexAccountAuthHost)
+	}
+	allow := buildEgressAllow(harnessHosts, f.hardened, cfg, f.modelBaseURL, log)
+	// The host-gateway alias is always an API host so a container that CONNECTs
+	// to host.docker.internal:<port> gets the port gate and loopback rewrite on
+	// every runtime, including Apple where the container reaches the proxy via
+	// the resolved gateway IP instead. Without the alias here, a HostPorts grant
+	// on Apple falls through to a plain hostname dial that cannot resolve.
+	apiHosts := []string{worker.HostGatewayAlias}
 	if apiHost != worker.HostGatewayAlias {
 		allow = append(allow, apiHost)
+		apiHosts = append(apiHosts, apiHost)
 	}
 	token := worker.NewProxyToken()
-	// Rootless --hardened runs the egress proxy as a per-scan sidecar reusing
-	// this allow-list and token; resolve it before the in-process host proxy so
-	// the latter can be skipped when the sidecar is in charge.
+	// Runtimes that cannot reach the host proxy across an internal network run
+	// the egress proxy as a per-scan sidecar. Resolve it before the in-process
+	// host proxy so the latter can be skipped when the sidecar is in charge.
 	if f.hardened {
 		egress, err = resolveEgressSidecar(rt, f, allow, token, log)
 		if err != nil {
@@ -847,7 +1085,7 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 			Allow:    allow,
 			Token:    token,
 			APIPort:  addrPort(f.addr),
-			APIHosts: []string{apiHost},
+			APIHosts: apiHosts,
 			Log:      log,
 		})
 		if err != nil {
@@ -863,8 +1101,8 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 		"hardened_runtime_only", f.hardenedRuntimeOnly, "selinux_relabel", relabel)
 	// Skills inside the container reach the host via the runtime's host endpoint,
 	// which the egress proxy rewrites to 127.0.0.1 when dialing the app.
-	apiBase = "http://" + net.JoinHostPort(apiHost, addrPort(f.addr)) + "/api"
-	return worker.ContainerRunner{
+	apiBase := "http://" + net.JoinHostPort(apiHost, addrPort(f.addr)) + "/api"
+	runner := worker.ContainerRunner{
 		Image:               f.runnerImage,
 		Effort:              f.effort,
 		Harness:             h,
@@ -879,7 +1117,175 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 		Runtime:             rt,
 		SELinuxRelabel:      relabel,
 		Egress:              egress,
-	}, apiBase, nil
+		ProviderProxy: worker.ScopedEgressProxyConfig{
+			Allow:         allow,
+			APIPort:       addrPort(f.addr),
+			APIHosts:      apiHosts,
+			ContainerHost: apiHost,
+			Log:           log,
+		},
+		OpencodeProviders: opencodeProviders,
+		OpencodeReadiness: worker.NewOpencodeReadinessCache(),
+		CodexAccountAuth:  worker.NewCodexAccountAuth(f.codexAuthFile),
+	}
+	return splitHostSkills(f, runner, local, hostBase, log), apiBase, nil
+}
+
+// enforceCodexAccountAuthConcurrency starts the queue at the same one-slot
+// limit SetMaxConcurrency retains across later settings-driven runner swaps.
+// The runner semaphore remains the credential-level backstop for chat turns.
+func enforceCodexAccountAuthConcurrency(f *flags, log *slog.Logger) {
+	if f.codexAuthFile == "" || f.concurrency == codexAccountAuthConcurrency {
+		return
+	}
+	log.Warn("codex account auth requires serialized scans; forcing concurrency to 1", "configured", f.concurrency)
+	f.concurrency = codexAccountAuthConcurrency
+}
+
+// splitHostSkills wraps the container runner so the host_skills entries run
+// through the local runner instead; a nil list leaves it untouched.
+//
+//nolint:ireturn // wraps or passes through the SkillRunner it is given
+func splitHostSkills(f *flags, runner worker.SkillRunner, local worker.LocalClaude, hostBase string, log *slog.Logger) worker.SkillRunner {
+	if len(f.hostSkills) == 0 {
+		return runner
+	}
+	if f.hardenedRuntimeOnly {
+		log.Warn("--hardened-runtime-only does not cover host_skills (no container to harden)", "skills", f.hostSkills)
+	}
+	log.Info("host_skills set, running those skills with the local runner (no isolation)", "skills", f.hostSkills)
+	return worker.HostSplitRunner{Container: runner, Host: local, HostSkills: f.hostSkills, HostAPIBase: hostBase}
+}
+
+// checkHostRunFlags refuses running claude on the host, via --no-container or
+// host_skills, under --hardened (nothing to harden) and under a non-claude
+// backend (its binary only exists in the runner image).
+func checkHostRunFlags(f *flags, isClaude bool) error {
+	var opt string
+	switch {
+	case f.noContainer:
+		opt = "--no-container"
+	case len(f.hostSkills) > 0:
+		opt = "host_skills"
+	default:
+		return nil
+	}
+	if f.hardened {
+		return fmt.Errorf("--hardened requires a container runtime; remove %s", opt)
+	}
+	if !isClaude {
+		return fmt.Errorf("backend %q requires the containerised runner; remove %s", f.backend, opt)
+	}
+	return nil
+}
+
+// hostAPIBase is the skill API address as reached from the host itself. An
+// unspecified listen host (":8080", "0.0.0.0:8080") is not dialable, so it
+// becomes the loopback address.
+func hostAPIBase(addr string) string {
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
+			addr = net.JoinHostPort("127.0.0.1", port)
+		}
+	}
+	return "http://" + addr + "/api"
+}
+
+// warnUnknownHostSkills flags host_skills entries that match no active skill
+// (a typo there silently leaves the skill in its container) and entries whose
+// skill pins a runner profile, which the local runner refuses on every run.
+func warnUnknownHostSkills(log *slog.Logger, gdb *gorm.DB, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	var found []db.Skill
+	if err := gdb.Select("name, requires_profile").Where("name IN ? AND active = ?", names, true).Find(&found).Error; err != nil {
+		log.Warn("host_skills check failed", "err", err)
+		return
+	}
+	byName := make(map[string]db.Skill, len(found))
+	for _, s := range found {
+		byName[s.Name] = s
+	}
+	for _, name := range names {
+		s, ok := byName[name]
+		switch {
+		case !ok:
+			log.Warn("host_skills names no active skill", "skill", name)
+		case s.RequiresProfile != "":
+			log.Warn("host_skills names a skill that requires a runner profile; the local runner refuses it", "skill", name, "profile", s.RequiresProfile)
+		}
+	}
+}
+
+func loadOpencodeProviders(h worker.Harness, providers map[string]config.OpencodeProvider, configPath string) (map[string]worker.OpencodeProviderConfig, error) {
+	if worker.HarnessName(h) != "opencode" || len(providers) == 0 {
+		return nil, nil
+	}
+	absConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve OpenCode config path: %w", err)
+	}
+	baseDir := filepath.Dir(absConfig)
+	result := make(map[string]worker.OpencodeProviderConfig, len(providers))
+	for id, provider := range providers {
+		configFile, err := resolveOpencodeHostPath(baseDir, provider.ConfigFile)
+		if err != nil {
+			return nil, fmt.Errorf("opencode.providers.%s.config_file: %w", id, err)
+		}
+		stateDir, err := resolveOpencodeHostPath(baseDir, provider.StateDir)
+		if err != nil {
+			return nil, fmt.Errorf("opencode.providers.%s.state_dir: %w", id, err)
+		}
+		var configContent string
+		if configFile != "" {
+			content, err := os.ReadFile(configFile)
+			if err != nil {
+				return nil, fmt.Errorf("read opencode.providers.%s.config_file: %w", id, err)
+			}
+			configContent = string(content)
+		}
+		var hostPort string
+		if provider.HostPort > 0 {
+			hostPort = strconv.Itoa(provider.HostPort)
+			// The readiness probe checks host.docker.internal:<host_port> is
+			// reachable, not that OpenCode is configured to send requests there.
+			// A config_file whose baseURL points at 127.0.0.1 or a different
+			// port passes readiness and then fails inside the OpenCode server.
+			// A substring check catches that at startup without depending on
+			// the config's exact JSON shape.
+			target := worker.HostGatewayAlias + ":" + hostPort
+			if !strings.Contains(configContent, target) {
+				return nil, fmt.Errorf("opencode.providers.%s: host_port %d is set but config_file does not point options.baseURL at http://%s", id, provider.HostPort, target)
+			}
+		}
+		result[id] = worker.OpencodeProviderConfig{
+			RunnerImage:      provider.RunnerImage,
+			ConfigContent:    configContent,
+			APIKeyEnv:        provider.APIKeyEnv,
+			AuthMetadata:     provider.AuthMetadata,
+			PassEnv:          append([]string(nil), provider.PassEnv...),
+			RequiredBinaries: append([]string(nil), provider.RequiredBinaries...),
+			EgressHosts:      append([]string(nil), provider.EgressAllow...),
+			HostPort:         hostPort,
+			StateDir:         stateDir,
+		}
+	}
+	return result, nil
+}
+
+func resolveOpencodeHostPath(baseDir, path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	expanded, err := expandHome(path)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(expanded) {
+		expanded = filepath.Join(baseDir, expanded)
+	}
+	return filepath.Clean(expanded), nil
 }
 
 // resolveScanNetworking prepares per-scan networking before the egress proxy
@@ -926,27 +1332,24 @@ func resolveScanNetworking(rt worker.ContainerRuntime, f *flags, log *slog.Logge
 	return gwIP, apiHost, nil
 }
 
-// resolveEgressSidecar builds the egress proxy sidecar config for a rootless
-// --hardened run. It resolves the default-network host-gateway the sidecar dials
-// to reach the loopback-bound host skill API, and warns when the podman backend
-// may not forward host-gateway to the host loopback. Returns the zero value (no
-// sidecar) for docker, rootful podman, and any non-rootless run -- those keep
-// the in-process host proxy.
+// resolveEgressSidecar builds the egress proxy sidecar config for runtimes that
+// cannot reach the in-process proxy across an internal network. It resolves the
+// default-network host gateway the sidecar dials to reach the loopback-bound
+// host skill API. Docker Engine, rootful podman, and Apple keep the in-process
+// proxy and return the zero value.
 func resolveEgressSidecar(rt worker.ContainerRuntime, f *flags, allow []string, token string, log *slog.Logger) (worker.EgressSidecarConfig, error) {
 	if !rt.NeedsEgressSidecar() {
 		return worker.EgressSidecarConfig{}, nil
 	}
-	// Fail fast if the runner image lacks the scrutineer binary the sidecar runs,
-	// rather than letting every hardened scan fail with a cryptic per-scan error.
+	// Fail fast if the runner image lacks the proxy policy capability the sidecar
+	// requires, rather than letting every hardened scan fail with a cryptic error.
 	smokeCtx, cancel := context.WithTimeout(context.Background(), f.smokeTimeout)
 	defer cancel()
 	if err := worker.VerifyProxyBinary(smokeCtx, rt, f.runnerImage); err != nil {
 		return worker.EgressSidecarConfig{}, err
 	}
-	// Rootless podman: the per-scan --internal network cannot reach the host
-	// proxy, so egress runs through a proxy sidecar on the network. The sidecar
-	// reaches the host skill API over its egress leg via the default-network
-	// host-gateway, resolved once here.
+	// The sidecar reaches the host skill API over its egress leg through the
+	// default-network host gateway, resolved once here.
 	if !rt.HostLoopbackBackendLikely() {
 		log.Warn("podman < 5.0 does not default to the pasta network backend; the egress proxy "+
 			"sidecar needs the backend to forward host-gateway to the host loopback (pasta "+
@@ -956,9 +1359,8 @@ func resolveEgressSidecar(rt worker.ContainerRuntime, f *flags, allow []string, 
 	}
 	egressGwIP := worker.ResolveHostGatewayIPv4(rt, f.runnerImage, "")
 	if egressGwIP == "" {
-		log.Warn("host-gateway did not resolve under rootless podman; hardened scans will be refused " +
-			"because the egress proxy sidecar cannot reach the host skill API (needs podman >= 4.7 and a " +
-			"working rootless network backend; see docs/podman.md)")
+		log.Warn("host-gateway did not resolve; hardened scans will be refused because the egress proxy sidecar cannot reach the host skill API",
+			"runtime", rt.Bin)
 	}
 	return worker.EgressSidecarConfig{Token: token, Allow: allow, APIPort: addrPort(f.addr), GatewayIP: egressGwIP}, nil
 }
@@ -968,6 +1370,14 @@ func resolveEgressSidecar(rt worker.ContainerRuntime, f *flags, allow []string, 
 // starts from HardenedEgressAllow and ignores cfg.EgressAllow (the
 // operator must drop --hardened to widen). The model base URL host is
 // still auto-added in both modes since it routes the same model API.
+//
+// ecosystems_enrichment deliberately does NOT filter *.ecosyste.ms out of
+// this list. Dropping it would 403 the metadata, packages and advisories
+// skills, which triage runs unconditionally, and their parsers replace the
+// repository's whole row set: a blessed empty report would wipe the packages
+// and advisories already recorded. The setting stops the enrichment
+// scrutineer's own process performs; denying the domain to the runner is the
+// operator's network policy to write.
 func buildEgressAllow(harnessHosts []string, hardened bool, cfg *config.Config, modelBaseURL string, log *slog.Logger) []string {
 	allow := append([]string{}, harnessHosts...)
 	if hardened {
@@ -1134,6 +1544,92 @@ func loadIdentities(path string) ([]age.Identity, error) {
 		return nil, fmt.Errorf("parse age identity: %w", err)
 	}
 	return ids, nil
+}
+
+// serializedPluginIdentity keeps terminal-backed plugin interactions from
+// overlapping across concurrent imports and federation passes. It also keeps
+// plugin-supplied error text behind a stable, provider-neutral boundary while
+// preserving the underlying error for errors.Is/errors.As and age's identity
+// fallback behavior.
+type serializedPluginIdentity struct {
+	name     string
+	identity age.Identity
+	mutex    *sync.Mutex
+}
+
+func (i *serializedPluginIdentity) Name() string { return i.name }
+
+func (i *serializedPluginIdentity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
+	i.mutex.Lock()
+	defer i.mutex.Unlock()
+
+	fileKey, err := i.identity.Unwrap(stanzas)
+	if err != nil {
+		// A non-match is normal age control flow, not a plugin malfunction.
+		// Canonicalize it to age's own sentinel so NoIdentityMatchError stays
+		// accurate without carrying any plugin-controlled error text.
+		if errors.Is(err, age.ErrIncorrectIdentity) {
+			return nil, age.ErrIncorrectIdentity
+		}
+		return nil, &pluginIdentityError{name: i.name, err: err}
+	}
+	return fileKey, nil
+}
+
+type pluginIdentityError struct {
+	name string
+	// err is retained only for errors.Is/errors.As. It can contain
+	// plugin-controlled protocol text and must not be logged or returned
+	// directly to a user.
+	err error
+}
+
+func (e *pluginIdentityError) Error() string {
+	var notFound *plugin.NotFoundError
+	if errors.As(e.err, &notFound) {
+		return fmt.Sprintf(
+			"configured identity plugin %q is unavailable; expected age-plugin-%s in PATH",
+			e.name, e.name)
+	}
+	return fmt.Sprintf("configured identity plugin %q failed", e.name)
+}
+
+func (e *pluginIdentityError) Unwrap() error { return e.err }
+
+// loadIdentityPlugins constructs data-less age plugin identities, equivalent
+// to age's -j option. Construction validates names but does not start plugin
+// executables or trigger authentication; that is deferred until decryption
+// needs an identity.
+func loadIdentityPlugins(names []string, ui *plugin.ClientUI) ([]age.Identity, error) {
+	identities := make([]age.Identity, 0, len(names))
+	mutex := new(sync.Mutex)
+	for _, name := range names {
+		identity, err := plugin.NewIdentityWithoutData(name, ui)
+		if err != nil {
+			return nil, fmt.Errorf("identity plugin %q: %w", name, err)
+		}
+		identities = append(identities, &serializedPluginIdentity{
+			name:     name,
+			identity: identity,
+			mutex:    mutex,
+		})
+	}
+	return identities, nil
+}
+
+// newIdentityPluginUI uses age's terminal UI so plugins can request public or
+// secret input directly from the controlling terminal. Only display messages
+// and UI errors reach structured logs; values entered by the user and raw age
+// plugin protocol traffic do not.
+func newIdentityPluginUI(log *slog.Logger) *plugin.ClientUI {
+	return plugin.NewTerminalUI(
+		func(format string, args ...any) {
+			log.Info("age identity plugin", "message", fmt.Sprintf(format, args...))
+		},
+		func(format string, args ...any) {
+			log.Warn("age identity plugin", "message", fmt.Sprintf(format, args...))
+		},
+	)
 }
 
 // promptPassphrase is the function called when an encrypted SSH key needs

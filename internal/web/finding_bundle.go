@@ -120,7 +120,10 @@ func (s *Server) bundleEntriesAt(f *db.Finding, repo *db.Repository, generatedAt
 	if err := s.DB.Where("finding_id = ?", f.ID).Find(&fdRows).Error; err != nil {
 		return nil, fmt.Errorf("load finding dependents: %w", err)
 	}
-	deps := loadFindingDependents(s, fdRows)
+	deps, err := loadFindingDependents(s, fdRows)
+	if err != nil {
+		return nil, fmt.Errorf("load dependents: %w", err)
+	}
 	hasDependents, err := repoHasDependents(s.DB, f.RepositoryID)
 	if err != nil {
 		return nil, fmt.Errorf("count dependents: %w", err)

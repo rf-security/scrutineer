@@ -53,6 +53,7 @@ func (s *Server) autoEnqueueFocusAreaDeepDives(scan *db.Scan) {
 	if len(config.FocusAreas) == 0 {
 		// Preserve normal coverage until a repository has a useful partition.
 		s.enqueueFocusAreaDeepDive(scan, skill.ID, group, "")
+		s.autoEnqueueExploratoryAudit(scan, skill.ID, group)
 		return
 	}
 	for _, area := range config.FocusAreas {
@@ -63,6 +64,7 @@ func (s *Server) autoEnqueueFocusAreaDeepDives(scan *db.Scan) {
 		}
 		s.enqueueFocusAreaDeepDive(scan, skill.ID, group, raw)
 	}
+	s.autoEnqueueExploratoryAudit(scan, skill.ID, group)
 }
 
 func (s *Server) enqueueFocusAreaDeepDive(parent *db.Scan, skillID uint, group, focusArea string) {
@@ -71,6 +73,7 @@ func (s *Server) enqueueFocusAreaDeepDive(parent *db.Scan, skillID uint, group, 
 
 	var existing int64
 	if err := s.DB.Model(&db.Scan{}).
+		Where("COALESCE(exploration_mode, '') = ''").
 		Where("repository_id = ? AND skill_id = ? AND scan_group = ? AND sub_path = ? AND ref = ? AND focus_area = ? AND status IN ?",
 			parent.RepositoryID, skillID, group, parent.SubPath, parent.Ref, focusArea,
 			[]db.ScanStatus{db.ScanQueued, db.ScanRunning, db.ScanDone}).
@@ -82,15 +85,22 @@ func (s *Server) enqueueFocusAreaDeepDive(parent *db.Scan, skillID uint, group, 
 		return
 	}
 	if _, err := s.enqueueSkillWith(context.Background(), parent.RepositoryID, skillID, ScanOpts{
+		// parent.Model is the threat-model scan's already-resolved concrete
+		// id (high tier by default); passing it through would win precedence
+		// over the deep-dive skill's own scrutineer.model: max declaration.
+		// focusAreaDeepDiveModel therefore returns "" unless the operator
+		// explicitly picked a model for the parent run.
 		Model:          s.focusAreaDeepDiveModel(parent),
 		Effort:         parent.Effort,
 		Profile:        parent.Profile,
 		SubPath:        parent.SubPath,
+		ScopeMode:      parent.ScopeMode,
 		Ref:            parent.Ref,
 		RescanMode:     parent.RescanMode,
 		DiffBaseScanID: parent.DiffBaseScanID,
 		ScanGroup:      group,
 		FocusArea:      focusArea,
+		TriageScanID:   parent.TriageScanID,
 	}); err != nil {
 		name := "repository"
 		if focusArea != "" {

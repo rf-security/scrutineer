@@ -1,10 +1,51 @@
 package worker
 
-import "github.com/alpha-omega-security/harness"
+import (
+	"strings"
+
+	"github.com/alpha-omega-security/harness"
+)
+
+const (
+	modelDaybreakBlueID = "gpt-daybreak-blue-latest"
+	modelGPT56SolID     = "gpt-5.6-sol"
+	modelGPT6AstraID    = "gpt-6-astra"
+	perMillionTokens    = 1e6
+
+	// Standard base list prices in USD per million tokens. The aggregate
+	// Usage event cannot identify requests that crossed the long-context
+	// threshold, so this deliberately remains a base-rate estimate.
+	// https://developers.openai.com/api/docs/pricing
+	gpt6AstraInputPrice       = 10.00
+	gpt6AstraOutputPrice      = 50.00
+	gpt6AstraCachedInputPrice = 1.00
+	gpt6AstraCacheWritePrice  = 12.50
+)
 
 // CostFromUsage computes the dollar cost of one result event's token usage
-// against the given model's list price. The pricing table lives in
-// github.com/alpha-omega-security/harness alongside each backend's
-// DefaultModels(); the coverage tripwire that every DefaultModels() id is
-// priced is upstream in that module's tests.
-func CostFromUsage(model string, u Usage) float64 { return harness.CostFromUsage(model, u) }
+// against the given model's list price. Harness owns the shared pricing table;
+// local handling bridges GPT-6 Astra until the module ships its pricing.
+func CostFromUsage(model string, u Usage) float64 {
+	if normalizePricingModelID(model) != modelGPT6AstraID {
+		return harness.CostFromUsage(model, u)
+	}
+
+	uncached := u.InputTokens - u.CacheReadTokens - u.CacheWriteTokens
+	if uncached < 0 {
+		uncached = 0
+	}
+	return (float64(uncached)*gpt6AstraInputPrice +
+		float64(u.CacheReadTokens)*gpt6AstraCachedInputPrice +
+		float64(u.CacheWriteTokens)*gpt6AstraCacheWritePrice +
+		float64(u.OutputTokens)*gpt6AstraOutputPrice) / perMillionTokens
+}
+
+func normalizePricingModelID(id string) string {
+	if slash := strings.LastIndexByte(id, '/'); slash >= 0 {
+		id = id[slash+1:]
+	}
+	if bracket := strings.IndexByte(id, '['); bracket > 0 {
+		id = id[:bracket]
+	}
+	return id
+}

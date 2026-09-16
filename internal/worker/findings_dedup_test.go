@@ -181,15 +181,72 @@ func TestParseFindingsOutput_auditSchemasReferencesIngest(t *testing.T) {
 			}]}`,
 			wantTags: "advisory,audit-exfil",
 		},
+		{
+			skillName: "audit-authz",
+			report: `{"findings":[{
+				"id":"F001",
+				"title":"Invoice lookup omits tenant ownership",
+				"severity":"High",
+				"confidence":"high",
+				"cwe":"CWE-639",
+				"location":"internal/invoices/show.go:74",
+				"reachability":"reachable",
+				"quality_tier":"high",
+				"trace":"The authenticated endpoint passes the caller-controlled invoice ID to a global lookup and returns the row.",
+				"boundary":"A tenant member may supply another tenant's invoice ID.",
+				"validation":"Static review resolved the route middleware and repository helper, then confirmed neither checks invoice tenant membership.",
+				"discovered_via":"source",
+				"rating":"High because any authenticated tenant member can read another tenant's billing record.",
+				"references":[{"url":"https://example.com/advisory","summary":"Related advisory","tags":"advisory,audit-authz"}]
+			}]}`,
+			wantTags: "advisory,audit-authz",
+		},
+		{
+			skillName: "audit-pii",
+			report: `{"findings":[{
+				"id":"F001",
+				"title":"Customer email is written to an analytics event",
+				"severity":"Medium",
+				"confidence":"high",
+				"cwe":"CWE-359",
+				"location":"internal/analytics/signup.go:64",
+				"reachability":"reachable",
+				"quality_tier":"high",
+				"trace":"The signup handler passes the account email to the analytics properties map without redaction.",
+				"boundary":"A user email leaves the application database and is retained by the third-party analytics provider.",
+				"validation":"Static review confirmed this is a runtime account value, not an example literal, and found no hashing or analytics allowlist.",
+				"discovered_via":"source",
+				"rating":"Medium because every signup discloses a personal identifier to a durable third-party sink.",
+				"references":[{"url":"https://example.com/advisory","summary":"Related advisory","tags":"advisory,audit-pii"}]
+			}]}`,
+			wantTags: "advisory,audit-pii",
+		},
+		{
+			skillName: "audit-memory",
+			report: `{"findings":[{
+				"id":"F001",
+				"title":"Overflowed growth leaves parser buffer undersized",
+				"severity":"High",
+				"confidence":"high",
+				"cwe":"CWE-787",
+				"location":"lib/xmlparse.c:418",
+				"reachability":"reachable",
+				"quality_tier":"high",
+				"trace":"A library caller's XML token length reaches bytes * 2 in size_t; the wrapped allocation is smaller after overflow and the decoder writes the full token.",
+				"boundary":"The public parser API accepts untrusted XML bytes and reaches the first-party token buffer in the library build.",
+				"validation":"The literal realloc inventory hit was traced through the local wrapper; neither the wrapper nor callers check multiplication overflow before allocation.",
+				"discovered_via":"source",
+				"rating":"High because a crafted document can cause an out-of-bounds write in applications embedding the parser.",
+				"references":[{"url":"https://example.com/advisory","summary":"Related advisory","tags":"advisory,audit-memory"}]
+			}]}`,
+			wantTags: "advisory,audit-memory",
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.skillName, func(t *testing.T) {
-			schema, err := os.ReadFile(filepath.Join("../../skills", tc.skillName, "schema.json"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := ValidateReportSchema(string(schema), tc.report); got != "" {
+			schema := loadBundledSchema(t, filepath.Join("../../skills", tc.skillName, "schema.json"))
+			if got := ValidateReportSchema(schema, tc.report); got != "" {
 				t.Fatalf("schema rejected parser fixture: %s", got)
 			}
 
@@ -809,5 +866,98 @@ func TestParseFindingsOutput_notObservedSkipsClosedFindings(t *testing.T) {
 	gdb.First(&f)
 	if f.MissedCount != 0 {
 		t.Errorf("closed finding should not accrue missed count: missed=%d", f.MissedCount)
+	}
+}
+
+func TestParseFindingsOutput_focusAreaScanDoesNotMarkOtherAreasMissed(t *testing.T) {
+	gdb, err := db.Open(filepath.Join(t.TempDir(), "p.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "https://x/r", Name: "r"}
+	gdb.Create(&repo)
+	w := &Worker{DB: gdb, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	emit := func(Event) {}
+
+	// Focus-area deep-dive on auth finds F1.
+	s1 := &db.Scan{RepositoryID: repo.ID, Kind: JobSkill, SkillName: "security-deep-dive",
+		SubPath: "", FocusArea: `{"name":"auth"}`, Status: db.ScanDone, Commit: "abc"}
+	gdb.Create(s1)
+	if err := w.parseFindingsOutput(&db.Skill{}, s1,
+		`{"findings":[{"id":"F1","title":"x","severity":"High","cwe":"CWE-89","location":"a.rb:1"}]}`, emit); err != nil {
+		t.Fatal(err)
+	}
+
+	// A sibling focus area finds its own finding and nothing from auth. It
+	// was never in scope to re-observe F1, so it must not count as a miss.
+	s2 := &db.Scan{RepositoryID: repo.ID, Kind: JobSkill, SkillName: "security-deep-dive",
+		SubPath: "", FocusArea: `{"name":"deserialization"}`, Status: db.ScanDone, Commit: "abc"}
+	gdb.Create(s2)
+	if err := w.parseFindingsOutput(&db.Skill{}, s2,
+		`{"findings":[{"id":"F2","title":"y","severity":"High","cwe":"CWE-502","location":"b.rb:2"}]}`, emit); err != nil {
+		t.Fatal(err)
+	}
+
+	var f1 db.Finding
+	if err := gdb.Where("title = ?", "x").First(&f1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if f1.MissedCount != 0 {
+		t.Errorf("sibling focus-area scan marked F1 missed: missed=%d last_missed=%d",
+			f1.MissedCount, f1.LastMissedScanID)
+	}
+
+	// A full-repo rescan of the same skill IS in scope for everything, so it
+	// still counts as a miss. Guards against disabling the signal outright.
+	s3 := &db.Scan{RepositoryID: repo.ID, Kind: JobSkill, SkillName: "security-deep-dive",
+		SubPath: "", Status: db.ScanDone, Commit: "def"}
+	gdb.Create(s3)
+	if err := w.parseFindingsOutput(&db.Skill{}, s3, `{"findings":[]}`, emit); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gdb.Where("title = ?", "x").First(&f1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if f1.MissedCount != 1 || f1.LastMissedScanID != s3.ID {
+		t.Errorf("full-repo rescan should mark F1 missed: missed=%d last_missed=%d",
+			f1.MissedCount, f1.LastMissedScanID)
+	}
+}
+
+func TestParseFindingsOutput_focusAreaScanDoesNotAutoReject(t *testing.T) {
+	gdb, err := db.Open(filepath.Join(t.TempDir(), "p.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "https://x/r", Name: "r"}
+	gdb.Create(&repo)
+	w := &Worker{DB: gdb, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), AutoRejectMissedCount: 1}
+	emit := func(Event) {}
+
+	s1 := &db.Scan{RepositoryID: repo.ID, Kind: JobSkill, SkillName: "security-deep-dive",
+		SubPath: "", FocusArea: `{"name":"auth"}`, Status: db.ScanDone, Commit: "abc"}
+	gdb.Create(s1)
+	if err := w.parseFindingsOutput(&db.Skill{}, s1,
+		`{"findings":[{"id":"F1","title":"x","severity":"High","cwe":"CWE-89","location":"a.rb:1"}]}`, emit); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := &db.Scan{RepositoryID: repo.ID, Kind: JobSkill, SkillName: "security-deep-dive",
+		SubPath: "", FocusArea: `{"name":"ssrf"}`, Status: db.ScanDone, Commit: "abc"}
+	gdb.Create(s2)
+	if err := w.parseFindingsOutput(&db.Skill{}, s2, `{"findings":[]}`, emit); err != nil {
+		t.Fatal(err)
+	}
+
+	var f1 db.Finding
+	if err := gdb.Where("title = ?", "x").First(&f1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if f1.Status == db.FindingRejected {
+		t.Errorf("sibling focus-area scan auto-rejected a valid finding (missed=%d)", f1.MissedCount)
+	}
+	if f1.MissedCount != 0 {
+		t.Errorf("sibling focus-area scan marked F1 missed: missed=%d", f1.MissedCount)
 	}
 }

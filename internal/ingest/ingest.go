@@ -43,6 +43,69 @@ func normaliseSeverity(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// maxModelLen bounds an imported model id. Real ids are a few dozen
+// characters; anything longer is not attribution.
+const maxModelLen = 100
+
+// normaliseModel admits an imported model only when it looks like a model
+// id: leading alphanumeric, the id charset, bounded length. Anything else
+// is dropped to "" — the finding imports as unattributed — because bundle
+// text is externally supplied and a partially-stripped value would be
+// fabricated attribution. Unlike severity, invalid values do NOT pass
+// through: this field ends up in the reporting CSV, where a value with a
+// leading `=`, `+`, `-`, `@`, tab, or CR reads as a spreadsheet formula
+// (CWE-1236), and the leading-alphanumeric rule is what rules those out.
+func normaliseModel(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > maxModelLen {
+		return ""
+	}
+	if !isAlphanumeric(rune(s[0])) {
+		return ""
+	}
+	for _, r := range s {
+		// Brackets carry the context-window suffix on built-in claude ids
+		// (claude-fable-5-1[1m]); they are inert in spreadsheets without a
+		// leading trigger, which the leading-alphanumeric rule prevents.
+		if !isAlphanumeric(r) && !strings.ContainsRune("._:/@+-_[]", r) {
+			return ""
+		}
+	}
+	return s
+}
+
+func isAlphanumeric(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
+// normaliseTool is defence in depth for the producer name, which unlike a
+// model id is a free-form label ("GitHub Code Scanning"), so it keeps
+// interior spaces and punctuation and only rejects the dangerous shapes: a
+// leading spreadsheet-formula trigger, control characters, or an unbounded
+// length. Invalid values become "unknown" rather than "" because an empty
+// Tool would unmark the finding as imported (Finding.ImportedFrom) and
+// feed an empty skill name into fingerprinting; "unknown" keeps the import
+// provenance honest without carrying the hostile text.
+func normaliseTool(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if len(s) > maxModelLen {
+		return "unknown"
+	}
+	switch s[0] {
+	case '=', '+', '-', '@':
+		return "unknown"
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return "unknown"
+		}
+	}
+	return s
+}
+
 // Result is one batch of findings against one repository from one tool.
 // A single uploaded file can yield several Results when it contains
 // multiple SARIF runs.
@@ -102,6 +165,10 @@ type Finding struct {
 	Rating     string
 	// FixCommit is the base revision SuggestedFix applies to.
 	FixCommit string
+	// Model is the model id of the scan that produced the finding on the
+	// exporting instance, so a bundle round-trip preserves which model
+	// generated it rather than attributing it to the receiving ingest run.
+	Model string
 
 	// Sinks (comma-joined sink ids) rides the default bundle alongside the
 	// six-step prose; it is finding substance, not triage. Snippet and the
@@ -123,6 +190,7 @@ type Finding struct {
 	BreakingChangeRationale string
 	DupCheck                string
 	DisclosureDraft         string
+	DisclosureTitle         string
 	SuggestedRecipients     string
 	ExploitedInWild         string
 	ExploitedInWildEvidence string
@@ -178,8 +246,19 @@ const (
 var ErrUnrecognised = errors.New("ingest: input matches no supported format (want SARIF 2.1.0, minimal JSON, findings CSV, or findings markdown)")
 
 // Parse sniffs data, picks a parser, and returns one Result per
-// repository-scoped batch.
+// repository-scoped batch. Every result's Tool passes through
+// normaliseTool on the way out, whichever parser produced it: SARIF
+// driver names and minimal-JSON tool fields are externally supplied and
+// flow into Scan.SkillName, Finding.ImportedFrom, and history rows.
 func Parse(data []byte) ([]Result, Format, error) {
+	rs, format, err := parseDetected(data)
+	for i := range rs {
+		rs[i].Tool = normaliseTool(rs[i].Tool)
+	}
+	return rs, format, err
+}
+
+func parseDetected(data []byte) ([]Result, Format, error) {
 	switch detect(data) {
 	case FormatSARIF:
 		rs, err := parseSARIF(data)

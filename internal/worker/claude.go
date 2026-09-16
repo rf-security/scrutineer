@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/alpha-omega-security/harness"
@@ -138,7 +139,7 @@ func (sj SkillJob) toJob(effort string, maxTurns int, baseURL string) harness.Jo
 		Effort:          effectiveEffort(sj.Effort, effort),
 		MaxTurns:        effectiveMaxTurns(sj.MaxTurns, maxTurns),
 		OutputFile:      sj.OutputFile,
-		ValidationHint:  scrutineerValidationHint(sj.OutputFile),
+		ValidationHint:  scrutineerValidationHint(sj.OutputFile, sj.AllowedTools),
 		AllowedTools:    sj.AllowedTools,
 		BaseURL:         baseURL,
 		ResumeSessionID: sj.ResumeSessionID,
@@ -167,6 +168,12 @@ type SkillResult struct {
 	// belongs to a different agent CLI and starts fresh instead of passing
 	// e.g. a codex thread id to claude --resume.
 	Backend string
+	// Provider is the provider prefix selected from an OpenCode model id.
+	// RunnerImage and RunnerImageDigest identify the provider base image before
+	// any repository language profile is layered on it.
+	Provider          string
+	RunnerImage       string
+	RunnerImageDigest string
 	// SessionID is the harness session this run belonged to, as seen in
 	// the stream. The worker already persists it live via the emit callback;
 	// this is a backstop so the final save reflects the latest value (e.g.
@@ -313,14 +320,32 @@ const maxReportBytes = 50 << 20
 // at path, or an empty string if the file doesn't exist. Oversize files
 // are truncated and a log line is emitted to the scan so the operator
 // knows the report was clipped.
+//
+// The report is whatever the agent left under that name in a workspace it
+// controls, so the read goes through a root opened at the parent directory
+// and accepts only a regular file: a link to a host file, or to the
+// context.json beside it, yields no report rather than that file's contents.
+// The parent is the workspace root itself — validateSkillPaths keeps
+// output_file to a bare name — which the agent cannot replace from inside its
+// bind mount.
 func readCappedReport(path string, emit func(Event)) string {
-	f, err := os.Open(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = root.Close() }()
+	name := filepath.Base(path)
+	entryInfo, err := root.Lstat(name)
+	if err != nil || !entryInfo.Mode().IsRegular() {
+		return ""
+	}
+	f, err := root.Open(name)
 	if err != nil {
 		return ""
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
-	if err != nil {
+	if err != nil || !info.Mode().IsRegular() || !os.SameFile(entryInfo, info) {
 		return ""
 	}
 	if info.Size() > maxReportBytes {
@@ -354,6 +379,24 @@ func effectiveEffort(perScan, runnerDefault string) string {
 	return runnerDefault
 }
 
+// toolsAllowShell reports whether a skill's allowed-tools list lets the agent
+// run shell commands, which is what the API validation route needs. An empty
+// list is the unrestricted case (see Job.AllowedTools), so it allows Bash.
+// Entries may carry a scope qualifier ("Bash(git:*)"), so only the tool name
+// in front of the parenthesis is compared.
+func toolsAllowShell(allowedTools string) bool {
+	if strings.TrimSpace(allowedTools) == "" {
+		return true
+	}
+	for _, tool := range strings.Split(allowedTools, ",") {
+		name, _, _ := strings.Cut(tool, "(")
+		if strings.EqualFold(strings.TrimSpace(name), "Bash") {
+			return true
+		}
+	}
+	return false
+}
+
 // scrutineerValidationHint is the ValidationHint scrutineer supplies on every
 // harness.Job so the agent validates its JSON output via scrutineer's API
 // instead of installing a JSON Schema library inside the runner container.
@@ -362,9 +405,19 @@ func effectiveEffort(perScan, runnerDefault string) string {
 // the endpoint reuses scrutineer's own validator, so a pass here means the
 // post-scan check will also pass. The harness module appends this after the
 // OutputFile clause when OutputFile ends in .json.
-func scrutineerValidationHint(outputFile string) string {
+//
+// The POST route needs Bash, so a skill whose allowed-tools omits it gets the
+// read-based wording instead (#834): recon was told to POST on every run and
+// burned its turn budget failing to. Returning "" for those skills is not an
+// option -- the harness substitutes its own generic "Validate ./x against
+// ./schema.json before finishing" for an empty hint on any .json output, which
+// is the same unexecutable instruction minus the don't-install guard.
+func scrutineerValidationHint(outputFile, allowedTools string) string {
 	if outputFile == "" {
 		return ""
+	}
+	if !toolsAllowShell(allowedTools) {
+		return fmt.Sprintf("To check ./%s against ./schema.json, read both files and compare them yourself; your tool set has no shell, so don't install a schema validator.", outputFile)
 	}
 	return fmt.Sprintf("To check ./%s against ./schema.json, POST it to {scrutineer.api_base}/scans/{scrutineer.scan_id}/validate-report (header \"Authorization: Bearer {scrutineer.token}\", values in ./context.json); {\"valid\":true} means it conforms. Don't install a schema validator.", outputFile)
 }
@@ -381,7 +434,7 @@ func buildLoggedPrompt(skill *db.Skill, backend string) string {
 	prompt := h.Prompt(harness.Job{
 		SkillName:      skill.Name,
 		OutputFile:     skill.OutputFile,
-		ValidationHint: scrutineerValidationHint(skill.OutputFile),
+		ValidationHint: scrutineerValidationHint(skill.OutputFile, skill.AllowedTools),
 	})
 	return prompt +
 		"\n\n--- SKILL.md ---\n\n" + renderSkillMD(skill)

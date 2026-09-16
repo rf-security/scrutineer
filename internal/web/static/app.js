@@ -39,11 +39,40 @@
     if (list) list.scrollTop = list.scrollHeight;
   }
 
+  // Mirrors humanDuration in server.go: seconds under a minute, then minutes,
+  // then hours (with minutes when non-zero), then days. Keep the two in step,
+  // or a row's elapsed time jumps the moment the server re-renders it.
+  function humanDuration(ms) {
+    var s = Math.floor(ms / 1000);
+    if (s < 1) return '0s';
+    if (s < 60) return s + 's';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + 'm';
+    var h = Math.floor(m / 60);
+    if (h < 24) return m % 60 === 0 ? h + 'h' : h + 'h' + (m % 60) + 'm';
+    return Math.floor(h / 24) + 'd';
+  }
+
+  // Elapsed times are rendered server-side, so a scan in flight would keep
+  // reading "0s ago" until something else refreshed the row. Recounting from
+  // the instant in <time datetime> keeps them climbing with no request. Keyed
+  // on data-elapsed, which the `since` helper sets: a <time> holding anything
+  // other than a "this long ago" value must not be rewritten as one.
+  function elapsed() {
+    var now = Date.now();
+    document.querySelectorAll('time[data-elapsed][datetime]').forEach(function (el) {
+      var t = Date.parse(el.getAttribute('datetime'));
+      if (isNaN(t)) return;
+      el.textContent = humanDuration(Math.max(0, now - t)) + ' ago';
+    });
+  }
+
   function init() {
     icons();
     highlight();
     restoreTab();
     chatToBottom();
+    elapsed();
   }
 
   if (document.readyState === 'loading') {
@@ -53,16 +82,78 @@
     init();
   }
 
-  document.addEventListener('htmx:afterSwap', function () { icons(); highlight(); });
+  setInterval(elapsed, 1000);
+
+  document.addEventListener('htmx:afterSwap', function () { icons(); highlight(); elapsed(); });
   document.addEventListener('htmx:historyRestore', init);
-  document.addEventListener('htmx:oobAfterSwap', function () { icons(); highlight(); });
+  document.addEventListener('htmx:oobAfterSwap', function () { icons(); highlight(); elapsed(); });
 
   document.body.addEventListener('htmx:sseMessage', function (e) {
     var el = e.target.closest('[data-reload-on-sse]');
     if (el && e.detail.type === el.getAttribute('data-reload-on-sse')) location.reload();
   });
 
+  function activateDisclosureMode(button, focusEditor) {
+    var disclosure = button.closest('[data-disclosure-editor]');
+    if (!disclosure) return;
+    var editing = button.getAttribute('data-disclosure-mode') === 'edit';
+    var preview = disclosure.querySelector('[data-disclosure-preview]');
+    var editor = disclosure.querySelector('[data-disclosure-form]');
+    var textarea = editor && editor.querySelector('textarea');
+    var stale = preview && preview.querySelector('[data-disclosure-preview-stale]');
+    if (preview) preview.hidden = editing;
+    if (editor) editor.hidden = !editing;
+    if (stale && !editing) stale.hidden = !textarea || textarea.value === textarea.defaultValue;
+    disclosure.querySelectorAll('[data-disclosure-mode]').forEach(function (candidate) {
+      var selected = candidate === button;
+      candidate.setAttribute('aria-selected', selected ? 'true' : 'false');
+      candidate.setAttribute('tabindex', selected ? '0' : '-1');
+      candidate.className = selected ? 'btn-sm' : 'btn-sm-outline';
+    });
+    if (editing && focusEditor && textarea) textarea.focus();
+  }
+
+  document.addEventListener('keydown', function (e) {
+    var tab = e.target.closest('[data-disclosure-mode][role="tab"]');
+    if (!tab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    var tabs = Array.from(tab.closest('[role="tablist"]').querySelectorAll('[role="tab"]'));
+    var index = tabs.indexOf(tab);
+    if (e.key === 'Home') index = 0;
+    else if (e.key === 'End') index = tabs.length - 1;
+    else index = (index + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    e.preventDefault();
+    activateDisclosureMode(tabs[index], false);
+    tabs[index].focus();
+  });
+
   document.addEventListener('click', function (e) {
+    var disclosureMode = e.target.closest('[data-disclosure-mode]');
+    if (disclosureMode) {
+      e.preventDefault();
+      activateDisclosureMode(disclosureMode, true);
+      return;
+    }
+
+    var disclosureCancel = e.target.closest('[data-disclosure-cancel]');
+    if (disclosureCancel) {
+      var disclosureForm = disclosureCancel.closest('form');
+      var disclosureRoot = disclosureCancel.closest('[data-disclosure-editor]');
+      if (disclosureForm) disclosureForm.reset();
+      if (disclosureRoot) {
+        // Cancel returns to the saved draft, so with nothing saved the editor
+        // stays open rather than dropping the analyst on an empty preview.
+        // Focus follows the tab, which the panel it came from just hid.
+        var draft = disclosureRoot.querySelector('[data-disclosure-form] textarea');
+        var saved = draft && draft.defaultValue.trim() !== '';
+        var target = disclosureRoot.querySelector('[data-disclosure-mode="' + (saved ? 'preview' : 'edit') + '"]');
+        if (target) {
+          activateDisclosureMode(target, false);
+          target.focus();
+        }
+      }
+      return;
+    }
+
     var copyBtn = e.target.closest('[data-copy]');
     if (copyBtn && navigator.clipboard) {
       e.preventDefault();

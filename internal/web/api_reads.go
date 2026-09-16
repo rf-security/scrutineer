@@ -11,10 +11,31 @@ import (
 	"scrutineer/internal/worker"
 )
 
+const (
+	repositoryReadDefaultLimit = 200
+	repositoryReadMaxLimit     = 1000
+)
+
 // The read endpoints below expose the structured rows scrutineer already
 // populates from prior skill scans. Skills that need context for a repo
 // (verify/patch/disclose, security-deep-dive's reach and prior-art steps)
 // call these instead of re-parsing the original scan reports.
+
+func parseLimit(r *http.Request, defaultN, maxN int) (int, error) {
+	query := r.URL.Query()
+	if !query.Has("limit") {
+		return defaultN, nil
+	}
+	raw := query.Get("limit")
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0, errors.New("limit must be a non-negative integer")
+	}
+	if n > maxN {
+		n = maxN
+	}
+	return n, nil
+}
 
 // repoScopedID parses the path id and enforces the scan-owns-repo auth
 // rule for the apiList* handlers. Returns false when the response has
@@ -71,6 +92,14 @@ type packageResponse struct {
 	DependentRepos    int        `json:"dependent_repos"`
 	RegistryURL       string     `json:"registry_url"`
 	LatestReleaseAt   *time.Time `json:"latest_release_at"`
+	// SubPath is the monorepo sub-package this package is attributed to (its
+	// Subproject's path), when monorepo attribution linked it. Empty for a
+	// repo-level package. Lets an API consumer group a monorepo's packages by
+	// sub-package without a second lookup.
+	SubPath string `json:"sub_path,omitempty"`
+	// RiskFlags are the packages skill's supply-chain hygiene warnings for
+	// this package. The evidence for each stays in the scan report.
+	RiskFlags []string `json:"risk_flags,omitempty"`
 }
 
 func (s *Server) apiListPackages(w http.ResponseWriter, r *http.Request) {
@@ -80,9 +109,17 @@ func (s *Server) apiListPackages(w http.ResponseWriter, r *http.Request) {
 	}
 	var rows []db.Package
 	s.DB.Where("repository_id = ?", id).Order("dependent_repos desc, downloads desc").Find(&rows)
+	// Resolve each linked package's sub-package path in one query rather than
+	// per row.
+	subPaths := map[uint]string{}
+	var subs []db.Subproject
+	s.DB.Select("id", "path").Where("repository_id = ?", id).Find(&subs)
+	for _, sp := range subs {
+		subPaths[sp.ID] = sp.Path
+	}
 	out := make([]packageResponse, 0, len(rows))
 	for _, p := range rows {
-		out = append(out, packageResponse{
+		resp := packageResponse{
 			ID:                p.ID,
 			Name:              p.Name,
 			Ecosystem:         p.Ecosystem,
@@ -93,7 +130,12 @@ func (s *Server) apiListPackages(w http.ResponseWriter, r *http.Request) {
 			DependentRepos:    p.DependentRepos,
 			RegistryURL:       p.RegistryURL,
 			LatestReleaseAt:   p.LatestReleaseAt,
-		})
+			RiskFlags:         db.PackageRiskFlags(p.RiskFlags),
+		}
+		if p.SubprojectID != nil {
+			resp.SubPath = subPaths[*p.SubprojectID]
+		}
+		out = append(out, resp)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -153,8 +195,13 @@ func (s *Server) apiListDependents(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	limit, err := parseLimit(r, repositoryReadDefaultLimit, repositoryReadMaxLimit)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var rows []db.Dependent
-	s.DB.Where("repository_id = ?", id).Order("dependent_repos desc").Find(&rows)
+	s.DB.Where("repository_id = ?", id).Order("dependent_repos desc").Limit(limit).Find(&rows)
 	out := make([]dependentResponse, 0, len(rows))
 	for _, d := range rows {
 		out = append(out, dependentResponse{
@@ -190,8 +237,13 @@ func (s *Server) apiListDependencies(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	limit, err := parseLimit(r, repositoryReadDefaultLimit, repositoryReadMaxLimit)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	var rows []db.Dependency
-	s.DB.Where("repository_id = ?", id).Order("ecosystem, name").Find(&rows)
+	s.DB.Where("repository_id = ?", id).Order("ecosystem, name").Limit(limit).Find(&rows)
 	out := make([]dependencyResponse, 0, len(rows))
 	for _, d := range rows {
 		out = append(out, dependencyResponse{
@@ -210,10 +262,10 @@ func (s *Server) apiListDependencies(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// apiListDependencyFindings returns findings on any library repository whose
-// published package appears in this repository's dependency list. The skill
-// token still only authorises the caller's own repo; the cross-repo read is
-// derived from that repo's dependencies, not chosen by the caller.
+// apiListDependencyFindings returns notified or published findings on any
+// library repository whose published package appears in this repository's
+// dependency list. The caller's dependency rows select candidate libraries,
+// but unpublished findings never cross the repository boundary.
 func (s *Server) apiListDependencyFindings(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.repoScopedID(w, r)
 	if !ok {
@@ -266,7 +318,7 @@ func (s *Server) apiListFindings(w http.ResponseWriter, r *http.Request) {
 		q = q.Where("status = ?", status)
 	}
 	var rows []db.Finding
-	q.Find(&rows)
+	q.Select(findingSummaryColumns).Find(&rows)
 	out := make([]map[string]any, 0, len(rows))
 	for _, f := range rows {
 		out = append(out, findingSummary(f))
@@ -323,38 +375,85 @@ func (s *Server) apiGetFinding(w http.ResponseWriter, r *http.Request) {
 	summary["reach"] = f.Reach
 	summary["rating"] = f.Rating
 	summary["disclosure_draft"] = f.DisclosureDraft
+	summary["disclosure_title"] = f.DisclosureTitle
 	summary["suggested_recipients"] = f.SuggestedRecipients
 	summary["suggested_fix"] = f.SuggestedFix
 	summary["suggested_fix_commit"] = f.SuggestedFixCommit
+	verification, err := db.LatestFindingVerification(s.DB, f.ID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "load finding verification")
+		return
+	}
+	if verification != nil {
+		summary["verification"] = findingVerificationResponse(verification)
+	}
+	attackPath, err := db.LatestFindingAttackPath(s.DB, f.ID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "load finding attack path")
+		return
+	}
+	if attackPath != nil {
+		summary["attack_path"] = findingAttackPathResponse(attackPath)
+	}
+	attempt, err := db.LatestRemediationAttempt(s.DB, f.ID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "load remediation attempt")
+		return
+	}
+	if attempt != nil {
+		validation, err := db.LatestRemediationValidation(s.DB, attempt.ID)
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "load remediation validation")
+			return
+		}
+		summary["remediation"] = remediationAttemptResponse(attempt, validation)
+	}
 	writeJSON(w, http.StatusOK, summary)
+}
+
+// findingSummaryColumns lists what findingSummary reads, leaving out the prose
+// blobs it never emits. Keep in sync with findingSummary.
+var findingSummaryColumns = []string{
+	"id", "scan_id", "repository_id", "finding_id", "commit", "sinks", "title",
+	"severity", "severity_caps", "severity_calibration_incomplete", "status", "cwe", "location", "vid", "affected", "reachability",
+	"quality_tier", "cve_id", "ghsa_id", "cvss_vector", "cvss_score",
+	"fix_version", "fix_commit", "resolution", "assignee", "missed_count",
+	"dup_check", "novelty", "novelty_checked_commit", "novelty_checked_at",
+	"production_viability",
 }
 
 func findingSummary(f db.Finding) map[string]any {
 	return map[string]any{
-		"id":            f.ID,
-		"scan_id":       f.ScanID,
-		"repository_id": f.RepositoryID,
-		"finding_id":    f.FindingID,
-		"commit":        f.Commit,
-		"sinks":         f.Sinks,
-		"title":         f.Title,
-		"severity":      f.Severity,
-		statusKey:       string(f.Status),
-		"cwe":           f.CWE,
-		"location":      f.Location,
-		"vid":           f.VID,
-		"affected":      f.Affected,
-		"reachability":  f.Reachability,
-		"quality_tier":  f.QualityTier,
-		"cve_id":        f.CVEID,
-		"ghsa_id":       f.GHSAID,
-		"cvss_vector":   f.CVSSVector,
-		"cvss_score":    f.CVSSScore,
-		"fix_version":   f.FixVersion,
-		"fix_commit":    f.FixCommit,
-		"resolution":    string(f.Resolution),
-		"assignee":      f.Assignee,
-		"missed_count":  f.MissedCount,
-		"dup_check":     f.DupCheck,
+		"id":                              f.ID,
+		"scan_id":                         f.ScanID,
+		"repository_id":                   f.RepositoryID,
+		"finding_id":                      f.FindingID,
+		"commit":                          f.Commit,
+		"sinks":                           f.Sinks,
+		"title":                           f.Title,
+		"severity":                        f.Severity,
+		"severity_caps":                   f.SeverityCapList(),
+		"severity_calibration_incomplete": f.SeverityCalibrationIncomplete,
+		statusKey:                         string(f.Status),
+		"cwe":                             f.CWE,
+		"location":                        f.Location,
+		"vid":                             f.VID,
+		"affected":                        f.Affected,
+		"reachability":                    f.Reachability,
+		"quality_tier":                    f.QualityTier,
+		"cve_id":                          f.CVEID,
+		"ghsa_id":                         f.GHSAID,
+		"cvss_vector":                     f.CVSSVector,
+		"cvss_score":                      f.CVSSScore,
+		"fix_version":                     f.FixVersion,
+		"fix_commit":                      f.FixCommit,
+		"resolution":                      string(f.Resolution),
+		"assignee":                        f.Assignee,
+		"missed_count":                    f.MissedCount,
+		"dup_check":                       f.DupCheck,
+		"novelty":                         string(f.Novelty),
+		"novelty_checked_commit":          f.NoveltyCheckedCommit,
+		"novelty_checked_at":              f.NoveltyCheckedAt,
+		"production_viability":            f.ProductionViability,
 	}
 }

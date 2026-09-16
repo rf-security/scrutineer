@@ -13,7 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"scrutineer/internal/llm"
+	"github.com/alpha-omega-security/harness/llm"
+
 	"scrutineer/internal/worker"
 )
 
@@ -107,6 +108,125 @@ should_find:
 	}
 }
 
+func TestValidateExperimentPairs(t *testing.T) {
+	paired := []Scenario{
+		{
+			Path:       "a.yaml",
+			Given:      "same fixture and rubric",
+			Fixture:    "fixtures/a",
+			Experiment: "prompt",
+			Variant:    "production",
+			ShouldFind: []Assertion{
+				{Finding: "SQL injection", Required: true},
+				{Finding: "command injection", Required: true},
+			},
+			ShouldNotFind: []Assertion{
+				{Finding: "unused import"},
+				{Finding: "dead code"},
+			},
+		},
+		{
+			Path:       "a-short.yaml",
+			Given:      "same fixture and rubric",
+			Fixture:    "fixtures/a",
+			Experiment: "prompt",
+			Variant:    "candidate",
+			ShouldFind: []Assertion{
+				{Finding: "command injection", Required: true, requiredSet: true},
+				{Finding: "SQL injection", Required: true, requiredSet: true},
+			},
+			ShouldNotFind: []Assertion{
+				{Finding: "dead code"},
+				{Finding: "unused import"},
+			},
+		},
+	}
+	if err := validateExperimentPairs(paired); err != nil {
+		t.Fatalf("validateExperimentPairs() = %v, want nil", err)
+	}
+
+	tests := []struct {
+		name      string
+		scenarios []Scenario
+		want      string
+	}{
+		{
+			name: "one variant",
+			scenarios: []Scenario{
+				{Path: "a.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "production"},
+			},
+			want: "at least 2",
+		},
+		{
+			name: "different fixtures",
+			scenarios: []Scenario{
+				{Path: "a.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "production"},
+				{Path: "b.yaml", Fixture: "fixtures/b", Experiment: "prompt", Variant: "candidate"},
+			},
+			want: "different fixtures",
+		},
+		{
+			name: "duplicate fixture",
+			scenarios: []Scenario{
+				{Path: "a.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "production"},
+				{Path: "again.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "production"},
+				{Path: "candidate.yaml", Fixture: "fixtures/a", Experiment: "prompt", Variant: "candidate"},
+			},
+			want: "repeats fixture",
+		},
+		{
+			name: "different given",
+			scenarios: []Scenario{
+				{
+					Path:       "a.yaml",
+					Given:      "SQL injection reaches the database",
+					Fixture:    "fixtures/a",
+					Experiment: "prompt",
+					Variant:    "production",
+					ShouldFind: []Assertion{{Finding: "SQL injection"}},
+				},
+				{
+					Path:       "candidate.yaml",
+					Given:      "An injection reaches the database",
+					Fixture:    "fixtures/a",
+					Experiment: "prompt",
+					Variant:    "candidate",
+					ShouldFind: []Assertion{{Finding: "SQL injection"}},
+				},
+			},
+			want: "different given text",
+		},
+		{
+			name: "different assertions",
+			scenarios: []Scenario{
+				{
+					Path:       "a.yaml",
+					Fixture:    "fixtures/a",
+					Experiment: "prompt",
+					Variant:    "production",
+					ShouldFind: []Assertion{{Finding: "SQL injection"}},
+				},
+				{
+					Path:       "candidate.yaml",
+					Fixture:    "fixtures/a",
+					Experiment: "prompt",
+					Variant:    "candidate",
+					ShouldFind: []Assertion{{Finding: "command injection"}},
+				},
+			},
+			want: "different assertions",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateExperimentPairs(tc.scenarios)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateExperimentPairs() = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestScenarioValidate(t *testing.T) {
 	tests := []struct {
 		name string
@@ -195,6 +315,53 @@ func TestScenarioValidate(t *testing.T) {
 				ShouldFind:  []Assertion{{Finding: "x"}},
 			},
 		},
+		{
+			name: "experiment without variant",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "security-deep-dive",
+				Experiment: "prompt-test",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
+		{
+			name: "invalid variant identifier",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "security-deep-dive",
+				Experiment: "prompt-test",
+				Variant:    "candidate/one",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
+		{
+			name: "experiment surrounding whitespace",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "security-deep-dive",
+				Experiment: " prompt-test",
+				Variant:    "candidate",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
+		{
+			name: "variant surrounding whitespace",
+			sc: Scenario{
+				Path:       "case.yaml",
+				Given:      "x",
+				Fixture:    "fixtures/x",
+				Skill:      "security-deep-dive",
+				Experiment: "prompt-test",
+				Variant:    "candidate ",
+				ShouldFind: []Assertion{{Finding: "x"}},
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -263,7 +430,8 @@ func TestHeuristicJudge(t *testing.T) {
 }
 
 func TestAssertionMatchesFinding(t *testing.T) {
-	baseFinding := Finding{Title: "SQL injection in buildQuery", Severity: "high", CWE: "cwe-89", Location: "app.py:12:3"}
+	baseFinding := Finding{Sinks: []string{"S1"}, Title: "SQL injection in buildQuery", Severity: "high", CWE: "cwe-89", Location: "app.py:12:3"}
+	classes := map[string]string{"S1": "Template or interpolation"}
 	tests := []struct {
 		name string
 		a    Assertion
@@ -290,6 +458,20 @@ func TestAssertionMatchesFinding(t *testing.T) {
 			f:    Finding{Title: "nested", Location: "pkg/app.py:1"},
 			want: true,
 		},
+		{name: "sink class match", a: Assertion{SinkClass: "template or interpolation"}, want: true},
+		{name: "sink class mismatch", a: Assertion{SinkClass: "API misuse"}, want: false},
+		{
+			name: "sink class needs an inventory entry",
+			a:    Assertion{SinkClass: "Template or interpolation"},
+			f:    Finding{Sinks: []string{"S9"}, Title: "uninventoried", Location: "app.py:1"},
+			want: false,
+		},
+		{
+			name: "sink class needs a cited sink",
+			a:    Assertion{SinkClass: "Template or interpolation"},
+			f:    Finding{Title: "sinkless", Location: "app.py:1"},
+			want: false,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -297,7 +479,7 @@ func TestAssertionMatchesFinding(t *testing.T) {
 			if f.Title == "" && f.Location == "" {
 				f = baseFinding
 			}
-			if got := assertionMatchesFinding(tc.a, f); got != tc.want {
+			if got := assertionMatchesFinding(tc.a, f, classes); got != tc.want {
 				t.Fatalf("assertionMatchesFinding() = %v, want %v", got, tc.want)
 			}
 		})
@@ -371,6 +553,34 @@ func TestRunnerLoadsEvalSkillWithProductionSchema(t *testing.T) {
 	}
 	if res.FailedRequired != 0 || res.Unexpected != 0 {
 		t.Fatalf("unexpected failures: %+v", res)
+	}
+}
+
+func TestRunnerStagesEvalSkillReferences(t *testing.T) {
+	sc := mustLoadScenario(t, "../../evals/security-deep-dive-short-sqli.yaml")
+	inspected := false
+	r := Runner{
+		Runner: fakeSkillRunner{
+			report: validDeepDiveReport(),
+			inspect: func(sj worker.SkillJob) error {
+				inspected = true
+				for _, name := range []string{"sink-taxonomy.md", "report-contract.md"} {
+					if _, err := os.Stat(filepath.Join(sj.SkillDir, "references", name)); err != nil {
+						return fmt.Errorf("staged reference %s: %w", name, err)
+					}
+				}
+				return nil
+			},
+		},
+		SkillsRoot: "../../skills",
+		EvalsRoot:  "../../evals",
+		WorkRoot:   t.TempDir(),
+	}
+	if _, err := r.RunScenario(context.Background(), sc); err != nil {
+		t.Fatal(err)
+	}
+	if !inspected {
+		t.Fatal("skill runner did not inspect staged references")
 	}
 }
 
@@ -589,6 +799,198 @@ func TestMassAssignmentScenario(t *testing.T) {
 	}
 }
 
+func TestAPIMisuseScenario(t *testing.T) {
+	sc := mustLoadScenario(t, "../../evals/security-deep-dive-api-misuse.yaml")
+	// The scenario asserts the class the run put on the sink it cites, not just
+	// the prose, so the inventory entry is what carries `API misuse` here.
+	report := `{
+  "inventory":[{"id":"S1","location":"client.py:5","class":"API misuse","boundary":"caller of the fetch helper","consumes":"the verify argument default"}],
+  "findings":[{
+  "sinks":["S1"],
+  "title":"TLS verification disabled by default in fetch",
+  "cwe":"CWE-295",
+  "location":"client.py:5",
+  "trace":"fetch(url, verify=False) leaves context.verify_mode at ssl.CERT_NONE for a caller who passes nothing."
+}]}`
+	got, err := (HeuristicJudge{}).Judge(sc, report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("results = %d, want 3", len(got))
+	}
+	for _, result := range got {
+		if !result.Matched {
+			t.Fatalf("api-misuse assertion did not pass: %+v", result)
+		}
+	}
+
+	// The two helpers have identical bodies, so a run that reports the one
+	// whose default is safe is reacting to the opt-out rather than to the
+	// default. That is what the negative assertion exists to catch. Each
+	// helper owns a file, so both assertions turn on the path: this title
+	// never says fetch_pinned yet the report is still caught, while the
+	// evidence that carries the real finding no longer buys it the positive.
+	safeReport := `{
+  "inventory":[{"id":"S1","location":"pinned_client.py:5","class":"API misuse","boundary":"caller of the fetch helper","consumes":"the verify argument default"}],
+  "findings":[{
+  "sinks":["S1"],
+  "title":"Certificate validation can be disabled in the pinned helper",
+  "cwe":"CWE-295",
+  "location":"pinned_client.py:5",
+  "trace":"fetch_pinned(url, verify=False) reaches ssl.CERT_NONE, although its default keeps certificate checking on."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, safeReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("safe results = %d, want 3", len(got))
+	}
+	if got[0].Matched {
+		t.Errorf("report naming only the safe helper passed the required positive: %+v", got[0])
+	}
+	if got[2].Kind != assertionShouldNotFind {
+		t.Fatalf("safe result kind = %q, want %q", got[2].Kind, assertionShouldNotFind)
+	}
+	if got[2].Matched {
+		t.Fatalf("safely defaulted helper unexpectedly passed should_not_find: %+v", got[2])
+	}
+
+	// The skill steers a write-up toward contrasting the two defaults, so a
+	// correct finding may well name the safe helper. It stays in client.py,
+	// which is what keeps the negative off it.
+	contrastReport := `{
+  "inventory":[{"id":"S1","location":"client.py:5","class":"API misuse","boundary":"caller of the fetch helper","consumes":"the verify argument default"}],
+  "findings":[{
+  "sinks":["S1"],
+  "title":"fetch defaults verify off while fetch_pinned is the safe counterpart",
+  "cwe":"CWE-295",
+  "location":"client.py:5",
+  "trace":"fetch(url, verify=False) leaves context.verify_mode at ssl.CERT_NONE for a caller who passes nothing."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, contrastReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("contrast results = %d, want 3", len(got))
+	}
+	for _, result := range got {
+		if !result.Matched {
+			t.Errorf("write-up contrasting the two helpers failed an assertion: %+v", result)
+		}
+	}
+
+	// The same finding filed as a plain TLS bug at the call site. Everything the
+	// prose assertions look at is unchanged, so the class on the cited sink is
+	// the only thing standing between this and the required positive: the
+	// scenario is about reaching the API definition, not about noticing that
+	// urlopen can run without certificate checks.
+	networkReport := `{
+  "inventory":[{"id":"S1","location":"client.py:11","class":"Network","boundary":"caller of the fetch helper","consumes":"the url argument"}],
+  "findings":[{
+  "sinks":["S1"],
+  "title":"TLS verification disabled by default in fetch",
+  "cwe":"CWE-295",
+  "location":"client.py:11",
+  "trace":"fetch(url, verify=False) leaves context.verify_mode at ssl.CERT_NONE for a caller who passes nothing."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, networkReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("network-class results = %d, want 3", len(got))
+	}
+	if got[0].Matched {
+		t.Errorf("finding whose sink is not classified API misuse passed the required positive: %+v", got[0])
+	}
+}
+
+func TestConventionPrevalenceScenario(t *testing.T) {
+	sc := mustLoadScenario(t, "../../evals/security-deep-dive-convention.yaml")
+	// One finding for the reachable site, with the other eight named as the
+	// convention in prior_art. Citing them there must not read as reporting
+	// them, which is what keeps the convention write-up from tripping the
+	// negative assertion.
+	report := `{"findings":[{
+  "title":"SQL injection in search",
+  "cwe":"CWE-89",
+  "location":"search.py:11",
+  "trace":"flask.request.args supplies q, which reaches SELECT id FROM items through store.query.",
+  "prior_art":"grep -rn 'query(\"SELECT' finds 9 hits; the 8 in reports.py interpolate module constants."
+}]}`
+	got, err := (HeuristicJudge{}).Judge(sc, report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("results = %d, want 2", len(got))
+	}
+	for _, result := range got {
+		if !result.Matched {
+			t.Fatalf("convention assertion did not pass: %+v", result)
+		}
+	}
+
+	// The reachable site is written up correctly here. What the negative catches
+	// is the eight house-idiom sites filed alongside it, so the search finding
+	// keeps its prior art to leave the count out of the verdict.
+	conventionReport := `{"findings":[{
+  "title":"SQL injection in search",
+  "cwe":"CWE-89",
+  "location":"search.py:11",
+  "trace":"flask.request.args supplies q, which reaches SELECT id FROM items through store.query.",
+  "prior_art":"grep -rn 'query(\"SELECT' finds 9 hits; the 8 in reports.py interpolate module constants."
+},{
+  "title":"SQL injection in active_accounts",
+  "cwe":"CWE-89",
+  "location":"reports.py:5",
+  "trace":"STATUS_ACTIVE is interpolated into the accounts query."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, conventionReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("convention results = %d, want 2", len(got))
+	}
+	if got[1].Kind != assertionShouldNotFind {
+		t.Fatalf("convention result kind = %q, want %q", got[1].Kind, assertionShouldNotFind)
+	}
+	if got[1].Matched {
+		t.Fatalf("house-idiom site unexpectedly passed should_not_find: %+v", got[1])
+	}
+
+	// The same sweep cited without its count. Everything else the assertion asks
+	// for is here, the grep command included, so the count is the only thing
+	// missing: prevalence is what tells this site apart from the eight the run
+	// is meant to leave alone, so a write-up that never counted them has not
+	// done that work. The rating and the handler location are what a real report
+	// carries; each holds a 9 that a bare "9" evidence term would have taken for
+	// the count.
+	uncountedReport := `{"findings":[{
+  "title":"SQL injection in search",
+  "cwe":"CWE-89",
+  "location":"search.py:11",
+  "locations":["search.py:9","search.py:11"],
+  "rating":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H, 9.8 critical",
+  "trace":"flask.request.args supplies q, which reaches SELECT id FROM items through store.query.",
+  "prior_art":"grep -rn 'query(\"SELECT' shows the same idiom across the reports module."
+}]}`
+	got, err = (HeuristicJudge{}).Judge(sc, uncountedReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("uncounted results = %d, want 2", len(got))
+	}
+	if got[0].Matched {
+		t.Errorf("sweep cited with no hit count passed the required positive: %+v", got[0])
+	}
+}
+
 func TestRunnerCountsMustNotContainFailure(t *testing.T) {
 	sc, err := LoadScenario("../../evals/security-deep-dive-sqli.yaml")
 	if err != nil {
@@ -637,15 +1039,22 @@ func TestRunFixtures(t *testing.T) {
 		}}
 	}
 	results, err := r.RunAll(context.Background(), scenarios)
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, res := range results {
 		t.Logf("%s: assertions=%d required_misses=%d optional_misses=%d unexpected=%d cost=$%.4f turns=%d",
 			res.Scenario.Path, res.AssertionTotal, res.FailedRequired, res.OptionalMisses, res.Unexpected, res.Cost.USD, res.Cost.Turns)
 		if res.FailedRequired > 0 || res.Unexpected > 0 {
 			t.Fail()
 		}
+	}
+	for _, summary := range SummarizeExperiments(results) {
+		t.Logf("experiment=%s variant=%s scenarios=%d passed=%d errors=%d assertions=%d required_misses=%d optional_misses=%d unexpected=%d cost=$%.4f turns=%d input_tokens=%d output_tokens=%d cache_read_tokens=%d cache_write_tokens=%d",
+			summary.Experiment, summary.Variant, summary.ScenarioTotal, summary.Passed, summary.Errors,
+			summary.AssertionTotal, summary.FailedRequired, summary.OptionalMisses, summary.Unexpected,
+			summary.Cost.USD, summary.Cost.Turns, summary.Cost.InputTokens, summary.Cost.OutputTokens,
+			summary.Cost.CacheReadTokens, summary.Cost.CacheWriteTokens)
+	}
+	if err != nil {
+		t.Errorf("run scenarios: %v", err)
 	}
 }
 
@@ -723,6 +1132,48 @@ func TestRunAllContinuesAfterScenarioError(t *testing.T) {
 	}
 }
 
+func TestSummarizeExperiments(t *testing.T) {
+	results := []Result{
+		{
+			Scenario:       Scenario{Experiment: "prompt", Variant: "production"},
+			AssertionTotal: 2,
+			Cost:           Cost{USD: 0.03, Turns: 2, InputTokens: 30},
+		},
+		{
+			Scenario:       Scenario{Experiment: "prompt", Variant: "production"},
+			AssertionTotal: 3,
+			FailedRequired: 1,
+			OptionalMisses: 1,
+			Cost:           Cost{USD: 0.04, Turns: 3, InputTokens: 40},
+		},
+		{
+			Scenario:       Scenario{Experiment: "prompt", Variant: "reference-driven"},
+			AssertionTotal: 2,
+			Unexpected:     1,
+			Cost:           Cost{USD: 0.02, Turns: 1, InputTokens: 20},
+		},
+		{
+			Scenario: Scenario{Experiment: "prompt", Variant: "reference-driven"},
+			Error:    "runner failed",
+		},
+		{Scenario: Scenario{Skill: "unpaired"}, AssertionTotal: 99},
+	}
+
+	got := SummarizeExperiments(results)
+	if len(got) != 2 {
+		t.Fatalf("summaries = %d, want 2: %+v", len(got), got)
+	}
+	if got[0].Variant != "production" || got[0].ScenarioTotal != 2 || got[0].Passed != 1 ||
+		got[0].AssertionTotal != 5 || got[0].FailedRequired != 1 || got[0].OptionalMisses != 1 ||
+		got[0].Cost.USD < 0.0699 || got[0].Cost.USD > 0.0701 || got[0].Cost.Turns != 5 || got[0].Cost.InputTokens != 70 {
+		t.Fatalf("production summary = %+v", got[0])
+	}
+	if got[1].Variant != "reference-driven" || got[1].ScenarioTotal != 2 || got[1].Passed != 0 ||
+		got[1].Errors != 1 || got[1].Unexpected != 1 || got[1].AssertionTotal != 2 {
+		t.Fatalf("reference-driven summary = %+v", got[1])
+	}
+}
+
 func mustLoadScenario(t *testing.T, path string) Scenario {
 	t.Helper()
 	sc, err := LoadScenario(path)
@@ -769,7 +1220,7 @@ func validDeepDiveReport() string {
 	return `{
   "repository": "https://example.com/eval",
   "commit": "abcdef1",
-  "spec_version": 13,
+  "spec_version": 14,
   "model": "test-model",
   "date": "2026-07-09",
   "languages": ["Python"],
@@ -826,7 +1277,7 @@ func incompleteDeepDiveReport() string {
 	return `{
   "repository": "https://example.com/eval",
   "commit": "abcdef1",
-  "spec_version": 13,
+  "spec_version": 14,
   "model": "test-model",
   "date": "2026-07-09",
   "languages": ["Python"],
@@ -857,13 +1308,19 @@ func incompleteDeepDiveReport() string {
 }
 
 type fakeSkillRunner struct {
-	report string
-	err    error
+	report  string
+	err     error
+	inspect func(worker.SkillJob) error
 }
 
 func (f fakeSkillRunner) RunSkill(ctx context.Context, sj worker.SkillJob, emit func(worker.Event)) (worker.SkillResult, error) {
 	if f.err != nil {
 		return worker.SkillResult{}, f.err
+	}
+	if f.inspect != nil {
+		if err := f.inspect(sj); err != nil {
+			return worker.SkillResult{}, err
+		}
 	}
 	if sj.Name == "" || sj.SkillDir == "" || sj.OutputFile == "" {
 		return worker.SkillResult{}, os.ErrInvalid

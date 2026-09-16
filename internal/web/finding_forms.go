@@ -1,6 +1,8 @@
 package web
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -21,7 +23,14 @@ import (
 var analystFields = []string{
 	"title", "severity", "cwe", "location", "affected",
 	"cve_id", "ghsa_id", "cvss_vector", "cvss_v4_vector", "fix_version", "fix_commit",
-	"resolution", "disclosure_draft", "suggested_recipients", "assignee",
+	"resolution", "disclosure_draft", "disclosure_title", "suggested_recipients", "assignee",
+}
+
+func findingWriteErrorStatus(err error, fallback int) int {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return http.StatusServiceUnavailable
+	}
+	return fallback
 }
 
 func (s *Server) findingFields(w http.ResponseWriter, r *http.Request) {
@@ -33,7 +42,7 @@ func (s *Server) findingFields(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.DB.Transaction(func(tx *gorm.DB) error {
+	if err := db.FindingWriteTransaction(s.DB.WithContext(r.Context()), f.ID, func(tx *gorm.DB) error {
 		for _, field := range analystFields {
 			value, ok := r.Form[field]
 			if !ok {
@@ -45,10 +54,29 @@ func (s *Server) findingFields(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}); err != nil {
-		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		http.Error(w, err.Error(), findingWriteErrorStatus(err, http.StatusUnprocessableEntity))
 		return
 	}
 	s.redirect(w, r, fmt.Sprintf("/findings/%d", f.ID))
+}
+
+// findingDisclosureDraftSave persists edits from the disclosure editor.
+func (s *Server) findingDisclosureDraftSave(w http.ResponseWriter, r *http.Request) {
+	f, ok := loadByID[db.Finding](s, w, r)
+	if !ok {
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	draft := strings.TrimSpace(strings.ReplaceAll(r.FormValue("disclosure_draft"), "\r\n", "\n"))
+	if err := db.WriteFindingField(s.DB.WithContext(r.Context()), f.ID, "disclosure_draft", draft, db.SourceAnalyst, ""); err != nil {
+		http.Error(w, err.Error(), findingWriteErrorStatus(err, http.StatusUnprocessableEntity))
+		return
+	}
+	setFlash(w, Flash{Category: successKey, Title: "Disclosure draft saved"})
+	s.redirect(w, r, fmt.Sprintf("/findings/%d#disclosure", f.ID))
 }
 
 func (s *Server) findingCommunications(w http.ResponseWriter, r *http.Request) {

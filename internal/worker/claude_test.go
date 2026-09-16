@@ -11,6 +11,27 @@ import (
 	"scrutineer/internal/db"
 )
 
+// These test-only shims keep the pre-extraction argv assertions below working
+// as integration tests over SkillJob.toJob() + the module's Args()/Prompt().
+// They exist so a harness-module bump that changes argv shape or prompt bytes
+// fails an existing test rather than silently changing what operators see.
+//
+//nolint:unparam // maxTurns is always 0 in these tests; kept for signature parity
+func buildClaudeArgs(sj SkillJob, effort string, maxTurns int) []string {
+	return ClaudeHarness{}.Args(sj.toJob(effort, maxTurns, ""))
+}
+
+func buildSkillPrompt(name, outputFile string) string {
+	return ClaudeHarness{}.Prompt(SkillJob{Name: name, OutputFile: outputFile}.toJob("", 0, ""))
+}
+
+func buildResumePrompt(name, outputFile string) string {
+	sj := SkillJob{Name: name, OutputFile: outputFile, ResumeSessionID: "x"}
+	return ClaudeHarness{}.Prompt(sj.toJob("", 0, ""))
+}
+
+func claudeAccountErrorText(s string) string { return ClaudeHarness{}.AccountErrorText(s) }
+
 func TestBuildLoggedPrompt_includesActivationAndRenderedSkill(t *testing.T) {
 	skill := &db.Skill{
 		Name:        "metadata",
@@ -18,7 +39,7 @@ func TestBuildLoggedPrompt_includesActivationAndRenderedSkill(t *testing.T) {
 		Body:        "## Workspace\n\n- `./src` — the cloned repo.",
 		OutputFile:  "report.json",
 	}
-	got := buildLoggedPrompt(skill)
+	got := buildLoggedPrompt(skill, "claude")
 	for _, want := range []string{
 		buildSkillPrompt("metadata", "report.json"),
 		"--- SKILL.md ---",
@@ -30,6 +51,31 @@ func TestBuildLoggedPrompt_includesActivationAndRenderedSkill(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("logged prompt missing %q\nfull prompt:\n%s", want, got)
 		}
+	}
+}
+
+func TestBuildLoggedPrompt_usesBackendActivationPrompt(t *testing.T) {
+	skill := &db.Skill{
+		Name:        "metadata",
+		Description: "Identify the repository.",
+		OutputFile:  "report.json",
+	}
+	for _, tc := range []struct {
+		backend string
+		prefix  string
+	}{
+		{"codex", "Follow the instructions in ./skills/metadata/SKILL.md"},
+		{"opencode", "Follow the instructions in ./.opencode/skill/metadata/SKILL.md"},
+	} {
+		t.Run(tc.backend, func(t *testing.T) {
+			got := buildLoggedPrompt(skill, tc.backend)
+			if !strings.HasPrefix(got, tc.prefix) {
+				t.Errorf("logged prompt = %q, want prefix %q", got, tc.prefix)
+			}
+			if strings.HasPrefix(got, `Use the "metadata" skill`) {
+				t.Errorf("logged prompt uses claude activation wording: %q", got)
+			}
+		})
 	}
 }
 
@@ -51,7 +97,7 @@ func TestLocalClaude_RunSkill_rejectsProfileRequiringSkill(t *testing.T) {
 }
 
 func TestBuildClaudeArgs_NoAllowedTools(t *testing.T) {
-	sj := SkillJob{Name: "metadata", Model: "claude-opus-4-7", OutputFile: "report.json"}
+	sj := SkillJob{Name: "metadata", Model: "claude-opus-4-8", OutputFile: "report.json"}
 	args := buildClaudeArgs(sj, "", 0)
 
 	if got := flagValue(args, "--permission-mode"); got != "bypassPermissions" {
@@ -71,7 +117,7 @@ func TestBuildClaudeArgs_NoAllowedTools(t *testing.T) {
 func TestBuildClaudeArgs_AllowedTools(t *testing.T) {
 	sj := SkillJob{
 		Name:         "metadata",
-		Model:        "claude-sonnet-4-6",
+		Model:        "claude-sonnet-5",
 		OutputFile:   "report.json",
 		AllowedTools: "Read,Write,WebFetch",
 		MaxTurns:     50,
@@ -84,7 +130,7 @@ func TestBuildClaudeArgs_AllowedTools(t *testing.T) {
 	if got := flagValue(args, "--allowedTools"); got != "Read,Write,WebFetch,Skill" {
 		t.Errorf("allowedTools = %q, want Read,Write,WebFetch,Skill", got)
 	}
-	if got := flagValue(args, "--model"); got != "claude-sonnet-4-6" {
+	if got := flagValue(args, "--model"); got != "claude-sonnet-5" {
 		t.Errorf("model = %q", got)
 	}
 	if got := flagValue(args, "--effort"); got != "high" {
@@ -155,6 +201,9 @@ func TestBuildClaudeArgs_Resume(t *testing.T) {
 	// The deliverable still has to be restated so a resumed agent writes it.
 	if !strings.Contains(last, "report.json") {
 		t.Errorf("resume prompt %q should restate the output file", last)
+	}
+	if !strings.Contains(last, "validate-report") {
+		t.Errorf("resume prompt %q should restate schema validation", last)
 	}
 }
 

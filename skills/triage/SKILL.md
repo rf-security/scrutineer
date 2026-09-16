@@ -20,7 +20,7 @@ Kick off the standard set of scans against a freshly-added repository.
 
 ## Classify the repository
 
-Run `brief ./src` and read its JSON. Two fields decide which scans are worth queueing:
+Run `brief --json ./src` and read its JSON. These fields decide which scans are worth queueing:
 
 - `languages` — programming languages detected; `null` or empty means no source
 - `package_managers` — manifest/lockfile ecosystems detected; `null` or empty means nothing publishes or consumes packages here
@@ -30,9 +30,23 @@ From those, set two flags:
 - `has_packages` = `package_managers` is present and non-empty
 - `has_code` = `languages` is present and non-empty
 
-A docs repo (markdown only) has neither. Anything with detected source gets the code scans, whether it is an application, a library, infra scripts, or a flat-layout package. The cost of running semgrep on a stray shell script is far lower than missing a real library because brief failed to populate `layout.source_dirs`. Do not gate on `layout.source_dirs`; it is a heuristic and routinely empty for legitimate codebases. If `brief` is not on PATH or exits non-zero, set both flags true and carry on.
+A docs repo (markdown only) has neither. Anything with detected source gets the code scans, whether it is an application, a library, infra scripts, or a flat-layout package. The cost of running semgrep on a stray shell script is far lower than missing a real library because brief failed to populate `layout.source_dirs`. Do not gate on `layout.source_dirs`; it is a heuristic and routinely empty for legitimate codebases.
 
-`brief` does not report CI configuration, so set a third flag from a direct filesystem check:
+Set `has_embedded_native` when Brief reports any of these signals:
+
+- `tools.native_extension` is non-empty
+- `tools.dependency_bot` contains `Git Submodules`
+- the detected languages include at least one of C, C++, Objective-C, Objective-C++, Rust, Go, Fortran, Zig, Assembly, or CUDA, and either another language or a CMake, Meson, or Autotools build tool is also present
+
+This covers native extensions and mixed-language repositories without assuming that native code means C or C++. If `brief` is not on PATH or exits non-zero, set `has_code`, `has_packages`, and `has_embedded_native` true and carry on so the follow-up scan can retry Brief after source preparation.
+
+`languages` also decides one language-specific scanner:
+
+- `has_python` = `languages` contains Python, matched case-insensitively
+
+This gates `bandit`, which reads Python and nothing else. It follows `has_code`: when `brief` is unavailable it is true too, since a missed Python codebase costs more than a scan that finds nothing.
+
+`brief` does not report CI configuration, so set a fourth flag from a direct filesystem check:
 
 - `has_workflows` = `./src/.github/workflows` exists and is a directory
 
@@ -44,9 +58,9 @@ Before enqueueing anything, check what already ran so a re-trigger does not doub
 
 Get the commit you are running at: `git -C ./src rev-parse HEAD`. Then fetch `GET {api_base}/repositories/{repository_id}/scans`, which returns every scan on this repository with `skill_name`, `status`, and `commit`. If that fetch fails, treat the skip set as empty and carry on. Otherwise build a set of skill names to skip: a skill goes in the skip set if it has a scan with `status` in {`queued`, `running`}, or a scan with `status="done"` whose `commit` equals the current HEAD. A `done` scan at any other commit does not count; the repository has moved since then and the skill should run again. `failed` scans are re-enqueued.
 
-Classify each skill in the list below into exactly one bucket, checking in this order and stopping at the first match: `gated` (its `has_code`/`has_packages`/`has_workflows` flag is false), `already_done` (it is in the skip set), `triggered` (enqueue it). Enqueue with `POST {api_base}/repositories/{id}/skills/{name}/run` and an `Authorization: Bearer {token}` header. Order does not matter; the scrutineer worker runs them as they come in. A 404 response moves the skill from `triggered` to `skipped`.
+Classify each skill in the list below into exactly one bucket, checking in this order and stopping at the first match: `gated` (its `has_code`/`has_packages`/`has_python`/`has_workflows`/`has_embedded_native` flag is false), `already_done` (it is in the skip set), `triggered` (enqueue it). Enqueue with `POST {api_base}/repositories/{id}/skills/{name}/run` and an `Authorization: Bearer {token}` header. Order does not matter; the scrutineer worker runs them as they come in. A 404 response moves the skill from `triggered` to `skipped`.
 
-If `scrutineer.scan_ref` is set in `context.json`, include it in the POST body as `{"ref": "<value>"}` so child scans clone the same branch. If it is empty, send an empty JSON body or omit the body. Verify runs (below) always send `{}`; they are finding-scoped and do not take a ref.
+If `scrutineer.scan_ref` is set in `context.json`, include it in the POST body as `{"ref": "<value>"}` so child scans clone the same branch. If `scrutineer.scan_subpath` is set, also include `"sub_path": "<value>"` in the same body so every child stays scoped to the same monorepo sub-package — a scan submitted as `repo#sub/dir` (or a `/tree/<branch>/<sub/dir>` URL) sets this, and without forwarding it the pipeline would silently widen back to the whole repository. Combine them when both are present, e.g. `{"ref": "main", "sub_path": "activesupport"}`. When both are empty, send an empty JSON body or omit it. Verify runs (below) always send `{}`; they are finding-scoped and take neither.
 
 Always:
 
@@ -59,6 +73,10 @@ Only when `has_workflows`:
 
 - `zizmor`
 
+Only when `has_python`:
+
+- `bandit`
+
 Only when `has_packages`:
 
 - `dependencies`
@@ -70,13 +88,20 @@ Only when `has_code`:
 
 - `subprojects`
 - `recon`
+- `history`
 - `threat-model`
 - `semgrep`
+
+Only when `has_embedded_native`:
+
+- `embedded-native`
 
 After `threat-model` finishes, Scrutineer reads its durable `scan_config` and
 enqueues one `security-deep-dive` per focus area. Do not enqueue
 `security-deep-dive` here: starting it before the threat model is complete
 would create an unscoped repository-wide audit and defeat the partition.
+
+For one third of eligible triage runs, Scrutineer also schedules at most one independent random-dig `security-deep-dive` after a successful threat model has queued a planned audit. Do not request this extra scan yourself. It keeps explicit path exclusions and subproject scope but receives no threat-model or focus-area guidance. Repeated completion notifications do not select another extra audit.
 
 If a skill name comes back `404 skill not found or inactive`, skip it and note which one in your report; the operator may have disabled it on purpose.
 
@@ -88,7 +113,7 @@ Do not verify findings in `new`, `enriched`, `triaged`, `ready`, `published`, `r
 
 ## Watch fixed findings for an upstream release
 
-When a finding reaches `fixed` the maintainer has landed a patch, but consumers cannot pin to a commit — they need a tagged release. For findings in `status=fixed`, enqueue release-watch the same way: `POST {api_base}/findings/{id}/skills/release-watch/run`. Record the ids in a `release_watch` field of your report. If the endpoint returns `404 skill not found or inactive`, leave the field empty and carry on. Release-watch is idempotent: a finding that already has a release recorded re-confirms the existing value rather than flapping.
+When a finding reaches `fixed` the maintainer has landed a patch, but consumers cannot pin to a commit — they need a tagged release. For findings in `status=fixed`, enqueue release-watch the same way: `POST {api_base}/findings/{id}/skills/release-watch/run`. Record the ids in a `release_watch` field of your report; if there are none, write an empty list. If the endpoint returns `404 skill not found or inactive`, write an empty list and carry on. Release-watch is idempotent: a finding that already has a release recorded re-confirms the existing value rather than flapping.
 
 ## Output
 
@@ -98,8 +123,10 @@ Write `./report.json` as:
 {
   "has_code": true,
   "has_packages": true,
+  "has_python": false,
   "has_workflows": false,
-  "brief": {"languages": ["Ruby"], "package_managers": ["Bundler"]},
+  "has_embedded_native": true,
+  "brief": {"languages": ["Ruby", "Rust"], "package_managers": ["Bundler", "Cargo"], "native_signals": ["native_extension:rb-sys", "language:Rust"]},
   "triggered": ["packages", "advisories", ...],
   "skipped":   ["semgrep"],
   "gated":     ["zizmor"],
@@ -110,7 +137,7 @@ Write `./report.json` as:
 }
 ```
 
-`gated` lists skills that were not enqueued because `has_code`, `has_packages`, or `has_workflows` was false. `already_done` holds skills that were skipped because a scan is currently running or already completed at this commit. `skipped` is for skills that came back `404 skill not found or inactive`. `brief` is the subset of brief's output the gates were derived from, so an operator can see why a repo got the short treatment and re-run triage manually if the classification was wrong.
+`gated` lists skills that were not enqueued because `has_code`, `has_packages`, `has_python`, `has_workflows`, or `has_embedded_native` was false. `already_done` holds skills that were skipped because a scan is currently running or already completed at this commit. `skipped` is for skills that came back `404 skill not found or inactive`. `brief` is the subset of brief's output the gates were derived from, including short `native_signals` entries for the embedded-native decision, so an operator can see why a repo got the short treatment and re-run triage manually if the classification was wrong.
 
 Do not wait for any of the scans to finish. The API returns a scan id immediately; your job is to fire them off and exit.
 

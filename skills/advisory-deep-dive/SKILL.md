@@ -2,7 +2,7 @@
 name: advisory-deep-dive
 description: Re-audit every past GHSA/CVE advisory published against this repository, anchored on each advisory's fix commit, for four failure modes, a regression of the original bug, a bypass of the fix, an incomplete fix that left a path open, and the same class of bug in sibling code the fix never touched. Records one verdict per advisory (fixed, bypass, variant or regressed) with standalone evidence, opening findings for anything that did not hold, and a fixed verdict backs a public fix-audit certificate. Use when you want to prove that prior fixes actually held rather than trusting that a shipped patch closed the hole. The target is this codebase's own first-party source, not its dependencies.
 license: MIT
-compatibility: Needs the cloned repo with full git history in ./src, the scrutineer API for the advisory cache, and network access to read advisory pages. Uses `git` and may use Claude subagents.
+compatibility: Needs the cloned repo with full git history in ./src, the scrutineer API for advisory and mined-history inputs, and network access to read advisory pages. Uses `git` and may use Claude subagents.
 allowed-tools: Read,Write,Bash,Grep,Glob,WebFetch,Task
 metadata:
   scrutineer.version: 1
@@ -44,18 +44,21 @@ If `scrutineer.scan_subpath` is set, scope every code read, trace, and reported 
 ## Scrutineer API (call with `Authorization: Bearer {token}`)
 
 - `GET {api_base}/repositories/{repository_id}/advisories` — the advisory worklist: `uuid`, `url`, `title`, `description`, `severity`, `cvss_score`, `classification` (the CWE), `packages`, `published_at`, `withdrawn_at`. This is your input.
+- `GET {api_base}/repositories/{repository_id}/scans?skill=history&status=done` then `GET {api_base}/scans/{id}` — the latest schema-version-1 mined security-fix report matching the current `scan_ref` and `scan_subpath`. Its `fixes` are additional historical anchors; `partial: true` means the list is incomplete.
 - `GET {api_base}/repositories/{repository_id}` — canonical metadata
 - `GET {api_base}/repositories/{repository_id}/packages` — published packages, to verify against the shipped artefact in Step 4 of the per-candidate checklist
 - `GET {api_base}/repositories/{repository_id}/dependents` — top dependents for reach analysis
 - `GET {api_base}/repositories/{repository_id}/scans?skill=threat-model&status=done` then `GET {api_base}/scans/{id}` — the structured threat model for trust boundaries, if one ran
 
-If any request returns an empty list or a non-200, that upstream scan has not run or the API is unreachable; fall back to reasoning over `./src`.
+If any request returns an empty list or a non-200, that upstream scan has not run or the API is unreachable; fall back to the other worklist and reasoning over `./src`.
 
-## Step 1: Build the advisory worklist
+## Step 1: Build the historical-fix worklist
 
 Fetch the advisories. Drop any with a non-empty `withdrawn_at` — a withdrawn advisory was not a real vulnerability. Process the rest in a stable order (by `published_at`, then `uuid`) so two runs against the same commit produce the same report.
 
-**If the list is empty, write `{"audits": [], "findings": []}` and exit.** A repository with no published advisories has nothing for this skill to re-audit; that is a valid clean result, not a failure.
+Fetch the latest compatible history report and process its `fixes` oldest first. When a history entry's `cve_if_any` or commit matches a published advisory, merge it into that advisory rather than auditing the same fix twice; its commit is a strong Step 2 anchor. A history-only entry remains a separate historical-fix lead.
+
+**If both lists are empty, write `{"audits": [], "findings": []}` and exit.** A repository with neither published advisories nor mined fixes has no historical anchor for this skill; that is a valid clean result, not a failure. A partial history report cannot establish that no older fixes exist, but it does not block analysis of the fixes it contains.
 
 ## Step 2: Locate the fix for each advisory
 
@@ -66,6 +69,8 @@ The advisory record does not carry the fix commit. Find it:
 3. Read the fix diff with `git show <commit>`. This diff — what it added, and what it left alone — is the anchor for all four questions below.
 
 If you genuinely cannot locate the fix, say so in the finding's `prior_art` and still run the sibling-vulnerability analysis over the code region the advisory describes; skip the regression, bypass, and incompleteness questions, which need the patch.
+
+For a history-only fix, the mined commit is already the anchor. Read it with `git show <commit>` and verify that the diff supports the history report's vulnerability class before using it. There may be no public reproduction, advisory prose, or publication date: do not fabricate them. Ask the bypass, incomplete-fix, and sibling-vulnerability questions from the patch itself, and ask regression only when the pre-fix code and tests let you reconstruct the original behavior.
 
 ## Step 3: The four questions
 
@@ -86,7 +91,7 @@ For every candidate from Step 3, apply the `security-deep-dive` six steps in ord
 1. **Trace** the value from the sink back to a trust boundary.
 2. **Boundary** — is the input actually attacker-controlled in this project's threat model, or a trusted developer/operator choice? Check any existing mitigation the project already has before concluding the input reaches unguarded.
 3. **Validate** — write a reproduction and run it against current HEAD. Paste the script verbatim and its output into `validation`. A bypass or incomplete-fix candidate that cannot be reproduced at HEAD is not a finding: the fix held.
-4. **Prior art** — cite the advisory (`uuid`, `url`) this candidate descends from. Check issues and PRs for whether a maintainer already considered and declined this variant. Set `discovered_via` to `advisory` (this skill descends every candidate from one) unless the variant was actually described by an open issue you found while checking, in which case `issue-tracker`.
+4. **Prior art** — cite the advisory (`uuid`, `url`) or history-only fix commit this candidate descends from. Check issues and PRs for whether a maintainer already considered and declined this variant. Set `discovered_via` to `advisory` for a published advisory, `source` for a history-only fix, or `issue-tracker` when the variant was actually described by an open issue you found while checking.
 5. **Reach** — is the candidate reachable from a public entry point in the shipped artefact? Record `reachable`, `harness_only`, or `unclear`.
 6. **Rate** severity and confidence given everything above.
 
@@ -106,7 +111,7 @@ Write `./report.json` to match `./schema.json`: two arrays, `audits` and `findin
 
 ### `audits` — one verdict per advisory
 
-Emit exactly one entry for every advisory you processed (every non-withdrawn advisory in the worklist), even the clean ones. Each entry has:
+Emit exactly one entry for every published advisory you processed (every non-withdrawn advisory in the worklist), even the clean ones. History-only fixes do not receive an `audits` entry: `AdvisoryAudit` rows back public advisory certificates, and inventing a synthetic advisory UUID would publish a false certificate. Findings descended from history-only fixes still belong in `findings`.
 
 - `advisory_uuid` — the advisory's `uuid` from the worklist. Required; this is what the verdict is keyed on.
 - `status` — one of `fixed`, `bypass`, `variant`, `regressed`. Use `fixed` only when the reproduction fails at the audited commit and no bypass, incomplete path, or sibling survived the checklist. `regressed` when the original reproduction fires again; `bypass` when a crafted input reaches the same sink past the new check; `variant` when the surviving issue is a sibling/incomplete-fix path rather than the exact original bug.
@@ -118,7 +123,7 @@ Emit exactly one entry for every advisory you processed (every non-withdrawn adv
 For each surviving finding:
 
 - `id` is a stable `F001`, `F002`, … referenced from the matching audit's `finding_ids`. Then `title`, `severity`, `confidence`, `cwe`, `location` (`path:line`), `reachability`, `quality_tier`, and the per-step markdown `trace` / `boundary` / `validation` / `prior_art` / `reach` / `rating` as in `security-deep-dive`.
-- `references` links the origin: one entry `{"url": <advisory url>, "tags": "advisory"}` (use `ghsa` or `cve` when the url is that specific), and, when you found it, one `{"url": <fix commit or PR url>, "tags": "patch"}` (or `pr`).
+- `references` links the origin: for a published advisory, one entry `{"url": <advisory url>, "tags": "advisory"}` (use `ghsa` or `cve` when the url is that specific); for every origin, include `{"url": <fix commit or PR url>, "tags": "patch"}` (or `pr`) when available. A history-only finding cites its commit and does not invent an advisory URL.
 - Say in `title` which mode it is, e.g. "Regression of GHSA-xxxx: original repro fires at HEAD" / "Bypass of GHSA-xxxx path-traversal fix" / "GHSA-xxxx fix left <sibling path> open" / "Same OS-command-injection class as GHSA-xxxx in <other file>".
 
-A clean re-audit still writes one `fixed` audit per advisory with an empty `findings` array — that is the expected common result, and it is what makes the certificate available. Write `{"audits": [], "findings": []}` only when the worklist was empty.
+A clean re-audit still writes one `fixed` audit per published advisory with an empty `findings` array — that is the expected common result, and it is what makes the certificate available. A clean history-only lead adds neither an audit nor a finding. Write `{"audits": [], "findings": []}` when there were only clean history-only leads or when both worklists were empty.

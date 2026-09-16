@@ -1,15 +1,23 @@
 package web
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"scrutineer/internal/db"
 	"scrutineer/internal/worker"
+
+	"gorm.io/gorm"
 )
 
 func TestResumeOpts(t *testing.T) {
@@ -403,6 +411,309 @@ func TestScansResumePaused(t *testing.T) {
 	}
 }
 
+func TestEnqueueResumedScan_usesFindingPriority(t *testing.T) {
+	findingID := uint(1)
+	tests := []struct {
+		name     string
+		scan     db.Scan
+		priority int
+	}{
+		{name: "repository scan", scan: db.Scan{ID: 1, Kind: worker.JobSkill}, priority: worker.PrioScan},
+		{name: "finding scan", scan: db.Scan{ID: 2, Kind: worker.JobSkill, FindingID: &findingID}, priority: worker.PrioFinding},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+
+			if err := s.enqueueResumedScan(t.Context(), tt.scan); err != nil {
+				t.Fatal(err)
+			}
+			sqldb, err := s.DB.DB()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var priority int
+			if err := sqldb.QueryRow("SELECT priority FROM goqite").Scan(&priority); err != nil {
+				t.Fatal(err)
+			}
+			if priority != tt.priority {
+				t.Errorf("resume queue priority = %d, want %d", priority, tt.priority)
+			}
+		})
+	}
+}
+
+func TestResumeScan_enqueueFailureLeavesScanPaused(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	if err := s.DB.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	pausedUntil := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	scan := db.Scan{
+		RepositoryID:   repo.ID,
+		Kind:           worker.JobSkill,
+		Status:         db.ScanPaused,
+		StatusPriority: db.StatusPriorityFor(db.ScanPaused),
+		Error:          "paused by operator",
+		PausedUntil:    &pausedUntil,
+	}
+	if err := s.DB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	resumeErr := s.resumeScan(ctx, &scan)
+	if !errors.Is(resumeErr, context.Canceled) {
+		t.Fatalf("resume error = %v, want context canceled", resumeErr)
+	}
+
+	var got db.Scan
+	if err := s.DB.First(&got, scan.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != db.ScanPaused || got.StatusPriority != db.StatusPriorityFor(db.ScanPaused) {
+		t.Errorf("status = %q priority = %d, want paused/%d",
+			got.Status, got.StatusPriority, db.StatusPriorityFor(db.ScanPaused))
+	}
+	wantError := "resume failed: " + resumeErr.Error()
+	if got.Error != wantError {
+		t.Errorf("error = %q, want %q", got.Error, wantError)
+	}
+	if got.PausedUntil == nil || !got.PausedUntil.Equal(pausedUntil) {
+		t.Errorf("paused_until = %v, want %v", got.PausedUntil, pausedUntil)
+	}
+	if got.FinishedAt == nil {
+		t.Error("finished_at = nil, want rollback timestamp")
+	}
+	assertQueuedJobCount(t, s, 0)
+}
+
+func TestResumeScan_updateFailureLeavesPausedScanWithoutJob(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	if err := s.DB.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{
+		RepositoryID:   repo.ID,
+		Kind:           worker.JobSkill,
+		Status:         db.ScanPaused,
+		StatusPriority: db.StatusPriorityFor(db.ScanPaused),
+		Error:          "paused by operator",
+	}
+	if err := s.DB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	updateErr := errors.New("injected resume update failure")
+	const callback = "test:fail-single-resume-update"
+	if err := s.DB.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "scans" {
+			_ = tx.AddError(updateErr)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = s.DB.Callback().Update().Remove(callback)
+	}()
+
+	if err := s.resumeScan(t.Context(), &scan); !errors.Is(err, updateErr) {
+		t.Fatalf("resume error = %v, want %v", err, updateErr)
+	}
+
+	var got db.Scan
+	if err := s.DB.First(&got, scan.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != db.ScanPaused || got.StatusPriority != db.StatusPriorityFor(db.ScanPaused) {
+		t.Errorf("status = %q priority = %d, want paused/%d",
+			got.Status, got.StatusPriority, db.StatusPriorityFor(db.ScanPaused))
+	}
+	if got.Error != scan.Error {
+		t.Errorf("error = %q, want %q", got.Error, scan.Error)
+	}
+	assertQueuedJobCount(t, s, 0)
+}
+
+func TestResumeScan_noLongerPausedDoesNotEnqueue(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	if err := s.DB.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{
+		RepositoryID:   repo.ID,
+		Kind:           worker.JobSkill,
+		Status:         db.ScanPaused,
+		StatusPriority: db.StatusPriorityFor(db.ScanPaused),
+	}
+	if err := s.DB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var loaded db.Scan
+	if err := s.DB.First(&loaded, scan.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Model(&db.Scan{}).Where("id = ?", scan.ID).
+		Updates(scanStatusUpdates(db.ScanQueued, "", nil, nil)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := fmt.Sprintf("scan %d is no longer paused", scan.ID)
+	if err := s.resumeScan(t.Context(), &loaded); err == nil || err.Error() != wantErr {
+		t.Fatalf("resume error = %v, want %q", err, wantErr)
+	}
+
+	var got db.Scan
+	if err := s.DB.First(&got, scan.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != db.ScanQueued || got.StatusPriority != db.StatusPriorityFor(db.ScanQueued) {
+		t.Errorf("status = %q priority = %d, want queued/%d",
+			got.Status, got.StatusPriority, db.StatusPriorityFor(db.ScanQueued))
+	}
+	assertQueuedJobCount(t, s, 0)
+}
+
+func assertQueuedJobCount(t *testing.T, s *Server, want int) {
+	t.Helper()
+	sqldb, err := s.DB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jobs int
+	if err := sqldb.QueryRow("SELECT COUNT(*) FROM goqite").Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != want {
+		t.Errorf("queued jobs = %d, want %d", jobs, want)
+	}
+}
+
+func TestEnqueueResumedScan_restoresPausedUntilOnEnqueueFailure(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	pausedUntil := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
+	scan := db.Scan{
+		RepositoryID:   repo.ID,
+		Kind:           worker.JobSkill,
+		Status:         db.ScanPaused,
+		StatusPriority: db.StatusPriorityFor(db.ScanPaused),
+		Error:          worker.AccountPausePrefix + "reset pending",
+		PausedUntil:    &pausedUntil,
+	}
+	s.DB.Create(&scan)
+
+	scans, err := s.bulkResumePaused(s.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scans) != 1 {
+		t.Fatalf("resumed scans = %d, want 1", len(scans))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.enqueueResumedScan(ctx, scans[0]); err == nil {
+		t.Fatal("enqueue with cancelled context succeeded")
+	}
+
+	var got db.Scan
+	s.DB.First(&got, scan.ID)
+	if got.Status != db.ScanPaused {
+		t.Fatalf("status = %q, want paused", got.Status)
+	}
+	if got.PausedUntil == nil || !got.PausedUntil.Equal(pausedUntil) {
+		t.Errorf("paused_until = %v, want %v", got.PausedUntil, pausedUntil)
+	}
+}
+
+func TestBulkResumePaused_usesSetBasedUpdate(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	for range 2 {
+		s.DB.Create(&db.Scan{
+			RepositoryID: repo.ID,
+			Kind:         worker.JobSkill,
+			Status:       db.ScanPaused,
+		})
+	}
+
+	updates := 0
+	const callback = "test:count-bulk-resume-updates"
+	if err := s.DB.Callback().Update().Before("gorm:update").Register(callback, func(*gorm.DB) {
+		updates++
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = s.DB.Callback().Update().Remove(callback)
+	}()
+
+	scans, err := s.bulkResumePaused(s.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scans) != 2 {
+		t.Fatalf("resumed scans = %d, want 2", len(scans))
+	}
+	if updates != 1 {
+		t.Fatalf("update statements = %d, want 1", updates)
+	}
+}
+
+func TestBulkResumePaused_usesCallerTransaction(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	scan := db.Scan{
+		RepositoryID: repo.ID,
+		Kind:         worker.JobSkill,
+		Status:       db.ScanPaused,
+	}
+	s.DB.Create(&scan)
+
+	rollback := errors.New("roll back test")
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		scans, err := s.bulkResumePaused(tx)
+		if err != nil {
+			return err
+		}
+		if len(scans) != 1 {
+			t.Fatalf("resumed scans = %d, want 1", len(scans))
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatalf("transaction error = %v, want %v", err, rollback)
+	}
+
+	var got db.Scan
+	s.DB.First(&got, scan.ID)
+	if got.Status != db.ScanPaused {
+		t.Fatalf("status after caller rollback = %q, want paused", got.Status)
+	}
+}
+
 func TestScansResumePaused_scopedToRepo(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -506,5 +817,308 @@ func TestScansRetryFailed_dedupesRepeatedFailures(t *testing.T) {
 	}
 	if queued[0].SubPath != "" {
 		t.Errorf("retried sub_path = %q, want the repeated-failure tuple (parked is superseded)", queued[0].SubPath)
+	}
+}
+
+func TestScanRetry_blocksNonViableExternalReporting(t *testing.T) {
+	for _, skillName := range []string{discloseSkillName, reportUpstreamSkillName, publicIssueSkillName} {
+		t.Run(skillName, func(t *testing.T) {
+			s, done := newTestServer(t)
+			defer done()
+
+			repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+			s.DB.Create(&repo)
+			skill := db.Skill{Name: skillName, Description: "d", Body: "b",
+				OutputFile: "report.json", OutputKind: "freeform", Version: 1,
+				Active: true, Source: "ui"}
+			s.DB.Create(&skill)
+			failed := db.Scan{RepositoryID: repo.ID, Kind: worker.JobSkill, Status: db.ScanFailed,
+				StatusPriority: db.StatusPriorityFor(db.ScanFailed), SkillID: &skill.ID, SkillName: skill.Name}
+			s.DB.Create(&failed)
+			finding := db.Finding{RepositoryID: repo.ID, ScanID: failed.ID, Title: "x", Severity: "Low",
+				ProductionViability: db.ProductionViabilityNonViable}
+			s.DB.Create(&finding)
+			s.DB.Model(&failed).Update("finding_id", finding.ID)
+
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, localReq(http.MethodPost, fmt.Sprintf("/scans/%d/retry", failed.ID)))
+			if w.Code != http.StatusPreconditionFailed || !strings.Contains(w.Body.String(), "NON_VIABLE") {
+				t.Fatalf("status = %d, body=%s; want 412 NON_VIABLE", w.Code, w.Body)
+			}
+			var count int64
+			s.DB.Model(&db.Scan{}).Where("id > ?", failed.ID).Count(&count)
+			if count != 0 {
+				t.Fatalf("retry created %d scans, want 0", count)
+			}
+		})
+	}
+}
+
+func TestScansRetryFailed_skipsNonViableExternalReporting(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	disclose := db.Skill{Name: discloseSkillName, Description: "d", Body: "b",
+		OutputFile: "report.json", OutputKind: "freeform", Version: 1, Active: true, Source: "ui"}
+	regular := db.Skill{Name: "metadata", Description: "d", Body: "b",
+		OutputFile: "report.json", OutputKind: "freeform", Version: 1, Active: true, Source: "ui"}
+	s.DB.Create(&disclose)
+	s.DB.Create(&regular)
+	blocked := db.Scan{RepositoryID: repo.ID, Kind: worker.JobSkill, Status: db.ScanFailed,
+		StatusPriority: db.StatusPriorityFor(db.ScanFailed), SkillID: &disclose.ID, SkillName: disclose.Name}
+	allowed := db.Scan{RepositoryID: repo.ID, Kind: worker.JobSkill, Status: db.ScanFailed,
+		StatusPriority: db.StatusPriorityFor(db.ScanFailed), SkillID: &regular.ID, SkillName: regular.Name}
+	s.DB.Create(&blocked)
+	s.DB.Create(&allowed)
+	finding := db.Finding{RepositoryID: repo.ID, ScanID: blocked.ID, Title: "x", Severity: "Low",
+		ProductionViability: db.ProductionViabilityNonViable}
+	s.DB.Create(&finding)
+	s.DB.Model(&blocked).Update("finding_id", finding.ID)
+
+	w := httptest.NewRecorder()
+	s.scansRetryFailed(w, localReq(http.MethodPost, "/scans/retry-failed"))
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body=%s", w.Code, w.Body)
+	}
+	var retried []db.Scan
+	s.DB.Where("id > ?", allowed.ID).Find(&retried)
+	if len(retried) != 1 || retried[0].SkillName != regular.Name {
+		t.Fatalf("retried scans = %+v, want only %q", retried, regular.Name)
+	}
+}
+
+func TestScansRetryFailed_preservesFocusArea(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	skill := db.Skill{Name: "security-deep-dive", Description: "d", Body: "b",
+		OutputFile: "report.json", OutputKind: "findings", Version: 1,
+		Active: true, Source: "ui"}
+	s.DB.Create(&skill)
+	focusArea := `{"name":"request parser","paths":["internal/parser/**"],"surface":"untrusted requests"}`
+	failed := db.Scan{
+		RepositoryID:   repo.ID,
+		Kind:           worker.JobSkill,
+		Status:         db.ScanFailed,
+		StatusPriority: db.StatusPriorityFor(db.ScanFailed),
+		SkillID:        &skill.ID,
+		SkillName:      skill.Name,
+		FocusArea:      focusArea,
+	}
+	s.DB.Create(&failed)
+
+	w := httptest.NewRecorder()
+	s.scansRetryFailed(w, localReq("POST", "/scans/retry-failed"))
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body=%s", w.Code, w.Body)
+	}
+
+	var retried db.Scan
+	if err := s.DB.Where("id > ? AND status = ?", failed.ID, db.ScanQueued).First(&retried).Error; err != nil {
+		t.Fatalf("load retried scan: %v", err)
+	}
+	if retried.FocusArea != focusArea {
+		t.Errorf("retried focus_area = %q, want %q", retried.FocusArea, focusArea)
+	}
+}
+
+func TestScansRetryFailed_preservesScopeMode(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/r", Name: "r"}
+	s.DB.Create(&repo)
+	skill := db.Skill{Name: "security-deep-dive", Description: "d", Body: "b",
+		OutputFile: "report.json", OutputKind: "findings", Version: 1,
+		Active: true, Source: "ui"}
+	s.DB.Create(&skill)
+	failed := db.Scan{
+		RepositoryID:   repo.ID,
+		Kind:           worker.JobSkill,
+		Status:         db.ScanFailed,
+		StatusPriority: db.StatusPriorityFor(db.ScanFailed),
+		SkillID:        &skill.ID,
+		SkillName:      skill.Name,
+		SubPath:        "activesupport",
+		ScopeMode:      "soft", // widened by the automatic fallback; a retry must reproduce it
+	}
+	s.DB.Create(&failed)
+
+	w := httptest.NewRecorder()
+	s.scansRetryFailed(w, localReq("POST", "/scans/retry-failed"))
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303; body=%s", w.Code, w.Body)
+	}
+
+	var retried db.Scan
+	if err := s.DB.Where("id > ? AND status = ?", failed.ID, db.ScanQueued).First(&retried).Error; err != nil {
+		t.Fatalf("load retried scan: %v", err)
+	}
+	if retried.ScopeMode != "soft" {
+		t.Errorf("retried scope_mode = %q, want soft (reproduced on retry)", retried.ScopeMode)
+	}
+	if retried.SubPath != "activesupport" {
+		t.Errorf("retried sub_path = %q, want activesupport", retried.SubPath)
+	}
+}
+
+// The page's SSE listener re-requests /scans to refresh its table, so an htmx
+// request must return the table alone: the full page would nest a second
+// layout inside the swapped element and kill the EventSource with it.
+func TestJobs_htmxServesTableFragment(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/frag", Name: "frag"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", SkillName: "audit", Status: db.ScanRunning,
+		StatusPriority: db.StatusPriorityFor(db.ScanRunning)}
+	s.DB.Create(&scan)
+
+	r := localReq("GET", "/scans")
+	r.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("status %d: %s", w.Code, w.Body)
+	}
+	frag := w.Body.String()
+	if !strings.Contains(frag, `id="jobs"`) {
+		t.Errorf("fragment missing the swap target: %s", frag)
+	}
+	if strings.Contains(frag, "<html") {
+		t.Error("htmx request got a full page instead of the table fragment")
+	}
+	if strings.Contains(frag, "sse-connect") {
+		t.Error("fragment must not carry the SSE listener; swapping it would drop the connection")
+	}
+
+	full := httptest.NewRecorder()
+	s.Handler().ServeHTTP(full, localReq("GET", "/scans"))
+	body := full.Body.String()
+	if !strings.Contains(body, `sse-connect="/events?events=scan-status"`) {
+		t.Error("page does not subscribe to scan status events")
+	}
+	if !strings.Contains(body, `hx-target="#jobs"`) {
+		t.Errorf("page does not aim its refresh at the table: %s", body)
+	}
+}
+
+// The refresh replays the current request URI, so a filtered view must stay
+// filtered rather than silently widening to every scan.
+func TestJobs_htmxFragmentKeepsStatusFilter(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/filter", Name: "filter"}
+	s.DB.Create(&repo)
+	mk := func(st db.ScanStatus) db.Scan {
+		sc := db.Scan{RepositoryID: repo.ID, Kind: "skill", SkillName: "audit", Status: st,
+			StatusPriority: db.StatusPriorityFor(st)}
+		s.DB.Create(&sc)
+		return sc
+	}
+	running, finished := mk(db.ScanRunning), mk(db.ScanDone)
+
+	r := localReq("GET", "/scans?status=running")
+	r.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+
+	frag := w.Body.String()
+	if !strings.Contains(frag, fmt.Sprintf(`/scans/%d"`, running.ID)) {
+		t.Errorf("running scan missing from the filtered fragment: %s", frag)
+	}
+	if strings.Contains(frag, fmt.Sprintf(`/scans/%d"`, finished.ID)) {
+		t.Error("fragment leaked a scan the status filter excludes")
+	}
+}
+
+// The skill dropdown moved into the fragment with the split, so a refresh that
+// dropped its multi-skill label would silently reword the control the operator
+// is filtering with.
+func TestJobs_htmxFragmentKeepsTheSkillFilterLabel(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/skill-label", Name: "skill-label"}
+	s.DB.Create(&repo)
+	for _, name := range []string{"alpha", "bravo"} {
+		s.DB.Create(&db.Scan{RepositoryID: repo.ID, Kind: "skill", SkillName: name, Status: db.ScanDone,
+			StatusPriority: db.StatusPriorityFor(db.ScanDone)})
+	}
+
+	r := localReq("GET", "/scans?skill=alpha,bravo")
+	r.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, r)
+
+	frag := w.Body.String()
+	if !strings.Contains(frag, "2 skills") {
+		t.Errorf("fragment lost the combined filter label: %s", frag)
+	}
+	if !strings.Contains(frag, `aria-label="Skills: alpha,bravo"`) {
+		t.Errorf("fragment lost the accessible label listing the selected skills: %s", frag)
+	}
+}
+
+// A fragment carries no #toaster, so popping the flash there would swallow the
+// message the full render a POST is redirecting to is about to display.
+// Started is an elapsed time baked in at render time, so the row would read
+// "0s ago" for the scan's whole run. app.js recounts it every second from the
+// instant in the datetime attribute, which is the only reason it climbs.
+func TestJobs_startedCarriesTheInstantForTheClientToRecount(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	repo := db.Repository{URL: "https://example.com/ticker", Name: "ticker"}
+	s.DB.Create(&repo)
+	startedAt := time.Now().Add(-90 * time.Second)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", SkillName: "audit", Status: db.ScanRunning,
+		StatusPriority: db.StatusPriorityFor(db.ScanRunning), StartedAt: &startedAt}
+	s.DB.Create(&scan)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, localReq("GET", "/scans"))
+	body := w.Body.String()
+
+	want := fmt.Sprintf(`<time datetime="%s" data-elapsed>1m ago</time>`, startedAt.UTC().Format(time.RFC3339))
+	if !strings.Contains(body, want) {
+		t.Errorf("Started cell cannot be recounted client-side; want %s in:\n%s", want, body)
+	}
+}
+
+func TestJobs_htmxFragmentLeavesFlashForTheNextPage(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	withFlash := func(path string, hx bool) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(Flash{Category: successKey, Title: "3 queued scans paused"})
+		r := localReq("GET", path)
+		r.AddCookie(&http.Cookie{Name: "flash", Value: base64.RawURLEncoding.EncodeToString(raw)})
+		if hx {
+			r.Header.Set("HX-Request", "true")
+		}
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+
+	if got := withFlash("/scans", true).Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Errorf("fragment consumed the flash: %v", got)
+	}
+
+	// The full page does show it, and clearing the cookie there is what keeps
+	// the toast from reappearing on every later render.
+	full := withFlash("/scans", false)
+	if !strings.Contains(full.Body.String(), "3 queued scans paused") {
+		t.Error("full page did not render the pending flash")
+	}
+	if !strings.Contains(strings.Join(full.Header().Values("Set-Cookie"), " "), "flash=;") {
+		t.Errorf("full page did not clear the flash cookie: %v", full.Header().Values("Set-Cookie"))
 	}
 }

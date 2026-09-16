@@ -1,18 +1,27 @@
 package db
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	"gorm.io/gorm"
+)
 
 func TestNormaliseLocation(t *testing.T) {
 	cases := map[string]string{
-		"src/users.rb:42":                "src/users.rb",
-		"src/users.rb:42:7":              "src/users.rb",
-		"src/users.rb":                   "src/users.rb",
-		"./src/users.rb:1":               "src/users.rb",
-		"  Src/Users.rb:10  ":            "src/users.rb",
-		"C:\\project\\src\\main.go:42":   "c:\\project\\src\\main.go",
-		"C:\\project\\src\\main.go:42:7": "c:\\project\\src\\main.go",
-		"C:\\project\\src\\main.go":      "c:\\project\\src\\main.go",
-		"":                               "",
+		"src/users.rb:42":                 "src/users.rb",
+		"src/users.rb:42:7":               "src/users.rb",
+		"src/users.rb:12-34":              "src/users.rb",
+		"src/users.rb":                    "src/users.rb",
+		"./src/users.rb:1":                "src/users.rb",
+		"  Src/Users.rb:10  ":             "src/users.rb",
+		"C:\\project\\src\\main.go:42":    "c:\\project\\src\\main.go",
+		"C:\\project\\src\\main.go:42:7":  "c:\\project\\src\\main.go",
+		"C:\\project\\src\\main.go:12-34": "c:\\project\\src\\main.go",
+		"C:\\project\\src\\main.go":       "c:\\project\\src\\main.go",
+		"":                                "",
 	}
 	for in, want := range cases {
 		if got := normaliseLocation(in); got != want {
@@ -26,6 +35,10 @@ func TestFingerprintFinding(t *testing.T) {
 
 	if base != FingerprintFinding("security-deep-dive", "", "CWE-89", "src/users.rb:77", "SQLi rephrased") {
 		t.Errorf("line drift / title change must not change fingerprint")
+	}
+	if FingerprintFinding("security-deep-dive", "", "CWE-89", "src/users.rb:12-34", "SQLi") !=
+		FingerprintFinding("security-deep-dive", "", "CWE-89", "src/users.rb:14-36", "SQLi") {
+		t.Errorf("range drift must not change fingerprint")
 	}
 	if base != FingerprintFinding("Security-Deep-Dive", "", "cwe-89", "./SRC/users.rb", "x") {
 		t.Errorf("skill/cwe/location case must not change fingerprint")
@@ -95,7 +108,9 @@ func TestBackfillFindingFingerprints(t *testing.T) {
 	f := Finding{ScanID: s.ID, RepositoryID: r.ID, Commit: "abc", CWE: "CWE-89", Location: "src/users.rb:42", Title: "SQLi"}
 	gdb.Create(&f)
 
-	BackfillFindingFingerprints(gdb)
+	if err := BackfillFindingFingerprints(gdb); err != nil {
+		t.Fatal(err)
+	}
 
 	var got Finding
 	gdb.First(&got, f.ID)
@@ -108,9 +123,109 @@ func TestBackfillFindingFingerprints(t *testing.T) {
 	}
 
 	// Idempotent: a second run does not bump SeenCount.
-	BackfillFindingFingerprints(gdb)
+	if err := BackfillFindingFingerprints(gdb); err != nil {
+		t.Fatal(err)
+	}
 	gdb.First(&got, f.ID)
 	if got.SeenCount != 1 {
 		t.Errorf("backfill not idempotent: seen=%d", got.SeenCount)
+	}
+}
+
+func TestBackfillFindingFingerprintsReturnsSelectionError(t *testing.T) {
+	gdb, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gdb.Migrator().DropTable(&Scan{}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = BackfillFindingFingerprints(gdb)
+	if err == nil {
+		t.Fatal("expected selection error after dropping scans table")
+	}
+	if !strings.Contains(err.Error(), "select findings for fingerprint backfill") {
+		t.Fatalf("error = %v, want selection context", err)
+	}
+}
+
+func TestBackfillFindingFingerprintsPreservesCompletedRowsOnUpdateError(t *testing.T) {
+	gdb, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := Repository{URL: "https://x/r", Name: "r"}
+	if err := gdb.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := Scan{RepositoryID: repo.ID, Kind: "skill", SkillName: "security-deep-dive", Status: ScanDone, Commit: "abc"}
+	if err := gdb.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	findings := []Finding{
+		{ScanID: scan.ID, RepositoryID: repo.ID, Commit: "abc", CWE: "CWE-79", Location: "src/a.go:10", Title: "first"},
+		{ScanID: scan.ID, RepositoryID: repo.ID, Commit: "abc", CWE: "CWE-89", Location: "src/b.go:20", Title: "second"},
+	}
+	if err := gdb.Create(&findings).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("injected fingerprint update failure")
+	updates := 0
+	const callbackName = "test:fail_second_fingerprint_update"
+	if err := gdb.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != "findings" {
+			return
+		}
+		updates++
+		if updates == 2 {
+			_ = tx.AddError(wantErr)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = BackfillFindingFingerprints(gdb)
+	if removeErr := gdb.Callback().Update().Remove(callbackName); removeErr != nil {
+		t.Fatal(removeErr)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want injected update error", err)
+	}
+	wantContext := fmt.Sprintf("update fingerprint for finding %d", findings[1].ID)
+	if !strings.Contains(err.Error(), wantContext) {
+		t.Fatalf("error = %v, want context %q", err, wantContext)
+	}
+
+	var got []Finding
+	if err := gdb.Order("id").Find(&got, []uint{findings[0].ID, findings[1].ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("findings = %d, want 2", len(got))
+	}
+	wantFirst := FingerprintFinding(scan.SkillName, findings[0].SubPath, findings[0].CWE, findings[0].Location, findings[0].Title)
+	if got[0].Fingerprint != wantFirst || got[0].LastSeenScanID != scan.ID || got[0].LastSeenCommit != scan.Commit || got[0].SeenCount != 1 {
+		t.Errorf("first finding was not preserved after second update failed: %+v", got[0])
+	}
+	if got[1].Fingerprint != "" || got[1].LastSeenScanID != 0 || got[1].LastSeenCommit != "" || got[1].SeenCount != 0 {
+		t.Errorf("failed finding was unexpectedly backfilled: %+v", got[1])
+	}
+
+	if err := BackfillFindingFingerprints(gdb); err != nil {
+		t.Fatalf("retry backfill: %v", err)
+	}
+	got = nil
+	if err := gdb.Order("id").Find(&got, []uint{findings[0].ID, findings[1].ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("findings after retry = %d, want 2", len(got))
+	}
+	for _, finding := range got {
+		if finding.Fingerprint == "" || finding.LastSeenScanID != scan.ID || finding.LastSeenCommit != scan.Commit || finding.SeenCount != 1 {
+			t.Errorf("finding %d not complete after retry: %+v", finding.ID, finding)
+		}
 	}
 }

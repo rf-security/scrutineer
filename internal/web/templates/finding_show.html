@@ -15,9 +15,24 @@
     {{template "finding-status" (fstatus $f.Status)}}
   </h2>
   <div class="flex gap-2 shrink-0">
-    <a href="/findings/{{$f.ID}}/report.md" class="btn-outline" download>
+    {{if .VINCEReady}}
+    <a href="/findings/{{$f.ID}}/vince" class="btn-outline">
+      <i data-lucide="send"></i> Submit to VINCE
+    </a>
+    {{else}}
+    <button type="button" class="btn-outline" disabled title="{{.VINCEReason}}">
+      <i data-lucide="send"></i> Submit to VINCE
+    </button>
+    {{end}}
+    {{if .HasDisclosureDraft}}
+    <a href="/findings/{{$f.ID}}/disclosure.md" class="btn-outline" download="{{findingDisclosureMarkdownFilename $repo $f}}">
+      <i data-lucide="download"></i> Export disclosure
+    </a>
+    {{else}}
+    <a href="/findings/{{$f.ID}}/report.md" class="btn-outline" download="{{findingReportFilename $repo $f}}">
       <i data-lucide="download"></i> Export report
     </a>
+    {{end}}
     <a href="/findings/{{$f.ID}}/bundle.tar.gz" class="btn-outline"
        title="{{if .HasDependents}}OSV + CSAF VEX + markdown report + patch + manifest{{else}}OSV + markdown report + patch + manifest{{end}}, packaged for a disclosure recipient"
        download>
@@ -36,10 +51,98 @@
 
 {{template "finding_workflow" .Workflow}}
 
+  <section class="border-b py-4" id="verification-run">
+    <h3 class="text-sm font-medium mb-3">Verification</h3>
+    <form method="post" action="/findings/{{$f.ID}}/verify" hx-post="/findings/{{$f.ID}}/verify" hx-swap="none" class="form grid gap-3">
+      <label for="verification-feedback" class="text-sm">Feedback (optional)</label>
+      <textarea id="verification-feedback" name="feedback" class="input w-full" rows="3" maxlength="4000" {{if .Workflow.VerifyInFlight}}disabled{{end}}></textarea>
+      <div class="flex justify-end">
+        {{if .Workflow.VerifyInFlight}}
+        <button type="button" class="btn-outline" disabled><i data-lucide="loader-circle" class="animate-spin"></i> Verification in progress</button>
+        {{else}}
+        <button type="submit" class="btn"><i data-lucide="play"></i> {{if .Verifications}}Rerun verification{{else}}Run verification{{end}}</button>
+        {{end}}
+      </div>
+    </form>
+  </section>
+
+<section id="disclosure" class="card mb-6 scroll-mt-6" data-disclosure-editor>
+  <header class="flex items-start justify-between gap-4 mb-4">
+    <div>
+      <div class="flex items-center gap-2">
+        <h3 class="text-lg font-semibold">Disclosure draft</h3>
+        {{if .HasDisclosureDraft}}
+        <span class="badge-secondary">Needs review</span>
+        {{else}}
+        <span class="badge-outline">No saved draft</span>
+        {{end}}
+      </div>
+      {{if .HasDisclosureDraft}}
+      <p class="text-sm text-muted-foreground mt-1">This is the latest saved maintainer-facing draft.</p>
+      {{else}}
+      <p class="text-sm text-muted-foreground mt-1">Write or paste a disclosure draft below, or use Draft disclosure to generate one.</p>
+      {{end}}
+    </div>
+    <div class="flex items-center gap-1" role="tablist" aria-label="Disclosure draft view">
+      <button type="button" id="disclosure-preview-tab-{{$f.ID}}" role="tab"
+              aria-controls="disclosure-preview-panel-{{$f.ID}}" aria-selected="{{if .HasDisclosureDraft}}true{{else}}false{{end}}"
+              tabindex="{{if .HasDisclosureDraft}}0{{else}}-1{{end}}"
+              class="{{if .HasDisclosureDraft}}btn-sm{{else}}btn-sm-outline{{end}}" data-disclosure-mode="preview">Preview</button>
+      <button type="button" id="disclosure-edit-tab-{{$f.ID}}" role="tab"
+              aria-controls="disclosure-edit-panel-{{$f.ID}}" aria-selected="{{if .HasDisclosureDraft}}false{{else}}true{{end}}"
+              tabindex="{{if .HasDisclosureDraft}}-1{{else}}0{{end}}"
+              class="{{if .HasDisclosureDraft}}btn-sm-outline{{else}}btn-sm{{end}}" data-disclosure-mode="edit">Edit</button>
+    </div>
+  </header>
+
+  <div id="disclosure-preview-panel-{{$f.ID}}" role="tabpanel" tabindex="0"
+       aria-labelledby="disclosure-preview-tab-{{$f.ID}}" class="prose max-w-none"
+       data-disclosure-preview{{if not .HasDisclosureDraft}} hidden{{end}}>
+    <div class="alert mb-4 not-prose" data-disclosure-preview-stale hidden>
+      <i data-lucide="info"></i>
+      <section>{{if .HasDisclosureDraft}}Showing the saved draft. Save your edits to update this preview.{{else}}Nothing saved yet. Save your draft to preview it.{{end}}</section>
+    </div>
+    {{if .HasDisclosureDraft}}{{md $f.DisclosureDraft}}{{else}}<p class="text-muted-foreground">No saved disclosure draft.</p>{{end}}
+  </div>
+  <div id="disclosure-edit-panel-{{$f.ID}}" role="tabpanel" tabindex="0"
+       aria-labelledby="disclosure-edit-tab-{{$f.ID}}"
+       data-disclosure-form{{if .HasDisclosureDraft}} hidden{{end}}>
+    <form method="post" action="/findings/{{$f.ID}}/disclosure-draft" class="form grid gap-3">
+      <label class="text-xs text-muted-foreground" for="disclosure-draft-{{$f.ID}}">Markdown disclosure</label>
+      <textarea id="disclosure-draft-{{$f.ID}}" class="input font-mono text-xs min-h-96"
+                name="disclosure_draft" rows="24">{{$f.DisclosureDraft}}</textarea>
+      <div class="flex justify-end gap-2">
+        <button type="reset" class="btn-sm-outline" data-disclosure-cancel>Cancel</button>
+        <button type="submit" class="btn-sm">Save</button>
+      </div>
+    </form>
+  </div>
+
+  {{if .HasDisclosureDraft}}
+  <footer class="flex flex-wrap gap-3 mt-4 pt-3 border-t text-xs">
+    <a href="/findings/{{$f.ID}}/disclosure.md" class="text-muted-foreground hover:text-foreground hover:underline inline-flex items-center gap-1">
+      <i data-lucide="download" class="size-3.5"></i> Export saved Markdown
+    </a>
+    <a href="/findings/{{$f.ID}}/report.md" class="text-muted-foreground hover:text-foreground hover:underline inline-flex items-center gap-1">
+      <i data-lucide="file-text" class="size-3.5"></i> Export finding report
+    </a>
+    <a href="/findings/{{$f.ID}}/disclosure.html" target="_blank" rel="noopener"
+       class="text-muted-foreground hover:text-foreground hover:underline inline-flex items-center gap-1"
+       title="Open the draft as styled HTML, then select-all and paste into a Gmail compose window">
+      <i data-lucide="external-link" class="size-3.5"></i> Open Gmail-ready HTML
+    </a>
+  </footer>
+  {{end}}
+</section>
+
 <dl class="grid grid-cols-2 sm:grid-cols-6 gap-4 mb-6 text-sm">
   <div>
     <dt class="text-muted-foreground">Severity</dt>
-    <dd>{{$f.Severity}}</dd>
+    <dd>
+      {{$f.Severity}}
+      {{range $f.SeverityCapList}}<div class="text-xs text-muted-foreground mt-1">{{.}}</div>{{end}}
+      {{if $f.SeverityCalibrationIncomplete}}<div class="text-xs text-amber-700 dark:text-amber-400 mt-1">Calibration incomplete</div>{{end}}
+    </dd>
   </div>
   <div>
     <dt class="text-muted-foreground">CWE</dt>
@@ -88,6 +191,21 @@
     <dt class="text-muted-foreground">Quality tier</dt>
     <dd>{{if $f.QualityTier}}{{$f.QualityTier}}{{else}}-{{end}}</dd>
   </div>
+  {{with .LatestVerification}}
+  <div>
+    <dt class="text-muted-foreground">Verification</dt>
+    <dd>
+      <a href="/scans/{{.ScanID}}" class="hover:underline">{{.Status}}</a>
+      <span class="badge-outline ml-1">{{.ScoreLabel}}</span>
+    </dd>
+  </div>
+  {{end}}
+  {{with .LatestAttackPath}}
+  <div>
+    <dt class="text-muted-foreground">Production viability</dt>
+    <dd><a href="/scans/{{.ScanID}}" class="badge-outline hover:underline">{{.ProductionViability}}</a></dd>
+  </div>
+  {{end}}
   <div>
     <dt class="text-muted-foreground">Sinks</dt>
     <dd>{{if $f.Sinks}}<a href="/repositories/{{$repo.ID}}#rt10"
@@ -95,7 +213,10 @@
   </div>
   <div>
     <dt class="text-muted-foreground">Model</dt>
-    <dd>{{$scan.Model}}</dd>
+    {{/* The finding's own denormalized model, not $scan.Model: for a
+         bundle-imported finding it names the exporting instance's
+         producing model rather than the local ingest run. */}}
+    <dd>{{if $f.Model}}{{$f.Model}}{{else}}-{{end}}</dd>
   </div>
   <div>
     <dt class="text-muted-foreground">First seen</dt>
@@ -306,6 +427,118 @@
   </details>
   {{end}}
 
+  {{if .MigrationGuide}}{{$g := .MigrationGuide}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Migration guide
+        {{if $g.Alternatives}}<span class="text-muted-foreground ml-auto mr-2 text-xs">{{len $g.Alternatives}} alternative{{if ne (len $g.Alternatives) 1}}s{{end}}</span>{{end}}
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-4">
+      <div class="grid gap-1 text-sm">
+        <p>
+          Repository health:
+          {{if $g.Health}}<span class="badge-outline">{{$g.Health}}</span>{{else}}<span class="text-muted-foreground">unknown</span>{{end}}
+        </p>
+      </div>
+
+      {{if $g.Packages}}
+      <div>
+        <h4 class="text-sm font-medium mb-2">Published packages to migrate from</h4>
+        <table class="w-full text-sm">
+          <thead class="text-xs text-muted-foreground">
+            <tr><th class="text-left py-2">Package</th><th class="text-left">Ecosystem</th><th class="text-left">Latest</th><th class="text-left">Dependents</th></tr>
+          </thead>
+          <tbody>
+            {{range $g.Packages}}
+            <tr class="border-t align-top">
+              <td class="py-2"><code class="break-all">{{if .PURL}}{{.PURL}}{{else}}{{.Name}}{{end}}</code></td>
+              <td>{{.Ecosystem}}</td>
+              <td>{{if .LatestVersion}}{{.LatestVersion}}{{else}}-{{end}}</td>
+              <td>{{bignum .DependentRepos}} repos</td>
+            </tr>
+            {{end}}
+          </tbody>
+        </table>
+      </div>
+      {{end}}
+
+      {{if $g.Alternatives}}
+      <div>
+        <h4 class="text-sm font-medium mb-2">Recommended migration targets</h4>
+        <table class="w-full text-sm">
+          <thead class="text-xs text-muted-foreground">
+            <tr><th class="text-left py-2">Alternative</th><th class="text-left">Kind</th><th class="text-left">Note</th></tr>
+          </thead>
+          <tbody>
+            {{range $g.Alternatives}}
+            <tr class="border-t align-top">
+              <td class="py-2"><code class="break-all">{{.PURL}}</code></td>
+              <td><span class="badge-outline">{{.Kind}}</span></td>
+              <td class="text-muted-foreground">{{.Note}}</td>
+            </tr>
+            {{end}}
+          </tbody>
+        </table>
+      </div>
+      {{else}}
+      <p class="text-sm text-muted-foreground">
+        No migration alternatives are recorded yet. Add forks, successors, or equivalent packages from the repository Alternatives tab before starting a consumer campaign.
+      </p>
+      {{end}}
+
+      <div>
+        <h4 class="text-sm font-medium mb-2">Consumer prioritization</h4>
+        {{if $g.PriorityDependents}}
+        <table class="w-full text-sm">
+          <thead class="text-xs text-muted-foreground">
+            <tr><th class="text-left py-2">Dependent</th><th class="text-left">Exposure</th><th class="text-left">Reach</th><th class="text-left">Evidence</th><th class="text-left">Campaign</th></tr>
+          </thead>
+          <tbody>
+            {{range $g.PriorityDependents}}{{$row := .}}
+            <tr class="border-t align-top">
+              <td class="py-2">
+                {{if .RepositoryURL}}<a class="hover:underline" href="{{.RepositoryURL}}" rel="noopener" target="_blank"><code>{{.Name}}</code></a>{{else}}<code>{{.Name}}</code>{{end}}
+                <span class="text-xs text-muted-foreground">{{.Ecosystem}}</span>
+              </td>
+              <td>{{.Status}}</td>
+              <td>{{bignum .DependentRepos}} repos</td>
+              <td class="text-xs text-muted-foreground">{{if .Rationale}}{{.Rationale}}{{else}}-{{end}}</td>
+              <td class="py-2 min-w-64">
+                <form method="post" action="/findings/{{$f.ID}}/dependents/{{.DependentID}}/campaign" class="grid gap-2">
+                  <select class="input text-xs" name="status" aria-label="Campaign status for {{.Name}}">
+                    <option value=""{{if not .CampaignStatus}} selected{{end}}>not started</option>
+                    {{range $g.CampaignStatuses}}
+                    <option value="{{.}}"{{if eq . $row.CampaignStatus}} selected{{end}}>{{.}}</option>
+                    {{end}}
+                  </select>
+                  <input class="input text-xs" name="note" value="{{.CampaignNote}}" placeholder="Campaign note">
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-xs text-muted-foreground">{{if .CampaignUpdatedAt}}Updated {{.CampaignUpdatedAt.Format "2006-01-02"}}{{end}}</span>
+                    <button type="submit" class="btn-sm">Save</button>
+                  </div>
+                </form>
+              </td>
+            </tr>
+            {{end}}
+          </tbody>
+        </table>
+        {{else if $g.TotalExposureRows}}
+        <p class="text-sm text-muted-foreground">
+          Exposure tracking has {{$g.TotalExposureRows}} row{{if ne $g.TotalExposureRows 1}}s{{end}}, with {{$g.KnownSafeCount}} known not affected{{if $g.FixedCount}} and {{$g.FixedCount}} fixed{{end}}. No affected or under-investigation dependents need migration follow-up yet.
+        </p>
+        {{else}}
+        <p class="text-sm text-muted-foreground">
+          No dependent exposure rows are recorded for this finding yet. Run exposure before starting targeted migration outreach.
+        </p>
+        {{end}}
+      </div>
+    </section>
+  </details>
+  {{end}}
+
   <details class="group border-b">
     <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
       <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
@@ -352,11 +585,12 @@
   </details>
   {{end}}
 
-  {{if .Patch}}{{$p := .Patch}}{{$ps := .PatchScan}}
+  {{if .Patch}}{{$p := .Patch}}{{$ps := .PatchScan}}{{$rem := .CurrentRemediation}}
   <details open class="group border-b">
     <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
       <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
         Proposed patch
+        {{with $rem}}<span class="badge-outline ml-2">{{.Status}}</span>{{end}}
         <span class="text-muted-foreground ml-auto mr-2 text-xs">scan #{{$ps.ID}}</span>
         <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
       </h3>
@@ -378,6 +612,19 @@
         <a class="btn-sm-outline" href="/scans/{{$ps.ID}}">
           <i data-lucide="arrow-up-right"></i> View scan
         </a>
+        {{if not $rem}}
+        <span class="text-xs text-muted-foreground" title="Legacy patches need a fresh gated patch attempt before re-attack">Re-run Propose patch to enable re-attack</span>
+        {{else if .ReattackInFlight}}
+        <button type="button" class="btn-sm-outline" disabled title="This patch attempt is already being re-attacked">
+          <i data-lucide="loader-circle" class="animate-spin"></i> Re-attack in progress
+        </button>
+        {{else}}
+        <form method="post" action="/findings/{{$f.ID}}/reattack" hx-post="/findings/{{$f.ID}}/reattack" hx-swap="none">
+          <button type="submit" class="btn-sm-outline">
+            <i data-lucide="shield-check"></i> Re-attack patch
+          </button>
+        </form>
+        {{end}}
         {{if $p.BaseCommit}}
           <span class="text-xs text-muted-foreground">base <code>{{short $p.BaseCommit}}</code></span>
         {{end}}
@@ -397,6 +644,31 @@ git commit -m "fix: {{$f.Title}}"</pre>
       </details>
       {{if $p.Notes}}
         <div class="text-xs text-muted-foreground border-l-2 pl-3 mt-1">{{$p.Notes}}</div>
+      {{end}}
+      {{if .RemediationAttempts}}
+      <details class="group">
+        <summary class="text-xs text-muted-foreground cursor-pointer hover:underline">
+          Patch attempt history ({{len .RemediationAttempts}})
+        </summary>
+        <div class="overflow-x-auto mt-2">
+          <table class="w-full text-xs">
+            <thead class="text-muted-foreground">
+              <tr><th class="text-left py-2">Attempt</th><th class="text-left">Patch scan</th><th class="text-left">Status</th><th class="text-left">Re-attack</th><th class="text-left">Evidence</th></tr>
+            </thead>
+            <tbody>
+              {{range .RemediationAttempts}}
+              <tr class="border-t align-top">
+                <td class="py-2">#{{.Attempt}} <code>@{{short .BaseCommit}}</code></td>
+                <td><a href="/scans/{{.PatchScanID}}" class="hover:underline">#{{.PatchScanID}}</a></td>
+                <td><span class="badge-outline">{{.Status}}</span></td>
+                <td>{{with .Validation}}<a href="/scans/{{.ScanID}}" class="hover:underline">#{{.ScanID}}</a>{{else}}-{{end}}</td>
+                <td>{{with .Validation}}{{.ValidVariants}} variants; benign {{if .BenignControlPassed}}passed{{else}}not proven{{end}}{{if .BypassInput}}; bypass captured{{end}}{{else}}not run{{end}}</td>
+              </tr>
+              {{end}}
+            </tbody>
+          </table>
+        </div>
+      </details>
       {{end}}
       {{if $f.BreakingChange}}
         <div class="mt-3 border rounded p-3 text-sm">
@@ -424,6 +696,11 @@ git commit -m "fix: {{$f.Title}}"</pre>
     </summary>
     <section class="pb-4">
       <form method="post" action="/findings/{{$f.ID}}/fields" class="form grid grid-cols-2 gap-3">
+        <div class="grid gap-1 col-span-2">
+          <label class="text-xs text-muted-foreground"
+                 title="The disclose skill's drafted GHSA summary. May differ from the finding's own title above, which is set at audit time and left untouched by disclose re-runs.">Disclosure title</label>
+          <input class="input" name="disclosure_title" value="{{$f.DisclosureTitle}}">
+        </div>
         <div class="grid gap-1">
           <label class="text-xs text-muted-foreground">Severity</label>
           <input class="input" name="severity" value="{{$f.Severity}}" list="severity-options">
@@ -484,17 +761,6 @@ git commit -m "fix: {{$f.Title}}"</pre>
                  title="File-level owners of the finding's location, from CODEOWNERS or recent non-bot committers">Suggested recipients</label>
           <input class="input" name="suggested_recipients" value="{{$f.SuggestedRecipients}}">
         </div>
-        <div class="grid gap-1 col-span-2">
-          <label class="text-xs text-muted-foreground">Disclosure draft</label>
-          <textarea class="input font-mono text-xs" name="disclosure_draft" rows="6">{{$f.DisclosureDraft}}</textarea>
-          {{if $f.DisclosureDraft}}
-          <a href="/findings/{{$f.ID}}/disclosure.html" target="_blank" rel="noopener"
-             class="text-xs text-muted-foreground hover:text-foreground hover:underline inline-flex items-center gap-1 justify-self-start"
-             title="Open the draft as styled HTML, then select-all and paste into a Gmail compose window">
-            <i data-lucide="external-link" class="size-3.5"></i> Open Gmail-ready HTML
-          </a>
-          {{end}}
-        </div>
         <div class="col-span-2 flex justify-end">
           <button type="submit" class="btn-sm">Save</button>
         </div>
@@ -528,6 +794,168 @@ git commit -m "fix: {{$f.Title}}"</pre>
       </ul>
     </section>
   </details>
+
+  {{if .Verifications}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Verification history <span class="text-muted-foreground ml-auto mr-2 text-xs">{{len .Verifications}}</span>
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-4">
+      {{range .Verifications}}
+      <article class="border-b pb-4 last:border-b-0">
+        <div class="flex items-center gap-2 text-sm mb-3">
+          <a href="/scans/{{.ScanID}}" class="font-medium hover:underline">scan #{{.ScanID}}</a>
+          <span class="badge-outline">{{.Status}}</span>
+          <span class="badge-outline">{{.ScoreLabel}}</span>
+          <span class="text-xs text-muted-foreground">{{.CreatedAt.Format "2006-01-02 15:04"}}</span>
+        </div>
+        {{with .VerificationFeedback}}
+        <div class="mb-3 text-sm"><span class="font-medium">Operator feedback</span><pre class="whitespace-pre-wrap break-words font-sans">{{.}}</pre></div>
+        {{end}}
+        {{if .HasRubric}}
+        {{with .AttackTree}}
+        <div class="mb-4">
+          <div class="flex flex-wrap items-center gap-2 text-sm mb-2">
+            <span class="font-medium">Attack path</span>
+            <span class="badge-outline">{{.Verdict}}</span>
+            <span class="text-muted-foreground">{{.Goal}}</span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead><tr class="border-b"><th class="text-left py-2">Node</th><th class="text-left">Parent</th><th class="text-left">Kind</th><th class="text-left">Status</th><th class="text-left">Condition</th><th class="text-left">Evidence</th></tr></thead>
+              <tbody>
+              {{range .Nodes}}
+                <tr class="border-b align-top">
+                  <td class="py-2 pr-3 font-medium">{{.ID}}</td>
+                  <td class="py-2 pr-3">{{if .ParentID}}{{.ParentID}}{{else}}-{{end}}</td>
+                  <td class="py-2 pr-3">{{.Kind}}</td>
+                  <td class="py-2 pr-3">{{.Status}}</td>
+                  <td class="py-2 pr-3">{{.Description}}</td>
+                  <td class="py-2">{{.Evidence}}</td>
+                </tr>
+              {{end}}
+              </tbody>
+            </table>
+          </div>
+          {{if .Blockers}}<div class="text-sm mt-2"><span class="font-medium">Blockers:</span> {{range $i, $blocker := .Blockers}}{{if $i}}; {{end}}{{$blocker}}{{end}}</div>{{end}}
+        </div>
+        {{end}}
+        {{if .Prerequisites}}
+        <div class="overflow-x-auto mt-4">
+          <table class="w-full text-sm">
+            <thead><tr class="border-b"><th class="text-left py-2">Severity prerequisite</th><th class="text-left">Classification</th><th class="text-left">Evidence</th></tr></thead>
+            <tbody>
+            {{range .Prerequisites}}
+              <tr class="border-b align-top">
+                <td class="py-2 pr-3 font-medium">{{.Name}}</td>
+                <td class="py-2 pr-3">{{.Assessment.Value}}</td>
+                <td class="py-2">{{.Assessment.Evidence}}</td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        {{end}}
+        <div class="overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead><tr class="border-b"><th class="text-left py-2">Criterion</th><th class="text-left">Verdict</th><th class="text-left">Evidence</th><th class="text-left">Proof gap</th></tr></thead>
+            <tbody>
+            {{range .Criteria}}
+              <tr class="border-b align-top">
+                <td class="py-2 pr-3 font-medium">{{.Name}}</td>
+                <td class="py-2 pr-3">{{.Criterion.Verdict}}</td>
+                <td class="py-2 pr-3"><div>{{.Criterion.Evidence}}</div><div class="text-xs text-muted-foreground mt-1">Method: {{.Criterion.Method}}</div>{{if .Criterion.Counterevidence}}<div class="text-xs text-muted-foreground mt-1">Against: {{.Criterion.Counterevidence}}</div>{{end}}</td>
+                <td class="py-2">{{if .Criterion.ProofGap}}{{.Criterion.ProofGap}}{{else}}-{{end}}</td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        {{with .ControlBypass}}
+        {{if or .MatchedControls .UnavailableReason}}
+        <div class="mt-4">
+          <div class="flex flex-wrap items-center gap-2 text-sm mb-2">
+            <span class="font-medium">Control bypass</span>
+            <span class="badge-outline">{{len .MatchedControls}} matched</span>
+          </div>
+          {{if .UnavailableReason}}<p class="text-sm text-muted-foreground mb-2">Resolution unavailable: {{.UnavailableReason}}</p>{{end}}
+          {{if .Assessments}}
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead><tr class="border-b"><th class="text-left py-2">Control</th><th class="text-left">Disposition</th><th class="text-left">Evidence</th></tr></thead>
+              <tbody>
+              {{range .Assessments}}
+                <tr class="border-b align-top">
+                  <td class="py-2 pr-3 font-medium">{{.ControlID}}</td>
+                  <td class="py-2 pr-3">{{.Disposition}}</td>
+                  <td class="py-2">{{.Evidence}}</td>
+                </tr>
+              {{end}}
+              </tbody>
+            </table>
+          </div>
+          {{end}}
+        </div>
+        {{end}}
+        {{end}}
+        <div class="overflow-x-auto mt-4">
+          <table class="w-full text-sm">
+            <thead><tr class="border-b"><th class="text-left py-2">Attempt</th><th class="text-left">Outcome</th><th class="text-left">Failure class</th><th class="text-left">First-party site</th><th class="text-left">Evidence</th></tr></thead>
+            <tbody>
+            {{range .Attempts}}
+              <tr class="border-b align-top">
+                <td class="py-2 pr-3 font-medium">#{{.Number}}</td>
+                <td class="py-2 pr-3">{{.Outcome}}</td>
+                <td class="py-2 pr-3">{{if .FailureClass}}{{.FailureClass}}{{else}}-{{end}}</td>
+                <td class="py-2 pr-3">{{if .CrashSite}}{{.CrashSite}}{{else}}-{{end}}</td>
+                <td class="py-2">{{.Evidence}}</td>
+              </tr>
+            {{end}}
+            </tbody>
+          </table>
+        </div>
+        {{end}}
+      </article>
+      {{end}}
+    </section>
+  </details>
+  {{end}}
+
+  {{if .AttackPaths}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Production viability history <span class="text-muted-foreground ml-auto mr-2 text-xs">{{len .AttackPaths}}</span>
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4 grid gap-4">
+      {{range .AttackPaths}}
+      <article class="border-b pb-4 last:border-b-0">
+        <div class="flex flex-wrap items-center gap-2 text-sm mb-3">
+          <a href="/scans/{{.ScanID}}" class="font-medium hover:underline">scan #{{.ScanID}}</a>
+          <span class="badge-outline">{{.ProductionViability}}</span>
+          <span class="text-xs text-muted-foreground">{{.CreatedAt.Format "2006-01-02 15:04"}}</span>
+        </div>
+        {{if .Parsed}}
+        <dl class="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm mb-3">
+          <div><dt class="text-muted-foreground">Source state</dt><dd>{{.Assessment.SourceState}}</dd></div>
+          <div><dt class="text-muted-foreground">Attacker position</dt><dd>{{.Assessment.AttackerPosition}}</dd></div>
+          <div><dt class="text-muted-foreground">Likelihood</dt><dd>{{.Assessment.Likelihood}}</dd></div>
+        </dl>
+        <div class="prose max-w-none text-sm mb-3"><p>{{.Assessment.Reason}}</p><p><strong>Impact:</strong> {{.Assessment.Impact}}</p></div>
+        {{if .Assessment.Preconditions}}<div class="text-sm mb-2"><span class="font-medium">Preconditions:</span> {{range $i, $item := .Assessment.Preconditions}}{{if $i}}; {{end}}{{$item}}{{end}}</div>{{end}}
+        {{if .Assessment.Counterevidence}}<div class="text-sm mb-2"><span class="font-medium">Counterevidence:</span> {{range $i, $item := .Assessment.Counterevidence}}{{if $i}}; {{end}}{{$item}}{{end}}</div>{{end}}
+        {{if .Assessment.FactsThatWouldChangeTheResult}}<div class="text-sm"><span class="font-medium">Would change the result:</span> {{range $i, $item := .Assessment.FactsThatWouldChangeTheResult}}{{if $i}}; {{end}}{{$item}}{{end}}</div>{{end}}
+        {{end}}
+      </article>
+      {{end}}
+    </section>
+  </details>
+  {{end}}
 
   <details class="group border-b">
     <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">

@@ -2,6 +2,7 @@ package web
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -10,6 +11,23 @@ import (
 	"scrutineer/internal/db"
 	"scrutineer/internal/ingest"
 )
+
+func importSingleResult(s *Server, res ingest.Result, revalidate bool) (map[string]any, error) {
+	return importSingleResultAs(s, ingest.FormatMinimal, res, revalidate)
+}
+
+// importSingleResultAs imports one result under a named format, which decides
+// whether the scanner caps apply (see import_cap.go).
+func importSingleResultAs(s *Server, format ingest.Format, res ingest.Result, revalidate bool) (map[string]any, error) {
+	out, err := s.importResults([]ingest.Result{res}, format, "", revalidate)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) != 1 {
+		return nil, fmt.Errorf("import results = %d, want 1", len(out))
+	}
+	return out[0], nil
+}
 
 func TestKnownPURLsMatchWithAndWithoutQualifiers(t *testing.T) {
 	gdb, err := db.Open("file::memory:?cache=shared")
@@ -126,7 +144,7 @@ func TestImportFindings_reimportBumpsSeenCount(t *testing.T) {
 			{Title: "two", Severity: "Low", Location: "b.go:1", CWE: "CWE-89"},
 		},
 	}
-	first, err := s.importResult(res, "", false)
+	first, err := importSingleResult(s, res, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +158,7 @@ func TestImportFindings_reimportBumpsSeenCount(t *testing.T) {
 		{Title: "one", Severity: "High", Location: "a.go:1", CWE: "CWE-79"},
 		{Title: "three", Severity: "Medium", Location: "c.go:1", CWE: "CWE-22"},
 	}
-	second, err := s.importResult(res, "", false)
+	second, err := importSingleResult(s, res, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +191,109 @@ func TestImportFindings_reimportBumpsSeenCount(t *testing.T) {
 		Where("finding_id = ? AND field = ?", reobserved.ID, "observed").Count(&hist)
 	if hist != 1 {
 		t.Errorf("history rows = %d, want 1", hist)
+	}
+}
+
+// referenceRows returns a finding's references in id order.
+func referenceRows(t *testing.T, s *Server, findingID uint) []db.FindingReference {
+	t.Helper()
+	var refs []db.FindingReference
+	if err := s.DB.Where("finding_id = ?", findingID).Order("id").Find(&refs).Error; err != nil {
+		t.Fatalf("load references: %v", err)
+	}
+	return refs
+}
+
+// bundleWithReferences builds a one-finding result carrying the given
+// references, the shape an include=all sharing bundle arrives in.
+func bundleWithReferences(refs ...ingest.Reference) ingest.Result {
+	return ingest.Result{
+		RepoURL: "https://example.com/r",
+		Tool:    "scrutineer",
+		Commit:  "abc",
+		Findings: []ingest.Finding{{
+			Title: "one", Severity: "High", Location: "a.go:1", CWE: "CWE-79",
+			References: refs,
+		}},
+	}
+}
+
+func TestImportFindings_referencesDedupWithinOneBundle(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	// A bundle listing one URL twice describes one reference. (finding_id, url)
+	// is unique, so passing both through would fail the insert.
+	out, err := importSingleResult(s, bundleWithReferences(
+		ingest.Reference{URL: "https://example.com/advisory", Tags: "advisory"},
+		ingest.Reference{URL: "https://example.com/advisory", Tags: "cve", Summary: "second spelling"},
+		ingest.Reference{URL: "  ", Tags: "junk"},
+	), false)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	ids, ok := out["finding_ids"].([]uint)
+	if !ok || len(ids) != 1 {
+		t.Fatalf("finding_ids = %v, want one id", out["finding_ids"])
+	}
+	refs := referenceRows(t, s, ids[0])
+	if len(refs) != 1 {
+		t.Fatalf("stored %d references, want 1: %+v", len(refs), refs)
+	}
+	if refs[0].Tags != "advisory" {
+		t.Errorf("Tags = %q, want the first spelling %q", refs[0].Tags, "advisory")
+	}
+}
+
+func TestImportFindings_reimportedReferenceWithNewMetadataIsNotDuplicated(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	if _, err := importSingleResult(s, bundleWithReferences(
+		ingest.Reference{URL: "https://example.com/advisory", Tags: "advisory"},
+	), false); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	// Re-importing the same URL under different metadata used to append a second
+	// row, which the unique index now rejects outright. The URL is the identity,
+	// so the row already on the finding stands.
+	out, err := importSingleResult(s, bundleWithReferences(
+		ingest.Reference{URL: "https://example.com/advisory", Tags: "cve", Summary: "rewritten"},
+		ingest.Reference{URL: "https://example.com/pull/42", Tags: "pr"},
+	), false)
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if out["observed"] != 1 {
+		t.Fatalf("observed = %v, want 1", out["observed"])
+	}
+	var finding db.Finding
+	if err := s.DB.Where("title = ?", "one").First(&finding).Error; err != nil {
+		t.Fatal(err)
+	}
+	refs := referenceRows(t, s, finding.ID)
+	if len(refs) != 2 {
+		t.Fatalf("stored %d references, want 2: %+v", len(refs), refs)
+	}
+	if refs[0].URL != "https://example.com/advisory" || refs[0].Tags != "advisory" {
+		t.Errorf("existing reference = %+v, want it left as first imported", refs[0])
+	}
+	if refs[1].URL != "https://example.com/pull/42" {
+		t.Errorf("new reference = %+v, want the pull request URL", refs[1])
+	}
+}
+
+func TestImportRelationsFrom_normalisesReferences(t *testing.T) {
+	rel := importRelationsFrom(ingest.Finding{References: []ingest.Reference{
+		{URL: "  https://example.com/advisory\n", Tags: " advisory ", Summary: " Upstream "},
+		{URL: "   "},
+	}})
+	if len(rel.References) != 1 {
+		t.Fatalf("mapped %d references, want 1: %+v", len(rel.References), rel.References)
+	}
+	got := rel.References[0]
+	if got.URL != "https://example.com/advisory" || got.Tags != "advisory" || got.Summary != "Upstream" {
+		t.Errorf("reference = %+v, want every field trimmed", got)
 	}
 }
 
@@ -209,6 +330,35 @@ func TestImportFindings_rollbackLeavesNoScanOrFindings(t *testing.T) {
 	s.DB.Model(&db.Finding{}).Count(&findings)
 	if scans != 0 || findings != 0 {
 		t.Fatalf("after rollback: scans=%d findings=%d, want 0/0", scans, findings)
+	}
+}
+
+func TestExistingByFingerprint_chunksLargeInput(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	const sqliteMaxVariables = 32766
+	fingerprints := make([]string, sqliteMaxVariables)
+	for i := range fingerprints {
+		fingerprints[i] = "missing"
+	}
+	if _, err := existingByFingerprint(s.DB, 1, fingerprints); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateObservedFindings_chunksLargeInput(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+
+	const sqliteMaxVariables = 32766
+	ids := make([]uint, sqliteMaxVariables)
+	for i := range ids {
+		ids[i] = uint(i + 1)
+	}
+	scan := db.Scan{Model: "test", Commit: "abc123"}
+	if err := updateObservedFindings(s.DB, &scan, ids); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -280,7 +430,7 @@ func TestImportFindings_revalidateToggle(t *testing.T) {
 					{Title: "low", Severity: "Low", Location: "b.go:1"},
 				},
 			}
-			out, err := s.importResult(res, "", tc.revalidate)
+			out, err := importSingleResult(s, res, tc.revalidate)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -303,7 +453,7 @@ func TestImportFindings_skipsRevalidateWhenSkillAbsent(t *testing.T) {
 	defer done()
 	// No revalidate skill registered. Import must still succeed.
 	res := ingest.Result{RepoURL: "https://example.com/r", Tool: "x", Findings: []ingest.Finding{{Title: "t", Severity: "High", Location: "a.go:1"}}}
-	out, err := s.importResult(res, "", true)
+	out, err := importSingleResult(s, res, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,11 +473,11 @@ func TestImportFindings_enqueuesOneMetadataOnboardingRunForExistingHollowRepo(t 
 
 	res := ingest.Result{RepoURL: repo.URL, Tool: "scrutineer",
 		Findings: []ingest.Finding{{Title: "imported", Severity: "High", Location: "lib/rdoc.rb:1"}}}
-	if _, err := s.importResult(res, "", false); err != nil {
+	if _, err := importSingleResult(s, res, false); err != nil {
 		t.Fatal(err)
 	}
 	// Reimport while metadata is queued must not pile up another run.
-	if _, err := s.importResult(res, "", false); err != nil {
+	if _, err := importSingleResult(s, res, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -354,7 +504,7 @@ func TestImportFindings_existingDoneMetadataIsNotDuplicated(t *testing.T) {
 
 	res := ingest.Result{RepoURL: repo.URL, Tool: "scrutineer",
 		Findings: []ingest.Finding{{Title: "imported", Severity: "Medium"}}}
-	if _, err := s.importResult(res, "", false); err != nil {
+	if _, err := importSingleResult(s, res, false); err != nil {
 		t.Fatal(err)
 	}
 	var count int64
@@ -376,7 +526,7 @@ func TestImportFindings_localRepoWithValidPathGetsNoMetadataScan(t *testing.T) {
 	dir := t.TempDir()
 	res := ingest.Result{RepoURL: LocalScheme + dir, Tool: "scrutineer",
 		Findings: []ingest.Finding{{Title: "local", Severity: "High", Location: "main.go:1"}}}
-	if _, err := s.importResult(res, "", false); err != nil {
+	if _, err := importSingleResult(s, res, false); err != nil {
 		t.Fatal(err)
 	}
 	var count int64

@@ -41,6 +41,7 @@
 
     "findings":  { "type": "array", "items": { "$ref": "#/$defs/finding" } },
     "ruled_out": { "type": "array", "items": { "$ref": "#/$defs/ruled_out_entry" } },
+    "coverage": { "$ref": "#/$defs/coverage_claim" },
 
     "prior_art": { "$ref": "#/$defs/markdown" },
     "reach":     { "$ref": "#/$defs/markdown" }
@@ -58,6 +59,62 @@
     "confidence": {
       "type": "string",
       "enum": ["high", "medium", "low"]
+    },
+    "coverage_disposition": {
+      "type": "string",
+      "enum": ["reviewed_clean", "reviewed_findings", "supporting", "deferred", "excluded", "failed", "cost_capped"]
+    },
+    "coverage_claim": {
+      "type": "object",
+      "required": ["receipts"],
+      "additionalProperties": false,
+      "properties": {
+        "receipts": { "type": "array", "items": { "$ref": "#/$defs/coverage_receipt" } },
+        "surfaces": { "type": "array", "items": { "$ref": "#/$defs/coverage_surface" } },
+        "open_questions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "dropped_findings": { "type": "array", "items": { "$ref": "#/$defs/coverage_dropped_finding" } }
+      }
+    },
+    "coverage_receipt": {
+      "type": "object",
+      "required": ["path", "disposition"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "disposition": { "$ref": "#/$defs/coverage_disposition" },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "disposition": { "enum": ["deferred", "excluded", "failed", "cost_capped"] } }, "required": ["disposition"] },
+          "then": { "required": ["reason"] }
+        }
+      ]
+    },
+    "coverage_surface": {
+      "type": "object",
+      "required": ["name", "disposition", "evidence_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "disposition": { "$ref": "#/$defs/coverage_disposition" },
+        "evidence_ref": { "type": "string", "minLength": 1 }
+      }
+    },
+    "coverage_dropped_finding": {
+      "type": "object",
+      "required": ["reason"],
+      "additionalProperties": false,
+      "properties": {
+        "fingerprint": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string" }
+      },
+      "anyOf": [
+        { "required": ["fingerprint"] },
+        { "required": ["path"] }
+      ]
     },
     "sink_class": {
       "type": "string",
@@ -81,7 +138,8 @@
         "Round-trip integrity",
         "Authorization and access control",
         "Temporary files",
-        "Agentic"
+        "Agentic",
+        "API misuse"
       ]
     },
     "sink_id":    { "type": "string", "pattern": "^S[0-9]+$" },

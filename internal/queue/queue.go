@@ -69,6 +69,9 @@ type Queue struct {
 	// blocks on mu while Reconfigure holds it for the duration of a runner
 	// swap (which includes the cancelled scan's teardown).
 	concurrency atomic.Int64
+	// maxConcurrency is zero when unbounded. A positive value is enforced by
+	// every Reconfigure call, including settings-driven runner restarts.
+	maxConcurrency atomic.Int64
 
 	mu        sync.Mutex
 	runner    *jobs.Runner
@@ -139,6 +142,26 @@ func (q *Queue) Concurrency() int {
 	return int(q.concurrency.Load())
 }
 
+// EffectiveConcurrency reports the runner limit that would be applied for a
+// requested value after process-level caps. It does not rebuild the runner.
+func (q *Queue) EffectiveConcurrency(requested int) int {
+	if requested <= 0 {
+		requested = DefaultWorkerConcurrency
+	}
+	if maximum := int(q.maxConcurrency.Load()); maximum > 0 {
+		requested = min(requested, maximum)
+	}
+	return requested
+}
+
+// SetMaxConcurrency applies a process-lifetime admission cap. It is used when
+// a shared backend credential requires serialization; keeping the cap in the
+// queue means every live runner rebuild observes it.
+func (q *Queue) SetMaxConcurrency(maximum int) {
+	q.maxConcurrency.Store(int64(max(0, maximum)))
+	q.Reconfigure(q.Concurrency())
+}
+
 func (q *Queue) Register(name string, fn jobs.Func) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -186,9 +209,7 @@ func (q *Queue) startRunnerLocked() {
 // Calling before Start just records the value, applied when Start builds the
 // first runner.
 func (q *Queue) Reconfigure(concurrency int) {
-	if concurrency <= 0 {
-		concurrency = DefaultWorkerConcurrency
-	}
+	concurrency = q.EffectiveConcurrency(concurrency)
 	q.concurrency.Store(int64(concurrency))
 	q.mu.Lock()
 	defer q.mu.Unlock()

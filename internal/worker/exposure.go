@@ -2,28 +2,17 @@ package worker
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
 
+	"github.com/git-pkgs/clone"
+
 	"scrutineer/internal/db"
 )
-
-// dependentCacheRoot returns the shared on-disk path scrutineer reuses
-// across exposure scans of the same dependent URL. Keyed by sha256 of the
-// URL so different URLs cannot collide and the path is filesystem-safe.
-// The directory survives wrap()'s per-scan workspace cleanup, so the
-// second exposure scan on the same dependent only fetches the delta.
-func dependentCacheRoot(dataDir, url string) string {
-	sum := sha256.Sum256([]byte(url))
-	return filepath.Join(dataDir, "dependent-cache", hex.EncodeToString(sum[:]))
-}
 
 // cacheMutex returns the per-URL mutex used to serialise fetch+copy on
 // the dependent cache. Lazily created on first use.
@@ -38,73 +27,34 @@ func (w *Worker) cacheMutex(url string) *sync.Mutex {
 // is whatever the skill leaves behind. Returns the HEAD commit of the
 // freshly-synced cache.
 func (w *Worker) prepareDependentSrc(ctx context.Context, url, ref, workRoot string, emit func(Event)) (string, error) {
+	// Validate before emitting so a bad URL or ref does not log a
+	// "$ git clone" line for a command that will never run.
+	if err := clone.ValidateURL(url); err != nil {
+		return "", &RepoUnreachableError{URL: url, Err: err}
+	}
+	if err := clone.ValidateRef(ref); err != nil {
+		return "", err
+	}
 	mu := w.cacheMutex(url)
 	mu.Lock()
 	defer mu.Unlock()
 
-	cacheRoot := dependentCacheRoot(w.DataDir, url)
-	if err := os.MkdirAll(cacheRoot, dirPerm); err != nil {
-		return "", err
+	cache := clone.Cache{
+		Root:  filepath.Join(w.DataDir, "dependent-cache"),
+		Retry: gitRetry{}.toCloneWithNotify(emit),
 	}
-	cacheSrc, err := ensureClone(ctx, db.Repository{URL: url}, cacheRoot, false, ref, emit)
-	if err != nil {
-		return "", err
+	if _, err := os.Stat(filepath.Join(cache.Dir(url), "src", ".git")); err == nil {
+		emit(Event{Kind: KindText, Text: "$ git fetch origin " + fetchTarget(ref) + " && reset"})
+	} else {
+		emit(Event{Kind: KindText, Text: "$ git clone " + url + " (shallow)"})
 	}
-	commit := gitHead(cacheSrc)
-	dst := filepath.Join(workRoot, "src")
-	if err := os.RemoveAll(dst); err != nil {
-		return "", err
-	}
-	if err := CopyTree(cacheSrc, dst); err != nil {
-		return "", fmt.Errorf("copy dependent cache: %w", err)
-	}
-	return commit, nil
+	return cache.Prepare(ctx, url, ref, filepath.Join(workRoot, "src"))
 }
 
 // CopyTree recursively copies src to dst, preserving permissions but not
 // ownership or timestamps. Symlinks are recreated; everything else is
 // copied byte-for-byte. Fast enough for git trees up to a few hundred MB.
-func CopyTree(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dst, rel)
-		switch {
-		case info.IsDir():
-			return os.MkdirAll(target, info.Mode().Perm())
-		case info.Mode()&os.ModeSymlink != 0:
-			link, err := os.Readlink(path)
-			if err != nil {
-				return err
-			}
-			return os.Symlink(link, target)
-		default:
-			return copyFile(path, target, info.Mode().Perm())
-		}
-	})
-}
-
-func copyFile(src, dst string, perm os.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	return out.Close()
-}
+func CopyTree(src, dst string) error { return clone.CopyTree(src, dst) }
 
 // doExposure runs the exposure skill for one (finding, dependent) pair.
 // The scan's Repository stays the library being audited; ./src in the
@@ -137,16 +87,21 @@ func (w *Worker) doExposure(ctx context.Context, scan *db.Scan, emit func(Event)
 	}
 	scan.SkillName = skill.Name
 	scan.SkillVersion = skill.Version
-	w.DB.Model(scan).Updates(map[string]any{
+	// Non-fatal: the in-memory scan already carries both fields and finalizeScan
+	// saves the whole row at the end, so a failure here only leaves the columns
+	// stale for readers watching the table while the scan runs.
+	if err := w.DB.Model(scan).Updates(map[string]any{
 		"skill_name":    skill.Name,
 		"skill_version": skill.Version,
-	})
+	}).Error; err != nil {
+		w.Log.Warn("update scan skill metadata", "scan", scan.ID, "skill", skill.Name, "err", err)
+	}
 
 	workRoot := w.scanWorkRoot(scan)
 	if err := validateSkillPaths(skill.Name, skill.OutputFile); err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(workRoot, dirPerm); err != nil {
+	if err := resetWorkspace(workRoot); err != nil {
 		return "", err
 	}
 	cacheCommit, err := w.prepareDependentSrc(ctx, dep.RepositoryURL, scan.Ref, workRoot, emit)
@@ -167,11 +122,13 @@ func (w *Worker) doExposure(ctx context.Context, scan *db.Scan, emit func(Event)
 	}
 
 	skillDir := w.Runner.SkillDir(workRoot, skill.Name)
-	if err := stageContext(workRoot, w.APIBase, w.ForkOrg, w.metadataDir(), scan, &scan.Repository); err != nil {
-		return "", fmt.Errorf("stage context: %w", err)
-	}
+	// stageSkill clears skillDir, so it runs before stageContext, which
+	// writes context.json into that directory (#499).
 	if err := stageSkill(&skill, workRoot, skillDir); err != nil {
 		return "", fmt.Errorf("stage skill: %w", err)
+	}
+	if err := stageContext(workRoot, skillDir, w.apiBaseFor(skill.Name), w.ForkOrg, w.metadataDir(), scan, &scan.Repository); err != nil {
+		return "", fmt.Errorf("stage context: %w", err)
 	}
 
 	depRepo := db.Repository{URL: dep.RepositoryURL, Name: dep.Name}

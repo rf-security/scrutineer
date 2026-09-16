@@ -2,10 +2,13 @@ package worker
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+
+	"scrutineer/internal/verification"
 )
 
 // SchemaValidationError carries the formatted validator output for a report
@@ -37,14 +40,30 @@ func ValidateSkillReport(skillName, schemaJSON, report string) string {
 // express. It intentionally applies only to skills with an explicit contract;
 // all other skills retain their existing schema-only validation behavior.
 func ValidateReportSemantics(skillName, report string) string {
-	if skillName != deepDiveSkillName {
+	switch skillName {
+	case deepDiveSkillName:
+		var parsed deepDiveSemanticReport
+		if err := json.Unmarshal([]byte(report), &parsed); err != nil {
+			return "report.json is not valid JSON: " + err.Error()
+		}
+		return validateDeepDiveSinkDispositions(parsed)
+	case verifySkillName:
+		_, err := verification.Parse(report)
+		if errors.Is(err, verification.ErrMissingRubric) {
+			return ""
+		}
+		if err != nil {
+			return "verify rubric: " + err.Error()
+		}
+		return ""
+	case reattackSkillName:
+		if _, _, _, err := decodeReattackReport(report); err != nil {
+			return "reattack report: " + err.Error()
+		}
+		return ""
+	default:
 		return ""
 	}
-	var parsed deepDiveSemanticReport
-	if err := json.Unmarshal([]byte(report), &parsed); err != nil {
-		return "report.json is not valid JSON: " + err.Error()
-	}
-	return validateDeepDiveSinkDispositions(parsed)
 }
 
 // ValidateReportSchema compiles schemaJSON and validates report against it.

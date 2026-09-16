@@ -1,6 +1,7 @@
 /data/
 /data-*/
 /scrutineer
+*.test
 # Compiled helper binaries (build from source under scripts/ instead).
 /migrate-sqlite-to-postgres
 *.db

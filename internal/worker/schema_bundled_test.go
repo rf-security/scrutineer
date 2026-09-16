@@ -1,16 +1,59 @@
 package worker
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"scrutineer/internal/coverage"
+	"scrutineer/internal/skills"
 )
 
-// TestBundledSchemas_compileAndAcceptSamples checks that the three schemas
-// added for #182 compile and accept a representative report. repo-overview
-// and sbom samples are external-tool output so the schemas are intentionally
-// loose; the point is catching a typo in the schema, not proving CycloneDX
-// conformance.
+const sharedAuditSchemaRef = "../_shared/audit-findings.schema.json"
+
+func TestAuditFindingSchemasReferenceSharedContract(t *testing.T) {
+	paths := []string{
+		"../../skills/audit-injection/schema.json",
+		"../../skills/audit-exfil/schema.json",
+		"../../skills/audit-authz/schema.json",
+		"../../skills/audit-pii/schema.json",
+		"../../skills/audit-memory/schema.json",
+	}
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		var wrapper map[string]any
+		if err := json.Unmarshal(raw, &wrapper); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		if got := wrapper["$ref"]; got != sharedAuditSchemaRef {
+			t.Errorf("%s $ref = %v, want %q", path, got, sharedAuditSchemaRef)
+		}
+		for _, keyword := range []string{"type", "properties", "$defs"} {
+			if _, ok := wrapper[keyword]; ok {
+				t.Errorf("%s defines validation keyword %q instead of using the shared contract", path, keyword)
+			}
+		}
+	}
+}
+
+func loadBundledSchema(t *testing.T, schemaPath string) string {
+	t.Helper()
+	parsed, err := skills.ParseFile(filepath.Join(filepath.Dir(schemaPath), "SKILL.md"))
+	if err != nil {
+		t.Fatalf("load schema for %s: %v", schemaPath, err)
+	}
+	return parsed.SchemaJSON
+}
+
+// TestBundledSchemas_compileAndAcceptSamples checks that bundled schemas
+// compile and accept representative reports. Some samples are external-tool
+// output, so the point is catching schema mistakes rather than proving each
+// upstream format's conformance.
 func TestBundledSchemas_compileAndAcceptSamples(t *testing.T) {
 	cases := []struct {
 		schema string
@@ -18,15 +61,27 @@ func TestBundledSchemas_compileAndAcceptSamples(t *testing.T) {
 	}{
 		{
 			"../../skills/triage/schema.json",
-			`{"has_code":true,"has_packages":true,
-			  "brief":{"languages":["Go"],"package_managers":["Go Modules"]},
+			`{"has_code":true,"has_packages":true,"has_embedded_native":true,
+			  "brief":{"languages":["Go","C"],"package_managers":["Go Modules"],
+			    "native_signals":["language:Go","language:C"]},
 			  "triggered":["packages","advisories","security-deep-dive"],
 			  "skipped":["semgrep"],"gated":[],"already_done":["metadata"],
-			  "verify":[12,34],"errors":[]}`,
+			  "verify":[12,34],"release_watch":[55,56],"errors":[]}`,
 		},
 		{
 			"../../skills/triage/schema.json",
 			`{"error":"context.json missing scrutineer block"}`,
+		},
+		{
+			"../../skills/bandit/schema.json",
+			`{"findings":[{"id":"F1","title":"B608 hardcoded_sql_expressions",
+			  "severity":"Medium","confidence":"low","cwe":"CWE-89",
+			  "location":"app.py:9","locations":["app.py:9"],
+			  "trace":"Possible SQL injection vector through string-based query construction.",
+			  "rating":"Medium from bandit test B608",
+			  "references":[{"url":"https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
+			    "summary":"bandit docs: B608","tags":"docs"}]}],
+			  "notes":"bandit could not read 1 file(s): bad.py (syntax error while parsing AST from file)"}`,
 		},
 		{
 			"../../skills/repo-overview/schema.json",
@@ -37,6 +92,19 @@ func TestBundledSchemas_compileAndAcceptSamples(t *testing.T) {
 			  "resources":{"license_type":"MIT","readme":"README.md"},
 			  "tools":{},"lines":{"total_files":1},"dependencies":[],
 			  "stats":{"duration_ms":1.2},"unknown_future_key":42}`,
+		},
+		{
+			"../../skills/embedded-native/schema.json",
+			`{"schema_version":1,
+			  "root":{"languages":[{"name":"Python"}],"tools":{"dependency_bot":[{"name":"Git Submodules"}]}},
+			  "components":[{"path":"vendor/native","url":"https://github.com/example/native.git",
+			    "commit":"abc123","purl":"pkg:github/example/native@abc123","initialized":true,
+			    "status":"initialized","error":""}],
+			  "submodules":[{"path":"/work/src/vendor/native","languages":[{"name":"C"}]}]}`,
+		},
+		{
+			"../../skills/embedded-native/schema.json",
+			`{"error":"brief not found on PATH"}`,
 		},
 		{
 			"../../skills/repo-overview/schema.json",
@@ -56,11 +124,24 @@ func TestBundledSchemas_compileAndAcceptSamples(t *testing.T) {
 		},
 		{
 			"../../skills/dependencies/schema.json",
-			`{"dependencies":[]}`,
+			depEnvelope(`[]`, ""),
 		},
 		{
 			"../../skills/dependencies/schema.json",
-			`{"dependencies":[],"error":"git-pkgs not found on PATH"}`,
+			depEnvelope(`[{"name":"x","ecosystem":"npm","type":"runtime"}]`, cdxEnvelopeFixture),
+		},
+		{
+			"../../skills/dependencies/schema.json",
+			`{"schema_version":1,"analyses":{
+				"inventory":{"status":"error","error":"git-pkgs: exit 1"},
+				"sbom":{"status":"error","error":"git-pkgs: exit 1"}}}`,
+		},
+		{
+			// The SKILL.md fallback shape for a wholesale script failure:
+			// analyses is present but empty. Sections are not required so
+			// schema validation still surfaces the top-level error.
+			"../../skills/dependencies/schema.json",
+			`{"schema_version":1,"analyses":{},"error":"git-pkgs init failed"}`,
 		},
 		{
 			"../../skills/public-issue/schema.json",
@@ -110,6 +191,114 @@ func TestBundledSchemas_compileAndAcceptSamples(t *testing.T) {
 			  "notes":["Examples and vendored code were excluded."]}`,
 		},
 		{
+			"../../skills/history/schema.json",
+			`{"schema_version":1,
+			  "analyzed_head":"0123456789abcdef0123456789abcdef01234567",
+			  "continuation":{"base":null,"after":"abcdef0123456789abcdef0123456789abcdef01"},
+			  "scope_ref":"","scope_subpath":"","partial":true,
+			  "gaps":["Candidate pagination is incomplete."],
+			  "cache":{"reused":false,"previous_head":null,"invalidated_reason":"no prior cache"},
+			  "candidate_stats":{"matched":2,"reviewed":2,"security_fixes":1,"not_security":1,"unclear":0},
+			  "fixes":[{"commit":"abcdef0123456789abcdef0123456789abcdef01",
+			    "title":"fix parser bounds check",
+			    "description":"The patch rejects lengths beyond the destination buffer before copying.",
+			    "code_paths":["src/parser.c"],"vuln_type":"out-of-bounds write","cve_if_any":null}]}`,
+		},
+		{
+			"../../skills/history/schema.json",
+			`{"error":"src is not a Git repository"}`,
+		},
+		{
+			"../../skills/critic/schema.json",
+			`{"production_viability":"VIABLE","source_state":"PRESENT",
+			  "reason":"Makefile and release workflow compile src/parser.c into the default binary.",
+			  "counterevidence":[],"attacker_position":"unauthenticated network client",
+			  "preconditions":["default server configuration"],
+			  "impact":"attacker-controlled bytes reach the vulnerable parser",
+			  "likelihood":"likely","applied_adjustments":[],
+			  "facts_that_would_change_the_result":["release build disables the parser"]}`,
+		},
+		{
+			"../../skills/critic/schema.json",
+			`{"production_viability":"VIABLE","source_state":"MOVED",
+			  "reason":"The relocated parser is linked into the release binary.",
+			  "counterevidence":[],"attacker_position":"remote client","preconditions":[],
+			  "impact":"code execution","likelihood":"plausible","applied_adjustments":[],
+			  "facts_that_would_change_the_result":[]}`,
+		},
+		{
+			"../../skills/critic/schema.json",
+			`{"production_viability":"SAMPLE_OR_TEST","source_state":"MOVED",
+			  "reason":"The relocated parser now exists only under tests.",
+			  "counterevidence":[],"attacker_position":"test author","preconditions":[],
+			  "impact":"test process aborts","likelihood":"unlikely","applied_adjustments":[],
+			  "facts_that_would_change_the_result":[]}`,
+		},
+		{
+			"../../skills/verify/schema.json",
+			`{"status":"confirmed","preflight":{"classification":"local-safe","justification":"local file input"},
+				  "attack_tree":{"goal":"Trigger parser panic","root_id":"AT1","verdict":"reachable","nodes":[
+			    {"id":"AT1","parent_id":null,"kind":"goal","description":"Trigger parser panic","status":"satisfied","evidence":"attempts 1-3 panic"},
+			    {"id":"AT2","parent_id":"AT1","kind":"entry_point","description":"Call public Parse","status":"satisfied","evidence":"api.go:18"},
+				    {"id":"AT3","parent_id":"AT2","kind":"sink","description":"Reach parser sink","status":"satisfied","evidence":"parser.go:42"}],"blockers":[]},
+				  "severity_prerequisites":{"attacker_position":{"value":"remote_unauthenticated","evidence":"public parser accepts remote bytes"},"user_interaction":{"value":"none","evidence":"request alone triggers parsing"},"outcome_determinism":{"value":"deterministic","evidence":"3/3 attempts panic"},"impact":{"value":"code_execution_or_equivalent","evidence":"memory corruption reaches an attacker-controlled write"},"existing_capability":{"value":"none","evidence":"no prior host access is required"}},
+			  "attempts":[
+			    {"number":1,"outcome":"reproduced","evidence":"boom","failure_class":"panic","crash_site":"parser.go:42"},
+			    {"number":2,"outcome":"reproduced","evidence":"boom","failure_class":"panic","crash_site":"parser.go:42"},
+			    {"number":3,"outcome":"reproduced","evidence":"boom","failure_class":"panic","crash_site":"parser.go:42"}],
+			  "criteria":{
+			    "poc_well_formed":{"verdict":"pass","method":"run","evidence":"parsed","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "reproduces_three_of_three":{"verdict":"pass","method":"run three times","evidence":"3/3","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "claimed_failure_class":{"verdict":"pass","method":"trace","evidence":"panic","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "public_interface_to_first_party_sink":{"verdict":"pass","method":"stack","evidence":"public API to parser.go","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "deterministic":{"verdict":"pass","method":"compare","evidence":"same site","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "control_bypass":{"matched_controls":["web-authz"],"assessments":[{"control_id":"web-authz","disposition":"bypassed","evidence":"attempts reach the handler without authentication"}]}}}`,
+		},
+		{
+			"../../skills/verify/schema.json",
+			`{"status":"fixed","attack_tree":{"goal":"Trigger parser panic","root_id":"AT1","verdict":"blocked","nodes":[
+			  {"id":"AT1","parent_id":null,"kind":"goal","description":"Trigger parser panic","status":"blocked","evidence":"length guard rejects input"},
+				  {"id":"AT2","parent_id":"AT1","kind":"precondition","description":"Bypass length guard","status":"blocked","evidence":"parser.go:31 returns before the sink"}],"blockers":["parser.go:31 rejects oversized input"]},
+				  "severity_prerequisites":{"attacker_position":{"value":"remote_unauthenticated","evidence":"public parser accepts remote bytes"},"user_interaction":{"value":"none","evidence":"request alone reaches the guard"},"outcome_determinism":{"value":"deterministic","evidence":"the guard blocks 3/3 attempts"},"impact":{"value":"code_execution_or_equivalent","evidence":"the original claim is memory corruption"},"existing_capability":{"value":"none","evidence":"no prior host access is required"}},
+			  "attempts":[
+			    {"number":1,"outcome":"not_reproduced","evidence":"guard returned error","failure_class":"","crash_site":""},
+			    {"number":2,"outcome":"not_reproduced","evidence":"guard returned error","failure_class":"","crash_site":""},
+			    {"number":3,"outcome":"not_reproduced","evidence":"guard returned error","failure_class":"","crash_site":""}],
+			  "criteria":{
+			    "poc_well_formed":{"verdict":"pass","method":"run","evidence":"parsed","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "reproduces_three_of_three":{"verdict":"fail","method":"run three times","evidence":"0/3","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "claimed_failure_class":{"verdict":"fail","method":"trace","evidence":"no failure","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "public_interface_to_first_party_sink":{"verdict":"pass","method":"stack","evidence":"public API reached guard","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "deterministic":{"verdict":"pass","method":"compare","evidence":"same guard in 3/3","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "control_bypass":{"matched_controls":[],"assessments":[],"unavailable_reason":"the repository threat model could not be read"}}}`,
+		},
+		{
+			"../../skills/verify/schema.json",
+			`{"status":"deferred","preflight":{"classification":"external-reach","justification":"curl https://example.com/callback"},
+				  "attack_tree":{"goal":"Reach callback","root_id":"AT1","verdict":"not_attempted","nodes":[
+				    {"id":"AT1","parent_id":null,"kind":"goal","description":"Reach callback","status":"not_attempted","evidence":"preflight requires external reach"}],"blockers":[]},
+				  "severity_prerequisites":{"attacker_position":{"value":"not_attempted","evidence":"external-reach preflight blocked evaluation"},"user_interaction":{"value":"not_attempted","evidence":"external-reach preflight blocked evaluation"},"outcome_determinism":{"value":"not_attempted","evidence":"external-reach preflight blocked evaluation"},"impact":{"value":"not_attempted","evidence":"external-reach preflight blocked evaluation"},"existing_capability":{"value":"not_attempted","evidence":"external-reach preflight blocked evaluation"}},
+			  "attempts":[
+			    {"number":1,"outcome":"not_attempted","evidence":"external reach prohibited","failure_class":"","crash_site":""},
+			    {"number":2,"outcome":"not_attempted","evidence":"external reach prohibited","failure_class":"","crash_site":""},
+			    {"number":3,"outcome":"not_attempted","evidence":"external reach prohibited","failure_class":"","crash_site":""}],
+			  "criteria":{
+			    "poc_well_formed":{"verdict":"not_attempted","method":"preflight","evidence":"external reach","counterevidence":"","proof_gap":"execution","confidence":"high"},
+			    "reproduces_three_of_three":{"verdict":"not_attempted","method":"preflight","evidence":"external reach","counterevidence":"","proof_gap":"execution","confidence":"high"},
+			    "claimed_failure_class":{"verdict":"not_attempted","method":"preflight","evidence":"external reach","counterevidence":"","proof_gap":"execution","confidence":"high"},
+			    "public_interface_to_first_party_sink":{"verdict":"not_attempted","method":"preflight","evidence":"external reach","counterevidence":"","proof_gap":"execution","confidence":"high"},
+			    "deterministic":{"verdict":"not_attempted","method":"preflight","evidence":"external reach","counterevidence":"","proof_gap":"execution","confidence":"high"},
+			    "control_bypass":{"matched_controls":[],"assessments":[]}}}`,
+		},
+		{
+			"../../skills/reattack/schema.json",
+			`{"outcome":"failed_to_bypass","variants":[
+			  {"name":"v1","input":"a","origin":"generated","valid":true,"outcome":"blocked","same_bug_class":true,"same_sink":true,"failure_class":"","sink":"parser.go:42","evidence":"blocked at guard"},
+			  {"name":"v2","input":"b","origin":"generated","valid":true,"outcome":"blocked","same_bug_class":true,"same_sink":true,"failure_class":"","sink":"parser.go:42","evidence":"blocked at guard"},
+			  {"name":"v3","input":"c","origin":"generated","valid":true,"outcome":"blocked","same_bug_class":true,"same_sink":true,"failure_class":"","sink":"parser.go:42","evidence":"blocked at guard"}],
+			  "benign_control":{"input":"ok","reached_sink":true,"crashed":false,"evidence":"returned expected result"},"notes":""}`,
+		},
+		{
 			"../../skills/security-deep-dive/schema.json",
 			`{"repository":"https://github.com/o/r","commit":"abc1234","spec_version":13,
 			  "model":"claude","date":"2026-07-16","languages":["C"],
@@ -122,7 +311,10 @@ func TestBundledSchemas_compileAndAcceptSamples(t *testing.T) {
 			    "boundary":"library caller","primitive":"realloc","consumes":"XML length"},
 			    {"id":"S2","location":"lib/parser.c:42","class":"Memory safety",
 			    "boundary":"CLI operator","primitive":"realloc","consumes":"command-line length"}],
-			  "findings":[],"ruled_out":[{"sinks":["S1","S2"],"step":2,"reason":"Bounded by documented caller invariants."}]}`,
+			  "findings":[],"ruled_out":[{"sinks":["S1","S2"],"step":2,"reason":"Bounded by documented caller invariants."}],
+			  "coverage":{"receipts":[{"path":"lib/parser.c","disposition":"reviewed_clean"}],
+			    "surfaces":[{"name":"Memory safety","disposition":"reviewed_clean","evidence_ref":"lib/parser.c:42"}],
+			    "open_questions":[],"dropped_findings":[]}}`,
 		},
 		{
 			"../../skills/forensics/schema.json",
@@ -155,6 +347,74 @@ func TestBundledSchemas_compileAndAcceptSamples(t *testing.T) {
 		},
 		{
 			"../../skills/audit-injection/schema.json",
+			`{"findings":[]}`,
+		},
+		{
+			"../../skills/audit-exfil/schema.json",
+			`{"findings":[{"id":"F001","title":"Webhook URL fetch can reach internal metadata service",
+			  "severity":"High","confidence":"high","cwe":"CWE-918","location":"internal/webhooks/route:v2/fetch.go:91",
+			  "reachability":"reachable","quality_tier":"high",
+			  "trace":"The webhook endpoint stores a caller-provided callback URL and later passes it to http.Client.Do.",
+			  "boundary":"An authenticated project member controls the callback URL, while the worker can reach internal services.",
+			  "validation":"Static review confirmed the request follows redirects and found no host, scheme, or private-IP allowlist.",
+			  "discovered_via":"source",
+			  "rating":"High because a project member can make the server disclose cloud metadata or internal service responses.",
+			  "references":[{"url":"https://owasp.org/www-community/attacks/Server_Side_Request_Forgery",
+			    "summary":"SSRF overview","tags":"ssrf"}]}]}`,
+		},
+		{
+			"../../skills/audit-exfil/schema.json",
+			`{"findings":[]}`,
+		},
+		{
+			"../../skills/audit-authz/schema.json",
+			`{"findings":[{"id":"F001","title":"Invoice lookup omits tenant ownership",
+			  "severity":"High","confidence":"high","cwe":"CWE-639","location":"internal/invoices/show.go:74",
+			  "reachability":"reachable","quality_tier":"high",
+			  "trace":"The authenticated endpoint passes the caller-controlled invoice ID to a global lookup and returns the row.",
+			  "boundary":"A tenant member may supply another tenant's invoice ID.",
+			  "validation":"Static review resolved the route middleware and repository helper, then confirmed neither checks invoice tenant membership.",
+			  "discovered_via":"source",
+			  "rating":"High because any authenticated tenant member can read another tenant's billing record.",
+			  "references":[{"url":"https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/",
+			    "summary":"OWASP API1:2023 Broken Object Level Authorization","tags":"authorization,idor"}]}]}`,
+		},
+		{
+			"../../skills/audit-authz/schema.json",
+			`{"findings":[]}`,
+		},
+		{
+			"../../skills/audit-pii/schema.json",
+			`{"findings":[{"id":"F001","title":"Customer email is written to an analytics event",
+			  "severity":"Medium","confidence":"high","cwe":"CWE-359","location":"internal/analytics/signup.go:64",
+			  "reachability":"reachable","quality_tier":"high",
+			  "trace":"The signup handler passes the account email to the analytics properties map without redaction.",
+			  "boundary":"A user email leaves the application database and is retained by the third-party analytics provider.",
+			  "validation":"Static review confirmed this is a runtime account value, not an example literal, and found no hashing or analytics allowlist.",
+			  "discovered_via":"source",
+			  "rating":"Medium because every signup discloses a personal identifier to a durable third-party sink.",
+			  "references":[{"url":"https://cwe.mitre.org/data/definitions/359.html",
+			    "summary":"CWE-359","tags":"privacy,pii"}]}]}`,
+		},
+		{
+			"../../skills/audit-pii/schema.json",
+			`{"findings":[]}`,
+		},
+		{
+			"../../skills/audit-memory/schema.json",
+			`{"findings":[{"id":"F001","title":"Overflowed growth leaves parser buffer undersized",
+			  "severity":"High","confidence":"high","cwe":"CWE-787","location":"lib/xmlparse.c:418",
+			  "reachability":"reachable","quality_tier":"high",
+			  "trace":"A library caller's XML token length reaches bytes * 2 in size_t; the wrapped allocation is smaller after overflow and the decoder writes the full token.",
+			  "boundary":"The public parser API accepts untrusted XML bytes and reaches the first-party token buffer in the library build.",
+			  "validation":"The literal realloc inventory hit was traced through the local wrapper; neither the wrapper nor callers check multiplication overflow before allocation.",
+			  "discovered_via":"source",
+			  "rating":"High because a crafted document can cause an out-of-bounds write in applications embedding the parser.",
+			  "references":[{"url":"https://cwe.mitre.org/data/definitions/787.html",
+			    "summary":"CWE-787","tags":"memory-safety,out-of-bounds-write"}]}]}`,
+		},
+		{
+			"../../skills/audit-memory/schema.json",
 			`{"findings":[]}`,
 		},
 		{
@@ -223,13 +483,62 @@ func TestBundledSchemas_compileAndAcceptSamples(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		schema, err := os.ReadFile(tc.schema)
-		if err != nil {
-			t.Fatalf("read %s: %v", tc.schema, err)
-		}
-		if got := ValidateReportSchema(string(schema), tc.report); got != "" {
+		schema := loadBundledSchema(t, tc.schema)
+		if got := ValidateReportSchema(schema, tc.report); got != "" {
 			t.Errorf("%s rejected sample: %s\nreport: %s", tc.schema, got, tc.report)
 		}
+	}
+}
+
+func TestSecurityDeepDiveSchemaRejectsInvalidCoverage(t *testing.T) {
+	const base = `{
+		"repository":"https://github.com/o/r","commit":"abc1234","spec_version":14,
+		"model":"claude","date":"2026-08-27","languages":["Go"],
+		"boundaries":[{"actor":"caller","trusted":"no","controls":"bytes","source":"README.md:1"}],
+		"method":{"scope":"./src","grep_patterns":[],"inventory_count":0,"ruled_out_count":0,"unresolved_count":0},
+		"inventory":[],"findings":[],"ruled_out":[],
+		"coverage":{"receipts":[]}}
+	`
+	schema := loadBundledSchema(t, "../../skills/security-deep-dive/schema.json")
+	if got := ValidateReportSchema(schema, base); got != "" {
+		t.Fatalf("valid coverage rejected: %s", got)
+	}
+	tests := []struct {
+		name   string
+		claim  map[string]any
+		needle string
+	}{
+		{
+			name:   "unknown disposition",
+			claim:  map[string]any{"receipts": []any{map[string]any{"path": "a.go", "disposition": "complete"}}},
+			needle: "/coverage/receipts/0/disposition",
+		},
+		{
+			name:   "unfinished receipt without reason",
+			claim:  map[string]any{"receipts": []any{map[string]any{"path": "a.go", "disposition": "failed"}}},
+			needle: "/coverage/receipts/0",
+		},
+		{
+			name:   "worker-owned completeness",
+			claim:  map[string]any{"receipts": []any{}, "completeness": "complete"},
+			needle: "/coverage",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var report map[string]any
+			if err := json.Unmarshal([]byte(base), &report); err != nil {
+				t.Fatal(err)
+			}
+			report[coverage.ReportMetadataKey] = tc.claim
+			raw, err := json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := ValidateReportSchema(schema, string(raw)); !strings.Contains(got, tc.needle) {
+				t.Fatalf("error = %q, want containing %q", got, tc.needle)
+			}
+		})
 	}
 }
 
@@ -241,11 +550,21 @@ func TestBundledSchemas_rejectBadShapes(t *testing.T) {
 	}{
 		{"../../skills/triage/schema.json", `{"triggered":"not-a-list"}`, "/triggered"},
 		{"../../skills/triage/schema.json", `{"triggered":["Bad Name"]}`, "/triggered/0"},
+		{"../../skills/triage/schema.json", `{"release_watch":["55"]}`, "/release_watch/0"},
+		{"../../skills/bandit/schema.json",
+			`{"findings":[{"id":"F1","title":"B608","severity":"Severe","location":"app.py:9"}]}`,
+			"/findings/0/severity"},
 		{"../../skills/repo-overview/schema.json", `{"languages":"go"}`, "/languages"},
 		{"../../skills/sbom/schema.json", `{"bomFormat":"SPDX","specVersion":"1.5"}`, "/bomFormat"},
 		{"../../skills/sbom/schema.json", `{"specVersion":"1.5"}`, "bomFormat"},
 		{"../../skills/sbom/schema.json", `{}`, "oneOf"},
-		{"../../skills/dependencies/schema.json", `{"dependencies":null}`, "/dependencies"},
+		{"../../skills/dependencies/schema.json", `{"schema_version":1}`, "analyses"},
+		{"../../skills/dependencies/schema.json",
+			`{"schema_version":1,"analyses":{"inventory":{"status":"maybe"}}}`,
+			"/analyses/inventory"},
+		{"../../skills/dependencies/schema.json",
+			`{"schema_version":1,"analyses":{"inventory":{"status":"ok"},"licenses":{"status":"ok"}}}`,
+			"/analyses"},
 		{"../../skills/advisories/schema.json",
 			`{"advisories":[{"uuid":"u1","severity":"HIGHISH"}]}`,
 			"/advisories/0/severity"},
@@ -253,6 +572,76 @@ func TestBundledSchemas_rejectBadShapes(t *testing.T) {
 			`{"upstream":"owner/repo","url":"https://github.com/owner/repo/issues/123"}`, "oneOf"},
 		{"../../skills/threat-model/schema.json", `{"spec_version":2}`, "/spec_version"},
 		{"../../skills/recon/schema.json", `{"focus_areas":[{"name":"parser","surface":"bytes","paths":[]}],"notes":[]}`, "/focus_areas/0/paths"},
+		{"../../skills/critic/schema.json",
+			`{"production_viability":"NON_VIABLE","source_state":"MISSING","reason":"path absent",
+			  "counterevidence":[],"attacker_position":"unknown","preconditions":[],
+			  "impact":"unknown","likelihood":"unknown",
+			  "applied_adjustments":[],"facts_that_would_change_the_result":[]}`,
+			"/production_viability"},
+		{"../../skills/critic/schema.json",
+			`{"production_viability":"VIABLE","source_state":"PRESENT","reason":"ships",
+			  "counterevidence":[],"attacker_position":"remote","preconditions":[],
+			  "impact":"execution","likelihood":"likely",
+			  "applied_adjustments":[{"kind":"cap","reason":"x","severity_before":"High","severity_after":"Low"}],
+			  "facts_that_would_change_the_result":[]}`,
+			"/applied_adjustments"},
+		{"../../skills/history/schema.json",
+			`{"schema_version":1,"analyzed_head":"abc","continuation":null,"scope_ref":"","scope_subpath":"",
+			  "partial":false,"gaps":[],"cache":{"reused":false,"previous_head":null,"invalidated_reason":null},
+			  "candidate_stats":{"matched":0,"reviewed":0,"security_fixes":0,"not_security":0,"unclear":0},"fixes":[]}`,
+			"/analyzed_head"},
+		{"../../skills/history/schema.json",
+			`{"schema_version":1,"analyzed_head":"0123456789abcdef0123456789abcdef01234567",
+			  "continuation":null,
+			  "scope_ref":"","scope_subpath":"","partial":false,"gaps":[],
+			  "cache":{"reused":false,"previous_head":null,"invalidated_reason":null},
+			  "candidate_stats":{"matched":1,"reviewed":1,"security_fixes":1,"not_security":0,"unclear":0},
+			  "fixes":[{"commit":"abcdef0123456789abcdef0123456789abcdef01","title":"fix",
+			    "description":"fix","code_paths":["../outside.c"],"vuln_type":"bounds","cve_if_any":null}]}`,
+			"/fixes/0/code_paths/0"},
+		{"../../skills/history/schema.json",
+			`{"schema_version":1,"analyzed_head":"0123456789abcdef0123456789abcdef01234567",
+			  "continuation":{"base":null,"after":"abcdef0123456789abcdef0123456789abcdef01"},
+			  "scope_ref":"","scope_subpath":"","partial":false,"gaps":[],
+			  "cache":{"reused":false,"previous_head":null,"invalidated_reason":null},
+			  "candidate_stats":{"matched":1,"reviewed":1,"security_fixes":0,"not_security":1,"unclear":0},
+			  "fixes":[]}`,
+			"validation failed"},
+		{"../../skills/verify/schema.json",
+			`{"status":"confirmed","attack_tree":{"goal":"Trigger panic","root_id":"AT1","verdict":"reachable","nodes":[
+			  {"id":"AT1","parent_id":null,"kind":"goal","description":"Trigger panic","status":"satisfied","evidence":"attempts 1-3"},
+			  {"id":"AT2","parent_id":"AT1","kind":"entry_point","description":"Call public API","status":"satisfied","evidence":"api.go:1"},
+				  {"id":"AT3","parent_id":"AT2","kind":"sink","description":"Reach sink","status":"satisfied","evidence":"x.go:1"}],"blockers":[]},"severity_prerequisites":{"attacker_position":{"value":"remote_unauthenticated","evidence":"public API"},"user_interaction":{"value":"none","evidence":"request only"},"outcome_determinism":{"value":"deterministic","evidence":"same input"},"impact":{"value":"code_execution_or_equivalent","evidence":"claimed panic"},"existing_capability":{"value":"none","evidence":"no prior access"}},"attempts":[
+			  {"number":1,"outcome":"reproduced","evidence":"x","failure_class":"panic","crash_site":"x.go:1"},
+			  {"number":2,"outcome":"reproduced","evidence":"x","failure_class":"panic","crash_site":"x.go:1"},
+			  {"number":3,"outcome":"not_reproduced","evidence":"clean","failure_class":"","crash_site":""}],
+			  "criteria":{
+			    "poc_well_formed":{"verdict":"pass","method":"run","evidence":"x","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "reproduces_three_of_three":{"verdict":"fail","method":"run","evidence":"2/3","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "claimed_failure_class":{"verdict":"pass","method":"trace","evidence":"x","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "public_interface_to_first_party_sink":{"verdict":"pass","method":"trace","evidence":"x","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "deterministic":{"verdict":"fail","method":"compare","evidence":"flaky","counterevidence":"","proof_gap":"","confidence":"high"},
+			    "control_bypass":{"matched_controls":[],"assessments":[]}}}`,
+			"/attempts/2/outcome"},
+		{"../../skills/verify/schema.json",
+			`{"status":"not_attempted","attack_tree":{"goal":"Trigger panic","root_id":"AT1","verdict":"not_attempted","nodes":[
+				  {"id":"AT1","parent_id":null,"kind":"goal","description":"Trigger panic","status":"satisfied","evidence":"setup failed"}],"blockers":[]},
+				  "severity_prerequisites":{"attacker_position":{"value":"not_attempted","evidence":"setup failed"},"user_interaction":{"value":"not_attempted","evidence":"setup failed"},"outcome_determinism":{"value":"not_attempted","evidence":"setup failed"},"impact":{"value":"not_attempted","evidence":"setup failed"},"existing_capability":{"value":"not_attempted","evidence":"setup failed"}},
+			  "attempts":[
+			  {"number":1,"outcome":"not_attempted","evidence":"setup failed","failure_class":"","crash_site":""},
+			  {"number":2,"outcome":"not_attempted","evidence":"setup failed","failure_class":"","crash_site":""},
+			  {"number":3,"outcome":"not_attempted","evidence":"setup failed","failure_class":"","crash_site":""}],
+			  "criteria":{
+			    "poc_well_formed":{"verdict":"not_attempted","method":"setup","evidence":"failed","counterevidence":"","proof_gap":"runtime","confidence":"low"},
+			    "reproduces_three_of_three":{"verdict":"not_attempted","method":"setup","evidence":"failed","counterevidence":"","proof_gap":"runtime","confidence":"low"},
+			    "claimed_failure_class":{"verdict":"not_attempted","method":"setup","evidence":"failed","counterevidence":"","proof_gap":"runtime","confidence":"low"},
+			    "public_interface_to_first_party_sink":{"verdict":"not_attempted","method":"setup","evidence":"failed","counterevidence":"","proof_gap":"runtime","confidence":"low"},
+			    "deterministic":{"verdict":"not_attempted","method":"setup","evidence":"failed","counterevidence":"","proof_gap":"runtime","confidence":"low"},
+			    "control_bypass":{"matched_controls":[],"assessments":[]}}}`,
+			"/attack_tree/nodes/0/status"},
+		{"../../skills/reattack/schema.json",
+			`{"outcome":"inconclusive","variants":[{"name":"v1","input":"a","valid":true,"outcome":"blocked","same_bug_class":true,"same_sink":true,"failure_class":"","sink":"parser.go:42","evidence":"blocked"}],"benign_control":{"input":"","reached_sink":false,"crashed":false,"evidence":"harness unavailable"},"notes":""}`,
+			"/variants/0"},
 		{"../../skills/security-deep-dive/schema.json",
 			`{"repository":"https://github.com/o/r","commit":"abc1234","spec_version":13,
 			  "model":"claude","date":"2026-07-16","languages":["C"],"boundaries":[],
@@ -327,6 +716,86 @@ func TestBundledSchemas_rejectBadShapes(t *testing.T) {
 			  "validation":"x","discovered_via":"source","rating":"x",
 			  "references":["https://example.com/advisory"]}]}`,
 			"/findings/0/references/0"},
+		{"../../skills/audit-exfil/schema.json",
+			`{"findings":[{"id":"F001","title":"Harness-only SSRF","severity":"High",
+			  "confidence":"high","cwe":"CWE-918","location":"internal/webhooks/fetch.go:91",
+			  "reachability":"harness_only","quality_tier":"high","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/reachability"},
+		{"../../skills/audit-exfil/schema.json",
+			`{"findings":[{"id":"F001","title":"Low-quality file read","severity":"High",
+			  "confidence":"high","cwe":"CWE-22","location":"internal/files/read.go:24",
+			  "reachability":"reachable","quality_tier":"low","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/quality_tier"},
+		{"../../skills/audit-exfil/schema.json",
+			`{"findings":[{"id":"F001","title":"String references","severity":"High",
+			  "confidence":"high","cwe":"CWE-918","location":"internal/webhooks/fetch.go:91",
+			  "reachability":"reachable","quality_tier":"high","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x",
+			  "references":["https://example.com/advisory"]}]}`,
+			"/findings/0/references/0"},
+		{"../../skills/audit-authz/schema.json",
+			`{"findings":[{"id":"F001","title":"Harness-only IDOR","severity":"High",
+			  "confidence":"high","cwe":"CWE-639","location":"internal/invoices/show.go:74",
+			  "reachability":"harness_only","quality_tier":"high","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/reachability"},
+		{"../../skills/audit-authz/schema.json",
+			`{"findings":[{"id":"F001","title":"Low-quality tenant bypass","severity":"High",
+			  "confidence":"high","cwe":"CWE-863","location":"internal/invoices/show.go:74",
+			  "reachability":"reachable","quality_tier":"low","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/quality_tier"},
+		{"../../skills/audit-authz/schema.json",
+			`{"findings":[{"id":"F001","title":"Wrong provenance","severity":"High",
+			  "confidence":"high","cwe":"CWE-862","location":"internal/admin/delete.go:51",
+			  "reachability":"reachable","quality_tier":"high","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"documentation","rating":"x"}]}`,
+			"/findings/0/discovered_via"},
+		{"../../skills/audit-authz/schema.json",
+			`{"findings":[{"id":"F001","title":"String references","severity":"High",
+			  "confidence":"high","cwe":"CWE-639","location":"internal/invoices/show.go:74",
+			  "reachability":"reachable","quality_tier":"high","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x",
+			  "references":["https://example.com/advisory"]}]}`,
+			"/findings/0/references/0"},
+		{"../../skills/audit-authz/schema.json",
+			`{"findings":[{"id":"F001","title":"Invalid confidence","severity":"High",
+			  "confidence":"certain","cwe":"CWE-639","location":"internal/invoices/show.go:74",
+			  "reachability":"reachable","quality_tier":"high","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/confidence"},
+		{"../../skills/audit-authz/schema.json",
+			`{"findings":[{"id":"F001","title":"Location without line","severity":"High",
+			  "confidence":"high","cwe":"CWE-639","location":"internal/invoices/show.go",
+			  "reachability":"reachable","quality_tier":"high","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/location"},
+		{"../../skills/audit-pii/schema.json",
+			`{"findings":[{"id":"F001","title":"Low-quality PII resemblance","severity":"Medium",
+			  "confidence":"high","cwe":"CWE-359","location":"fixtures/profile.json:12",
+			  "reachability":"reachable","quality_tier":"low","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/quality_tier"},
+		{"../../skills/audit-pii/schema.json",
+			`{"findings":[{"id":"F001","title":"Non-reachable PII candidate","severity":"Medium",
+			  "confidence":"high","cwe":"CWE-359","location":"fixtures/profile.json:12",
+			  "reachability":"unclear","quality_tier":"high","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/reachability"},
+		{"../../skills/audit-memory/schema.json",
+			`{"findings":[{"id":"F001","title":"Unproven resize candidate","severity":"High",
+			  "confidence":"high","cwe":"CWE-787","location":"lib/parser.c:88",
+			  "reachability":"harness_only","quality_tier":"high","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/reachability"},
+		{"../../skills/audit-memory/schema.json",
+			`{"findings":[{"id":"F001","title":"Low-quality lifetime candidate","severity":"High",
+			  "confidence":"high","cwe":"CWE-416","location":"lib/callback.c:119",
+			  "reachability":"reachable","quality_tier":"low","trace":"x","boundary":"x",
+			  "validation":"x","discovered_via":"source","rating":"x"}]}`,
+			"/findings/0/quality_tier"},
 		{"../../skills/variants/schema.json",
 			`{"findings":[{"id":"F1","title":"Variant of finding #42: weak confidence","severity":"High",
 			  "confidence":"maybe","cwe":"CWE-22","location":"pkg/archive/legacy.go:88",
@@ -383,11 +852,8 @@ func TestBundledSchemas_rejectBadShapes(t *testing.T) {
 			"/components/0/provenance"},
 	}
 	for _, tc := range cases {
-		schema, err := os.ReadFile(tc.schema)
-		if err != nil {
-			t.Fatalf("read %s: %v", tc.schema, err)
-		}
-		got := ValidateReportSchema(string(schema), tc.report)
+		schema := loadBundledSchema(t, tc.schema)
+		got := ValidateReportSchema(schema, tc.report)
 		if got == "" {
 			t.Errorf("%s accepted bad report %s", tc.schema, tc.report)
 			continue
@@ -395,5 +861,164 @@ func TestBundledSchemas_rejectBadShapes(t *testing.T) {
 		if !strings.Contains(got, tc.want) {
 			t.Errorf("%s: error %q does not mention %q", tc.schema, got, tc.want)
 		}
+	}
+}
+
+func TestVerifySchema_rejectsAttackTreeVerdictContradictions(t *testing.T) {
+	criterion := func(verdict string) map[string]any {
+		return map[string]any{
+			"verdict": verdict, "method": "run", "evidence": "observed",
+			"counterevidence": "", "proof_gap": "", "confidence": "high",
+		}
+	}
+	base := map[string]any{
+		"status": "confirmed",
+		"attack_tree": map[string]any{
+			"goal": "Trigger parser panic", "root_id": "AT1", "verdict": "reachable",
+			"nodes": []any{
+				map[string]any{"id": "AT1", "parent_id": nil, "kind": "goal", "description": "Trigger parser panic", "status": "satisfied", "evidence": "attempts 1-3 panic"},
+				map[string]any{"id": "AT2", "parent_id": "AT1", "kind": "entry_point", "description": "Call public Parse", "status": "satisfied", "evidence": "api.go:18"},
+				map[string]any{"id": "AT3", "parent_id": "AT2", "kind": "sink", "description": "Reach parser sink", "status": "satisfied", "evidence": "parser.go:42"},
+			},
+			"blockers": []any{},
+		},
+		"severity_prerequisites": map[string]any{
+			"attacker_position":   map[string]any{"value": "remote_unauthenticated", "evidence": "public API"},
+			"user_interaction":    map[string]any{"value": "none", "evidence": "request only"},
+			"outcome_determinism": map[string]any{"value": "deterministic", "evidence": "3/3 attempts"},
+			"impact":              map[string]any{"value": "code_execution_or_equivalent", "evidence": "code execution"},
+			"existing_capability": map[string]any{"value": "none", "evidence": "no prior access"},
+		},
+		"attempts": []any{
+			map[string]any{"number": 1, "outcome": "reproduced", "evidence": "boom", "failure_class": "panic", "crash_site": "parser.go:42"},
+			map[string]any{"number": 2, "outcome": "reproduced", "evidence": "boom", "failure_class": "panic", "crash_site": "parser.go:42"},
+			map[string]any{"number": 3, "outcome": "reproduced", "evidence": "boom", "failure_class": "panic", "crash_site": "parser.go:42"},
+		},
+		"criteria": map[string]any{
+			"poc_well_formed":                      criterion("pass"),
+			"reproduces_three_of_three":            criterion("pass"),
+			"claimed_failure_class":                criterion("pass"),
+			"public_interface_to_first_party_sink": criterion("pass"),
+			"deterministic":                        criterion("pass"),
+			"control_bypass": map[string]any{
+				"matched_controls": []any{},
+				"assessments":      []any{},
+			},
+		},
+	}
+	tests := []struct {
+		name    string
+		mutate  func(map[string]any)
+		wantErr string
+	}{
+		{
+			name: "reachable tree with blocker",
+			mutate: func(report map[string]any) {
+				report["attack_tree"].(map[string]any)["blockers"] = []any{"length guard"}
+			},
+			wantErr: "/attack_tree",
+		},
+		{
+			name: "blocked tree without blocker",
+			mutate: func(report map[string]any) {
+				report["status"] = "inconclusive"
+				tree := report["attack_tree"].(map[string]any)
+				tree["verdict"] = "blocked"
+				tree["nodes"].([]any)[0].(map[string]any)["status"] = "blocked"
+			},
+			wantErr: "/attack_tree",
+		},
+		{
+			name: "blocked tree without blocked node",
+			mutate: func(report map[string]any) {
+				report["status"] = "inconclusive"
+				tree := report["attack_tree"].(map[string]any)
+				tree["verdict"] = "blocked"
+				tree["blockers"] = []any{"length guard"}
+			},
+			wantErr: "/attack_tree",
+		},
+		{
+			name: "confirmed with held control",
+			mutate: func(report map[string]any) {
+				report["criteria"].(map[string]any)["control_bypass"] = map[string]any{
+					"matched_controls": []any{"web-authz"},
+					"assessments": []any{map[string]any{
+						"control_id": "web-authz", "disposition": "held", "evidence": "router rejected the request",
+					}},
+				}
+			},
+			wantErr: "/criteria/control_bypass",
+		},
+		{
+			name: "missing control bypass gate",
+			mutate: func(report map[string]any) {
+				delete(report["criteria"].(map[string]any), "control_bypass")
+			},
+			wantErr: "/criteria",
+		},
+		{
+			name: "missing severity prerequisites",
+			mutate: func(report map[string]any) {
+				delete(report, "severity_prerequisites")
+			},
+			wantErr: "missing property 'severity_prerequisites'",
+		},
+		{
+			name: "invalid attacker position",
+			mutate: func(report map[string]any) {
+				report["severity_prerequisites"].(map[string]any)["attacker_position"].(map[string]any)["value"] = "internet"
+			},
+			wantErr: "/severity_prerequisites/attacker_position",
+		},
+		{
+			name: "active report cannot skip prerequisite",
+			mutate: func(report map[string]any) {
+				report["severity_prerequisites"].(map[string]any)["user_interaction"].(map[string]any)["value"] = "not_attempted"
+			},
+			wantErr: "/severity_prerequisites/user_interaction/value",
+		},
+		{
+			name: "unavailable control resolution with matched IDs",
+			mutate: func(report map[string]any) {
+				report["criteria"].(map[string]any)["control_bypass"] = map[string]any{
+					"matched_controls": []any{"web-authz"},
+					"assessments": []any{map[string]any{
+						"control_id": "web-authz", "disposition": "bypassed", "evidence": "attempt bypassed router",
+					}},
+					"unavailable_reason": "the repository threat model could not be read",
+				}
+			},
+			wantErr: "/criteria/control_bypass",
+		},
+	}
+
+	schema := loadBundledSchema(t, "../../skills/verify/schema.json")
+	rawBase, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ValidateReportSchema(schema, string(rawBase)); got != "" {
+		t.Fatalf("base report rejected: %s\nreport: %s", got, rawBase)
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var report map[string]any
+			if err := json.Unmarshal(raw, &report); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(report)
+			raw, err = json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := ValidateReportSchema(schema, string(raw)); !strings.Contains(got, tc.wantErr) {
+				t.Fatalf("error = %q, want substring %q", got, tc.wantErr)
+			}
+		})
 	}
 }

@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "security-fix history report",
+  "description": "A cumulative, ancestry-checked cache of security fixes mined from repository history.",
+  "oneOf": [
+    { "$ref": "#/$defs/report" },
+    { "$ref": "#/$defs/error" }
+  ],
+  "$defs": {
+    "report": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "analyzed_head",
+        "continuation",
+        "scope_ref",
+        "scope_subpath",
+        "partial",
+        "gaps",
+        "cache",
+        "candidate_stats",
+        "fixes"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": ["continuation"],
+            "properties": { "continuation": { "type": "object" } }
+          },
+          "then": {
+            "properties": { "partial": { "const": true } }
+          }
+        }
+      ],
+      "properties": {
+        "schema_version": { "type": "integer", "const": 1 },
+        "analyzed_head": {
+          "$ref": "#/$defs/commit",
+          "description": "The pinned range head while pagination is incomplete, or the latest fully analyzed repository head otherwise."
+        },
+        "continuation": {
+          "description": "Pagination state for an incomplete pinned history range, kept separate from analyzed_head.",
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/continuation" }
+          ]
+        },
+        "scope_ref": { "type": "string" },
+        "scope_subpath": { "type": "string" },
+        "partial": { "type": "boolean" },
+        "gaps": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "cache": {
+          "type": "object",
+          "required": ["reused", "previous_head", "invalidated_reason"],
+          "additionalProperties": false,
+          "properties": {
+            "reused": { "type": "boolean" },
+            "previous_head": { "oneOf": [{ "$ref": "#/$defs/commit" }, { "type": "null" }] },
+            "invalidated_reason": { "type": ["string", "null"] }
+          }
+        },
+        "candidate_stats": {
+          "type": "object",
+          "required": ["matched", "reviewed", "security_fixes", "not_security", "unclear"],
+          "additionalProperties": false,
+          "properties": {
+            "matched": { "type": "integer", "minimum": 0 },
+            "reviewed": { "type": "integer", "minimum": 0 },
+            "security_fixes": { "type": "integer", "minimum": 0 },
+            "not_security": { "type": "integer", "minimum": 0 },
+            "unclear": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "fixes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fix" }
+        }
+      }
+    },
+    "fix": {
+      "type": "object",
+      "required": ["commit", "title", "description", "code_paths", "vuln_type", "cve_if_any"],
+      "additionalProperties": false,
+      "properties": {
+        "commit": { "$ref": "#/$defs/commit" },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "code_paths": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "allOf": [
+              { "pattern": "^[^/\\\\](?:[^\\\\]*[^/\\\\])?$" },
+              { "not": { "pattern": "(^|/)\\.{1,2}(/|$)" } }
+            ]
+          }
+        },
+        "vuln_type": { "type": "string", "minLength": 1 },
+        "cve_if_any": {
+          "type": ["string", "null"],
+          "pattern": "^(?:CVE-[0-9]{4}-[0-9]+|GHSA-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4}-[23456789cfghjmpqrvwx]{4})$"
+        }
+      }
+    },
+    "continuation": {
+      "type": "object",
+      "required": ["base", "after"],
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "description": "The original lower bound of the pinned range, or null for a full-history scan.",
+          "oneOf": [{ "$ref": "#/$defs/commit" }, { "type": "null" }]
+        },
+        "after": {
+          "$ref": "#/$defs/commit",
+          "description": "The last candidate fully classified in the pinned range."
+        }
+      }
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "error": {
+      "type": "object",
+      "required": ["error"],
+      "additionalProperties": false,
+      "properties": {
+        "error": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

@@ -80,8 +80,21 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # modernc.org/sqlite is machine-transpiled C and does unsafe.Pointer
+      # arithmetic on every VDBE step; -race enables checkptr, and validating
+      # those conversions dominates the DB-heavy packages' runtime. Disabling
+      # checkptr for that tree keeps TSAN's data-race detection while dropping
+      # the per-op pointer validation the transpiler already guarantees.
       - name: Test
-        run: go test -race ./...
+        run: go test -race -gcflags='modernc.org/...=-d=checkptr=0' ./...
+
+      # The deterministic eval harness is behind //go:build evals. Live model
+      # runs remain disabled unless SCRUTINEER_RUN_EVALS is explicitly set.
+      - name: Vet skill eval harness
+        run: go vet -tags evals ./internal/evals/...
+
+      - name: Test skill eval harness
+        run: go test -race -tags evals ./internal/evals/...
 
       # The podman integration tests are behind //go:build podman and are not
       # built by the steps above; vet them under the tag so they can't silently
@@ -170,7 +183,7 @@ jobs:
             ${{ runner.os }}-go-${{ github.job }}-
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
       - name: Scan for known vulnerabilities
         run: govulncheck ./...
@@ -197,7 +210,7 @@ jobs:
           persist-credentials: false
 
       - name: Install zizmor
-        run: pipx install zizmor==1.26.1
+        run: pipx install zizmor==1.30.1
 
       - name: Audit GitHub Actions
         run: zizmor --persona auditor .github/

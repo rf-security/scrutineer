@@ -74,7 +74,7 @@ func TestRunScheduledScan_skipsOptedOutRepositoryBeforeAnyNetworkCall(t *testing
 		ID: repo.ID, Name: repo.Name, URL: repo.URL,
 		UpstreamURL:        "https://127.0.0.1:1/never/reached.git",
 		FederationOptOutAt: repo.FederationOptOutAt,
-	})
+	}, schedulerRemoteHeadTimeout)
 
 	var skip db.Scan
 	if err := s.DB.Where("repository_id = ?", repo.ID).Order("id desc").First(&skip).Error; err != nil {
@@ -243,9 +243,9 @@ func TestScansResumePaused_skipsOptedOutRepository(t *testing.T) {
 	}
 }
 
-// The tick loads every due repository up front and then fires them one at a
-// time, so a repository still waiting its turn must be re-read rather than
-// trusted from the snapshot.
+// The tick loads every due repository up front and then dispatches them
+// through a bounded pool, so a repository still waiting for a worker must be
+// re-read rather than trusted from the snapshot.
 func TestRunScheduledScan_rereadsOptOutRecordedAfterTheSnapshot(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
@@ -255,7 +255,7 @@ func TestRunScheduledScan_rereadsOptOutRecordedAfterTheSnapshot(t *testing.T) {
 	s.runScheduledScan(context.Background(), db.Repository{
 		ID: repo.ID, Name: repo.Name, URL: repo.URL,
 		UpstreamURL: "https://127.0.0.1:1/never/reached.git",
-	})
+	}, schedulerRemoteHeadTimeout)
 
 	var skip db.Scan
 	if err := s.DB.Where("repository_id = ?", repo.ID).Order("id desc").First(&skip).Error; err != nil {
@@ -321,7 +321,7 @@ func TestRunScheduledScan_optOutRecordedMidFiringWaitsForItAndStopsTheScans(t *t
 
 	reached, release := make(chan struct{}), make(chan struct{})
 	s.resolveRemoteHead = func(context.Context, db.Repository) (string, error) { return "deadbeef", nil }
-	s.syncUpstream = func(context.Context, string, string) error {
+	s.syncUpstream = func(context.Context, string, string, time.Duration) error {
 		close(reached)
 		<-release
 		return nil
@@ -332,7 +332,7 @@ func TestRunScheduledScan_optOutRecordedMidFiringWaitsForItAndStopsTheScans(t *t
 		defer close(fired)
 		s.runScheduledScan(context.Background(), db.Repository{
 			ID: repo.ID, Name: repo.Name, URL: repo.URL, UpstreamURL: upstream,
-		})
+		}, schedulerRemoteHeadTimeout)
 	}()
 	<-reached
 

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -38,6 +39,24 @@ func NewAPIToken() string {
 
 type apiCtxKey struct{}
 
+// scanBlobColumns are the wide columns on a scan row. A running scan's log
+// grows for the length of the run, so endpoints serving only a scan's identity
+// or summary omit them; apiGetScan, which returns the report and log, does not.
+var scanBlobColumns = []string{"Log", "Prompt", "Report", "RefusalAudit", "ImportPayload"}
+
+// authScanOmitColumns additionally drops the scoping blobs, which nothing
+// reachable from scanFromRequest reads.
+var authScanOmitColumns = slices.Concat(scanBlobColumns,
+	[]string{"FocusArea", "DiffStats", "Coverage"})
+
+// repositoryBlobColumns are the wide columns on a repository row, dominated by
+// the cached ecosyste.ms payloads.
+var repositoryBlobColumns = []string{
+	"Metadata", "ThreatModel", "ScanConfig",
+	"EcosystemsRepoData", "EcosystemsPackagesData", "EcosystemsAdvisoriesData",
+	"EcosystemsCommitsData", "EcosystemsIssuesData", "EcosystemsDependentsData",
+}
+
 // apiAuth validates bearer tokens against the currently running scan rows
 // and puts the scan on the request context so handlers can apply the
 // "skills only touch their own repo" rule.
@@ -49,13 +68,18 @@ func (s *Server) apiAuth(next http.Handler) http.Handler {
 			return
 		}
 		var scan db.Scan
-		if err := s.DB.Where("api_token = ? AND status = ?", token, db.ScanRunning).
+		if err := s.DB.Omit(authScanOmitColumns...).
+			Where("api_token = ? AND status = ?", token, db.ScanRunning).
 			First(&scan).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				writeAPIError(w, http.StatusUnauthorized, "token invalid or scan not running")
 				return
 			}
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if scan.ExplorationMode != "" && (r.Method != http.MethodPost || r.URL.Path != fmt.Sprintf("/scans/%d/validate-report", scan.ID)) {
+			writeAPIError(w, http.StatusForbidden, "exploratory audits may only validate their own report")
 			return
 		}
 		ctx := context.WithValue(r.Context(), apiCtxKey{}, &scan)
@@ -157,7 +181,7 @@ func (s *Server) apiGetRepository(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var repo db.Repository
-	if err := s.DB.First(&repo, id).Error; err != nil {
+	if err := s.DB.Omit(repositoryBlobColumns...).First(&repo, id).Error; err != nil {
 		writeAPIError(w, http.StatusNotFound, "repository not found")
 		return
 	}
@@ -194,7 +218,9 @@ var ecosystemsRawColumns = map[string]string{
 // apiGetEcosystemsRaw returns the verbatim cached ecosyste.ms payload for one
 // source: an operator/debug escape hatch, and a skill fallback when a
 // digested endpoint does not cover an edge case. 404 when nothing is cached
-// (the skill then falls back to WebFetch); 400 for an unknown source.
+// (the skill then falls back to WebFetch, which is also the steady state under
+// `ecosystems_enrichment: false`, where no source is ever cached); 400 for an
+// unknown source.
 func (s *Server) apiGetEcosystemsRaw(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.PathValue("id"))
 	if !s.scanOwnsRepo(r, uint(id)) {
@@ -259,7 +285,7 @@ func (s *Server) apiListScans(w http.ResponseWriter, r *http.Request) {
 		q = q.Where("skill_name = ?", skill)
 	}
 	var rows []db.Scan
-	q.Find(&rows)
+	q.Omit(scanBlobColumns...).Find(&rows)
 	out := make([]map[string]any, 0, len(rows))
 	for _, sc := range rows {
 		out = append(out, scanSummary(sc))
@@ -343,6 +369,7 @@ func (s *Server) apiRunSkill(w http.ResponseWriter, r *http.Request) {
 		Ref            string `json:"ref"`
 		Profile        string `json:"profile"`
 		RescanMode     string `json:"rescan_mode"`
+		SubPath        string `json:"sub_path"`
 		BaselineScanID *uint  `json:"baseline_scan_id"`
 	}
 	if !decodeOptionalAPIBody(w, r, &body) {
@@ -352,20 +379,34 @@ func (s *Server) apiRunSkill(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "unknown profile")
 		return
 	}
+	// sub_path scopes this run to a monorepo sub-package; triage forwards it to
+	// each pipeline child so the whole scan set stays scoped. Validated here so
+	// a traversal attempt is rejected before it can reach workspace staging.
+	subPath, err := worker.CleanSubPath(body.SubPath)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	s.agentEnqueueMu.Lock()
 	defer s.agentEnqueueMu.Unlock()
-	if s.hasOpenRepoScopedScan(uint(id), skill.ID) {
+	if s.hasOpenRepoScopedScan(uint(id), skill.ID, subPath) {
 		writeAPIError(w, http.StatusConflict, "equivalent scan already queued or running")
 		return
 	}
 	if !s.agentAPIRepoHasCapacity(w, uint(id)) {
 		return
 	}
+	var triageID *uint
+	if caller := scanFromRequest(r); caller != nil && caller.SkillName == "triage" {
+		triageID = &caller.ID
+	}
 	scanID, err := s.enqueueSkillWith(r.Context(), uint(id), skill.ID, ScanOpts{
+		TriageScanID:   triageID,
 		Model:          body.Model,
 		Ref:            body.Ref,
 		Profile:        body.Profile,
 		RescanMode:     body.RescanMode,
+		SubPath:        subPath,
 		DiffBaseScanID: body.BaselineScanID,
 	})
 	if err != nil {
@@ -398,7 +439,7 @@ func (s *Server) apiRunSkill(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiRunFindingSkill enqueues a finding-scoped skill (verify, patch,
-// disclose). The authenticated scan must be on the same repository that
+// reattack, disclose). The authenticated scan must be on the same repository that
 // owns the finding.
 func (s *Server) apiRunFindingSkill(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.PathValue("id"))
@@ -425,20 +466,32 @@ func (s *Server) apiRunFindingSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	s.agentEnqueueMu.Lock()
 	defer s.agentEnqueueMu.Unlock()
-	if s.hasOpenFindingScopedScan(uint(id), skill.ID) {
+	opts, err := s.findingSkillScanOpts(uint(id), name, body.Model)
+	if err != nil {
+		writeAPIError(w, http.StatusPreconditionFailed, err.Error())
+		return
+	}
+	if opts.RemediationAttemptID == nil && s.hasOpenFindingScopedScan(uint(id), skill.ID) {
+		writeAPIError(w, http.StatusConflict, "equivalent scan already queued or running")
+		return
+	}
+	if opts.RemediationAttemptID != nil && s.hasOpenScan(
+		"finding_id = ? AND skill_id = ? AND remediation_attempt_id = ?",
+		uint(id), skill.ID, *opts.RemediationAttemptID) {
 		writeAPIError(w, http.StatusConflict, "equivalent scan already queued or running")
 		return
 	}
 	if !s.agentAPIRepoHasCapacity(w, repoID) {
 		return
 	}
-	scanID, err := s.enqueueSkillScoped(r.Context(), repoID, skill.ID, new(uint(id)), body.Model)
+	opts.FindingID = new(uint(id))
+	scanID, err := s.enqueueSkillWith(r.Context(), repoID, skill.ID, opts)
 	if err != nil {
 		if errors.Is(err, ErrSkillRequiresRemote) {
 			writeAPIError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if errors.Is(err, ErrRepoFederationOptOut) {
+		if errors.Is(err, ErrRepoFederationOptOut) || errors.Is(err, ErrFederationClaimPending) {
 			writeAPIError(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -559,14 +612,30 @@ func scanSummary(sc db.Scan) map[string]any {
 		errorKey:               sc.Error,
 	}
 	m["refusal_audit_warning"] = sc.RefusalAuditWarning
+	if sc.VerificationFeedback != "" {
+		m["verification_feedback"] = sc.VerificationFeedback
+	}
+	if sc.ExplorationMode != "" {
+		m["exploration_mode"] = sc.ExplorationMode
+		m["exploration_path"] = sc.ExplorationPath
+	}
+	if sc.TriageScanID != nil {
+		m["triage_scan_id"] = *sc.TriageScanID
+	}
 	if sc.Ref != "" {
 		m["ref"] = sc.Ref
+	}
+	if sc.SubPath != "" {
+		m["sub_path"] = sc.SubPath
 	}
 	if sc.RescanMode != "" {
 		m["rescan_mode"] = sc.RescanMode
 	}
 	if sc.DiffBaseScanID != nil {
 		m["diff_base_scan_id"] = *sc.DiffBaseScanID
+	}
+	if sc.RemediationAttemptID != nil {
+		m["remediation_attempt_id"] = *sc.RemediationAttemptID
 	}
 	if sc.DiffBaseCommit != "" {
 		m["diff_base_commit"] = sc.DiffBaseCommit

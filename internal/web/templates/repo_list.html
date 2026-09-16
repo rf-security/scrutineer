@@ -5,6 +5,38 @@
            autocomplete="off" spellcheck="false">
     <input type="hidden" name="language" value="{{.Language}}">
     <input type="hidden" name="sort" value="{{.Sort}}">
+    <input type="hidden" name="deepdive" value="{{.Deepdive}}">
+    <input type="hidden" name="dd_dir" value="{{.DDDir}}">
+    <input type="hidden" name="dd_date" value="{{.DDDate}}">
+  </form>
+  <div class="dropdown-menu">
+    <button type="button" class="btn-outline" aria-haspopup="menu" aria-expanded="false">
+      <i data-lucide="shield-check"></i>
+      {{if eq .Deepdive "ran"}}Deep dive: run{{else if eq .Deepdive "notrun"}}Deep dive: not run{{else}}Deep dive{{end}}
+      <i data-lucide="chevron-down"></i>
+    </button>
+    <div data-popover aria-hidden="true" data-align="end">
+      <div role="menu">
+        <a role="menuitem" href="/?q={{.Q}}&language={{.Language}}&sort={{.Sort}}&dd_dir={{.DDDir}}&dd_date={{.DDDate}}"
+           {{if not .Deepdive}}aria-current="true"{{end}}>All</a>
+        <a role="menuitem" href="/?q={{.Q}}&language={{.Language}}&sort={{.Sort}}&deepdive=ran&dd_dir={{.DDDir}}&dd_date={{.DDDate}}"
+           {{if eq .Deepdive "ran"}}aria-current="true"{{end}}>Run</a>
+        <a role="menuitem" href="/?q={{.Q}}&language={{.Language}}&sort={{.Sort}}&deepdive=notrun&dd_dir={{.DDDir}}&dd_date={{.DDDate}}"
+           {{if eq .Deepdive "notrun"}}aria-current="true"{{end}}>Not run</a>
+      </div>
+    </div>
+  </div>
+  <form method="get" action="/" class="inline-flex items-center gap-1">
+    <input type="hidden" name="q" value="{{.Q}}">
+    <input type="hidden" name="language" value="{{.Language}}">
+    <input type="hidden" name="sort" value="{{.Sort}}">
+    <input type="hidden" name="deepdive" value="{{.Deepdive}}">
+    <select class="input" name="dd_dir" aria-label="Last deep-dive run, before or after">
+      <option value="before" {{if ne .DDDir "after"}}selected{{end}}>Deep dive before</option>
+      <option value="after"  {{if eq .DDDir "after"}}selected{{end}}>Deep dive after</option>
+    </select>
+    <input class="input" type="date" name="dd_date" value="{{.DDDate}}" aria-label="Last deep-dive date">
+    <button type="submit" class="btn-outline" aria-label="Apply date filter"><i data-lucide="filter"></i></button>
   </form>
   <div class="dropdown-menu">
     <button type="button" class="btn-outline" aria-haspopup="menu" aria-expanded="false">
@@ -14,9 +46,9 @@
     </button>
     <div data-popover aria-hidden="true" data-align="end">
       <div role="menu">
-        <a role="menuitem" href="/?q={{.Q}}&sort={{.Sort}}">All languages</a>
+        <a role="menuitem" href="/?q={{.Q}}&sort={{.Sort}}&deepdive={{.Deepdive}}&dd_dir={{.DDDir}}&dd_date={{.DDDate}}">All languages</a>
         {{range .Languages}}
-          <a role="menuitem" href="/?q={{$.Q}}&language={{.}}&sort={{$.Sort}}"
+          <a role="menuitem" href="/?q={{$.Q}}&language={{.}}&sort={{$.Sort}}&deepdive={{$.Deepdive}}&dd_dir={{$.DDDir}}&dd_date={{$.DDDate}}"
              {{if eq . $.Language}}aria-current="true"{{end}}>{{.}}</a>
         {{end}}
       </div>
@@ -31,7 +63,7 @@
     <div data-popover aria-hidden="true" data-align="end">
       <div role="menu">
         {{range (list "newest" "findings" "name" "stars" "language")}}
-          <a role="menuitem" href="/?q={{$.Q}}&language={{$.Language}}&sort={{.}}"
+          <a role="menuitem" href="/?q={{$.Q}}&language={{$.Language}}&sort={{.}}&deepdive={{$.Deepdive}}&dd_dir={{$.DDDir}}&dd_date={{$.DDDate}}"
              {{if eq . (sortkey $.Sort)}}aria-current="true"{{end}}>{{.}}</a>
         {{end}}
       </div>
@@ -77,8 +109,8 @@
     </tbody>
   </table>
   {{template "pagination" .Page}}
-{{else if .Q}}
-  {{template "empty" (dict "Icon" "search-x" "Title" "No matches" "Body" "No repositories matched the search.")}}
+{{else if or .Q .Deepdive .DDDate}}
+  {{template "empty" (dict "Icon" "search-x" "Title" "No matches" "Body" "No repositories matched the filters.")}}
 {{else}}
   {{if .Sharing}}
     {{template "empty" (dict "Icon" "folder-git-2" "Title" "No scanned repositories" "Body" "None of the repositories authorized for this account have been scanned by Scrutineer.")}}

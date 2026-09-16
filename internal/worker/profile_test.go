@@ -113,6 +113,9 @@ func TestMatchProfile(t *testing.T) {
 		{"rebar3 matches beam", briefJSON("package_manager:rebar3"), "beam"},
 		{"mix case-insensitive", briefJSON("package_manager:mix"), "beam"},
 		{"cargo matches rust", briefJSON("package_manager:Cargo"), "rust"},
+		// rust is registered before the c-cpp fallback, so a Cargo crate that
+		// also ships a Makefile (common for -sys crates) still routes to rust.
+		{"cargo + Make picks rust over c-cpp (registry order)", briefJSON("package_manager:Cargo", "build:Make"), "rust"},
 		{"SwiftPM matches swift", briefJSON("package_manager:Swift Package Manager"), "swift"},
 		{"opam matches ocaml", briefJSON("package_manager:opam"), "ocaml"},
 		{"cpanm matches perl", briefJSON("package_manager:cpanm"), "perl"},

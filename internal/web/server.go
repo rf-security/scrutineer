@@ -950,6 +950,33 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 			like, like, like, like)
 	}
 
+	// Filter by whether a completed security-deep-dive has run, and on the
+	// latest such run's date. ddRun is a fresh correlated subquery each call so
+	// chaining .Where on it never leaks conditions between uses.
+	deepdive := r.URL.Query().Get("deepdive") // "", "ran", "notrun"
+	ddDir := r.URL.Query().Get("dd_dir")      // "before" | "after"
+	ddDate := r.URL.Query().Get("dd_date")    // YYYY-MM-DD
+	ddRun := func() *gorm.DB {
+		return s.DB.Model(&db.Scan{}).Select("1").
+			Where("scans.repository_id = repositories.id AND skill_name = ? AND status = ?",
+				deepDiveSkillName, db.ScanDone)
+	}
+	switch deepdive {
+	case "ran":
+		q = q.Where("EXISTS (?)", ddRun())
+	case "notrun":
+		q = q.Where("NOT EXISTS (?)", ddRun())
+	}
+	if _, err := time.Parse("2006-01-02", ddDate); err == nil {
+		switch ddDir {
+		case "after": // most recent run on/after the cutoff ⟺ some run is
+			q = q.Where("EXISTS (?)", ddRun().Where("created_at >= ?", ddDate))
+		case "before": // most recent run before the cutoff ⟺ has runs, none on/after
+			q = q.Where("EXISTS (?)", ddRun()).
+				Where("NOT EXISTS (?)", ddRun().Where("created_at >= ?", ddDate))
+		}
+	}
+
 	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
 	const nameSort = "name"
 	switch sortCol {
@@ -1104,7 +1131,7 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 
 	data := map[string]any{
 		"Rows": rows, "Page": page, "Language": lang, "Sort": sort, "Languages": languages,
-		"Q": search,
+		"Q": search, "Deepdive": deepdive, "DDDir": ddDir, "DDDate": ddDate,
 	}
 	if scope, ok := viewScopeFrom(r); ok {
 		data["AuthorizedRepoCount"] = scope.AuthorizedRepoCount

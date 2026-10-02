@@ -45,7 +45,7 @@ func openTestDB(t *testing.T) *gorm.DB {
 
 func TestSessionRoundTrip(t *testing.T) {
 	c := testConfig()
-	in := session{Login: "octocat", Token: "ghp_test123", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	in := session{GitHubUserID: 1, Login: "octocat", Token: "ghp_test123", ExpiresAt: time.Now().Add(time.Hour).Unix()}
 	sealed, err := c.seal(in)
 	if err != nil {
 		t.Fatal(err)
@@ -54,14 +54,14 @@ func TestSessionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if out.Login != in.Login || out.Token != in.Token {
+	if out.GitHubUserID != in.GitHubUserID || out.Login != in.Login || out.Token != in.Token {
 		t.Fatalf("round-trip mismatch: %+v", out)
 	}
 }
 
 func TestSessionExpired(t *testing.T) {
 	c := testConfig()
-	sealed, err := c.seal(session{Login: "x", ExpiresAt: time.Now().Add(-time.Minute).Unix()})
+	sealed, err := c.seal(session{GitHubUserID: 1, Login: "x", ExpiresAt: time.Now().Add(-time.Minute).Unix()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,9 +70,20 @@ func TestSessionExpired(t *testing.T) {
 	}
 }
 
+func TestSessionWithoutNumericIdentityRejected(t *testing.T) {
+	c := testConfig()
+	sealed, err := c.seal(session{Login: "legacy", Token: "tok", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.open(sealed); err == nil || !strings.Contains(err.Error(), "GitHub user ID") {
+		t.Fatalf("open legacy session error = %v, want missing GitHub user ID", err)
+	}
+}
+
 func TestSessionTamperRejected(t *testing.T) {
 	c := testConfig()
-	sealed, err := c.seal(session{Login: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	sealed, err := c.seal(session{GitHubUserID: 1, Login: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,9 +102,47 @@ func TestSessionTamperRejected(t *testing.T) {
 	// A session sealed under a different key must not open under ours.
 	other := testConfig()
 	other.sessionKey = sha256.Sum256([]byte("different-key"))
-	otherSealed, _ := other.seal(session{Login: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	otherSealed, _ := other.seal(session{GitHubUserID: 1, Login: "x", ExpiresAt: time.Now().Add(time.Hour).Unix()})
 	if _, err := c.open(otherSealed); err == nil {
 		t.Fatal("expected foreign-key session to be rejected")
+	}
+}
+
+func TestFetchUserReturnsStableNumericIdentity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user" {
+			t.Errorf("path = %q, want /user", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		_, _ = io.WriteString(w, `{"id":583231,"login":"octocat"}`)
+	}))
+	defer srv.Close()
+	old := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = old }()
+
+	identity, err := fetchUser(context.Background(), "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.ID != 583231 || identity.Login != "octocat" {
+		t.Fatalf("identity = %+v", identity)
+	}
+}
+
+func TestFetchUserRejectsMissingNumericIdentity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"login":"octocat"}`)
+	}))
+	defer srv.Close()
+	old := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = old }()
+
+	if _, err := fetchUser(context.Background(), "tok"); err == nil || !strings.Contains(err.Error(), "user ID") {
+		t.Fatalf("fetchUser error = %v, want invalid user ID", err)
 	}
 }
 
@@ -332,7 +381,7 @@ func TestLogoutRevokesGrantAndClearsCookie(t *testing.T) {
 	cfg.clientSecret = "shh"
 
 	// A valid session cookie carrying a token to revoke.
-	sealed, err := cfg.seal(session{Login: "octocat", Token: "ghp_tok", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	sealed, err := cfg.seal(session{GitHubUserID: 1, Login: "octocat", Token: "ghp_tok", ExpiresAt: time.Now().Add(time.Hour).Unix()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +407,7 @@ func TestLogoutRevokesGrantAndClearsCookie(t *testing.T) {
 	githubAPI = srv.URL
 	defer func() { githubAPI = old }()
 
-	s := New(cfg, openTestDB(t), slog.New(slog.NewTextHandler(io.Discard, nil)), &sentinel{})
+	s := New(cfg, openTestDB(t), slog.New(slog.NewTextHandler(io.Discard, nil)), &sentinel{}, EmptyGrantSource())
 	r := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sealed})
 	w := httptest.NewRecorder()
@@ -398,7 +447,7 @@ func TestLogoutRevokesGrantAndClearsCookie(t *testing.T) {
 
 func TestLogoutHTMXRedirects(t *testing.T) {
 	cfg := testConfig()
-	sealed, err := cfg.seal(session{Login: "octocat", Token: "ghp_tok", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	sealed, err := cfg.seal(session{GitHubUserID: 1, Login: "octocat", Token: "ghp_tok", ExpiresAt: time.Now().Add(time.Hour).Unix()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +461,7 @@ func TestLogoutHTMXRedirects(t *testing.T) {
 	githubAPI = srv.URL
 	defer func() { githubAPI = old }()
 
-	s := New(cfg, openTestDB(t), slog.New(slog.NewTextHandler(io.Discard, nil)), &sentinel{})
+	s := New(cfg, openTestDB(t), slog.New(slog.NewTextHandler(io.Discard, nil)), &sentinel{}, EmptyGrantSource())
 	r := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
 	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sealed})
 	r.Header.Set("HX-Request", "true")
@@ -444,7 +493,7 @@ func TestResolveScopeIntersectsByURL(t *testing.T) {
 		{FullName: "o/unknown", HTMLURL: "https://github.com/o/unknown", CloneURL: "https://github.com/o/unknown.git", ViewerPermission: "MAINTAIN"},
 		{FullName: "o/other", HTMLURL: "https://github.com/o/other", CloneURL: "https://github.com/o/other.git", ViewerPermission: "READ"},
 	}
-	scope, err := resolveScope(context.Background(), gdb, gh)
+	scope, err := resolveScope(context.Background(), gdb, gh, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,9 +16,10 @@ import (
 // visitor's maintained repositories on every request for real-time tracking.
 // The short TTL bounds how long a stolen token could be replayed.
 type session struct {
-	Login     string `json:"l"`
-	Token     string `json:"t"` // GitHub OAuth access token
-	ExpiresAt int64  `json:"e"` // unix seconds
+	GitHubUserID int64  `json:"u"`
+	Login        string `json:"l"`
+	Token        string `json:"t"` // GitHub OAuth access token
+	ExpiresAt    int64  `json:"e"` // unix seconds
 }
 
 const (
@@ -70,6 +71,12 @@ func (c *Config) open(v string) (session, error) {
 	}
 	if err := json.Unmarshal(plain, &s); err != nil {
 		return s, err
+	}
+	// Cookies created before numeric identities were introduced have a zero ID.
+	// Reject them so every configured grant is bound to an identity freshly
+	// obtained from GitHub rather than a mutable login.
+	if s.GitHubUserID <= 0 {
+		return s, errors.New("sharing: session has no valid GitHub user ID")
 	}
 	if time.Now().Unix() > s.ExpiresAt {
 		return s, errors.New("sharing: session expired")

@@ -29,6 +29,7 @@ const (
 
 // githubUser is the slice of GET /user the portal needs.
 type githubUser struct {
+	ID    int64  `json:"id"`
 	Login string `json:"login"`
 }
 
@@ -60,16 +61,20 @@ func canSeeFindings(permission string) bool {
 	}
 }
 
-// fetchUser returns the authenticated visitor's GitHub login.
-func fetchUser(ctx context.Context, token string) (string, error) {
+// fetchUser returns the authenticated visitor's stable numeric GitHub ID and
+// display login. Authorization uses the ID; Login is informational only.
+func fetchUser(ctx context.Context, token string) (githubUser, error) {
 	var u githubUser
 	if err := githubGet(ctx, token, githubAPI+"/user", &u); err != nil {
-		return "", err
+		return u, err
+	}
+	if u.ID <= 0 {
+		return u, fmt.Errorf("sharing: GitHub returned an invalid user ID")
 	}
 	if u.Login == "" {
-		return "", fmt.Errorf("sharing: GitHub returned an empty login")
+		return u, fmt.Errorf("sharing: GitHub returned an empty login")
 	}
-	return u.Login, nil
+	return u, nil
 }
 
 const maintainedRepositoriesQuery = `

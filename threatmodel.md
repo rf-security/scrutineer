@@ -116,11 +116,11 @@ No rate limiting on `POST /repositories`, no cap on clone size, no timeout on th
 
 ### T10: Stale Go toolchain (resolved)
 
-The Go toolchain is selected in [go.mod](go.mod); container builds use the pinned Go builder images in [Dockerfile](Dockerfile) and [Dockerfile.runner](Dockerfile.runner). The previously identified stdlib vulnerabilities are fixed by these toolchain updates.
+The Go toolchain is selected in [go.mod](go.mod); container builds use the pinned Go builder images in [Dockerfile](docker/cmd/Dockerfile) and [Dockerfile.runner](docker/runner/Dockerfile.runner). The previously identified stdlib vulnerabilities are fixed by these toolchain updates.
 
 ### T11: Image supply chain (partially mitigated)
 
-Claude Code, Codex, OpenCode, and Copilot are pinned by release tag and per-architecture SHA256 digest in [Dockerfile.runner](Dockerfile.runner). Other tool versions and base-image digests are pinned there and in [Dockerfile](Dockerfile); workflow tools are pinned in [CI](.github/workflows/tests.yml). The container runs as non-root user `runner`. The runner image is built in CI, smoke-tested, and published to GHCR; users pull a known-good artifact rather than rebuilding against live registries.
+Claude Code, Codex, OpenCode, and Copilot are pinned by release tag and per-architecture SHA256 digest in [Dockerfile.runner](docker/runner/Dockerfile.runner). Other tool versions and base-image digests are pinned there and in [Dockerfile](docker/cmd/Dockerfile); workflow tools are pinned in [CI](.github/workflows/tests.yml). The container runs as non-root user `runner`. The runner image is built in CI, smoke-tested, and published to GHCR; users pull a known-good artifact rather than rebuilding against live registries.
 
 Supply-chain surface in the final stage:
 - `apt` pulls from Debian's official mirrors plus the GitHub CLI repo at `cli.github.com/packages` (signed-by keyring under `/etc/apt/keyrings/`). `gh` is used at scan time by the `fork` and `report-upstream` skills.

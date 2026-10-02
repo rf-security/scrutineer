@@ -5,13 +5,13 @@ set -euo pipefail
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
-mkdir -p "$test_dir/scripts" "$test_dir/internal/worker" "$test_dir/.github/workflows"
+mkdir -p "$test_dir/scripts" "$test_dir/internal/worker" "$test_dir/.github/workflows" "$test_dir/docker/cmd" "$test_dir/docker/runner"
 cp "$root/scripts/check-runner-cli-version-pins.sh" "$test_dir/scripts/"
-cp "$root/Dockerfile" "$test_dir/"
+cp "$root/docker/cmd/Dockerfile" "$test_dir/docker/cmd/"
 cp "$root/.github/workflows/tests.yml" "$test_dir/.github/workflows/"
 
 reset_pins() {
-  cp "$root/Dockerfile.runner" "$test_dir/"
+  cp "$root/docker/runner/Dockerfile.runner" "$test_dir/docker/runner/"
   cp "$root/internal/worker/harness.go" "$test_dir/internal/worker/"
 }
 
@@ -41,7 +41,7 @@ bash "$test_dir/scripts/check-runner-cli-version-pins.sh"
 printf 'ok - matching pins\n'
 
 sed 's/^ARG CODEX_ARM64_LOCK=rust-v[0-9.]*@/ARG CODEX_ARM64_LOCK=rust-v0.0.0@/' \
-  "$root/Dockerfile.runner" > "$test_dir/Dockerfile.runner"
+  "$root/docker/runner/Dockerfile.runner" > "$test_dir/docker/runner/Dockerfile.runner"
 expect_failure 'architecture mismatch' \
   'Codex version pins disagree:' \
   '  arm64: rust-v0.0.0'
@@ -50,7 +50,7 @@ reset_pins
 sed 's/^const CodexModelCatalogRelease = .*/const CodexModelCatalogRelease = "rust-v0.0.0"/' \
   "$root/internal/worker/harness.go" > "$test_dir/internal/worker/harness.go"
 runner_version=$(sed -E -n \
-  's/^ARG CODEX_AMD64_LOCK=(rust-v[0-9]+\.[0-9]+\.[0-9]+)@.*/\1/p' "$root/Dockerfile.runner")
+  's/^ARG CODEX_AMD64_LOCK=(rust-v[0-9]+\.[0-9]+\.[0-9]+)@.*/\1/p' "$root/docker/runner/Dockerfile.runner")
 expect_failure 'catalog mismatch' \
   'Codex runner and model catalog version pins disagree:' \
   "  runner: $runner_version" \

@@ -16,14 +16,30 @@ import (
 // owner/repo), which both sides always carry, avoiding the cross-forge
 // collisions a bare owner/repo key could cause.
 func resolveScope(ctx context.Context, gdb *gorm.DB, repos []githubRepo) (web.ViewScope, error) {
-	scope := web.ViewScope{RepoIDs: map[uint]struct{}{}, ReadOnly: true}
+	authorized := make([]githubRepo, 0, len(repos))
+	scope := web.ViewScope{
+		RepoIDs:  map[uint]struct{}{},
+		ReadOnly: true,
+	}
+	for _, repo := range repos {
+		if repo.maintained() {
+			authorized = append(authorized, repo)
+			continue
+		}
+		scope.InsufficientRepositories = append(scope.InsufficientRepositories, externalRepository(repo))
+	}
+	scope.AuthorizedRepoCount = len(authorized)
 
-	want := make(map[string]struct{}, len(repos)*2)
-	for _, r := range repos {
-		addKey(want, r.HTMLURL)
-		addKey(want, r.CloneURL)
+	// Keep the GitHub row behind each normalized URL so matched rows can be
+	// removed from the informational "not scanned" list. One GitHub repository
+	// has both an HTML and clone URL, which normalize to the same key.
+	want := make(map[string][]int, len(authorized))
+	for i, r := range authorized {
+		addIndexedKey(want, r.HTMLURL, i)
+		addIndexedKey(want, r.CloneURL, i)
 	}
 	if len(want) == 0 {
+		scope.UnscannedRepositories = externalRepositories(authorized, nil)
 		return scope, nil
 	}
 
@@ -37,27 +53,76 @@ func resolveScope(ctx context.Context, gdb *gorm.DB, repos []githubRepo) (web.Vi
 		Find(&rows).Error; err != nil {
 		return scope, err
 	}
+	matched := make([]bool, len(authorized))
 	for _, row := range rows {
-		if keyMatches(want, row.URL) || keyMatches(want, row.HTMLURL) {
+		indexes := matchingIndexes(want, row.URL, row.HTMLURL)
+		if len(indexes) > 0 {
 			scope.RepoIDs[row.ID] = struct{}{}
+			for _, i := range indexes {
+				matched[i] = true
+			}
 		}
 	}
+	scope.UnscannedRepositories = externalRepositories(authorized, matched)
 	return scope, nil
 }
 
-func addKey(set map[string]struct{}, rawURL string) {
-	if k := normURL(rawURL); k != "" {
-		set[k] = struct{}{}
+func addIndexedKey(set map[string][]int, rawURL string, index int) {
+	k := normURL(rawURL)
+	if k == "" {
+		return
+	}
+	for _, existing := range set[k] {
+		if existing == index {
+			return
+		}
+	}
+	set[k] = append(set[k], index)
+}
+
+func matchingIndexes(set map[string][]int, rawURLs ...string) []int {
+	seen := make(map[int]struct{})
+	var indexes []int
+	for _, rawURL := range rawURLs {
+		for _, index := range set[normURL(rawURL)] {
+			if _, ok := seen[index]; ok {
+				continue
+			}
+			seen[index] = struct{}{}
+			indexes = append(indexes, index)
+		}
+	}
+	return indexes
+}
+
+func externalRepositories(repos []githubRepo, matched []bool) []web.ExternalRepository {
+	var out []web.ExternalRepository
+	for i, repo := range repos {
+		if matched != nil && matched[i] {
+			continue
+		}
+		out = append(out, externalRepository(repo))
+	}
+	return out
+}
+
+func externalRepository(repo githubRepo) web.ExternalRepository {
+	return web.ExternalRepository{
+		Name:   repo.FullName,
+		URL:    repo.HTMLURL,
+		Access: permissionLabel(repo.ViewerPermission),
 	}
 }
 
-func keyMatches(set map[string]struct{}, rawURL string) bool {
-	k := normURL(rawURL)
-	if k == "" {
-		return false
+func permissionLabel(permission string) string {
+	switch permission {
+	case "READ":
+		return "Read access"
+	case "TRIAGE":
+		return "Triage access"
+	default:
+		return "Insufficient permission"
 	}
-	_, ok := set[k]
-	return ok
 }
 
 // normURL reduces a repository URL to a comparable host+path key: lower-cased,

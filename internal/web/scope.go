@@ -19,9 +19,30 @@ type ViewScope struct {
 	// scope with an empty set means "no repositories" (matches nothing),
 	// not "all repositories".
 	RepoIDs map[uint]struct{}
+	// AuthorizedRepoCount is the number of external repositories the visitor
+	// is authorized to see, including repositories Scrutineer has not scanned.
+	// It is informational only; RepoIDs remains the authorization boundary.
+	AuthorizedRepoCount int
+	// UnscannedRepositories describes authorized external repositories that do
+	// not yet have a Scrutineer repository row. The repositories page uses this
+	// to distinguish "not scanned" from "not authorized" in read-only views.
+	UnscannedRepositories []ExternalRepository
+	// InsufficientRepositories are public repositories the visitor can access
+	// on the external forge but cannot see findings for because their permission
+	// is below the sharing portal's authorization threshold.
+	InsufficientRepositories []ExternalRepository
 	// ReadOnly hides mutating controls in rendered pages via the template
 	// "Sharing" flag (see render and isReadOnly).
 	ReadOnly bool
+}
+
+// ExternalRepository is the safe, display-only repository identity a caller
+// may attach to a ViewScope. It deliberately carries no database ID and cannot
+// grant access to any Scrutineer resource.
+type ExternalRepository struct {
+	Name   string
+	URL    string
+	Access string
 }
 
 type viewScopeKey struct{}

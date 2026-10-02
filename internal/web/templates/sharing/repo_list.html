@@ -80,6 +80,10 @@
 {{else if .Q}}
   {{template "empty" (dict "Icon" "search-x" "Title" "No matches" "Body" "No repositories matched the search.")}}
 {{else}}
-  {{template "empty" (dict "Icon" "folder-git-2" "Title" "No repositories yet" "Body" "Add a git URL above to queue the first scan.")}}
+  {{if .Sharing}}
+    {{template "empty" (dict "Icon" "folder-git-2" "Title" "No scanned repositories" "Body" "None of the repositories authorized for this account have been scanned by Scrutineer.")}}
+  {{else}}
+    {{template "empty" (dict "Icon" "folder-git-2" "Title" "No repositories yet" "Body" "Add a git URL above to queue the first scan.")}}
+  {{end}}
 {{end}}
 </div>

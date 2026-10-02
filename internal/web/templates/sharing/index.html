@@ -4,6 +4,77 @@
   <i data-lucide="folder-git-2"></i> Repositories
 </h2>
 
+{{if .Sharing}}
+<section class="card p-4 mb-6" aria-labelledby="repository-access-heading">
+  <h3 id="repository-access-heading" class="font-semibold flex items-center gap-2">
+    <i data-lucide="key-round"></i> Repository access
+  </h3>
+  {{if eq .AuthorizedRepoCount 0}}
+    <p class="text-sm text-muted-foreground mt-2">
+      GitHub did not report any public repositories where this account has write,
+      maintain, or admin access. Findings require one of those permission levels.
+    </p>
+  {{else}}
+    <p class="text-sm text-muted-foreground mt-2">
+      GitHub authorizes this account for {{.AuthorizedRepoCount}} public
+      {{if eq .AuthorizedRepoCount 1}}repository{{else}}repositories{{end}}.
+      Scrutineer has scanned {{.ScannedRepoCount}}; {{len .UnscannedRepositories}}
+      {{if eq (len .UnscannedRepositories) 1}}has{{else}}have{{end}} not been scanned.
+    </p>
+    {{if .UnscannedRepositories}}
+      <details class="mt-3"{{if eq .ScannedRepoCount 0}} open{{end}}>
+        <summary class="cursor-pointer text-sm font-medium">
+          Show repositories not scanned by Scrutineer
+        </summary>
+        <ul class="mt-2 rounded-md border divide-y">
+          {{range .UnscannedRepositories}}
+          <li class="flex items-center justify-between gap-3 px-3 py-2">
+            <a href="{{.URL}}" target="_blank" rel="noopener noreferrer" class="text-sm hover:underline break-all">
+              {{if .Name}}{{.Name}}{{else}}{{trimscheme .URL}}{{end}}
+              <i data-lucide="external-link" class="inline size-3.5 ml-1"></i>
+            </a>
+            <span class="badge-secondary shrink-0">Not scanned</span>
+          </li>
+          {{end}}
+        </ul>
+      </details>
+    {{else}}
+      <p class="text-sm mt-3">Every authorized repository has been scanned by Scrutineer.</p>
+    {{end}}
+  {{end}}
+  {{if .InsufficientRepositories}}
+    <div class="mt-4 border-t pt-4">
+      <p class="text-sm text-muted-foreground">
+        GitHub also reports {{len .InsufficientRepositories}} public
+        {{if eq (len .InsufficientRepositories) 1}}repository{{else}}repositories{{end}}
+        where this account's permission is below the required level. Their findings
+        remain hidden until GitHub grants write, maintain, or admin access.
+      </p>
+      <details class="mt-3"{{if eq .AuthorizedRepoCount 0}} open{{end}}>
+        <summary class="cursor-pointer text-sm font-medium">
+          Show repositories with insufficient permission
+        </summary>
+        <ul class="mt-2 rounded-md border divide-y">
+          {{range .InsufficientRepositories}}
+          <li class="flex items-center justify-between gap-3 px-3 py-2">
+            <a href="{{.URL}}" target="_blank" rel="noopener noreferrer" class="text-sm hover:underline break-all">
+              {{if .Name}}{{.Name}}{{else}}{{trimscheme .URL}}{{end}}
+              <i data-lucide="external-link" class="inline size-3.5 ml-1"></i>
+            </a>
+            <span class="badge-outline shrink-0">{{.Access}}</span>
+          </li>
+          {{end}}
+        </ul>
+      </details>
+    </div>
+  {{end}}
+  <p class="text-xs text-muted-foreground mt-3">
+    If a repository is missing from every list, GitHub did not return it for this
+    account, or it is not public.
+  </p>
+</section>
+{{end}}
+
 {{template "repo_list.html" .}}
 
 {{template "foot" .}}

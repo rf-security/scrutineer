@@ -122,25 +122,30 @@ func TestPageTemplatesCloseTheLayoutTheyOpen(t *testing.T) {
 		head = `{{template "head" .}}`
 		foot = `{{template "foot" .}}`
 	)
-	entries, err := fs.ReadDir(tmplFS, "templates")
-	if err != nil {
-		t.Fatal(err)
-	}
 	var pages int
-	for _, entry := range entries {
-		body, err := fs.ReadFile(tmplFS, "templates/"+entry.Name())
+	// Walk rather than ReadDir: the sharing portal keeps its own template set
+	// in templates/sharing/, and those pages must pair head/foot too.
+	err := fs.WalkDir(tmplFS, "templates", func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		body, err := fs.ReadFile(tmplFS, path)
 		if err != nil {
-			t.Fatal(err)
+			return err
 		}
 		opens := strings.Count(string(body), head)
 		closes := strings.Count(string(body), foot)
 		if opens == 0 && closes == 0 {
-			continue
+			return nil
 		}
 		pages++
 		if opens != closes {
-			t.Errorf("%s: %d %s but %d %s", entry.Name(), opens, head, closes, foot)
+			t.Errorf("%s: %d %s but %d %s", path, opens, head, closes, foot)
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	if pages == 0 {
 		t.Fatal("no page templates found; the head/foot spelling must have changed")

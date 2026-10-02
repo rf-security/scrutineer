@@ -16,7 +16,7 @@
 # first and passes its content-addressed tag as BASE_IMAGE, then tags this
 # image scrutineer-profile-scala:<sha>. To build it manually:
 #
-#   docker build -t scrutineer-runner:local -f Dockerfile.runner .
+#   docker build -t scrutineer-runner:local -f docker/runner/Dockerfile.runner .
 #   docker build -t scrutineer-profile-java \
 #       -f docker/profiles/java/Dockerfile \
 #       --build-arg RUNNER_IMAGE=scrutineer-runner:local \

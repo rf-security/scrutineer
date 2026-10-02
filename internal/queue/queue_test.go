@@ -157,10 +157,7 @@ func waitChan(t *testing.T, ch <-chan struct{}, msg string) {
 // without running the goqite DDL (so a read-only consumer like the sharing
 // portal can construct it), while New still installs the schema.
 func TestNewNoSchema_skipsSchemaInstall(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "q.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	sqldb, err := gdb.DB()
 	if err != nil {
 		t.Fatal(err)

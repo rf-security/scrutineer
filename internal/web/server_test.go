@@ -24,7 +24,11 @@ import (
 	"scrutineer/internal/worker"
 )
 
-func newTestServer(t testing.TB) (*Server, func()) {
+func newTestServer(t testing.TB) (*Server, func()) { return newTestServerWith(t) }
+
+// newTestServerWith is newTestServer with New options — used to build a server
+// that renders the sharing portal's own template set.
+func newTestServerWith(t testing.TB, opts ...Option) (*Server, func()) {
 	t.Helper()
 	gdb := dbtest.Open(t)
 	sqldb, _ := gdb.DB()
@@ -33,7 +37,7 @@ func newTestServer(t testing.TB) (*Server, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(gdb, q, log, NewBroker(), &worker.Worker{DB: gdb})
+	s, err := New(gdb, q, log, NewBroker(), &worker.Worker{DB: gdb}, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,7 +676,7 @@ func TestDistinctLanguages_splitsJoinedColumn(t *testing.T) {
 	s.DB.Create(&db.Repository{URL: "https://x/4", Name: "d", Languages: "Go, Python"})
 	s.DB.Create(&db.Repository{URL: "https://x/5", Name: "e", Languages: ""})
 
-	got := distinctLanguages(s.DB)
+	got := distinctLanguages(s.DB, localReq("GET", "/"))
 	want := []string{"Go", "Java", "Kotlin", "Prolog", "Python"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("got %v, want %v", got, want)

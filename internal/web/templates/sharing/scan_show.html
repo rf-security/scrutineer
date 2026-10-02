@@ -1,0 +1,247 @@
+{{template "head" .}}
+{{with .Scan}}
+{{template "crumbs" (crumbs
+  "Repositories" "/"
+  .Repository.Name (printf "/repositories/%d" .Repository.ID)
+  (printf "scan #%d" .ID) "")}}
+
+<div class="flex items-start justify-between gap-4 mb-6">
+  <h2 class="text-2xl font-semibold flex items-center gap-3">
+    {{if .SkillName}}{{if .SkillID}}<a href="/skills/{{.SkillID}}">{{.SkillName}}</a>{{else}}{{.SkillName}}{{end}}{{else}}{{.Kind}}{{end}} / scan #{{.ID}}
+    {{template "status-badge" (status .Status)}}
+    {{if .MaxTurnsHit}}<span class="badge-outline"><i data-lucide="timer-off"></i> max turns</span>{{end}}
+    {{if .RefusalAuditWarning}}<span class="badge-outline"><i data-lucide="triangle-alert"></i> analysis incomplete</span>{{end}}
+  </h2>
+  {{if and (eq .Kind "skill") .SkillID}}
+    <div class="flex items-center gap-2">
+      {{if .HasExportableReport}}
+      <a href="/scans/{{.ID}}/report.md" class="btn-outline" download>
+        <i data-lucide="download"></i> Export as markdown
+      </a>
+      {{end}}
+      {{if not .Sharing}}
+      {{if or (eq (status .Status) "queued") (eq (status .Status) "running")}}
+      <form method="post" action="/scans/{{.ID}}/cancel"
+            hx-post="/scans/{{.ID}}/cancel" hx-swap="none">
+        <button type="submit" class="btn-outline"><i data-lucide="x"></i> Cancel</button>
+      </form>
+      {{else if eq (status .Status) "paused"}}
+      <form method="post" action="/scans/{{.ID}}/resume"
+            hx-post="/scans/{{.ID}}/resume" hx-swap="none">
+        <button type="submit" class="btn-outline"><i data-lucide="play"></i> Resume</button>
+      </form>
+      {{else}}
+      <form method="post" action="/scans/{{.ID}}/retry"
+            hx-post="/scans/{{.ID}}/retry" hx-swap="none">
+        <button type="submit" class="btn-outline"><i data-lucide="refresh-cw"></i> Retry</button>
+      </form>
+      {{end}}
+      {{end}}
+    </div>
+  {{else if .HasExportableReport}}
+    <a href="/scans/{{.ID}}/report.md" class="btn-outline" download>
+      <i data-lucide="download"></i> Export as markdown
+    </a>
+  {{end}}
+</div>
+
+<dl class="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-6 text-sm">
+  <div>
+    <dt class="text-muted-foreground">Model</dt>
+    <dd>{{if .Model}}{{.Model}}{{else}}-{{end}}</dd>
+  </div>
+  {{if .Ref}}<div>
+    <dt class="text-muted-foreground">Ref</dt>
+    <dd>{{.Ref}}</dd>
+  </div>{{end}}
+  {{if eq .RescanMode "diff"}}<div>
+    <dt class="text-muted-foreground">Mode</dt>
+    <dd>diff rescan</dd>
+  </div>{{end}}
+  {{if .DiffBaseCommit}}<div>
+    <dt class="text-muted-foreground">Diff base</dt>
+    <dd><code>{{short .DiffBaseCommit}}</code></dd>
+  </div>{{end}}
+  <div>
+    <dt class="text-muted-foreground">Commit</dt>
+    <dd><code>{{if .Commit}}{{short .Commit}}{{else}}-{{end}}</code></dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Started</dt>
+    <dd>{{if .StartedAt}}{{since .StartedAt}}{{else}}-{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Duration</dt>
+    <dd>{{if .FinishedAt}}{{dur .Duration}}{{else}}-{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Turns</dt>
+    <dd>{{if .Turns}}{{.Turns}}{{else}}-{{end}}</dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Cost</dt>
+    <dd>{{if gt .CostUSD 0.0}}{{usd .CostUSD}}{{else}}-{{end}}</dd>
+  </div>
+  {{if .SkillName}}
+  <div>
+    <dt class="text-muted-foreground">Skill</dt>
+    <dd>{{if .SkillID}}<a href="/skills/{{.SkillID}}">{{.SkillName}}</a>{{else}}{{.SkillName}}{{end}}</dd>
+  </div>
+  {{end}}
+  {{if .SkillsRepoSHA}}
+  <div>
+    <dt class="text-muted-foreground">Skills repo</dt>
+    <dd><code>{{short .SkillsRepoSHA}}</code></dd>
+  </div>
+  {{end}}
+</dl>
+
+{{if gt .TotalInputTokens 0}}
+<table class="table w-full max-w-2xl mb-6">
+  <thead><tr>
+    <th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th><th>Cache hit</th>
+  </tr></thead>
+  <tbody><tr>
+    <td>{{bignum .InputTokens}}</td>
+    <td>{{bignum .CacheReadTokens}}</td>
+    <td>{{bignum .CacheWriteTokens}}</td>
+    <td>{{bignum .OutputTokens}}</td>
+    <td>{{pct .CacheHitRatio}}</td>
+  </tr></tbody>
+</table>
+{{end}}
+
+{{if .Error}}
+  <div class="alert-destructive mb-6">
+    <i data-lucide="triangle-alert"></i>
+    <section>{{.Error}}</section>
+  </div>
+{{end}}
+
+{{with $.Diff}}
+  {{if .FallbackReason}}
+    <div class="alert mb-6">
+      <i data-lucide="info"></i>
+      <section>Diff rescan requested; ran as a full scan. {{.FallbackReason}}.</section>
+    </div>
+  {{else if eq .ActualMode "diff"}}
+    {{$scan := $.Scan}}
+    <div class="mb-6 rounded border">
+      <div class="flex items-center justify-between gap-4 px-3 py-2 text-sm">
+        <div class="flex items-center gap-2">
+          <i data-lucide="diff"></i>
+          <span>Diff rescan · {{.ChangedFiles}} file{{if ne .ChangedFiles 1}}s{{end}} changed · {{bytes .PatchBytes}} patch</span>
+        </div>
+        <span class="text-muted-foreground text-xs">
+          <code>{{short $scan.DiffBaseCommit}}</code> → <code>{{short $scan.Commit}}</code>
+        </span>
+      </div>
+      {{if .Files}}
+        <details>
+          <summary class="cursor-pointer px-3 py-2 text-xs text-muted-foreground hover:underline border-t">Changed files</summary>
+          <table class="table w-full text-xs">
+            <tbody>
+              {{range .Files}}
+                <tr>
+                  <td class="text-muted-foreground w-24">{{.StatusName}}</td>
+                  <td class="font-mono">
+                    {{if .Old}}<span class="text-muted-foreground">{{.Old}} → </span>{{end}}
+                    {{if and .Linkable $scan.Commit}}<a class="hover:underline" href="/repositories/{{$scan.RepositoryID}}/blob/{{$scan.Commit}}/{{.Path}}">{{.Path}}</a>{{else}}{{.Path}}{{end}}
+                  </td>
+                </tr>
+              {{end}}
+            </tbody>
+          </table>
+        </details>
+      {{end}}
+    </div>
+  {{end}}
+{{end}}
+
+{{if .MaxTurnsHit}}
+  <div class="alert mb-6">
+    <i data-lucide="timer-off"></i>
+    <section>This scan hit the max turns cap after producing partial output. Retry will resume the saved Claude session.</section>
+  </div>
+{{end}}
+
+{{if .RefusalAuditWarning}}
+  <div class="alert mb-6">
+    <i data-lucide="triangle-alert"></i>
+    <section>The deep-dive reported refused or skipped analysis. Review the refusal audit before treating coverage as complete.</section>
+  </div>
+{{end}}
+
+{{$live := and (not .Status.Terminal) (ne (status .Status) "paused")}}
+{{$default := 1}}{{if $live}}{{$default = 2}}{{end}}
+<div class="tabs w-full" id="scan-tabs">
+  <nav role="tablist" aria-orientation="horizontal" aria-label="Scan output">
+    <button type="button" role="tab" id="t1" aria-controls="p1"
+            aria-selected="{{if eq $default 1}}true{{else}}false{{end}}">Result</button>
+    <button type="button" role="tab" id="t2" aria-controls="p2"
+            aria-selected="{{if eq $default 2}}true{{else}}false{{end}}">Log</button>
+    {{if .Prompt}}<button type="button" role="tab" id="t3" aria-controls="p3" aria-selected="false">Prompt</button>{{end}}
+  </nav>
+
+  <div role="tabpanel" id="p1" aria-labelledby="t1" {{if ne $default 1}}hidden{{end}}>
+    {{if .Findings}}
+      <table class="table table-fixed w-full mb-4">
+        <thead><tr>
+          <th class="w-24">Severity</th><th>Title</th><th class="w-24">Status</th>
+          <th class="w-44">CWE</th><th class="w-64">Location</th>
+        </tr></thead>
+        <tbody>
+        {{range .Findings}}
+          <tr id="finding-{{.ID}}">
+            <td>{{template "severity-badge" .Severity}}</td>
+            <td class="min-w-0 whitespace-normal">
+              <a href="/findings/{{.ID}}" class="font-medium">{{.Title}}</a>
+              <div class="text-xs text-muted-foreground line-clamp-2">{{.Summary}}</div>
+            </td>
+            <td>{{template "finding-status" (fstatus .Status)}}</td>
+            <td class="text-muted-foreground">
+              {{if .CWE}}<span data-tooltip="{{cwename .CWE}}">{{with cwecatid .CWE}}<span class="text-muted-foreground">{{.}} ›</span> {{end}}{{.CWE}}</span>{{end}}
+            </td>
+            <td class="whitespace-normal">{{template "loc-link" (dict "RepoID" $.Scan.Repository.ID "Commit" $.Scan.Commit "Location" .Location "Extra" .ExtraLocationCount)}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      <details>
+        <summary class="cursor-pointer text-sm text-muted-foreground">raw report.json</summary>
+        <pre class="log mt-2" tabindex="0" role="region" aria-label="Raw report JSON">{{prettyjson .Report}}</pre>
+      </details>
+    {{else if .Report}}
+      <pre class="log" tabindex="0" role="region" aria-label="Report">{{prettyjson .Report}}</pre>
+    {{else}}
+      <p class="text-muted-foreground text-sm p-4">No result yet.</p>
+    {{end}}
+  </div>
+
+  <div role="tabpanel" id="p2" aria-labelledby="t2" {{if ne $default 2}}hidden{{end}}>
+    {{if $live}}
+      <div hx-ext="sse" sse-connect="/events?scan={{.ID}}"
+           sse-swap="scan-status" hx-swap="none" hx-disinherit="*"
+           data-reload-on-sse="scan-status">
+        <pre class="log" tabindex="0" role="region" aria-label="Scan log" sse-swap="scan-log" hx-swap="beforeend scroll:bottom">{{template "scan_log.html" .}}</pre>
+      </div>
+    {{else}}
+      <pre class="log" tabindex="0" role="region" aria-label="Scan log">{{template "scan_log.html" .}}</pre>
+    {{end}}
+  </div>
+
+  {{if .Prompt}}
+  <div role="tabpanel" id="p3" aria-labelledby="t3" hidden>
+    <pre class="log" tabindex="0" role="region" aria-label="Scan prompt">{{.Prompt}}</pre>
+  </div>
+  {{end}}
+
+  {{if .RefusalAudit}}
+  <details class="mt-4">
+    <summary class="cursor-pointer text-sm text-muted-foreground">Refusal audit</summary>
+    <pre class="log mt-2" tabindex="0" role="region" aria-label="Refusal audit JSON">{{prettyjson .RefusalAudit}}</pre>
+  </details>
+  {{end}}
+</div>
+{{end}}
+{{template "foot" .}}

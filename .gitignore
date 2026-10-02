@@ -13,6 +13,7 @@ __pycache__/
 .idea/
 .vscode/
 .claude/
+/CLAUDE.md
 scrutineer.yaml
 scrutineer.*.yaml
 !scrutineer.sample.yaml

@@ -41,6 +41,20 @@
 #   driver: postgres
 #   dsn: postgres://scrutineer:scrutineer@db:5432/scrutineer?sslmode=disable
 
+# Settings for the external maintainer portal (cmd/sharing). Optional; anything
+# omitted here falls back to the matching root config. By default the portal
+# shares the root database above.
+#
+# sharing.database points the portal at its own connection — for example a
+# read replica or a least-privilege role scoped to the portal — while the main
+# app keeps using the root database. Its shape matches the database block, and
+# unset fields inherit the root, so you can override just the dsn to reuse the
+# root driver. Only the driver/dsn differ; sqlite still lives under <data>.
+# sharing:
+#   database:
+#     driver: postgres
+#     dsn: postgres://portal_ro:secret@db:5432/scrutineer?sslmode=disable
+
 # Claude effort level for model-backed skills.
 # effort: high
 

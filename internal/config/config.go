@@ -251,6 +251,11 @@ type Config struct {
 	// LAN. Only enable it when a trusted front end already restricts who can
 	// connect, since it removes the DNS-rebinding protection.
 	AllowRemote bool `yaml:"allow_remote"`
+	// Sharing holds settings specific to the external maintainer portal
+	// (cmd/sharing). It is optional; unset values fall back to the matching
+	// root config, so a deployment that runs the portal against the same
+	// database as the main app needs no sharing block at all.
+	Sharing SharingConfig `yaml:"sharing"`
 }
 
 // Codex groups settings that apply only to the Codex backend.
@@ -435,6 +440,33 @@ func ParseBackendPreflightTTL(s string) (time.Duration, error) {
 	return d, nil
 }
 
+// SharingConfig holds settings specific to the external maintainer portal
+// (cmd/sharing).
+type SharingConfig struct {
+	// Database optionally points the sharing portal at a different database
+	// connection than the main app — e.g. a read replica or a least-privilege
+	// role dedicated to the portal. Its shape mirrors the root `database`
+	// block, and unset fields inherit the root database config (see
+	// Config.SharingDatabase), so setting only `dsn` reuses the root driver.
+	Database DatabaseConfig `yaml:"database"`
+}
+
+// SharingDatabase returns the database configuration the sharing portal
+// (cmd/sharing) should connect with: the root database config with any
+// sharing-specific `sharing.database` values overlaid on top. This lets the
+// portal default to the main database yet be pointed at its own DSN (for
+// example a separate least-privilege role) without duplicating the whole block.
+func (c *Config) SharingDatabase() DatabaseConfig {
+	d := c.Database
+	if c.Sharing.Database.Driver != "" {
+		d.Driver = c.Sharing.Database.Driver
+	}
+	if c.Sharing.Database.DSN != "" {
+		d.DSN = c.Sharing.Database.DSN
+	}
+	return d
+}
+
 // DatabaseConfig selects and locates the database backend. Driver is
 // "sqlite" (default when empty) or "postgres". DSN is required for
 // postgres (a libpq/pgx connection string or URL, e.g.
@@ -613,6 +645,14 @@ func Load(path string) (*Config, error) {
 	if err := ValidateEffort(c.Effort); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	if err := ValidateDatabase(c.Database); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	// Validate the portal's resolved database (root overlaid with any
+	// sharing.database overrides) so a bad sharing block fails fast too.
+	if err := ValidateDatabase(c.SharingDatabase()); err != nil {
+		return nil, fmt.Errorf("parse config %s: sharing.%w", path, err)
+	}
 	if err := ValidateSubprojectScope(c.SubprojectScope); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
@@ -626,9 +666,6 @@ func Load(path string) (*Config, error) {
 		if _, err := c.VINCE.Endpoint(); err != nil {
 			return nil, fmt.Errorf("parse config %s: %w", path, err)
 		}
-	}
-	if err := ValidateDatabase(c.Database); err != nil {
-		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	return &c, nil
 }

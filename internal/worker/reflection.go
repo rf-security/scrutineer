@@ -101,7 +101,7 @@ func (w *Worker) validateReflectionModel(repoID uint) error {
 
 func (w *Worker) reflectionSources(scan *db.Scan) ([]db.Scan, error) {
 	var sources []db.Scan
-	err := w.DB.Select("id, skill_name, status, `commit`").
+	err := w.DB.Select(`id, skill_name, status, "commit"`).
 		Where("repository_id = ? AND triage_scan_id = ? AND skill_name <> ? AND sub_path = '' AND ref = ''", scan.RepositoryID, *scan.TriageScanID, "reflect").
 		Order("id").Limit(reflection.MaxScans + 1).Find(&sources).Error
 	return sources, err

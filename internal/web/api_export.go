@@ -47,6 +47,10 @@ func (s *Server) apiDeleteRepository(w http.ResponseWriter, r *http.Request) {
 	}
 	deleted, err := s.deleteRepository(repo)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeAPIError(w, http.StatusNotFound, "repository not found")
+			return
+		}
 		if errors.Is(err, errRepositoryDeleteInFlight) {
 			writeAPIError(w, http.StatusConflict, err.Error())
 			return

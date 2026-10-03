@@ -41,6 +41,38 @@ func TestAuditFindingSchemasReferenceSharedContract(t *testing.T) {
 	}
 }
 
+// Audit modes share one report envelope (scope, inventory, negative results,
+// assumptions and design properties) so each new mode wraps it instead of
+// copying it.
+func TestAuditModeSchemasReferenceSharedEnvelope(t *testing.T) {
+	const sharedModeRef = "../_shared/audit-mode-report.schema.json"
+	for _, path := range []string{
+		"../../skills/audit-package-manager/schema.json",
+		"../../skills/audit-web/schema.json",
+		"../../skills/audit-embedded/schema.json",
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		var wrapper map[string]any
+		if err := json.Unmarshal(raw, &wrapper); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		if got := wrapper["$ref"]; got != sharedModeRef {
+			t.Errorf("%s $ref = %v, want %q", path, got, sharedModeRef)
+		}
+		for _, keyword := range []string{"type", "properties", "$defs"} {
+			if _, ok := wrapper[keyword]; ok {
+				t.Errorf("%s defines validation keyword %q instead of using the shared envelope", path, keyword)
+			}
+		}
+		if bundled := loadBundledSchema(t, path); strings.Contains(bundled, ".schema.json") {
+			t.Errorf("%s bundled schema still references an external file", path)
+		}
+	}
+}
+
 func loadBundledSchema(t *testing.T, schemaPath string) string {
 	t.Helper()
 	parsed, err := skills.ParseFile(filepath.Join(filepath.Dir(schemaPath), "SKILL.md"))
@@ -82,6 +114,14 @@ func TestBundledSchemas_compileAndAcceptSamples(t *testing.T) {
 			  "references":[{"url":"https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
 			    "summary":"bandit docs: B608","tags":"docs"}]}],
 			  "notes":"bandit could not read 1 file(s): bad.py (syntax error while parsing AST from file)"}`,
+		},
+		{
+			"../../skills/betterleaks/schema.json",
+			`{"findings":[{"id":"F1","title":"github-pat","severity":"High",
+			  "confidence":"high","cwe":"","location":"config/token.env:4",
+			  "locations":["config/token.env:4"],
+			  "trace":"Detected a GitHub personal access token.",
+			  "rating":"High from Betterleaks rule github-pat"}]}`,
 		},
 		{
 			"../../skills/repo-overview/schema.json",
@@ -553,6 +593,9 @@ func TestBundledSchemas_rejectBadShapes(t *testing.T) {
 		{"../../skills/triage/schema.json", `{"release_watch":["55"]}`, "/release_watch/0"},
 		{"../../skills/bandit/schema.json",
 			`{"findings":[{"id":"F1","title":"B608","severity":"Severe","location":"app.py:9"}]}`,
+			"/findings/0/severity"},
+		{"../../skills/betterleaks/schema.json",
+			`{"findings":[{"id":"F1","title":"github-pat","severity":"Severe","location":"app.py:9"}]}`,
 			"/findings/0/severity"},
 		{"../../skills/repo-overview/schema.json", `{"languages":"go"}`, "/languages"},
 		{"../../skills/sbom/schema.json", `{"bomFormat":"SPDX","specVersion":"1.5"}`, "/bomFormat"},

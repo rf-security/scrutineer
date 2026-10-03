@@ -10,6 +10,7 @@ import (
 )
 
 func TestZizmorScriptPreservesWorkflowPaths(t *testing.T) {
+	skipWithoutPython3(t)
 	script, err := filepath.Abs("../../skills/zizmor/scripts/scan.py")
 	if err != nil {
 		t.Fatal(err)
@@ -23,10 +24,7 @@ func TestZizmorScriptPreservesWorkflowPaths(t *testing.T) {
 	if err := os.Mkdir(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fakeZizmor := filepath.Join(bin, "zizmor")
-	if err := os.WriteFile(fakeZizmor, []byte(fakeZizmorScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBin(t, bin, "zizmor", fakeZizmorScript)
 
 	cmd := exec.Command("python3", script)
 	cmd.Dir = root

@@ -1,0 +1,14 @@
+given: a declarative package installer writes launchers using unchecked package-author-controlled names
+fixture: fixtures/package-manager-bin
+skill: audit-package-manager
+should_find:
+  - cwe: CWE-22
+    path: install.py
+    evidence_contains:
+      - install_package
+      - bin
+    required: true
+should_not_find:
+  - finding: arbitrary code execution through install hooks
+must_not_contain:
+  - npm postinstall

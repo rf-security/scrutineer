@@ -152,7 +152,7 @@ jobs:
 
       - name: Set up Docker Buildx
         if: steps.due.outputs.release_due == 'true'
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Resolve commit-matched runner image
         id: runner
@@ -190,6 +190,12 @@ jobs:
             goarch: amd64
             runner: macos-26
             run_binary: false
+          # Cross-compiled: CGO is off, and the Windows CI leg already runs a
+          # natively built scrutineer.exe.
+          - goos: windows
+            goarch: amd64
+            runner: ubuntu-24.04
+            run_binary: false
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
@@ -218,11 +224,16 @@ jobs:
           RUNNER_IMAGE: ${{ needs.preflight.outputs.runner_image }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
+          BINARY=scrutineer
+          if [[ "${GOOS}" == "windows" ]]; then
+            BINARY=scrutineer.exe
+          fi
+          echo "BINARY=${BINARY}" >> "${GITHUB_ENV}"
           BUILD_DATE=$(git show -s --format=%cI "${COMMIT_SHA}")
           mkdir -p dist
           CGO_ENABLED=0 go build -trimpath \
             -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT_SHA} -X main.buildDate=${BUILD_DATE} -X main.defaultRunnerImage=${RUNNER_IMAGE}" \
-            -o dist/scrutineer ./cmd/scrutineer
+            -o "dist/${BINARY}" ./cmd/scrutineer
 
       - name: Validate executable
         if: matrix.run_binary
@@ -230,7 +241,7 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
           RUNNER_IMAGE: ${{ needs.preflight.outputs.runner_image }}
         run: |
-          OUTPUT=$(dist/scrutineer --version)
+          OUTPUT=$("dist/${BINARY}" --version)
           grep -F "scrutineer ${VERSION}" <<< "${OUTPUT}"
           grep -F "runner: ${RUNNER_IMAGE}" <<< "${OUTPUT}"
 
@@ -239,13 +250,18 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          file dist/scrutineer
+          file "dist/${BINARY}"
           if [[ "${GOOS}" == "linux" ]]; then
-            if readelf -l dist/scrutineer | grep -q 'Requesting program interpreter'; then
+            if readelf -l "dist/${BINARY}" | grep -q 'Requesting program interpreter'; then
               echo "::error::${GOOS}-${GOARCH} binary is dynamically linked"
               exit 1
             fi
-          elif [[ "${GOARCH}" == "amd64" ]] && ! file dist/scrutineer | grep -q 'x86_64'; then
+          elif [[ "${GOOS}" == "windows" ]]; then
+            if ! file "dist/${BINARY}" | grep -q 'PE32+'; then
+              echo "::error::${GOOS}-${GOARCH} artifact is not a PE32+ executable"
+              exit 1
+            fi
+          elif [[ "${GOARCH}" == "amd64" ]] && ! file "dist/${BINARY}" | grep -q 'x86_64'; then
             echo "::error::darwin-amd64 artifact is not an x86_64 Mach-O binary"
             exit 1
           fi
@@ -253,7 +269,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p package
-          cp dist/scrutineer LICENSE README.md package/
+          cp "dist/${BINARY}" LICENSE README.md package/
           TAR_FLAGS=(--no-xattrs)
           if [[ "${RUNNER_OS}" == "macOS" ]]; then
             TAR_FLAGS+=(--no-mac-metadata)

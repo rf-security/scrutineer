@@ -16,6 +16,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"scrutineer/internal/egressgrant"
 	"scrutineer/internal/vince"
 )
 
@@ -100,6 +101,12 @@ type Config struct {
 	// extra hostnames. Entries are appended to worker.DefaultEgressAllow,
 	// not replacing it. "*.example.com" matches subdomains.
 	EgressAllow []string `yaml:"egress_allow"`
+	// EgressPolicies grants extra egress to named skills only, keyed by skill
+	// name. Each allow entry is "host:port" and the port is mandatory: the
+	// granted host is reachable on that port alone. Grants need --hardened so
+	// the per-scan --internal network makes the proxy the only way out. Only
+	// this file can grant egress; nothing a scan or a skill file says can.
+	EgressPolicies map[string]EgressPolicy `yaml:"egress_policies"`
 	// Concurrency controls how many scans the worker runs in parallel.
 	// 0 or negative leaves the built-in default (see queue.DefaultWorkerConcurrency).
 	Concurrency int `yaml:"concurrency"`
@@ -109,6 +116,8 @@ type Config struct {
 	// ScanTimeout is the wall-clock limit for a single scan, as a Go
 	// duration string ("30m", "1h"). Empty leaves the built-in default.
 	ScanTimeout string `yaml:"scan_timeout"`
+	// BackendPreflightTTL enables cached live backend probes when positive.
+	BackendPreflightTTL string `yaml:"backend_preflight_ttl"`
 	// MaxTurns is passed as --max-turns to claude-code. 0 means no limit.
 	MaxTurns int `yaml:"max_turns"`
 	// ModelBaseURL overrides the default model API endpoint for the
@@ -118,6 +127,10 @@ type Config struct {
 	// compatibility, only the claude backend also falls back to the
 	// ANTHROPIC_BASE_URL environment variable when this is unset.
 	ModelBaseURL string `yaml:"model_base_url"`
+	// ModelProxy keeps ANTHROPIC_API_KEY on the host: container scans get a
+	// per-scan token for a host-side Anthropic API proxy instead. Claude
+	// backend with API-key auth only. See docs/model-proxy.md.
+	ModelProxy *bool `yaml:"model_proxy"`
 	// LegacyAnthropicBaseURL is the former name of ModelBaseURL, kept so
 	// existing configs keep working. Load merges it into ModelBaseURL
 	// when that is unset; remove after one release.
@@ -147,6 +160,8 @@ type Config struct {
 	// subscription token reports overage. Off by default; the switch is logged
 	// and shown on the jobs page and /usage.
 	DowngradeOnOverage *bool `yaml:"downgrade_on_overage"`
+	// PauseOnOverage stops model work instead of allowing paid subscription overage.
+	PauseOnOverage *bool `yaml:"pause_on_overage"`
 	// RecipientsFile is a flat text file of public keys (one per line,
 	// age X25519 or SSH) used to encrypt format=bundle exports. Empty
 	// disables encrypted export.
@@ -265,6 +280,12 @@ type OpencodeProvider struct {
 	StateDir string `yaml:"state_dir"`
 }
 
+// EgressPolicy is the extra egress one skill is granted. Allow entries are
+// "host:port" where host is a DNS hostname or "*.domain" and port is 1..65535.
+type EgressPolicy struct {
+	Allow []string `yaml:"allow"`
+}
+
 const maxTCPPort = 65535
 
 var (
@@ -341,6 +362,24 @@ func validateOpencodeProvider(id string, provider OpencodeProvider) error {
 	return nil
 }
 
+// ValidateEgressPolicies checks every per-skill grant before any scan can use
+// it. Entries must name a DNS host and an explicit port so a grant can never
+// widen to IP literals or to the host services the sandbox keeps private.
+func ValidateEgressPolicies(policies map[string]EgressPolicy) error {
+	for skill, policy := range policies {
+		if strings.TrimSpace(skill) == "" {
+			return errors.New("egress_policies: skill name must not be empty")
+		}
+		if len(policy.Allow) == 0 {
+			return fmt.Errorf("egress_policies.%s.allow: at least one host:port entry is required", skill)
+		}
+		if _, err := egressgrant.Parse(policy.Allow); err != nil {
+			return fmt.Errorf("egress_policies.%s.allow: %w", skill, err)
+		}
+	}
+	return nil
+}
+
 func validateOpencodePassEnv(id string, names []string) error {
 	seen := map[string]bool{}
 	for _, name := range names {
@@ -372,6 +411,21 @@ func validateOpencodeBinaries(id string, names []string) error {
 	return nil
 }
 
+// ParseBackendPreflightTTL permits zero (disabled) or a positive cache lifetime.
+func ParseBackendPreflightTTL(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("backend_preflight_ttl: %w", err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("backend_preflight_ttl must not be negative")
+	}
+	return d, nil
+}
+
 // DatabaseConfig selects and locates the database backend. Driver is
 // "sqlite" (default when empty) or "postgres". DSN is required for
 // postgres (a libpq/pgx connection string or URL, e.g.
@@ -383,8 +437,7 @@ type DatabaseConfig struct {
 }
 
 // ParseScanTimeout validates and parses a scan_timeout string. Empty
-// returns 0 (caller keeps its default); anything else must be a positive
-// time.Duration.
+// returns 0 (caller keeps its default); anything else must be positive.
 func ParseScanTimeout(s string) (time.Duration, error) {
 	if s == "" {
 		return 0, nil
@@ -542,6 +595,9 @@ func Load(path string) (*Config, error) {
 	if _, err := ParseScanTimeout(c.ScanTimeout); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	if _, err := ParseBackendPreflightTTL(c.BackendPreflightTTL); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
 	if err := ValidateTheme(c.Theme); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
@@ -552,6 +608,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if err := ValidateOpencode(c.Opencode); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := ValidateEgressPolicies(c.EgressPolicies); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	if c.VINCE.Enabled() {

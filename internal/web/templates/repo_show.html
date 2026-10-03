@@ -49,7 +49,7 @@
     </a>
     <form method="post" action="/repositories/{{.Repo.ID}}/delete"
           hx-post="/repositories/{{.Repo.ID}}/delete" hx-swap="none"
-          hx-confirm="{{if .ActiveScans}}{{.ActiveScans}} scan(s) on {{.Repo.Name}} are still running or queued and will keep writing to disk until they finish; cancel them first. {{end}}Permanently delete {{.Repo.Name}}? This removes the repository, all its scans and findings, and its cached clone on disk. This cannot be undone.">
+          hx-confirm="{{if .ActiveScans}}{{.ActiveScans}} scan(s) on {{.Repo.Name}} are still running or queued and will keep writing to disk until they finish; cancel them first. {{end}}{{if .PausedScans}}{{.PausedScans}} paused scan(s) will also be permanently removed. {{end}}Permanently delete {{.Repo.Name}}? This removes the repository, all its scans and findings, and its cached clone on disk. This cannot be undone.">
       <button class="btn-destructive" type="submit"><i data-lucide="trash-2"></i> Delete</button>
     </form>
     <form method="post" action="/repositories/{{.Repo.ID}}/scan"
@@ -98,6 +98,11 @@
     {{if .ThreatModel}}
     <button type="button" role="tab" id="rt10" aria-controls="rp10" aria-selected="false">
       Threat Model
+    </button>
+    {{end}}
+    {{if .Compliance}}
+    <button type="button" role="tab" id="rt16" aria-controls="rp16" aria-selected="false">
+      Compliance {{if .Repo.BaselineLevel}}<span class="badge-outline ml-1">L{{.Repo.BaselineLevel}}</span>{{end}}
     </button>
     {{end}}
     <button type="button" role="tab" id="rt12" aria-controls="rp12" aria-selected="false">
@@ -566,6 +571,29 @@
   </div>
   {{end}}
 
+  {{if .Compliance}}
+  <div role="tabpanel" id="rp16" aria-labelledby="rt16" hidden>
+    <p class="text-sm mb-4">
+      {{if .Repo.BaselineLevel}}OpenSSF Baseline level {{.Repo.BaselineLevel}} attained.{{else}}No OpenSSF Baseline level attained.{{end}}
+      A level counts as attained only when every applicable control at that level and below passed.
+    </p>
+    <table class="table w-full">
+      <thead><tr><th>Control</th><th>Level</th><th>Status</th><th>Details</th><th>Source</th></tr></thead>
+      <tbody>
+      {{range .Compliance}}
+        <tr id="control-{{.ID}}">
+          <td class="font-medium"><code>{{.ControlID}}</code></td>
+          <td>{{.Level}}</td>
+          <td>{{if eq .Status "PASS"}}<span class="badge-secondary">PASS</span>{{else if eq .Status "FAIL"}}<span class="badge-destructive">FAIL</span>{{else}}<span class="badge-outline">{{.Status}}</span>{{end}}</td>
+          <td class="whitespace-normal text-sm">{{.Details}}</td>
+          <td class="text-xs text-muted-foreground">{{.Source}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{end}}
+
   <div role="tabpanel" id="rp12" aria-labelledby="rt12" hidden>
     {{template "threat_workbench" .}}
   </div>
@@ -744,7 +772,7 @@
 {{define "scan-row"}}{{with .S}}
   <tr id="scan-{{.ID}}"{{if $.OOB}} hx-swap-oob="true"{{end}}>
     <td><a href="/scans/{{.ID}}">{{.ID}}</a></td>
-    <td>{{if .SkillName}}{{.SkillName}}{{else}}{{.Kind}}{{end}} {{template "branch-tag" .Ref}}{{if eq .RescanMode "diff"}} <span class="badge-outline text-xs">diff</span>{{end}}</td>
+    <td>{{if .SkillName}}{{.SkillName}}{{else}}{{.Kind}}{{end}} {{template "branch-tag" .Ref}}{{if eq .RescanMode "diff"}} <span class="badge-outline text-xs">diff</span>{{end}} {{template "focus-tag" (focus .)}}</td>
     <td>{{template "status-badge" (status .Status)}} {{if .MaxTurnsHit}}<span class="badge-outline"><i data-lucide="timer-off"></i> max turns</span>{{end}}{{if .RefusalAuditWarning}} <span class="badge-outline" data-tooltip="The deep-dive reported refused or skipped analysis"><i data-lucide="triangle-alert"></i> analysis incomplete</span>{{end}}</td>
     <td>{{if gt .FindingsCount 0}}{{template "findings-badge" .FindingsCount}}{{end}}</td>
     <td class="text-muted-foreground">{{if .Model}}{{.Model}}{{else}}-{{end}}</td>

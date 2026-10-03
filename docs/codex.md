@@ -19,23 +19,25 @@ so there's nothing to install. Set the credential and start scrutineer:
 or in `scrutineer.yaml`:
 
     backend: codex
-    default_model: gpt-5.6-sol
+    default_model: gpt-6-sol
     models:
-      - name: GPT-5.6 Sol
-        id:   gpt-5.6-sol
+      - name: GPT-6 Sol
+        id:   gpt-6-sol
         tier: high
-      - name: GPT-5.6 Terra
-        id:   gpt-5.6-terra
-      - name: GPT-5.6 Luna
-        id:   gpt-5.6-luna
+      - name: GPT-6 Luna
+        id:   gpt-6-luna
         tier: mid
       - name: GPT-6 Astra
         id:   gpt-6-astra
         tier: max
+      - name: GPT-5.6 Sol
+        id:   gpt-5.6-sol
+      - name: GPT-5.6 Terra
+        id:   gpt-5.6-terra
+      - name: GPT-5.6 Luna
+        id:   gpt-5.6-luna
       - name: GPT-5.5
         id:   gpt-5.5
-      - name: GPT-5.2
-        id:   gpt-5.2
       - name: Daybreak Blue
         id:   gpt-daybreak-blue-latest
 
@@ -49,7 +51,7 @@ the default for that tier in `/settings`.
 requires separate OpenAI approval and provisioning and is hidden from Codex's
 own picker, so Scrutineer does not include it in the built-in defaults. The
 example above shows how approved operators can add it explicitly; placing it
-last preserves Sol as the default if `default_model` is omitted.
+last preserves GPT-6 Sol as the default if `default_model` is omitted.
 
 Model ids must be in the pinned codex version's built-in catalog
 (`codex-rs/models-manager/models.json` at the release tag stored in the

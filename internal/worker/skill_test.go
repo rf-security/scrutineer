@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/db/dbtest"
 	"scrutineer/internal/queue"
 	"scrutineer/internal/repoconfig"
 )
@@ -48,10 +50,7 @@ func TestStageThreatModel(t *testing.T) {
 }
 
 func TestApplySkillResultPersistsProviderImageProvenance(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "provider.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "https://example.com/provider", Name: "provider"}
 	if err := gdb.Create(&repo).Error; err != nil {
 		t.Fatal(err)
@@ -96,10 +95,7 @@ func (*embeddedNativeCaptureRunner) SkillDir(workRoot, name string) string {
 }
 
 func TestDoSkill_findingsKind(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "s.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "https://example.com/x", Name: "x"}
 	gdb.Create(&repo)
 	skill := db.Skill{
@@ -162,10 +158,7 @@ func TestDoSkill_findingsKind(t *testing.T) {
 }
 
 func TestDoSkill_passesSubmoduleOptionFromSkill(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "submodules.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "https://example.com/native", Name: "native"}
 	if err := gdb.Create(&repo).Error; err != nil {
 		t.Fatal(err)
@@ -227,10 +220,7 @@ func TestDoSkill_passesSubmoduleOptionFromSkill(t *testing.T) {
 
 func TestDoSkillStagesEmbeddedNativeComponentIdentity(t *testing.T) {
 	url := newEmbeddedNativeOrigin(t)
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "embedded-native-components.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: url, Name: "native"}
 	if err := gdb.Create(&repo).Error; err != nil {
 		t.Fatal(err)
@@ -254,7 +244,7 @@ func TestDoSkillStagesEmbeddedNativeComponentIdentity(t *testing.T) {
 	runner := &embeddedNativeCaptureRunner{}
 	w := &Worker{
 		DB: gdb, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		DataDir: t.TempDir(), Runner: runner,
+		DataDir: shortTempDir(t), Runner: runner,
 	}
 	body, err := json.Marshal(queue.Payload{ScanID: scan.ID})
 	if err != nil {
@@ -279,10 +269,7 @@ func TestDoSkillStagesEmbeddedNativeComponentIdentity(t *testing.T) {
 }
 
 func TestDoSkill_maintainersKind(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "m.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "https://example.com/x", Name: "x"}
 	gdb.Create(&repo)
 	skill := db.Skill{
@@ -342,10 +329,7 @@ func TestDoSkill_maintainersKind(t *testing.T) {
 }
 
 func TestDoSkill_cloneErrorFlagsRepo(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "ce.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "https://example.com/gone", Name: "gone"}
 	gdb.Create(&repo)
 	skill := db.Skill{
@@ -396,10 +380,7 @@ func TestDoSkill_cloneErrorFlagsRepo(t *testing.T) {
 }
 
 func TestDoSkill_successClearsCloneError(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "cc.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{
 		URL: "https://example.com/back", Name: "back",
 		CloneError: "previously unreachable",
@@ -447,7 +428,11 @@ func TestStageContext_writesRepoFacts(t *testing.T) {
 		DefaultBranch: "main",
 	}
 	scan := &db.Scan{ID: 7, RepositoryID: 3, APIToken: "tok"}
-	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	document, err := buildSkillContext("http://127.0.0.1:8080/api", "", "", scan, repo, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(dir, "", document); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -480,7 +465,11 @@ attack_surface: stdin is attacker controlled
 skip: [tests/**]`,
 	}
 	scan := &db.Scan{ID: 7, RepositoryID: 3, APIToken: "tok"}
-	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	document, err := buildSkillContext("http://127.0.0.1:8080/api", "", "", scan, repo, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(dir, "", document); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -509,9 +498,11 @@ func TestStageContext_includesReconFocusAreas(t *testing.T) {
 		}},
 		Notes: []string{"Examples excluded."},
 	}
-	if err := stageContextWithInputs(
-		dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo, recon, nil, nil,
-	); err != nil {
+	document, err := buildSkillContext("http://127.0.0.1:8080/api", "", "", scan, repo, recon, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(dir, "", document); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -537,7 +528,11 @@ func TestStageContext_includesFocusArea(t *testing.T) {
 		t.Fatal(err)
 	}
 	scan := &db.Scan{ID: 7, RepositoryID: 3, APIToken: "tok", FocusArea: raw}
-	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	document, err := buildSkillContext("http://127.0.0.1:8080/api", "", "", scan, repo, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(dir, "", document); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -562,10 +557,7 @@ type reconContextFixture struct {
 
 func newReconContextFixture(t *testing.T) reconContextFixture {
 	t.Helper()
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "recon.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "https://example.com/recon", Name: "recon"}
 	if err := gdb.Create(&repo).Error; err != nil {
 		t.Fatal(err)
@@ -756,7 +748,7 @@ func TestStageSkill_mirrorsScriptsToWorkRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0o100 == 0 {
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o100 == 0 {
 		t.Errorf("run.sh executable bit lost: %v", info.Mode())
 	}
 }
@@ -830,14 +822,18 @@ func TestStageSkill_noScriptsDirIsNoop(t *testing.T) {
 }
 
 func TestStageContext_writesToWorkRootAndSkillDir(t *testing.T) {
-	// stageContext owns context.json, so it writes both copies itself: the
+	// writeSkillContext owns context.json, so it writes both copies itself: the
 	// workspace root and the skill directory, where ./context.json must also
 	// resolve. Byte-identical, so the two can never disagree (#499).
 	work := t.TempDir()
 	skillDir := filepath.Join(work, ".claude", "skills", "s")
 	repo := &db.Repository{URL: "https://example.com/r", Name: "r"}
 	scan := &db.Scan{ID: 7, RepositoryID: 1, APIToken: "t"}
-	if err := stageContext(work, skillDir, "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	document, err := buildSkillContext("http://127.0.0.1:8080/api", "", "", scan, repo, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(work, skillDir, document); err != nil {
 		t.Fatal(err)
 	}
 	atRoot, err := os.ReadFile(filepath.Join(work, "context.json"))
@@ -866,7 +862,11 @@ func TestStageContext_emptySkillDirWritesWorkRootOnly(t *testing.T) {
 	work := t.TempDir()
 	repo := &db.Repository{URL: "https://example.com/r", Name: "r"}
 	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t"}
-	if err := stageContext(work, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	document, err := buildSkillContext("http://127.0.0.1:8080/api", "", "", scan, repo, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(work, "", document); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(work, "context.json")); err != nil {
@@ -914,7 +914,11 @@ func TestStageContext_includesRef(t *testing.T) {
 	dir := t.TempDir()
 	repo := &db.Repository{URL: "https://example.com/x", Name: "x"}
 	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t", Ref: "2.4.x"}
-	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	document, err := buildSkillContext("http://127.0.0.1:8080/api", "", "", scan, repo, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(dir, "", document); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -934,7 +938,11 @@ func TestStageContext_omitsRefWhenEmpty(t *testing.T) {
 	dir := t.TempDir()
 	repo := &db.Repository{URL: "https://example.com/x", Name: "x"}
 	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t"}
-	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", "", scan, repo); err != nil {
+	document, err := buildSkillContext("http://127.0.0.1:8080/api", "", "", scan, repo, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(dir, "", document); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -949,43 +957,39 @@ func TestStageContext_omitsRefWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestStageContext_includesForkOrg(t *testing.T) {
-	dir := t.TempDir()
-	repo := &db.Repository{URL: "https://github.com/o/r", Name: "r"}
-	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t"}
-	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "fork-central", "", scan, repo); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got skillContext
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Scrutineer.ForkOrg != "fork-central" {
-		t.Errorf("fork_org = %q, want fork-central", got.Scrutineer.ForkOrg)
-	}
-}
-
-func TestStageContext_includesMetadataDir(t *testing.T) {
-	dir := t.TempDir()
-	repo := &db.Repository{URL: "https://github.com/o/r", Name: "r"}
-	scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t"}
-	if err := stageContext(dir, "", "http://127.0.0.1:8080/api", "", ".ossprey/", scan, repo); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(filepath.Join(dir, "context.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got skillContext
-	if err := json.Unmarshal(b, &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.Scrutineer.MetadataDir != ".ossprey/" {
-		t.Errorf("metadata_dir = %q, want .ossprey/", got.Scrutineer.MetadataDir)
+func TestStageContext_includesWorkerSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name, forkOrg, metadataDir string
+	}{
+		{"fork organization", "fork-central", ""},
+		{"metadata directory", "", ".ossprey/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			repo := &db.Repository{URL: "https://github.com/o/r", Name: "r"}
+			scan := &db.Scan{ID: 1, RepositoryID: 1, APIToken: "t"}
+			document, err := buildSkillContext("http://127.0.0.1:8080/api", tc.forkOrg, tc.metadataDir, scan, repo, nil, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writeSkillContext(dir, "", document); err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(filepath.Join(dir, "context.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got skillContext
+			if err := json.Unmarshal(b, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Scrutineer.ForkOrg != tc.forkOrg {
+				t.Errorf("fork_org = %q, want %q", got.Scrutineer.ForkOrg, tc.forkOrg)
+			}
+			if got.Scrutineer.MetadataDir != tc.metadataDir {
+				t.Errorf("metadata_dir = %q, want %q", got.Scrutineer.MetadataDir, tc.metadataDir)
+			}
+		})
 	}
 }
 
@@ -1218,10 +1222,7 @@ func (r *workspaceInspectingRunner) RunSkill(ctx context.Context, sj SkillJob, e
 }
 
 func TestDoSkill_resetsReusedWorkspace(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "s.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "https://example.com/x", Name: "x"}
 	gdb.Create(&repo)
 	skill := db.Skill{

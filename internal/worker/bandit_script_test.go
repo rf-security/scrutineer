@@ -127,14 +127,13 @@ func banditWorkspace(t *testing.T, script string) (root, argvLog string) {
 		return root, argvLog
 	}
 	body := strings.Replace(script, "@ARGV_LOG@", argvLog, 1)
-	if err := os.WriteFile(filepath.Join(bin, "bandit"), []byte(body), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBin(t, bin, "bandit", body)
 	return root, argvLog
 }
 
 func runBanditAdapter(t *testing.T, root string, onPath bool) banditReport {
 	t.Helper()
+	skipWithoutPython3(t)
 	script, err := filepath.Abs("../../skills/bandit/scripts/scan.py")
 	if err != nil {
 		t.Fatal(err)

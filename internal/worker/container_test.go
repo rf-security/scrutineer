@@ -3,9 +3,12 @@ package worker
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -46,6 +49,10 @@ func TestBuildRunArgs_CodexAccountAuthMount(t *testing.T) {
 	d := ContainerRunner{
 		Harness:          h,
 		CodexAccountAuth: NewCodexAccountAuth("/secure/codex/auth.json"),
+	}
+	probe := strings.Join(d.buildContainerBaseArgs("/work/abs", hardenedNet{}, "/work"), " ")
+	if strings.Contains(probe, "auth.json") || strings.Contains(probe, "/harness-state") || strings.Contains(probe, "CODEX_HOME") {
+		t.Fatalf("capability probe received Codex credentials or state: %s", probe)
 	}
 	got := d.buildRunArgs("img:latest", hardenedNet{}, "/data/harness-state/scan-7")
 	if !hasAdjacent(got, "-v", "/secure/codex/auth.json:/harness-state/auth.json") {
@@ -223,6 +230,182 @@ func TestBuildRunArgs_SELinuxRelabel(t *testing.T) {
 	}
 }
 
+// TestBuildRunArgs_ModelProxy exercises harnessEnvArgs's -model-proxy branch: a
+// claude-like harness's own credential and base-url env must never reach the
+// container. The proxy's base URL and a bare passthrough take their place, so
+// containerProcessEnv (proved separately) is what fills that passthrough with
+// the scan's token rather than the host's real key.
+func TestBuildRunArgs_ModelProxy(t *testing.T) {
+	h := stubHarness{env: []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL=https://original.example"}}
+	proxyURL := "http://gw.internal:8080" + ModelProxyPathPrefix
+	d := ContainerRunner{Harness: h, ModelProxy: &ModelProxy{}, ModelProxyURL: proxyURL}
+	got := d.buildRunArgs("img:latest", hardenedNet{}, "")
+
+	if !hasAdjacent(got, "-e", "ANTHROPIC_BASE_URL="+proxyURL) {
+		t.Errorf("expected the model proxy base url in %v", got)
+	}
+	if !hasAdjacent(got, "-e", "ANTHROPIC_API_KEY") {
+		t.Errorf("expected a bare ANTHROPIC_API_KEY passthrough in %v", got)
+	}
+	for _, leaked := range []string{"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL=https://original.example"} {
+		if hasAdjacent(got, "-e", leaked) {
+			t.Errorf("model proxy mode leaked %q into %v", leaked, got)
+		}
+	}
+}
+
+// TestBuildRunArgs_WithoutModelProxyUnchanged pins today's args when
+// ModelProxy is nil: -model-proxy must be strictly opt-in.
+func TestBuildRunArgs_WithoutModelProxyUnchanged(t *testing.T) {
+	h := stubHarness{env: []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}}
+	got := ContainerRunner{Harness: h}.buildRunArgs("img:latest", hardenedNet{}, "")
+	if !hasAdjacent(got, "-e", "ANTHROPIC_API_KEY") || !hasAdjacent(got, "-e", "CLAUDE_CODE_OAUTH_TOKEN") {
+		t.Errorf("expected the harness env unchanged without a model proxy, got %v", got)
+	}
+}
+
+func TestContainerProcessEnv(t *testing.T) {
+	providerEnv := map[string]string{"FOO": "bar"}
+
+	without := ContainerRunner{}
+	if got := without.containerProcessEnv(providerEnv); !reflect.DeepEqual(got, providerEnv) {
+		t.Errorf("no proxy: containerProcessEnv = %v, want the provider env unchanged", got)
+	}
+
+	withToken := ContainerRunner{ModelProxy: &ModelProxy{}, modelProxyToken: "scrutineer-scan-abc"}
+	got := withToken.containerProcessEnv(providerEnv)
+	if got["ANTHROPIC_API_KEY"] != "scrutineer-scan-abc" {
+		t.Errorf("token not injected: %v", got)
+	}
+	if got["FOO"] != "bar" {
+		t.Errorf("provider env dropped: %v", got)
+	}
+	if providerEnv["ANTHROPIC_API_KEY"] != "" {
+		t.Error("containerProcessEnv mutated the caller's provider env map")
+	}
+
+	withoutToken := ContainerRunner{ModelProxy: &ModelProxy{}}
+	got = withoutToken.containerProcessEnv(providerEnv)
+	if v, ok := got["ANTHROPIC_API_KEY"]; !ok || v != "" {
+		t.Errorf("an unissued token must still override to empty (fail closed), got %v", got)
+	}
+}
+
+func TestIssueModelProxyToken(t *testing.T) {
+	without := ContainerRunner{}
+	got, revoke, err := without.issueModelProxyToken(context.Background())
+	if err != nil || got.modelProxyToken != "" {
+		t.Fatalf("no proxy: got %+v, err %v, want a no-op passthrough", got, err)
+	}
+	revoke() // must not panic
+
+	mp, err := NewModelProxy("", "key", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noURL := ContainerRunner{ModelProxy: mp}
+	if _, _, err := noURL.issueModelProxyToken(context.Background()); err == nil {
+		t.Error("expected an error when ModelProxyURL is empty")
+	}
+
+	withURL := ContainerRunner{ModelProxy: mp, ModelProxyURL: "http://gw.internal:8080" + ModelProxyPathPrefix}
+	issued, revoke, err := withURL.issueModelProxyToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if issued.modelProxyToken == "" {
+		t.Fatal("expected a non-empty token")
+	}
+	revoke()
+	req := httptest.NewRequest(http.MethodGet, ModelProxyPathPrefix+"/v1/models", nil)
+	req.Header.Set("X-Api-Key", issued.modelProxyToken)
+	w := httptest.NewRecorder()
+	mp.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("revoked token status = %d, want 401", w.Code)
+	}
+}
+
+// TestRunSkill_ModelProxyKeepsRealKeyOffRuntime proves the real
+// ANTHROPIC_API_KEY never reaches the runtime process's env or argv: a fake
+// runtime binary records both, standing in for what the docker/podman CLI
+// would otherwise inherit and copy into the container via the bare
+// "-e ANTHROPIC_API_KEY". It also proves the scan's token is revoked the
+// moment RunSkill returns.
+func TestRunSkill_ModelProxyKeepsRealKeyOffRuntime(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer upstream.Close()
+
+	const realKey = "sk-ant-REAL-SECRET-should-never-leak"
+	mp, err := NewModelProxy(upstream.URL, realKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyServer := httptest.NewServer(mp)
+	defer proxyServer.Close()
+
+	// The operator's real key is present in the host process environment,
+	// exactly as it would be for any claude scan; model-proxy mode is what
+	// must stop it flowing through to the runtime.
+	t.Setenv("ANTHROPIC_API_KEY", realKey)
+
+	recordDir := t.TempDir()
+	t.Setenv("RECORD_DIR", recordDir)
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nenv > \"$RECORD_DIR/env.txt\"\nprintf '%s\\n' \"$*\" > \"$RECORD_DIR/argv.txt\"\nexit 0\n"
+	runtimePath := writeFakeBin(t, binDir, "runtime", script)
+
+	d := ContainerRunner{
+		Runtime:       ContainerRuntime{Bin: runtimePath},
+		Harness:       dockerNoopHarness{stubHarness{env: []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"}}},
+		ModelProxy:    mp,
+		ModelProxyURL: proxyServer.URL + ModelProxyPathPrefix,
+	}
+
+	work := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(work, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := d.RunSkill(context.Background(), SkillJob{WorkRoot: work, SrcReady: true, Name: "noop"}, func(Event) {}); err != nil {
+		t.Fatalf("RunSkill: %v", err)
+	}
+
+	envData, err := os.ReadFile(filepath.Join(recordDir, "env.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	argvData, err := os.ReadFile(filepath.Join(recordDir, "argv.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(string(envData), realKey) {
+		t.Errorf("real ANTHROPIC_API_KEY reached the runtime process env:\n%s", envData)
+	}
+	if strings.Contains(string(argvData), realKey) {
+		t.Errorf("real ANTHROPIC_API_KEY reached the runtime argv:\n%s", argvData)
+	}
+
+	var issuedToken string
+	for _, line := range strings.Split(string(envData), "\n") {
+		if v, ok := strings.CutPrefix(line, "ANTHROPIC_API_KEY="); ok {
+			issuedToken = v
+		}
+	}
+	if !strings.HasPrefix(issuedToken, "scrutineer-scan-") {
+		t.Fatalf("expected a scan token in ANTHROPIC_API_KEY, got %q", issuedToken)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, ModelProxyPathPrefix+"/v1/models", nil)
+	req.Header.Set("X-Api-Key", issuedToken)
+	w := httptest.NewRecorder()
+	mp.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("token still valid after RunSkill returned: status = %d", w.Code)
+	}
+}
+
 func TestBuildRunArgs_ContainerHardening(t *testing.T) {
 	user := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
 	const tmpfs = "/tmp:rw,noexec,nosuid,size=256m"
@@ -265,14 +448,19 @@ func TestBuildRunArgs_ContainerHardening(t *testing.T) {
 		t.Errorf("default mode must set neither --read-only nor no-new-privileges: %v", def)
 	}
 
-	// The baseline -- --cap-drop ALL, non-root --user, the /tmp tmpfs -- is
-	// present in EVERY mode; the new flag must not disturb that invariant.
+	// The baseline -- --cap-drop ALL, the /tmp tmpfs and, except on Windows,
+	// the non-root --user -- is present in EVERY mode; the new flag must not
+	// disturb that invariant.
 	for _, mode := range []ContainerRunner{{}, {HardenedRuntimeOnly: true}, {Hardened: true}} {
 		args := mode.buildRunArgs("img:latest", hardenedNet{name: net}, "")
 		if !hasAdjacent(args, "--cap-drop", "ALL") {
 			t.Errorf("%+v: missing --cap-drop ALL: %v", mode, args)
 		}
-		if !hasAdjacent(args, "--user", user) {
+		if runtime.GOOS == "windows" {
+			if slices.Contains(args, "--user") {
+				t.Errorf("%+v: --user has no host uid to map on windows: %v", mode, args)
+			}
+		} else if !hasAdjacent(args, "--user", user) {
 			t.Errorf("%+v: missing --user %s: %v", mode, user, args)
 		}
 		if !hasAdjacent(args, "--tmpfs", tmpfs) {
@@ -632,10 +820,7 @@ func TestResolveProfile_DegradesToFallback(t *testing.T) {
 	// (no real build); anything else (e.g. resolveBaseDigest's `buildx`) exits
 	// non-zero, which the callers already treat as a soft miss.
 	binDir := t.TempDir()
-	stub := "#!/bin/sh\n[ \"$1\" = \"image\" ] && exit 0\nexit 1\n"
-	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte(stub), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBin(t, binDir, "docker", "#!/bin/sh\n[ \"$1\" = \"image\" ] && exit 0\nexit 1\n")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	d := ContainerRunner{ProfilesDir: profiles} // default Bin "docker" resolves to the stub
@@ -857,10 +1042,8 @@ func TestStartProxySidecar_ConnectsRuntimeBridge(t *testing.T) {
 			script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %q
 if [ "$1" = inspect ]; then printf '192.0.2.10\n'; fi
-`, logPath)
-			if err := os.WriteFile(filepath.Join(binDir, tc.runtime.Bin), []byte(script), 0o755); err != nil {
-				t.Fatal(err)
-			}
+`, filepath.ToSlash(logPath))
+			writeFakeBin(t, binDir, tc.runtime.Bin, script)
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			d := ContainerRunner{
 				Runtime:  tc.runtime,
@@ -1095,5 +1278,64 @@ func TestResolveProfile_refusesDetectionPathLeavingWorkspace(t *testing.T) {
 	want := []string{filepath.Join(src, "inside"), filepath.Join(src, "pkg", "missing")}
 	if !reflect.DeepEqual(seen, want) {
 		t.Errorf("detection paths = %q, want %q", seen, want)
+	}
+}
+
+func TestEgressPolicy_noPolicyScanArgsUnchanged(t *testing.T) {
+	base := ContainerRunner{
+		Hardened: true,
+		Runtime:  ContainerRuntime{Bin: "docker", Version: "24.0.7"},
+		ProxyURL: "http://scrutineer:tok@host.docker.internal:55000",
+	}
+	withPolicies := base
+	withPolicies.EgressPolicies = map[string][]EgressGrant{"other": {{Host: "a.example.com", Ports: []string{"443"}}}}
+	emit, events := collectEvents()
+	got, cleanup, err := withPolicies.applyEgressPolicy(SkillJob{Name: "plain"}, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	hn := hardenedNet{name: "scrutineer-hardened-1"}
+	if !slices.Equal(got.buildRunArgs("img", hn, ""), base.buildRunArgs("img", hn, "")) {
+		t.Error("a skill without a policy got different container args")
+	}
+	if len(events()) != 0 {
+		t.Errorf("unexpected events: %v", events())
+	}
+}
+
+func TestEgressSidecarEnv_grantsOnlyWhenSet(t *testing.T) {
+	cfg := EgressSidecarConfig{Token: "tok", Allow: []string{"x.test"}, APIPort: "8080", GatewayIP: "192.0.2.9"}
+	for _, kv := range EgressSidecarEnv(cfg, ":3128") {
+		if strings.HasPrefix(kv, "SCRUTINEER_PROXY_GRANTS=") {
+			t.Errorf("no-grant sidecar env carries %q", kv)
+		}
+	}
+	cfg.Grants = []EgressGrant{{Host: "a.example.com", Ports: []string{"443", "8443"}}}
+	if !slices.Contains(EgressSidecarEnv(cfg, ":3128"), "SCRUTINEER_PROXY_GRANTS=a.example.com:443|8443") {
+		t.Errorf("grants missing from env: %v", EgressSidecarEnv(cfg, ":3128"))
+	}
+}
+
+func TestProxySidecarRunArgs_requiredCapabilities(t *testing.T) {
+	d := ContainerRunner{Runtime: ContainerRuntime{Bin: "podman", Rootless: true}, Hardened: true, Egress: EgressSidecarConfig{Token: "tok", GatewayIP: "192.0.2.9"}}
+	args := d.proxySidecarRunArgs("p", "n")
+	if got := args[len(args)-1]; got != "--require-capability=deny-api-connect-v1" {
+		t.Errorf("no-grant capability arg = %q", got)
+	}
+	d.Egress.Grants = []EgressGrant{{Host: "a.example.com", Ports: []string{"443"}}}
+	args = d.proxySidecarRunArgs("p", "n")
+	if got := args[len(args)-1]; got != "--require-capability=deny-api-connect-v1,egress-port-grants-v1" {
+		t.Errorf("grant capability arg = %q", got)
+	}
+}
+
+func TestProxyBinaryCheckArgs_extraCapabilities(t *testing.T) {
+	rt := ContainerRuntime{Bin: "docker"}
+	if args := proxyBinaryCheckArgs(rt, "img"); !slices.Contains(args, "--require-capability=deny-api-connect-v1") {
+		t.Errorf("default check args: %v", args)
+	}
+	if args := proxyBinaryCheckArgs(rt, "img", ProxyCapabilityEgressPortGrants); !slices.Contains(args, "--require-capability=deny-api-connect-v1,egress-port-grants-v1") {
+		t.Errorf("grant check args: %v", args)
 	}
 }

@@ -45,6 +45,7 @@ The central entity. One row per git URL.
 | federation_opt_out_reason | text | Optional reason the maintainer gave; it travels with the `optout` record. |
 | posture | text | Disclosure-readiness tier from the `posture` skill: `ready`, `partial`, `unprepared`. |
 | posture_summary | text | One-line explanation that goes with `posture`. |
+| baseline_level | integer | Highest OpenSSF Baseline level (1-3) whose applicable controls all passed on the latest `compliance` run, every lower level included. 0 when none did or when the skill has not run. Derived from `compliance_controls` at write time. |
 | health | text | Evidence-based maintenance classification: `active`, `stale`, `abandoned`, or `zombie`. Empty until metadata or maintainer evidence is available. A repository whose newest package release is more than eighteen months old is held at `stale`. |
 | fork | text | `owner/name` of the staging fork inside `-fork-org`. Written by the `fork` skill. |
 | clone_error | text | Last clone/fetch failure message; non-empty means the repo is currently unreachable. Cleared on next successful clone. |
@@ -59,20 +60,28 @@ The central entity. One row per git URL.
 
 ## audit_events
 
-Append-only audit trail for lifecycle and future operator/system actions. It
-coexists with `finding_histories`, which remains the specialised per-field
-change history for findings. `payload` is JSON stored portably as text.
+Append-only audit trail for scan lifecycle, scan-control actions, finding mutations and operator-initiated repository creation/deletion. It coexists with `finding_histories`, which remains the specialised per-field change history for findings. `payload` is JSON stored portably as text.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | integer PK | |
-| kind | text | Event name, for example `scan.started`, `scan.finished`, `scan.failed`, `scan.cancelled`, or `scan.paused`. Indexed with `created_at` for chronological dashboards. |
-| subject_type | text | Polymorphic subject type, currently `scan`. Part of the timeline index with `subject_id`. |
-| subject_id | integer | ID of the subject row, for example `scans.id`. |
-| actor | text | Skill name when available, otherwise the scan kind. |
-| source | text | Existing provenance enum, currently `system` for worker lifecycle events. |
-| payload | text | JSON metadata. Scan events include stable execution metadata and terminal metrics, without duplicating reports or logs. |
+| kind | text | Event name: `scan.started`, `scan.finished`, `scan.failed`, `scan.cancelled`, `scan.paused`, `scan.retry_requested`, `scan.retry_enqueue_failed`, `scan.resume_requested`, `scan.resume_enqueue_failed`, `scan.cancel_requested`, `finding.status_changed`, `finding.severity_changed`, `finding.labels_changed`, `repo.created`, or `repo.deleted`. Indexed with `created_at` for chronological dashboards. |
+| subject_type | text | Polymorphic subject type: `scan`, `finding`, or `repository`. Part of the timeline index with `subject_id`. |
+| subject_id | integer | ID of the subject row, for example `scans.id`, `findings.id`, or `repositories.id`. Not a foreign key: events survive subject deletion. |
+| actor | text | Scan lifecycle events use the skill name or scan kind. Finding mutations use the helper's `by` value; browser edits leave it empty because there is no session user. Authenticated skill API mutations instead identify the scan and its skill from the bearer-token lookup, not client-supplied text. Repository events leave it empty rather than inventing an operator identity. |
+| source | text | Existing provenance enum: `tool`, `model_suggested`, `analyst`, or `system`. Worker lifecycle events use `system`; finding events preserve the mutation's source; operator-initiated repository and scan-control events use `analyst`. Enqueue-failure recovery and automatic cancellations use `system`. |
+| payload | text | JSON metadata. Scan events include execution metadata and terminal metrics. Finding events include `repository_id`, `field`, `old_value`, and `new_value`; skill API events also include the authenticated `scan_id` and `skill_name`. Repository events include only `repository_id`, `name`, and `full_name`, not URLs, configuration or raw metadata. Reports, transcripts, and bearer tokens are not copied. |
 | created_at | datetime | |
+
+Finding status and severity events are written by `WriteFindingField`, with severity-cap changes also covered by `ReconcileFindingSeverityCap`. `SetFindingLabels` writes label events using sorted, distinct name arrays, including `[]` for an empty set. The mutation, existing field history where applicable, and event commit or roll back together. Unchanged values or label sets produce no event. Existing history rows are not backfilled into the event table. Direct SQL/import paths that bypass these helpers and other finding fields are outside this event surface.
+
+Repository creation events cover single/bulk additions, organization imports, dependent additions, operator-confirmed SBOM resolution and report imports (including the ingest-skill fallback). Existing repositories do not produce another creation event. Parsed report imports write the event inside the import transaction, so a failed import also rolls back the repository and its event. Browser and operator API deletions use the same transactional helper; rejected or failed deletions produce no deletion event. Repository rows and their events commit or roll back together, and deletion retains earlier audit events. Prefetch, scan enqueueing and filesystem cleanup remain outside the mutation transaction, so `repo.created` does not imply that a scan was queued and `repo.deleted` does not certify filesystem cleanup. Direct database writes that bypass these helpers are not covered; existing rows are not backfilled.
+
+Scan-control events cover single/bulk operator retries, resumes, queued pauses and cancellations. They leave `actor` empty because there is no authenticated operator identity. Payloads contain `repository_id`, `old_status` and `new_status`, plus retry lineage (`parent_scan_id` and, when present, `resumed_from_scan_id`). They do not copy session identifiers, feedback, transcripts, tokens or raw enqueue errors. Retry events belong to the newly created scan; an empty `old_status` means creation, not a transition of its parent.
+
+`scan.retry_requested` commits with the new retry row and `scan.resume_requested` with the paused-to-queued transition. Neither certifies delivery to the queue or execution. Queue writes remain outside these database transactions. If enqueueing fails, `scan.retry_enqueue_failed` commits with marking the new row failed, or `scan.resume_enqueue_failed` with restoring the existing row to paused. A failed recovery transaction leaves both the state and its event unchanged and returns an error; request events remain append-only. `scan.started` is still emitted only by the worker when it claims a scan. Automatic enqueues do not create operator retry events.
+
+Queued pauses and direct cancellations write `scan.paused` or `scan.cancelled` in the same transaction as the guarded state update, only for affected rows. An in-flight cancellation instead records `scan.cancel_requested` before signalling the runner; it does not claim a terminal outcome. Repeated requests with the same reason for that in-flight attempt do not add another request event. The worker continues to record the eventual lifecycle outcome separately. Audit-write failures prevent the state change or cancellation signal. Bulk database updates and their events commit or roll back together; later per-scan queue operations and running-scan cancellation requests may succeed or fail independently.
 
 ## package_alternatives
 
@@ -121,12 +130,12 @@ One row per skill execution or external import. `skill_name` / `skill_version` p
 | diff_base_commit | text | Baseline commit used to generate `diff.patch` and `changed_files.json`. Empty for full scans. |
 | diff_threat_model_scan_id | integer FK | Prior `threat-model` scan staged as `old_threat_model.json` for a diff-aware run, when one is available. |
 | diff_stats | text | JSON metadata for the generated diff: base/head commits, changed-file count, patch size, file statuses, staged file names, and limits. |
-| coverage | text | JSON coverage metadata. Diff scans record requested versus actual mode and fallback reasons; threat-model scans also record whether the repository working model was updated or skipped for a small diff. |
+| coverage | text | JSON coverage metadata. Diff scans record requested versus actual mode and fallback reasons; threat-model scans also record whether the repository working model was updated or skipped for a small diff. Runtime requirements record worker-owned `preflight` with static `status`, `missing`, `degraded`, and optional `error`. When enabled, `preflight.backend` includes sanitized cached live probe evidence and its `scan_preflight_receipts` ID. Blocked or degraded preflight keeps completeness partial. |
 | scan_group | text | Groups a cohort of scans launched as one batch (Scan-all-subprojects, a single New-scan run, or a Diff rescan group). Each sibling streams a finding to `POST /repositories/{id}/findings` the moment it confirms it and reads `GET /repositories/{id}/findings?scan_group=...` before reporting, so an in-flight skill sees what a sibling has filed so far — not only after that sibling finishes — and can avoid re-filing it. Empty when not part of a batch. |
 | focus_area | text | Normalized JSON snapshot of the input-processing focus area assigned to a split `security-deep-dive`. It keeps queued work reproducible if repository `scan_config` changes. Empty means the scan is unscoped and covers its normal repository or subproject scope. |
 | triage_scan_id | integer | Nullable ID of the triage scan that requested the pipeline child. Preserved through threat-model fan-out and retries; used to bound automatic exploration to one extra audit per triage invocation. |
-| exploration_mode | text | Empty for ordinary scans; `random-dig` for an independent source audit without threat-model context. Its callback token only permits validating its own report. Exploratory scans cannot serve as diff baselines. |
-| exploration_path | text | Repository-relative source directory chosen after path filtering, or `.` for root-level source. Persisted before the agent starts and preserved on retries. Empty until selection occurs. |
+| exploration_mode | text | Empty for ordinary scans; `random-dig` for an independent source audit or `adversarial-sweep` for an audit that challenges one threat-model exclusion. Its callback token only permits validating its own report. Exploratory scans cannot serve as diff baselines. |
+| exploration_path | text | Repository-relative source directory selected for an exploratory audit, or `.` for root-level random source. Persisted before the agent starts and preserved on retries. |
 | profile | text | Runner profile that ran the scan (e.g. `php`). Empty = the default runner image. Set explicitly via `?profile=` or auto-detected from the clone by `brief` before launch; persisted so retries reuse the choice. |
 | backend | text | Agent CLI (`-backend`) that ran the scan: `claude`, `codex`, `opencode`, or `copilot`. Stamped by the worker so a retry after switching `-backend` starts fresh instead of passing one harness's session id to another's resume command. Empty on rows predating the column or that never reached the runner. |
 | provider | text | Provider prefix selected from an OpenCode model id, such as `groq` or `kiro`. Empty for other backends. |
@@ -151,6 +160,19 @@ One row per skill execution or external import. `skill_name` / `skill_version` p
 | findings_count | integer | Denormalised count of findings parsed from the report. |
 | created_at | datetime | |
 | updated_at | datetime | |
+
+## scan_preflight_receipts
+
+Append-only runtime extensions of the immutable claim-time scan recipe. Created transactionally with coverage before a live-backend-preflight-gated skill starts. A unique `(scan_id, probe_id)` prevents duplicate receipts on retries that reuse the same cached result. Repository deletion removes its scans' receipts. The in-memory cache is not restored from this table after restart.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | Referenced by `coverage.preflight.backend.receipt_id`. |
+| scan_id | integer | Owning scan. |
+| probe_id | text | Random identity of the actual probe, shared across scans that reuse it. |
+| recipe_sha256 | text | Digest of the exact claim-time `scans.recipe` JSON; empty for legacy scans without a recipe. |
+| report | text | Sanitized probe JSON with configuration digest, status, timestamps, rate-limit/reset metadata, reuse flag and usage. Never contains raw CLI output or credentials. Probe usage is added once to the originating scan's totals in the receipt transaction; cached reuse is not charged again. |
+| created_at | datetime | Time the scan pinned this probe. |
 
 ## expected_findings
 
@@ -183,12 +205,15 @@ One row per installed skill. Loaded from `skills/` directories on disk or the UI
 | body | text | Markdown body after the frontmatter. The prompt. |
 | schema_json | text | Optional schema.json contents. |
 | output_file | text | Relative path the skill writes to. Promoted from metadata. |
-| output_kind | text | Parser key: `findings`, `maintainers`, `packages`, `advisories`, `dependencies`, `finding_dedup`, `repo_metadata`, `repo_overview`, `subprojects`, `posture`, `verify`, `critic`, `patch`, `reattack`, `threat_model`, `exposure`, `freeform`. Promoted from metadata. |
+| output_kind | text | Parser key: `findings`, `maintainers`, `packages`, `advisories`, `dependencies`, `finding_dedup`, `repo_metadata`, `repo_overview`, `subprojects`, `posture`, `compliance`, `verify`, `critic`, `patch`, `reattack`, `threat_model`, `exposure`, `freeform`. Promoted from metadata. |
 | version | integer | Bumps on every save. |
 | active | boolean | |
 | requires_remote | boolean | When true, scrutineer refuses to enqueue this skill against a local-directory repository (file:// URL). Set via `scrutineer.requires_remote: true` in SKILL.md frontmatter. Use for skills that depend on a forge URL or remote-only data (advisories, exposure, fork, maintainers, metadata, packages, report-upstream). |
 | recurse_submodules | boolean | When true, remote scans initialize recursive depth-one Git submodules before the skill runs. Set via `scrutineer.recurse_submodules: true` in SKILL.md frontmatter. |
 | requires_profile | text | Constrains the skill to a single registered runner profile (e.g. `php`). Empty means no constraint. Set via `scrutineer.requires_profile` in SKILL.md frontmatter. Enqueue returns 400 when the requested profile mismatches; the worker fails the scan when auto-detection resolves to a different profile. |
+| requires_commands | text | Newline-joined executable names checked on the runner's PATH before model execution. Empty means no command requirements. |
+| requires_features | text | Newline-joined runtime feature names checked before model execution: `network-egress`, `docker-in-docker`, or `fuse`. Requirements do not grant capabilities. |
+| degraded_mode | boolean | Allows missing declared capabilities to produce a degraded run with partial coverage instead of blocking. Defaults to false; probe execution failures always block. |
 | paths | text | Newline-joined shell-glob allow-list from `scrutineer.paths`. When non-empty, the skill sees only matching files inside the workspace `src/` and the builtin skip list is bypassed. |
 | ignore_paths | text | Newline-joined shell-glob deny-list from `scrutineer.ignore_paths`. Always layered on top of the active include set. |
 | source | text | `bundled`, `local`, `remote`, or `ui`. |
@@ -309,10 +334,17 @@ findings that already have a row here.
 | id | integer PK | |
 | finding_id | integer FK | Cascade delete. |
 | verdict | text | `true_positive`, `false_positive`, `already_fixed`, `uncertain`. |
-| reason | text | Free-text justification. |
-| automated_outcome | text | Snapshot of the automation verdict (typically the latest revalidate verdict) at review time. Empty when no automation has spoken. |
+| reason | text | Free-text justification, at most 4096 characters (Unicode code points) after trimming whitespace on new reviews. Required for false-positive reviews and every browser rejection. |
+| automated_outcome | text | Snapshot of the automation verdict (typically the latest revalidate verdict) at review time. Empty when no automation has spoken or the decision is not an assessment of automation. Rejection-dialog decisions leave this empty and do not affect agreement metrics. |
 | reviewer | text | Optional free-text reviewer identity. |
+| source_scan_id | integer | Snapshot of the finding's most recent observation scan, falling back to its original scan. Zero on legacy reviews. |
+| source_commit | text | Commit of that observation. |
+| finding_fingerprint | text | Identity fingerprint at review time; not proof that two bugs are equivalent. |
+| finding_path | text, indexed | Repository-relative source path at review time, normalized using the finding's subproject path. |
+| cwe | text | CWE at review time. |
 | created_at | datetime | |
+
+Browser rejection records a review and the lifecycle change in one transaction. The analyst selects false positive, already fixed, or other/not actionable (`uncertain`); only the latest false-positive review on a still-rejected finding is eligible for skill feedback. Legacy reviews without observation snapshots are excluded rather than attributed retroactively. Reviewer names are operator-supplied labels, not authenticated identities.
 
 ## finding_verifications
 
@@ -577,6 +609,22 @@ Monorepo sub-paths discovered by the `subprojects` skill.
 | description | text | |
 | created_at | datetime | |
 | updated_at | datetime | |
+
+## compliance_controls
+
+One row per OpenSSF Baseline control from the latest `compliance` run. The repository's set is replaced wholesale on each run, and `repositories.baseline_level` is derived from it in the same transaction.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| repository_id | integer FK | |
+| scan_id | integer FK | The `compliance` scan that wrote the row. |
+| control_id | text, not null | Baseline identifier, e.g. `OSPS-AC-01.01`. The category is the second segment (`AC`, `BR`, `DO`, `GV`, `LE`, `QA`, `SA`, `VM`). |
+| level | integer | Baseline maturity level the control belongs to: 1, 2 or 3. |
+| status | text | `PASS`, `FAIL`, `WARN`, `NA`, `ERROR` or `PENDING_LLM`. `NA` is left out of the level computation; every other non-`PASS` status blocks the level. `PENDING_LLM` means darnit deferred the control to LLM analysis and the agent left it unresolved. |
+| details | text | The verdict's rationale, from darnit or from the agent. |
+| source | text | `darnit` when the verdict is the tool's own, `agent` when the scan's model resolved a control darnit had deferred or could not verify. |
+| created_at | datetime | |
 
 ## sbom_uploads
 

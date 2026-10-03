@@ -179,6 +179,8 @@ type Worker struct {
 	// vidMissingOnce gates the missing-binary warning so a deployment
 	// without vid on PATH logs it once, not once per finding.
 	vidMissingOnce sync.Once
+	// BackendPreflight enables opt-in cached live model probes for skill runs.
+	BackendPreflight *BackendPreflightCache
 
 	// LogFlushInterval overrides defaultLogFlushInterval. Tests set it to
 	// a tiny or huge value to assert flush behaviour without sleeping.
@@ -200,6 +202,9 @@ type Worker struct {
 	// (on overage), restoring it when the window resets. Off by default; only a
 	// subscription token reports overage, so it is inert on an API key.
 	DowngradeOnOverage bool
+	PauseOnOverage     bool
+	// Serializes policy-pause writes and auto-resume, not ordinary scan work.
+	overageMu sync.Mutex
 	// Now overrides time.Now in tests.
 	Now func() time.Time
 
@@ -210,6 +215,9 @@ type Worker struct {
 	// rlStatus holds the latest in-memory rate_limit_event per window type.
 	rlStatusMu sync.Mutex
 	rlStatus   map[string]RateLimitInfo
+	// Restored at startup alongside the account-resume timer; guarded by rlStatusMu.
+	persistedOverageHold  bool
+	persistedOverageReset *time.Time
 }
 
 // recordRateLimit stores the latest rate-limit status for its window type and,
@@ -227,7 +235,10 @@ func (w *Worker) recordRateLimit(info RateLimitInfo) {
 	w.rlStatus[info.Type] = info
 	after := w.onOverageLocked()
 	w.rlStatusMu.Unlock()
-	if w.DowngradeOnOverage && before != after && w.Log != nil {
+	if w.PauseOnOverage {
+		w.applyOveragePolicy(before)
+	}
+	if w.DowngradeOnOverage && !w.PauseOnOverage && before != after && w.Log != nil {
 		if after {
 			w.Log.Info("model overage fallback engaged: account on overage, new scans use the mid tier")
 		} else {
@@ -283,7 +294,7 @@ func (w *Worker) OnOverage() bool {
 // both enabled and currently active. The web layer calls it at enqueue to rewrite
 // max/high tier preferences to mid, and to surface the fallback banner.
 func (w *Worker) ShouldDowngradeModel() bool {
-	return w != nil && w.DowngradeOnOverage && w.OnOverage()
+	return w != nil && !w.PauseOnOverage && w.DowngradeOnOverage && w.OnOverage()
 }
 
 func (w *Worker) logFlushInterval() time.Duration {
@@ -346,26 +357,48 @@ const errorColumn = "error"
 // cancellation reads "cancelled by user" whatever asked for it, so a scan
 // stopped by a maintainer's opt-out would be misattributed to the operator.
 type runningScan struct {
-	cancel context.CancelFunc
-	reason string
+	cancelMu sync.Mutex
+	cancel   context.CancelFunc
+	reason   string
 }
 
-// Cancel aborts an in-flight scan and records reason as the row's error when it
-// unwinds; an empty reason falls back to CancelledByUser. Returns true if a
-// running job was found and signalled; false means the scan is queued (or
-// already finished) and the caller should flip the DB row itself so the queue
-// handler drops it.
-func (w *Worker) Cancel(scanID uint, reason string) bool {
+// CancelWithAudit records a cancellation request before signalling the runner,
+// whose row takes reason as its error when it unwinds; an empty reason falls
+// back to CancelledByUser and a nil audit skips the record. It returns true when
+// a running job was found or false when the scan is queued or already finished,
+// in which case the caller should flip the row itself. The callback must not request
+// another cancellation of the same scan. A failed audit leaves the runner
+// untouched; repeated requests with the same reason do not repeat the audit.
+func (w *Worker) CancelWithAudit(scanID uint, reason string, audit func() error) (bool, error) {
+	if reason == "" {
+		reason = CancelledByUser
+	}
 	w.mu.Lock()
 	rs, ok := w.running[scanID]
-	if ok {
-		rs.reason = reason
-	}
 	w.mu.Unlock()
-	if ok {
-		rs.cancel()
+	if !ok {
+		return false, nil
 	}
-	return ok
+	// Database I/O must not hold the worker-wide mutex or stall unrelated jobs.
+	rs.cancelMu.Lock()
+	defer rs.cancelMu.Unlock()
+	w.mu.Lock()
+	active := w.running[scanID] == rs
+	previousReason := rs.reason
+	w.mu.Unlock()
+	if !active {
+		return false, nil
+	}
+	if audit != nil && previousReason != reason {
+		if err := audit(); err != nil {
+			return true, err
+		}
+	}
+	w.mu.Lock()
+	rs.reason = reason
+	w.mu.Unlock()
+	rs.cancel()
+	return true, nil
 }
 
 // cancelReason is the reason the in-flight scan was cancelled under, empty when
@@ -517,7 +550,7 @@ func (w *Worker) applyResume(scan *db.Scan, sj *SkillJob, emit func(Event)) {
 // scan resumable.
 func (w *Worker) scanEmitter(scan *db.Scan) (func(Event), func()) {
 	interval := w.logFlushInterval()
-	lastFlush := time.Now()
+	lastFlush := w.now()
 	var logBuilder strings.Builder
 	logBuilder.Grow(len(scan.Log))
 	logBuilder.WriteString(scan.Log)
@@ -538,10 +571,10 @@ func (w *Worker) scanEmitter(scan *db.Scan) (func(Event), func()) {
 		line := FormatEvent(e)
 		logBuilder.WriteString(line)
 		logBuilder.WriteByte('\n')
-		if time.Since(lastFlush) >= interval {
+		if w.now().Sub(lastFlush) >= interval {
 			snapshot()
 			w.DB.Model(&db.Scan{}).Where("id = ?", scan.ID).Update("log", scan.Log)
-			lastFlush = time.Now()
+			lastFlush = w.now()
 		}
 		if e.Kind == KindResult {
 			// Claude reports total_cost_usd in its result event; harnesses
@@ -630,6 +663,26 @@ func (w *Worker) migrateLegacyState() {
 // The returned report string lands in Scan.Report.
 type handler func(ctx context.Context, scan *db.Scan, emit func(Event)) (report string, err error)
 
+// loadQueuedScan returns nil for stale queue messages: either the scan was
+// deleted or it has already left the queued state. Database failures remain
+// errors so goqite can retry them.
+func (w *Worker) loadQueuedScan(scanID uint) (*db.Scan, error) {
+	var scan db.Scan
+	err := w.DB.Preload("Repository").First(&scan, scanID).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		w.Log.Info("dropping stale job: scan deleted", "scan", scanID)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load scan %d: %w", scanID, err)
+	}
+	if scan.Status != db.ScanQueued {
+		w.Log.Info("dropping stale job", "scan", scan.ID, "status", scan.Status)
+		return nil, nil
+	}
+	return &scan, nil
+}
+
 // wrap turns a handler into a goqite jobs.Func: decode payload, load the
 // scan row, run the handler, persist status/log/report. Errors from the
 // handler mark the scan failed but return nil to goqite so it does not
@@ -640,21 +693,17 @@ func (w *Worker) wrap(h handler) func(context.Context, []byte) error {
 		if err := json.Unmarshal(body, &p); err != nil {
 			return fmt.Errorf("decode payload: %w", err)
 		}
-		var scan db.Scan
-		if err := w.DB.Preload("Repository").First(&scan, p.ScanID).Error; err != nil {
-			return fmt.Errorf("load scan %d: %w", p.ScanID, err)
-		}
-		if scan.Status != db.ScanQueued {
-			w.Log.Info("dropping stale job", "scan", scan.ID, "status", scan.Status)
-			return nil
+		scan, err := w.loadQueuedScan(p.ScanID)
+		if err != nil || scan == nil {
+			return err
 		}
 		if scan.Repository.FederationOptedOut() {
-			w.cancelOptedOut(&scan)
+			w.cancelOptedOut(scan)
 			return nil
 		}
 
 		if scan.Kind == JobSkill {
-			deferred, err := w.preflightSkill(ctx, &scan, p.Attempt)
+			deferred, err := w.preflightSkillUnlessOverage(ctx, scan, p.Attempt)
 			if err != nil {
 				return err
 			}
@@ -681,8 +730,8 @@ func (w *Worker) wrap(h handler) func(context.Context, []byte) error {
 			w.mu.Unlock()
 		}()
 
-		if err := w.startScan(&scan); err != nil {
-			return w.dropUnclaimedScan(&scan, err)
+		if err := w.startScanUnlessOverage(scan); err != nil {
+			return w.dropUnclaimedScan(scan, err)
 		}
 		// The claim is the only moment a row leaves `queued`, and finalizeScan
 		// is minutes away: without this the list pages keep showing the scan as
@@ -695,10 +744,14 @@ func (w *Worker) wrap(h handler) func(context.Context, []byte) error {
 			}
 		}
 
-		emit, snapshotLog := w.scanEmitter(&scan)
+		emit, snapshotLog := w.scanEmitter(scan)
 
-		report, err := h(ctx, &scan, emit)
-		return w.finalizeScan(ctx, &scan, report, err, timeout, emit, snapshotLog)
+		var report string
+		err = ctx.Err()
+		if err == nil {
+			report, err = h(ctx, scan, emit)
+		}
+		return w.finalizeScan(ctx, scan, report, err, timeout, emit, snapshotLog)
 	}
 }
 
@@ -719,8 +772,18 @@ func (w *Worker) cancelOptedOut(scan *db.Scan) {
 	scan.StatusPriority = db.StatusPriorityFor(db.ScanCancelled)
 	scan.Error = OptOutCancelReason
 	scan.FinishedAt = &now
-	if err := w.DB.Save(scan).Error; err != nil {
-		w.Log.Error("save opted-out scan", "scan", scan.ID, "err", err)
+	// A pause and repository deletion may have won since dispatch loaded
+	// this row. Only transition an existing queued scan; Save would upsert it.
+	res := w.DB.Model(&db.Scan{}).Where("id = ? AND status = ?", scan.ID, db.ScanQueued).
+		Updates(map[string]any{
+			"status": scan.Status, "status_priority": scan.StatusPriority,
+			errorColumn: scan.Error, "finished_at": scan.FinishedAt,
+		})
+	if res.Error != nil {
+		w.Log.Error("save opted-out scan", "scan", scan.ID, "err", res.Error)
+		return
+	}
+	if res.RowsAffected == 0 {
 		return
 	}
 	w.publish(scan.ID, scan.RepositoryID, "scan-status", string(scan.Status))
@@ -838,6 +901,14 @@ func (w *Worker) finalizeScan(ctx context.Context, scan *db.Scan, report string,
 	// Read before wrap's deferred cleanup drops the entry, so a cancellation
 	// that named a reason keeps it instead of falling back to the operator's.
 	finishScan(ctx, scan, report, err, timeout, w.cancelReason(scan.ID), emit)
+	if scan.Status == db.ScanPaused && scan.Error == OveragePauseReason {
+		w.overageMu.Lock()
+		defer w.overageMu.Unlock()
+		_, reset := w.overageState()
+		scan.PausedUntil = reset
+		scan.Error = appendAutoResume(OveragePauseReason, reset)
+		w.scheduleAccountResumeAtValue(reset)
+	}
 	snapshotLog()
 	if scan.Status == db.ScanDone && !scan.MaxTurnsHit {
 		w.clearSessionStore(scan)
@@ -977,6 +1048,10 @@ func finishScan(ctx context.Context, scan *db.Scan, report string, err error, ti
 		emit(Event{Kind: KindError, Text: scan.Error})
 	case errors.Is(ctx.Err(), context.Canceled):
 		scan.Status = db.ScanCancelled
+		if cancelReason == OveragePauseReason {
+			scan.Status = db.ScanPaused
+			scan.Report = report
+		}
 		scan.Error = cmp.Or(cancelReason, CancelledByUser)
 		emit(Event{Kind: KindError, Text: scan.Error})
 	case err != nil:
@@ -1231,26 +1306,48 @@ func (w *Worker) scheduleNextAccountResume() {
 	if w.DB == nil || w.Queue == nil {
 		return
 	}
-	var scan db.Scan
-	err := w.DB.Select("id", "paused_until").
-		Where("status = ? AND error LIKE ? AND paused_until IS NOT NULL", db.ScanPaused, AccountPausePrefix+"%").
+	w.overageMu.Lock()
+	defer w.overageMu.Unlock()
+	var scans []db.Scan
+	err := w.DB.Select(errorColumn, "paused_until").
+		Where("status = ? AND (error LIKE ? OR error LIKE ?)", db.ScanPaused, AccountPausePrefix+"%", OveragePauseReason+"%").
 		Order("paused_until ASC").
-		Limit(1).
-		Find(&scan).Error
-	if err != nil || scan.ID == 0 || scan.PausedUntil == nil {
+		Find(&scans).Error
+	if err != nil {
+		if w.PauseOnOverage {
+			w.setPersistedOverageHold(true, nil)
+			w.logOverageError(err)
+		}
+		w.scheduleAccountResumeAfter(w.autoResumeRetryDelay())
 		return
 	}
-	w.scheduleAccountResumeAt(*scan.PausedUntil)
+	var resets []*time.Time
+	var earliest *time.Time
+	for _, scan := range scans {
+		if strings.HasPrefix(scan.Error, OveragePauseReason) {
+			resets = append(resets, scan.PausedUntil)
+		}
+		if scan.PausedUntil != nil && (earliest == nil || scan.PausedUntil.Before(*earliest)) {
+			earliest = scan.PausedUntil
+		}
+	}
+	active, reset := w.overageResetState(resets)
+	w.setPersistedOverageHold(active, reset)
+	w.scheduleAccountResumeAtValue(earliest)
 }
 
 func (w *Worker) resumeAccountPaused(ctx context.Context) (int, error) {
+	if w.PauseOnOverage {
+		w.overageMu.Lock()
+		defer w.overageMu.Unlock()
+	}
 	if w.Queue == nil {
 		return 0, errors.New("queue not configured")
 	}
 	var scans []db.Scan
 	if err := w.DB.Select("id", "kind", "finding_id", errorColumn, "paused_until").
-		Where("status = ? AND error LIKE ? AND paused_until IS NOT NULL AND paused_until <= ?",
-			db.ScanPaused, AccountPausePrefix+"%", w.now().UTC()).
+		Where("status = ? AND (error LIKE ? OR error LIKE ?) AND paused_until IS NOT NULL AND paused_until <= ?",
+			db.ScanPaused, AccountPausePrefix+"%", OveragePauseReason+"%", w.now().UTC()).
 		Order("id").
 		Find(&scans).Error; err != nil {
 		return 0, err

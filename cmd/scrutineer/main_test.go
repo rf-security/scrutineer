@@ -23,6 +23,7 @@ import (
 
 	"scrutineer/internal/config"
 	"scrutineer/internal/db"
+	"scrutineer/internal/db/dbtest"
 	"scrutineer/internal/interchange"
 	"scrutineer/internal/web"
 	"scrutineer/internal/worker"
@@ -43,6 +44,7 @@ func fullConfig() *config.Config {
 		Codex:           config.Codex{AuthFile: "/var/lib/scrutineer/codex-rubygems/auth.json"},
 		NoContainer:     new(true),
 		Hardened:        new(true),
+		ModelProxy:      new(true),
 		RunnerImage:     "custom:v1",
 		SkillsRepo:      "https://example.com/skills.git",
 		SkillsRepoToken: "private-skills-token",
@@ -81,6 +83,9 @@ func TestFlagsMerge_configFillsUnset(t *testing.T) {
 	}
 	if !f.hardened {
 		t.Errorf("hardened not applied")
+	}
+	if !f.modelProxy {
+		t.Errorf("modelProxy not applied")
 	}
 	if !slices.Equal(f.hostSkills, []string{"verify"}) {
 		t.Errorf("hostSkills = %v, want [verify]", f.hostSkills)
@@ -126,9 +131,13 @@ func TestFlagsMerge_cliFlagWins(t *testing.T) {
 		set: map[string]bool{
 			"addr": true, "clone": true, "concurrency": true,
 			"model-base-url": true, "federation-contact": true,
+			"model-proxy": true,
 		},
 	}
 	f.merge(cfg)
+	if f.modelProxy {
+		t.Errorf("model_proxy config overrode an explicit -model-proxy=false")
+	}
 	if f.addr != "127.0.0.1:8080" {
 		t.Errorf("addr overridden despite explicit flag: %q", f.addr)
 	}
@@ -406,10 +415,7 @@ func TestHostAPIBase(t *testing.T) {
 func TestWarnUnknownHostSkills(t *testing.T) {
 	// A host_skills entry warns when it names no active skill or a skill the
 	// local runner refuses (requires_profile); a plain active skill stays quiet.
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	for _, s := range []db.Skill{
 		{Name: "verify", Description: "d", Body: "b", Version: 1, Active: true, Source: "ui"},
 		{Name: "php-audit", Description: "d", Body: "b", Version: 1, Active: true, Source: "ui", RequiresProfile: "php"},
@@ -635,6 +641,41 @@ func TestValidateFlags_rejectsInsecureEnvironmentBaseURL(t *testing.T) {
 	}
 }
 
+func TestValidateModelProxyFlags(t *testing.T) {
+	t.Run("disabled is a no-op regardless of other flags", func(t *testing.T) {
+		if err := validateModelProxyFlags(&flags{backend: "codex", noContainer: true}); err != nil {
+			t.Errorf("modelProxy=false: err = %v, want nil", err)
+		}
+	})
+	t.Run("non-claude backend refused", func(t *testing.T) {
+		t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+		err := validateModelProxyFlags(&flags{modelProxy: true, backend: "codex"})
+		if err == nil || !strings.Contains(err.Error(), "claude") {
+			t.Fatalf("err = %v, want a claude-backend complaint", err)
+		}
+	})
+	t.Run("no-container refused", func(t *testing.T) {
+		t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+		err := validateModelProxyFlags(&flags{modelProxy: true, noContainer: true})
+		if err == nil || !strings.Contains(err.Error(), "no-container") {
+			t.Fatalf("err = %v, want a no-container complaint", err)
+		}
+	})
+	t.Run("missing key refused", func(t *testing.T) {
+		t.Setenv("ANTHROPIC_API_KEY", "")
+		err := validateModelProxyFlags(&flags{modelProxy: true})
+		if err == nil || !strings.Contains(err.Error(), "ANTHROPIC_API_KEY") {
+			t.Fatalf("err = %v, want an ANTHROPIC_API_KEY complaint", err)
+		}
+	})
+	t.Run("ok case", func(t *testing.T) {
+		t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+		if err := validateModelProxyFlags(&flags{modelProxy: true}); err != nil {
+			t.Errorf("err = %v, want nil for a default-backend containerised scan with a key set", err)
+		}
+	})
+}
+
 func TestRegisterFlags_hardenedRuntimeOnlyAliasParsesFromArgv(t *testing.T) {
 	// Both the canonical --hardened-runtime-only and the deprecated
 	// --hardened-rootless-runtime alias must parse off the command line and set
@@ -796,7 +837,7 @@ func TestResolveEgressSidecar_HostProxyRuntimes(t *testing.T) {
 		{Bin: "podman"}, // rootful
 		{Bin: "apple"},  // apple -- hardened, but uses the host proxy, not a sidecar
 	} {
-		got, err := resolveEgressSidecar(rt, f, []string{"x"}, "tok", quietLog())
+		got, err := resolveEgressSidecar(rt, f, []string{"x"}, "tok", quietLog(), nil)
 		if err != nil {
 			t.Errorf("runtime %+v: unexpected error: %v", rt, err)
 		}
@@ -1422,10 +1463,7 @@ func TestBaseURLHost(t *testing.T) {
 
 func TestLoadSkillsLoadsBundledSkillsWithoutLocalDirectory(t *testing.T) {
 	dataDir := t.TempDir()
-	gdb, err := db.Open(filepath.Join(dataDir, "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	sha, err := loadSkills(log, gdb, dataDir, nil, "", "", false)
@@ -1453,14 +1491,11 @@ func TestLoadSkillsLoadsBundledSkillsWithoutLocalDirectory(t *testing.T) {
 
 func TestLoadSkillsRejectsRepoUserinfoWithoutEcho(t *testing.T) {
 	dataDir := t.TempDir()
-	gdb, err := db.Open(filepath.Join(dataDir, "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	const secret = "private-skills-token"
 
-	_, err = loadSkills(log, gdb, dataDir, nil,
+	_, err := loadSkills(log, gdb, dataDir, nil,
 		"https://user:"+secret+"@github.com/org/skills", "", false)
 	if err == nil {
 		t.Fatal("expected URL userinfo to be rejected")
@@ -1481,10 +1516,7 @@ func TestLoadSkillsLocalDirectoryOverridesBundledSkill(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(localSkill, "SKILL.md"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	gdb, err := db.Open(filepath.Join(dataDir, "test.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	if _, err := loadSkills(log, gdb, dataDir, skillDirs{localRoot}, "", "", false); err != nil {
@@ -1630,5 +1662,49 @@ func TestResolveProfilesDirPreservesConfigDisable(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.dataDir, "bundled-profiles")); !os.IsNotExist(err) {
 		t.Fatalf("bundled profiles were materialized despite config disable: %v", err)
+	}
+}
+
+func TestValidateEgressPolicies(t *testing.T) {
+	with := &config.Config{EgressPolicies: map[string]config.EgressPolicy{"metadata": {Allow: []string{"api.ecosyste.ms:443"}}}}
+	for _, tc := range []struct {
+		name    string
+		f       *flags
+		cfg     *config.Config
+		wantErr string
+	}{
+		{"no policies", &flags{}, &config.Config{}, ""},
+		{"nil config", &flags{}, nil, ""},
+		{"hardened", &flags{hardened: true}, with, ""},
+		{"not hardened", &flags{}, with, "require --hardened"},
+		{"no container", &flags{hardened: true, noContainer: true}, with, "--no-container"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateEgressPolicies(tc.f, tc.cfg)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("error = %v, want text %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestEgressPolicyGrants(t *testing.T) {
+	cfg := &config.Config{EgressPolicies: map[string]config.EgressPolicy{"metadata": {Allow: []string{"api.ecosyste.ms:443", "api.ecosyste.ms:8443"}}}}
+	got, err := egressPolicyGrants(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := got["metadata"]; len(g) != 1 || g[0].Host != "api.ecosyste.ms" || len(g[0].Ports) != 2 {
+		t.Errorf("grants = %+v", got)
+	}
+	if got, err := egressPolicyGrants(&config.Config{}); got != nil || err != nil {
+		t.Errorf("empty config = %v, %v", got, err)
+	}
+	bad := &config.Config{EgressPolicies: map[string]config.EgressPolicy{"x": {Allow: []string{"10.0.0.1:443"}}}}
+	if _, err := egressPolicyGrants(bad); err == nil {
+		t.Error("bad grant accepted")
 	}
 }

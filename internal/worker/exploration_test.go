@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/db/dbtest"
 	"scrutineer/internal/skills"
 )
 
@@ -46,11 +47,35 @@ func TestExploratoryDirectories(t *testing.T) {
 	}
 }
 
-func TestPrepareExplorationPreservesTargetAndFilters(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "exploration.db"))
-	if err != nil {
-		t.Fatal(err)
+func TestAdversarialSweepPaths(t *testing.T) {
+	report := `{
+		"components":[
+			{"name":"core","in_scope":true},
+			{"name":"contrib","in_scope":false}
+		],
+		"out_of_scope":[
+			{"item":"examples/"},
+			{"item":"contrib/"},
+			{"item":"tools/unsafe.go"},
+			{"item":"side-channel adversaries"},
+			{"item":"../escape"},
+			{"item":"generated/**"},
+			{"item":"https://example.com/code"}
+		]
+	}`
+	if got, want := AdversarialSweepPaths(report, ""), []string{"contrib", "examples", "tools"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("paths = %v, want %v", got, want)
 	}
+	if got, want := AdversarialSweepPaths(report, "packages/app"), []string{"packages/app/contrib", "packages/app/examples", "packages/app/tools"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("scoped paths = %v, want %v", got, want)
+	}
+	if got := AdversarialSweepPaths(`{"out_of_scope":{"not_applicable":true,"reason":"none"}}`, ""); len(got) != 0 {
+		t.Fatalf("not-applicable paths = %v, want none", got)
+	}
+}
+
+func TestPrepareExplorationPreservesTargetAndFilters(t *testing.T) {
+	gdb := dbtest.Open(t)
 	work := t.TempDir()
 	for _, file := range []string{"lib/main.go", "skip/secret.go", "docs/readme.md"} {
 		writeDiffTestFile(t, filepath.Join(work, "src"), file, "source")
@@ -91,6 +116,74 @@ func TestPrepareExplorationPreservesTargetAndFilters(t *testing.T) {
 	}
 }
 
+func TestPrepareAdversarialSweepAndFallback(t *testing.T) {
+	gdb := dbtest.Open(t)
+	work := t.TempDir()
+	writeDiffTestFile(t, filepath.Join(work, "src"), "examples/demo.go", "package main")
+	writeDiffTestFile(t, filepath.Join(work, "src"), "lib/main.go", "package lib")
+	model := `{"out_of_scope":[{"item":"examples/","reason":"sample code","provenance":"documented"}]}`
+	repo := db.Repository{URL: "https://example.com/adversarial", ThreatModel: model}
+	if err := gdb.Create(&repo).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := db.Scan{
+		RepositoryID: repo.ID, Repository: repo, SkillName: deepDiveSkillName, Status: db.ScanQueued,
+		ExplorationMode: ExplorationAdversarialSweep, ExplorationPath: "examples",
+	}
+	if err := gdb.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	w := Worker{DB: gdb}
+	if err := w.prepareExploration(t.Context(), work, &scan); err != nil {
+		t.Fatal(err)
+	}
+	if scan.ExplorationMode != ExplorationAdversarialSweep || scan.ExplorationPath != "examples" {
+		t.Fatalf("adversarial target changed: %+v", scan)
+	}
+
+	filteredWork := t.TempDir()
+	writeDiffTestFile(t, filepath.Join(filteredWork, "src"), "examples/demo.go", "package main")
+	writeDiffTestFile(t, filepath.Join(filteredWork, "src"), "lib/main.go", "package lib")
+	if err := applyRepositoryPathFilters(filteredWork, &db.Skill{Name: deepDiveSkillName}, "skip: [examples/**]\n", func(Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	filtered := db.Scan{
+		RepositoryID: repo.ID, Repository: repo, SkillName: deepDiveSkillName, Status: db.ScanQueued,
+		ExplorationMode: ExplorationAdversarialSweep, ExplorationPath: "examples",
+	}
+	if err := gdb.Create(&filtered).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := w.prepareExploration(t.Context(), filteredWork, &filtered); err != nil {
+		t.Fatal(err)
+	}
+	if filtered.ExplorationMode != ExplorationRandomDig || filtered.ExplorationPath != "lib" {
+		t.Fatalf("filtered fallback = mode %q path %q, want random-dig lib", filtered.ExplorationMode, filtered.ExplorationPath)
+	}
+
+	fallback := db.Scan{
+		RepositoryID: repo.ID, SkillName: deepDiveSkillName, Status: db.ScanQueued,
+		ExplorationMode: ExplorationAdversarialSweep, ExplorationPath: "examples",
+	}
+	if err := gdb.Create(&fallback).Error; err != nil {
+		t.Fatal(err)
+	}
+	fallback.Repository = db.Repository{ID: repo.ID, ThreatModel: `{"out_of_scope":[]}`}
+	if err := w.prepareExploration(t.Context(), work, &fallback); err != nil {
+		t.Fatal(err)
+	}
+	if fallback.ExplorationMode != ExplorationRandomDig || fallback.ExplorationPath != "lib" {
+		t.Fatalf("fallback = mode %q path %q, want random-dig lib", fallback.ExplorationMode, fallback.ExplorationPath)
+	}
+	var saved db.Scan
+	if err := gdb.First(&saved, fallback.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if saved.ExplorationMode != ExplorationRandomDig || saved.ExplorationPath != "lib" {
+		t.Fatalf("saved fallback = mode %q path %q", saved.ExplorationMode, saved.ExplorationPath)
+	}
+}
+
 func TestStageExplorationOmitsModelInputs(t *testing.T) {
 	parsed, err := skills.ParseFile("../../skills/security-deep-dive/SKILL.md")
 	if err != nil {
@@ -107,7 +200,24 @@ func TestStageExplorationOmitsModelInputs(t *testing.T) {
 		ExplorationMode: ExplorationRandomDig, ExplorationPath: "lib", SubPath: "lib",
 		Repository: db.Repository{URL: "https://example.com/repo", ThreatModel: `{"secret":"MODEL-CANARY"}`, ScanConfig: "attack_surface: CONFIG-CANARY"},
 	}
-	if err := StageWorkspace(work, skillDir, "http://localhost/api", "", "metadata-canary", &scan, skill); err != nil {
+	document, err := stageWorkspaceWithInputs(work, skillDir, "http://localhost/api", "", "metadata-canary", &scan, skill, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, _ := newStreamWorker(t)
+	if err := w.DB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	const present = "scrutineer-present-capability"
+	if err := os.WriteFile(filepath.Join(bin, exeName(present)), nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	skill.RequiresCommands = present
+	sj := SkillJob{WorkRoot: work, SkillDir: skillDir}
+	w.configureCapabilityPreflight(t.Context(), &scan, skill, &sj, document)
+	if err := sj.checkCapabilities(t.Context(), nil, false, func(Event) {}); err != nil {
 		t.Fatal(err)
 	}
 	for _, dir := range []string{work, skillDir} {
@@ -121,6 +231,9 @@ func TestStageExplorationOmitsModelInputs(t *testing.T) {
 		}
 		if got.Scrutineer.ScanConfig != nil || got.Scrutineer.Exploration == nil || got.Scrutineer.Exploration.Path != "lib" || got.Scrutineer.ScanSubPath != "lib" {
 			t.Fatalf("wrong context: %s", b)
+		}
+		if got.Scrutineer.Preflight == nil {
+			t.Fatal("capability preflight was not staged")
 		}
 		if strings.Contains(string(b), "CANARY") || strings.Contains(string(b), "metadata-canary") {
 			t.Fatalf("model input leaked: %s", b)
@@ -138,11 +251,54 @@ func TestStageExplorationOmitsModelInputs(t *testing.T) {
 	}
 }
 
-func TestExplorationCannotBeDiffBaseline(t *testing.T) {
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "baseline.db"))
+func TestStageAdversarialSweepIncludesThreatModel(t *testing.T) {
+	parsed, err := skills.ParseFile("../../skills/security-deep-dive/SKILL.md")
 	if err != nil {
 		t.Fatal(err)
 	}
+	skill, err := parsed.ToModel("disk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	skillDir := filepath.Join(work, ".claude", "skills", deepDiveSkillName)
+	scan := db.Scan{
+		ID: 14, RepositoryID: 1, SkillName: deepDiveSkillName, APIToken: "validation-token",
+		ExplorationMode: ExplorationAdversarialSweep, ExplorationPath: "examples",
+		Repository: db.Repository{
+			URL: "https://example.com/repo", ThreatModel: `{"out_of_scope":[{"item":"examples/","reason":"MODEL-CANARY"}]}`,
+			ScanConfig: "attack_surface: CONFIG-CANARY",
+		},
+	}
+	if err := StageWorkspace(work, skillDir, "http://localhost/api", "", "metadata-canary", &scan, skill); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(work, "context.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got skillContext
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Scrutineer.ScanConfig != nil || got.Scrutineer.Exploration == nil || got.Scrutineer.Exploration.Mode != ExplorationAdversarialSweep || got.Scrutineer.Exploration.Path != "examples" {
+		t.Fatalf("wrong context: %s", b)
+	}
+	if strings.Contains(string(b), "CONFIG-CANARY") || strings.Contains(string(b), "MODEL-CANARY") || strings.Contains(string(b), "metadata-canary") {
+		t.Fatalf("guidance leaked into context: %s", b)
+	}
+	model, err := os.ReadFile(filepath.Join(work, "threat_model.json"))
+	if err != nil || !strings.Contains(string(model), "MODEL-CANARY") {
+		t.Fatalf("threat model not staged: %s err=%v", model, err)
+	}
+	prompt := buildLoggedPrompt(skill, "claude")
+	if !strings.Contains(prompt, "Adversarial Scope Audit") || strings.Contains(prompt, "## Phase 1: Inventory") {
+		t.Fatal("logged prompt does not match adversarial instructions")
+	}
+}
+
+func TestExplorationCannotBeDiffBaseline(t *testing.T) {
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "https://example.com/baseline"}
 	if err := gdb.Create(&repo).Error; err != nil {
 		t.Fatal(err)
@@ -177,6 +333,8 @@ func TestValidateExploration(t *testing.T) {
 		{name: "pending", skill: deepDiveSkillName, mode: ExplorationRandomDig, valid: true},
 		{name: "root", skill: deepDiveSkillName, mode: ExplorationRandomDig, target: ".", valid: true},
 		{name: "subdir", skill: deepDiveSkillName, mode: ExplorationRandomDig, target: "lib/parser", valid: true},
+		{name: "adversarial", skill: deepDiveSkillName, mode: ExplorationAdversarialSweep, target: "examples", valid: true},
+		{name: "adversarial without target", skill: deepDiveSkillName, mode: ExplorationAdversarialSweep},
 		{name: "wrong skill", skill: "verify", mode: ExplorationRandomDig},
 		{name: "unknown mode", skill: deepDiveSkillName, mode: "other"},
 		{name: "orphan path", skill: deepDiveSkillName, target: "lib"},
@@ -248,5 +406,20 @@ func TestExplorationPrereqsAndRecipe(t *testing.T) {
 	}
 	if recipe.ThreatModelSHA256 != "" || recipe.ScanConfigSHA256 == "" || recipe.ExplorationPath != "lib" || recipe.ExplorationMode != ExplorationRandomDig || recipe.TriageScanID == nil || *recipe.TriageScanID != 12 {
 		t.Fatalf("wrong exploratory recipe: %s", raw)
+	}
+	adversarial := db.Scan{SkillID: new(uint(1)), ExplorationMode: ExplorationAdversarialSweep, ExplorationPath: "examples", TriageScanID: new(uint(13))}
+	if deferred, err := w.preflightSkill(t.Context(), &adversarial, 1); err != nil || deferred {
+		t.Fatalf("adversarial audit gated on reports it cannot read: deferred=%v err=%v", deferred, err)
+	}
+	raw, err = buildScanRecipe(&adversarial, "claude", "threat model", "retained path exclusions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recipe = ScanRecipe{}
+	if err := json.Unmarshal([]byte(raw), &recipe); err != nil {
+		t.Fatal(err)
+	}
+	if recipe.ThreatModelSHA256 == "" || recipe.ExplorationMode != ExplorationAdversarialSweep || recipe.ExplorationPath != "examples" {
+		t.Fatalf("wrong adversarial recipe: %s", raw)
 	}
 }

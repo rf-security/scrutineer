@@ -36,6 +36,7 @@ import (
 // (or a write-side guard) first, or a scoped run will wipe the repo's other
 // dependencies; see the note on parseDependenciesOutput.
 var repoWideProjectionKinds = map[string]bool{
+	"reflection":    true,
 	"subprojects":   true,
 	"dependencies":  true,
 	"packages":      true,
@@ -44,6 +45,7 @@ var repoWideProjectionKinds = map[string]bool{
 	"repo_metadata": true,
 	"repo_overview": true,
 	"posture":       true,
+	"compliance":    true,
 	"finding_dedup": true,
 }
 

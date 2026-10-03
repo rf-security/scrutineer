@@ -97,6 +97,7 @@ func TestDependenciesScript_sectionFailure(t *testing.T) {
 
 func runDependenciesScript(t *testing.T, mode string) (string, error) {
 	t.Helper()
+	skipWithoutBash(t)
 	script, err := filepath.Abs("../../skills/dependencies/scripts/index.sh")
 	if err != nil {
 		t.Fatal(err)

@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "required": ["review_status", "findings", "notes"],
+  "additionalProperties": false,
+  "properties": {
+    "review_status": {
+      "type": "string",
+      "enum": ["reviewed", "not-applicable"]
+    },
+    "findings": { "$ref": "audit-findings.schema.json#/properties/findings" },
+    "notes": { "type": "string", "minLength": 1 },
+    "scope": { "type": "string", "minLength": 1 },
+    "source_sink_inventory": { "$ref": "#/$defs/evidence_list" },
+    "negative_results": { "$ref": "#/$defs/evidence_list" },
+    "unverified_assumptions": { "$ref": "#/$defs/evidence_list" },
+    "design_properties": { "$ref": "#/$defs/evidence_list" }
+  },
+  "if": {
+    "properties": { "review_status": { "const": "not-applicable" } }
+  },
+  "then": {
+    "properties": { "findings": { "maxItems": 0 } }
+  },
+  "else": {
+    "required": ["scope", "source_sink_inventory", "negative_results", "unverified_assumptions", "design_properties"]
+  },
+  "$defs": {
+    "evidence_list": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}

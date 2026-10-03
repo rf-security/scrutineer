@@ -9,6 +9,7 @@
 *.db-wal
 .env
 .DS_Store
+__pycache__/
 .idea/
 .vscode/
 .claude/

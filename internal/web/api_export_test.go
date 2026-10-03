@@ -330,6 +330,9 @@ func TestAPIv1DeleteRepository(t *testing.T) {
 	s.DB.Create(&repo)
 	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
 	s.DB.Create(&scan)
+	if err := s.DB.Create(&db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanPaused, SkillName: "verify"}).Error; err != nil {
+		t.Fatal(err)
+	}
 	finding := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: "doomed", Severity: sevHigh}
 	s.DB.Create(&finding)
 	s.DB.Create(&db.FindingReview{FindingID: finding.ID, Verdict: "true_positive", Reviewer: "analyst"})
@@ -379,7 +382,7 @@ func TestAPIv1DeleteRepositoryRejectsInFlightScans(t *testing.T) {
 			if w.Code != http.StatusConflict {
 				t.Fatalf("status %d, want 409. body=%s", w.Code, w.Body)
 			}
-			if !strings.Contains(w.Body.String(), "queued, running, or paused scans") {
+			if !strings.Contains(w.Body.String(), "queued or running scans") {
 				t.Fatalf("body %q missing in-flight scan explanation", w.Body.String())
 			}
 			if n := countRows(t, s, &db.Repository{}, "id = ?", repo.ID); n != 1 {
@@ -434,9 +437,26 @@ func TestAPIv1DeleteRepositoryRejectsInFlightFindingScopedScans(t *testing.T) {
 }
 
 func TestAPIv1DeleteFinding(t *testing.T) {
+	for _, foreignKeys := range []bool{true, false} {
+		t.Run("foreign_keys="+strconv.FormatBool(foreignKeys), func(t *testing.T) {
+			testAPIv1DeleteFinding(t, foreignKeys)
+		})
+	}
+}
+
+func testAPIv1DeleteFinding(t *testing.T, foreignKeys bool) {
+	t.Helper()
 	s, done := newTestServer(t)
 	defer done()
 	s.Worker.DataDir = t.TempDir()
+	sqldb, err := s.DB.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqldb.SetMaxOpenConns(1)
+	if err := s.DB.Exec("PRAGMA foreign_keys=" + strconv.FormatBool(foreignKeys)).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	repo := db.Repository{URL: "https://github.com/acme/keep-repo", Name: "keep-repo"}
 	s.DB.Create(&repo)
@@ -454,6 +474,7 @@ func TestAPIv1DeleteFinding(t *testing.T) {
 	s.DB.Create(&db.FindingReference{FindingID: finding.ID, URL: "https://example.com/ref"})
 	s.DB.Create(&db.FindingHistory{FindingID: finding.ID, Field: "status", NewValue: "new"})
 	s.DB.Create(&db.FindingReview{FindingID: finding.ID, Verdict: "true_positive", Reviewer: "analyst"})
+	seedFindingAssessments(t, s, finding, scan)
 	dependent := db.Dependent{RepositoryID: repo.ID, Name: "downstream", Ecosystem: "npm"}
 	s.DB.Create(&dependent)
 	s.DB.Create(&db.FindingDependent{FindingID: finding.ID, DependentID: dependent.ID, Status: db.ExposureKnownAffected})
@@ -475,15 +496,19 @@ func TestAPIv1DeleteFinding(t *testing.T) {
 		t.Fatalf("status %d, want 204. body=%s", w.Code, w.Body)
 	}
 	for name, n := range map[string]int64{
-		"finding":      countRows(t, s, &db.Finding{}, "id = ?", finding.ID),
-		"notes":        countRows(t, s, &db.FindingNote{}, "finding_id = ?", finding.ID),
-		"comms":        countRows(t, s, &db.FindingCommunication{}, "finding_id = ?", finding.ID),
-		"refs":         countRows(t, s, &db.FindingReference{}, "finding_id = ?", finding.ID),
-		"history":      countRows(t, s, &db.FindingHistory{}, "finding_id = ?", finding.ID),
-		"reviews":      countRows(t, s, &db.FindingReview{}, "finding_id = ?", finding.ID),
-		"exposure":     countRows(t, s, &db.FindingDependent{}, "finding_id = ?", finding.ID),
-		"conversation": countRows(t, s, &db.Conversation{}, "finding_id = ?", finding.ID),
-		"messages":     countRows(t, s, &db.ChatMessage{}, "conversation_id = ?", conv.ID),
+		"finding":       countRows(t, s, &db.Finding{}, "id = ?", finding.ID),
+		"notes":         countRows(t, s, &db.FindingNote{}, "finding_id = ?", finding.ID),
+		"comms":         countRows(t, s, &db.FindingCommunication{}, "finding_id = ?", finding.ID),
+		"refs":          countRows(t, s, &db.FindingReference{}, "finding_id = ?", finding.ID),
+		"history":       countRows(t, s, &db.FindingHistory{}, "finding_id = ?", finding.ID),
+		"reviews":       countRows(t, s, &db.FindingReview{}, "finding_id = ?", finding.ID),
+		"exposure":      countRows(t, s, &db.FindingDependent{}, "finding_id = ?", finding.ID),
+		"verifications": countRows(t, s, &db.FindingVerification{}, "finding_id = ?", finding.ID),
+		"attackpaths":   countRows(t, s, &db.FindingAttackPath{}, "finding_id = ?", finding.ID),
+		"attempts":      countRows(t, s, &db.RemediationAttempt{}, "finding_id = ?", finding.ID),
+		"validations":   countRows(t, s, &db.RemediationValidation{}, "finding_id = ?", finding.ID),
+		"conversation":  countRows(t, s, &db.Conversation{}, "finding_id = ?", finding.ID),
+		"messages":      countRows(t, s, &db.ChatMessage{}, "conversation_id = ?", conv.ID),
 	} {
 		if n != 0 {
 			t.Fatalf("%s rows survived finding delete: %d", name, n)

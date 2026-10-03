@@ -203,7 +203,7 @@ func TestCloneOrFetchWithOptionsUpdatesShallowSubmodules(t *testing.T) {
 	retry := gitRetry{
 		attempts: 1,
 		run: func(_ context.Context, _ string, _ []string, args ...string) (string, error) {
-			if len(args) > 0 && args[0] == "submodule" {
+			if slices.Contains(args, "submodule") {
 				submoduleArgs = append([]string(nil), args...)
 			}
 			return "", nil
@@ -216,7 +216,7 @@ func TestCloneOrFetchWithOptionsUpdatesShallowSubmodules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cloneOrFetchWithOptions: %v", err)
 	}
-	want := []string{"submodule", "update", "--init", "--recursive", "--depth", "1"}
+	want := []string{"-c", "core.longpaths=true", "submodule", "update", "--init", "--recursive", "--depth", "1"}
 	if !slices.Equal(submoduleArgs, want) {
 		t.Errorf("submodule args = %v, want %v", submoduleArgs, want)
 	}

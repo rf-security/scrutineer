@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -116,7 +117,10 @@ func readCodexAuthFile(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("codex.auth_file is not a regular file: %s", path)
 	}
-	if info.Mode().Perm() != codexAuthFileMode {
+	// Windows reports every regular file as 0666 (0444 with the read-only
+	// attribute): its ACLs never surface as POSIX bits, so there is nothing
+	// for this check to read there.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != codexAuthFileMode {
 		// Codex rewrites this file on every refresh, so a mode change is as
 		// likely to be the CLI's doing as the operator's; name the fix.
 		return nil, fmt.Errorf("codex.auth_file permissions are %04o; require exactly 0600 (chmod 600 %s)", info.Mode().Perm(), path)

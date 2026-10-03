@@ -14,7 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +33,7 @@ import (
 	"scrutineer/internal/bundledassets"
 	"scrutineer/internal/config"
 	"scrutineer/internal/db"
+	"scrutineer/internal/egressgrant"
 	"scrutineer/internal/interchange"
 	"scrutineer/internal/queue"
 	"scrutineer/internal/skills"
@@ -40,29 +41,6 @@ import (
 	"scrutineer/internal/worker"
 	bundledskills "scrutineer/skills"
 )
-
-// commit is the git SHA scrutineer was built from, injected at build time
-// via -ldflags "-X main.commit=...". Empty in a plain `go build`/`go run`,
-// where buildCommit falls back to the VCS revision in the build info.
-var commit string
-
-// buildCommit reports the commit scrutineer was built from. It prefers the
-// ldflags-injected value (set in the container image build, where .git is excluded
-// from the context so the VCS stamp is unavailable) and otherwise reads the
-// vcs.revision the Go toolchain records during a normal local build.
-func buildCommit() string {
-	if commit != "" {
-		return commit
-	}
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, s := range info.Settings {
-			if s.Key == "vcs.revision" {
-				return s.Value
-			}
-		}
-	}
-	return ""
-}
 
 // skillDirs collects repeated -skills flags.
 type skillDirs []string
@@ -110,6 +88,7 @@ type flags struct {
 	backend               string
 	codexAuthFile         string
 	noContainer           bool
+	modelProxy            bool
 	hostSkills            []string
 	runtime               string
 	selinux               string
@@ -122,6 +101,7 @@ type flags struct {
 	concurrency           int
 	cloneMode             string
 	scanTimeout           time.Duration
+	backendPreflightTTL   time.Duration
 	smokeTimeout          time.Duration
 	maxTurns              int
 	modelBaseURL          string
@@ -129,6 +109,7 @@ type flags struct {
 	metadataDir           string
 	schemaStrict          bool
 	downgradeOnOverage    bool
+	pauseOnOverage        bool
 	recipientsFile        string
 	identityFile          string
 	identityPlugins       pluginNames
@@ -278,15 +259,18 @@ func registerFlags(fs *flag.FlagSet, f *flags) {
 	fs.IntVar(&f.concurrency, "concurrency", queue.DefaultWorkerConcurrency, "number of scans to run in parallel")
 	fs.StringVar(&f.cloneMode, "clone", "shallow", "clone depth: shallow (--depth 1) or full")
 	fs.DurationVar(&f.scanTimeout, "scan-timeout", worker.DefaultScanTimeout, "wall-clock limit per scan")
+	fs.DurationVar(&f.backendPreflightTTL, "backend-preflight-ttl", 0, "cache lifetime for live backend probes (0 disables; probes consume model tokens)")
 	fs.DurationVar(&f.smokeTimeout, "runtime-smoke-timeout", defaultRuntimeSmokeTimeout, "timeout for each rootless-podman startup container check (keep-id image remap, SELinux mount probe); raise if first-run image remapping is slow, lower if the image is pre-warmed")
 	fs.IntVar(&f.maxTurns, "max-turns", 0, "claude --max-turns limit (0 = unlimited)")
 	fs.StringVar(&f.modelBaseURL, "model-base-url", "", "custom HTTPS model API base URL for the active backend (HTTP allowed for local development; env fallback: ANTHROPIC_BASE_URL for claude)")
 	fs.StringVar(&f.modelBaseURL, "anthropic-base-url", "", "deprecated alias for -model-base-url")
+	fs.BoolVar(&f.modelProxy, "model-proxy", false, "keep ANTHROPIC_API_KEY on the host: container scans get a per-scan token for a host-side Anthropic API proxy (claude backend with API-key auth only)")
 	fs.StringVar(&f.forkOrg, "fork-org", "", "GitHub org the fork skill forks into and files draft advisories against")
 	fs.StringVar(&f.subprojectScope, "subproject-scope", "hard", "how a subproject-scoped scan stages its workspace: \"hard\" (copy only the sub-folder so build+findings are confined to the sub-package) or \"soft\" (stage the whole clone, sub-path is an advisory hint)")
 	fs.BoolVar(&f.monorepoAttribution, "monorepo-attribution", true, "link packages, advisories, maintainers and disclosure channel to the sub-package they belong to (matched by manifest name) instead of rolling up flat under the repository")
 	fs.BoolVar(&f.schemaStrict, "schema-strict", false, "fail scans whose report.json does not validate against the skill's schema (default: warn and continue)")
 	fs.BoolVar(&f.downgradeOnOverage, "downgrade-on-overage", false, "on a subscription token, fall the model tier back from max/high to the mid tier for new scans while the account is on overage; restores when the window resets")
+	fs.BoolVar(&f.pauseOnOverage, "pause-on-overage", false, "pause model scans when subscription overage is reported; takes precedence over downgrade-on-overage")
 	fs.StringVar(&f.recipientsFile, "recipients-file", "", "age recipients file (public keys) for encrypted export")
 	fs.StringVar(&f.identityFile, "identity-file", "", "age identity file or SSH private key for decrypting imports and federation feeds")
 	fs.Var(&f.identityPlugins, "identity-plugin", "data-less age identity plugin name for decrypting imports and federation feeds (repeatable)")
@@ -339,6 +323,9 @@ func (f *flags) merge(cfg *config.Config) {
 	if cfg.Hardened != nil && !f.set["hardened"] {
 		f.hardened = *cfg.Hardened
 	}
+	if cfg.ModelProxy != nil && !f.set["model-proxy"] {
+		f.modelProxy = *cfg.ModelProxy
+	}
 	// hardened_runtime_only, with the deprecated hardened_rootless_runtime alias.
 	cfgRuntimeOnly := cfg.HardenedRuntimeOnly
 	if cfgRuntimeOnly == nil {
@@ -372,6 +359,9 @@ func (f *flags) merge(cfg *config.Config) {
 	if d, _ := config.ParseScanTimeout(cfg.ScanTimeout); d > 0 && !f.set["scan-timeout"] {
 		f.scanTimeout = d
 	}
+	if !f.set["backend-preflight-ttl"] {
+		f.backendPreflightTTL, _ = config.ParseBackendPreflightTTL(cfg.BackendPreflightTTL)
+	}
 	if cfg.MaxTurns > 0 && !f.set["max-turns"] {
 		f.maxTurns = cfg.MaxTurns
 	}
@@ -395,6 +385,9 @@ func (f *flags) merge(cfg *config.Config) {
 	}
 	if cfg.DowngradeOnOverage != nil && !f.set["downgrade-on-overage"] {
 		f.downgradeOnOverage = *cfg.DowngradeOnOverage
+	}
+	if cfg.PauseOnOverage != nil && !f.set["pause-on-overage"] {
+		f.pauseOnOverage = *cfg.PauseOnOverage
 	}
 	if cfg.RecipientsFile != "" && !f.set["recipients-file"] {
 		f.recipientsFile = cfg.RecipientsFile
@@ -568,7 +561,35 @@ func validateFlags(f *flags) error {
 	if err := validateFederation(f); err != nil {
 		return err
 	}
+	if err := validateModelProxyFlags(f); err != nil {
+		return err
+	}
 	return validateModelBaseURL(f.modelBaseURL)
+}
+
+// validateModelProxyFlags refuses a -model-proxy configuration this narrow
+// scope does not support. Only the claude backend with a plain
+// ANTHROPIC_API_KEY is covered: account/OAuth login is out of scope. The
+// containerised runner is also required, since a bare-metal scan has no
+// container to keep the key out of.
+func validateModelProxyFlags(f *flags) error {
+	if !f.modelProxy {
+		return nil
+	}
+	h, err := worker.HarnessByName(f.backend)
+	if err != nil {
+		return err
+	}
+	if _, ok := h.(worker.ClaudeHarness); !ok {
+		return fmt.Errorf("-model-proxy requires the claude backend, got %q", worker.HarnessName(h))
+	}
+	if f.noContainer {
+		return errors.New("-model-proxy requires the containerised runner; remove -no-container")
+	}
+	if os.Getenv("ANTHROPIC_API_KEY") == "" {
+		return errors.New("-model-proxy requires ANTHROPIC_API_KEY; account login via CLAUDE_CODE_OAUTH_TOKEN is not supported by -model-proxy")
+	}
+	return nil
 }
 
 func isLoopbackListenAddr(addr string) bool {
@@ -649,6 +670,9 @@ func run(log *slog.Logger) error {
 	if err := validateFlags(f); err != nil {
 		return err
 	}
+	if err := validateEgressPolicies(f, cfg); err != nil {
+		return err
+	}
 	warnIfNonLoopbackListenAddr(log, f.addr)
 	// When --selinux is given explicitly, surface the host's SELinux mode at
 	// startup so the operator can confirm what scrutineer detected (e.g. that an
@@ -716,6 +740,7 @@ func run(log *slog.Logger) error {
 	}
 	retireRemovedSkills(log, gdb)
 	warnUnknownHostSkills(log, gdb, f.hostSkills)
+	warnEgressPolicySkills(log, gdb, cfg.EgressPolicies, f.hostSkills)
 
 	go func() {
 		if n, err := worker.SyncCNAs(context.Background(), gdb, ""); err != nil {
@@ -743,12 +768,17 @@ func run(log *slog.Logger) error {
 		ScanTimeout:           f.scanTimeout,
 		SchemaStrict:          f.schemaStrict,
 		DowngradeOnOverage:    f.downgradeOnOverage,
+		PauseOnOverage:        f.pauseOnOverage,
 		AutoRejectMissedCount: f.autoRejectMissedCount,
 		SubprojectScope:       f.subprojectScope,
 		MonorepoAttribution:   f.monorepoAttribution,
 		OnEvent: func(scanID, repoID uint, name, data string) {
 			broker.Publish(web.Event{Name: name, Data: data, ScanID: scanID, RepoID: repoID})
 		},
+	}
+	w.BackendPreflight, err = configuredBackendPreflight(f.backendPreflightTTL)
+	if err != nil {
+		return err
 	}
 	w.Register(q)
 
@@ -757,7 +787,11 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	srv.SkillsRepoSHA = skillsRepoSHA
+	srv.ModelProxy = worker.ModelProxyOf(runner)
 	srv.Version = version
+	build := readBuildMetadata()
+	srv.Commit = build.Commit
+	srv.CommitDate = build.CommitDate
 	wireEcosystems(f.ecosystemsEnrichment, w, srv, gdb, log)
 	if h, err := worker.HarnessByName(f.backend); err == nil {
 		srv.Backend = worker.HarnessName(h)
@@ -831,6 +865,13 @@ func configureEncryption(srv *web.Server, f *flags, log *slog.Logger) error {
 		log.Info("loaded identity plugins", "count", len(ids))
 	}
 	return nil
+}
+
+func configuredBackendPreflight(ttl time.Duration) (*worker.BackendPreflightCache, error) {
+	if ttl == 0 {
+		return nil, nil
+	}
+	return worker.NewBackendPreflightCache(ttl)
 }
 
 // wireEcosystems configures the worker's per-scan cache refresh and the
@@ -987,6 +1028,24 @@ func hashPath(s string) string {
 // -runtime-smoke-timeout.
 const defaultRuntimeSmokeTimeout = 5 * time.Minute
 
+// warnRuntimeCaveats logs the runtime limitations an operator should know
+// about before the first scan. It only logs; nothing here refuses a runtime.
+func warnRuntimeCaveats(rt worker.ContainerRuntime, f *flags, log *slog.Logger) {
+	if rt.Bin == "apple" {
+		log.Warn("Apple container runtime support is experimental", "version", rt.Version)
+		if f.hardened {
+			log.Info("Apple hardened mode: per-container VM boundary substitutes for " +
+				"--security-opt no-new-privileges (not exposed by Apple's CLI); the " +
+				"per-scan --internal network is verified fail-closed before each scan")
+		}
+	}
+	// Older podman lacks the host-gateway alias the egress path needs; warn
+	// rather than fail since the hardened path verifies reachability per-scan.
+	if !rt.HostGatewaySupported() {
+		log.Warn("podman may be too old for host-gateway egress; upgrade to >= 4.7", "version", rt.Version)
+	}
+}
+
 // setupRunner picks the SkillRunner implementation for the run loop:
 // ContainerRunner (docker, podman, or Apple's container) when a container runtime is in use,
 // LocalClaude otherwise, and a HostSplitRunner over both when host_skills sends
@@ -1029,19 +1088,7 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 	if err := worker.HardeningSupportError(rt, f.hardenedRuntimeOnly); err != nil {
 		return nil, "", err
 	}
-	if rt.Bin == "apple" {
-		log.Warn("Apple container runtime support is experimental", "version", rt.Version)
-		if f.hardened {
-			log.Info("Apple hardened mode: per-container VM boundary substitutes for " +
-				"--security-opt no-new-privileges (not exposed by Apple's CLI); the " +
-				"per-scan --internal network is verified fail-closed before each scan")
-		}
-	}
-	// Older podman lacks the host-gateway alias the egress path needs; warn
-	// rather than fail since the hardened path verifies reachability per-scan.
-	if !rt.HostGatewaySupported() {
-		log.Warn("podman may be too old for host-gateway egress; upgrade to >= 4.7", "version", rt.Version)
-	}
+	warnRuntimeCaveats(rt, f, log)
 	// Rootless podman needs an adequate /etc/subuid range for --userns=keep-id;
 	// smoke-test it once so a misconfiguration is one clear error here rather
 	// than a cryptic bind-mount failure on every scan. The first such run also
@@ -1068,6 +1115,10 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 		return nil, "", fmt.Errorf("--selinux=%s: %w", f.selinux, err)
 	}
 	gwIP, apiHost, err := resolveScanNetworking(rt, f, log)
+	if err != nil {
+		return nil, "", err
+	}
+	policies, err := egressPolicyGrants(cfg)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1100,7 +1151,7 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 	// the egress proxy as a per-scan sidecar. Resolve it before the in-process
 	// host proxy so the latter can be skipped when the sidecar is in charge.
 	if f.hardened {
-		egress, err = resolveEgressSidecar(rt, f, allow, token, log)
+		egress, err = resolveEgressSidecar(rt, f, allow, token, log, policies)
 		if err != nil {
 			return nil, "", err
 		}
@@ -1154,11 +1205,50 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 			ContainerHost: apiHost,
 			Log:           log,
 		},
+		EgressPolicies:    policies,
 		OpencodeProviders: opencodeProviders,
 		OpencodeReadiness: worker.NewOpencodeReadinessCache(),
 		CodexAccountAuth:  worker.NewCodexAccountAuth(f.codexAuthFile),
 	}
+	if err := applyModelProxy(f, log, apiHost, &runner); err != nil {
+		return nil, "", err
+	}
 	return splitHostSkills(f, runner, local, hostBase, log), apiBase, nil
+}
+
+// setupModelProxy builds the host-side Anthropic API proxy for -model-proxy:
+// each scan gets a short-lived token instead of the real ANTHROPIC_API_KEY, so
+// a hostile scan container never sees it. See docs/model-proxy.md.
+// validateModelProxyFlags has already confirmed ANTHROPIC_API_KEY is set and
+// the backend is claude; this only builds the proxy itself.
+func setupModelProxy(f *flags, log *slog.Logger) (*worker.ModelProxy, error) {
+	mp, err := worker.NewModelProxy(f.modelBaseURL, os.Getenv("ANTHROPIC_API_KEY"), log)
+	if err != nil {
+		return nil, fmt.Errorf("model proxy: %w", err)
+	}
+	upstream := baseURLHost(f.modelBaseURL)
+	if upstream == "" {
+		upstream = "api.anthropic.com"
+	}
+	log.Info("model proxy enabled, keeping ANTHROPIC_API_KEY off scan containers", "upstream_host", upstream)
+	return mp, nil
+}
+
+// applyModelProxy sets ModelProxy and ModelProxyURL on runner when
+// -model-proxy is set, isolating setupRunner's model-proxy branch (and its
+// nested error check) from setupRunner's own cognitive complexity budget.
+// A no-op when the flag is unset.
+func applyModelProxy(f *flags, log *slog.Logger, apiHost string, runner *worker.ContainerRunner) error {
+	if !f.modelProxy {
+		return nil
+	}
+	mp, err := setupModelProxy(f, log)
+	if err != nil {
+		return err
+	}
+	runner.ModelProxy = mp
+	runner.ModelProxyURL = "http://" + net.JoinHostPort(apiHost, addrPort(f.addr)) + worker.ModelProxyPathPrefix
+	return nil
 }
 
 // enforceCodexAccountAuthConcurrency starts the queue at the same one-slot
@@ -1244,6 +1334,61 @@ func warnUnknownHostSkills(log *slog.Logger, gdb *gorm.DB, names []string) {
 			log.Warn("host_skills names no active skill", "skill", name)
 		case s.RequiresProfile != "":
 			log.Warn("host_skills names a skill that requires a runner profile; the local runner refuses it", "skill", name, "profile", s.RequiresProfile)
+		}
+	}
+}
+
+// validateEgressPolicies refuses per-skill egress grants that nothing would
+// enforce. Grants are only sound on the per-scan --internal network that
+// --hardened creates. --no-container has no container to confine.
+func validateEgressPolicies(f *flags, cfg *config.Config) error {
+	if cfg == nil || len(cfg.EgressPolicies) == 0 {
+		return nil
+	}
+	if f.noContainer {
+		return errors.New("egress_policies cannot be enforced with --no-container (no container to confine)")
+	}
+	if !f.hardened {
+		return errors.New("egress_policies require --hardened so grants are enforced on an isolated network")
+	}
+	return nil
+}
+
+// egressPolicyGrants converts the validated config policies into the worker's
+// per-skill grants.
+func egressPolicyGrants(cfg *config.Config) (map[string][]egressgrant.Grant, error) {
+	if cfg == nil || len(cfg.EgressPolicies) == 0 {
+		return nil, nil
+	}
+	out := make(map[string][]egressgrant.Grant, len(cfg.EgressPolicies))
+	for skill, policy := range cfg.EgressPolicies {
+		grants, err := egressgrant.Parse(policy.Allow)
+		if err != nil {
+			return nil, fmt.Errorf("egress_policies.%s.allow: %w", skill, err)
+		}
+		out[skill] = grants
+	}
+	return out, nil
+}
+
+// warnEgressPolicySkills flags egress_policies entries that can never apply: a
+// skill that does not exist (a typo silently leaves it without egress) or one
+// listed in host_skills, which runs on the host and ignores policies.
+func warnEgressPolicySkills(log *slog.Logger, gdb *gorm.DB, policies map[string]config.EgressPolicy, hostSkills []string) {
+	if len(policies) == 0 {
+		return
+	}
+	var active []string
+	if err := gdb.Model(&db.Skill{}).Where("active = ?", true).Pluck("name", &active).Error; err != nil {
+		log.Warn("egress_policies check failed", "err", err)
+		return
+	}
+	for name := range policies {
+		switch {
+		case slices.Contains(hostSkills, name):
+			log.Warn("egress_policies names a host_skills skill; host skills run on the host and ignore policies", "skill", name)
+		case !slices.Contains(active, name):
+			log.Warn("egress_policies names no active skill", "skill", name)
 		}
 	}
 }
@@ -1367,7 +1512,7 @@ func resolveScanNetworking(rt worker.ContainerRuntime, f *flags, log *slog.Logge
 // default-network host gateway the sidecar dials to reach the loopback-bound
 // host skill API. Docker Engine, rootful podman, and Apple keep the in-process
 // proxy and return the zero value.
-func resolveEgressSidecar(rt worker.ContainerRuntime, f *flags, allow []string, token string, log *slog.Logger) (worker.EgressSidecarConfig, error) {
+func resolveEgressSidecar(rt worker.ContainerRuntime, f *flags, allow []string, token string, log *slog.Logger, policies map[string][]egressgrant.Grant) (worker.EgressSidecarConfig, error) {
 	if !rt.NeedsEgressSidecar() {
 		return worker.EgressSidecarConfig{}, nil
 	}
@@ -1375,7 +1520,11 @@ func resolveEgressSidecar(rt worker.ContainerRuntime, f *flags, allow []string, 
 	// requires, rather than letting every hardened scan fail with a cryptic error.
 	smokeCtx, cancel := context.WithTimeout(context.Background(), f.smokeTimeout)
 	defer cancel()
-	if err := worker.VerifyProxyBinary(smokeCtx, rt, f.runnerImage); err != nil {
+	var extraCaps []string
+	if len(policies) > 0 {
+		extraCaps = []string{worker.ProxyCapabilityEgressPortGrants}
+	}
+	if err := worker.VerifyProxyBinary(smokeCtx, rt, f.runnerImage, extraCaps...); err != nil {
 		return worker.EgressSidecarConfig{}, err
 	}
 	// The sidecar reaches the host skill API over its egress leg through the
@@ -1413,7 +1562,7 @@ func buildEgressAllow(harnessHosts []string, hardened bool, cfg *config.Config, 
 	if hardened {
 		allow = append(allow, worker.HardenedEgressAllow...)
 		if cfg != nil && len(cfg.EgressAllow) > 0 {
-			log.Warn("ignoring egress_allow config entries under --hardened", "count", len(cfg.EgressAllow))
+			log.Warn("ignoring egress_allow config entries under --hardened; grant a skill host:port pairs with egress_policies instead (docs/egress-policies.md)", "count", len(cfg.EgressAllow))
 		}
 	} else {
 		allow = append(allow, worker.DefaultEgressAllow...)

@@ -50,6 +50,9 @@ func TestValidateCodexAuthFile(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.mode != codexAuthFileMode {
+				skipOnWindows(t, "every file reads back as 0666, so the mode check does not run there")
+			}
 			err := ValidateCodexAuthFile(writeCodexAuthFile(t, tc.body, tc.mode))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want substring %q", err, tc.want)
@@ -201,7 +204,8 @@ func TestCodexAccountAuthAcquireHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestCodexAccountAuthAcquireRevalidatesCredential(t *testing.T) {
+func TestCodexAccountAuthAcquireRevalidatesMode(t *testing.T) {
+	skipOnWindows(t, "every file reads back as 0666, so the mode check does not run there")
 	path := writeCodexAuthFile(t, validCodexAuthJSON, 0o600)
 	auth := NewCodexAccountAuth(path)
 	if err := os.Chmod(path, 0o644); err != nil {
@@ -210,14 +214,25 @@ func TestCodexAccountAuthAcquireRevalidatesCredential(t *testing.T) {
 	if _, err := auth.acquire(context.Background()); err == nil || !strings.Contains(err.Error(), "require exactly 0600") {
 		t.Fatalf("acquire after permission change error = %v", err)
 	}
+}
+
+func TestCodexAccountAuthAcquireRevalidatesCredential(t *testing.T) {
+	path := writeCodexAuthFile(t, validCodexAuthJSON, 0o600)
+	auth := NewCodexAccountAuth(path)
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auth.acquire(context.Background()); err == nil || !strings.Contains(err.Error(), "invalid JSON") {
+		t.Fatalf("acquire after credential change error = %v", err)
+	}
 
 	// A failed validation must release the semaphore for a corrected file.
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(validCodexAuthJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	unlock, err := auth.acquire(context.Background())
 	if err != nil {
-		t.Fatalf("acquire after correcting permissions: %v", err)
+		t.Fatalf("acquire after correcting the credential: %v", err)
 	}
 	unlock()
 }

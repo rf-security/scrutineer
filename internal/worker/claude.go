@@ -9,10 +9,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/alpha-omega-security/harness"
 
+	"scrutineer/internal/coverage"
 	"scrutineer/internal/db"
 )
 
@@ -99,7 +99,15 @@ type SkillJob struct {
 	// RequiresProfile pins the skill to a named profile. When set, the
 	// runner fails the scan if the resolved profile does not match.
 	// Empty means no constraint. Mirrors db.Skill.RequiresProfile.
-	RequiresProfile string
+	RequiresProfile  string
+	RequiresCommands []string
+	RequiresFeatures []string
+	DegradedMode     bool
+	// RecordPreflight persists worker-owned evidence before the first model turn.
+	RecordPreflight func(coverage.Preflight) error
+	// Shared by job copies used for whole-tree fallback and repair runs.
+	preflight    *capabilityPreflightState
+	checkBackend func(context.Context, []byte, func(context.Context) coverage.BackendProbe) error
 	// ResumeSessionID, when non-empty, makes the runner invoke
 	// `claude -p --resume <id>` so a retried scan continues the previous
 	// conversation with full history instead of restarting from turn 0.
@@ -219,6 +227,13 @@ func (l LocalClaude) RunSkill(ctx context.Context, sj SkillJob, emit func(Event)
 		return SkillResult{Commit: commit}, fmt.Errorf("skill %q requires profile %q, not supported by the local runner", sj.Name, sj.RequiresProfile)
 	}
 
+	if err := sj.checkCapabilities(ctx, nil, true, emit); err != nil {
+		return SkillResult{Commit: commit}, err
+	}
+	if err := l.checkBackendPreflight(ctx, sj); err != nil {
+		return SkillResult{Commit: commit}, err
+	}
+
 	var outPath string
 	if sj.OutputFile != "" {
 		outPath = filepath.Join(work, sj.OutputFile)
@@ -280,16 +295,17 @@ func (l LocalClaude) RunSkill(ctx context.Context, sj SkillJob, emit func(Event)
 func (l LocalClaude) runClaudeOnce(ctx context.Context, args []string, work string, emit func(Event)) (hitMaxTurns bool, sessionID string, waitErr error) {
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = work
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return false, "", err
 	}
 	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
+	terminate, err := startSupervised(cmd)
+	if err != nil {
 		return false, "", fmt.Errorf("start claude: %w", err)
 	}
+	defer terminate()
 
 	wrappedEmit := func(e Event) {
 		switch {
@@ -302,9 +318,6 @@ func (l LocalClaude) runClaudeOnce(ctx context.Context, args []string, work stri
 	}
 	ClaudeHarness{}.ParseStream(stdout, wrappedEmit)
 	waitErr = cmd.Wait()
-	if cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-	}
 	return hitMaxTurns, sessionID, waitErr
 }
 

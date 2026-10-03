@@ -125,7 +125,7 @@ var builtinProfiles = []Profile{
 		FallbackProfile: "ruby",
 		Detect:          []BriefMatch{{briefBuild, []string{"Rails"}}},
 	},
-	{Name: "ruby", Detect: pm("Bundler")},
+	{Name: "ruby", Detect: pm("Bundler", "RubyGems")},
 	{Name: "node", Detect: pm("npm", "pnpm", "Yarn", "Bun")},
 	{
 		// Before python: brief's setuptools-Extension detector keys on
@@ -150,6 +150,15 @@ var builtinProfiles = []Profile{
 			{briefPackageManager, []string{"sbt"}},
 			{briefLanguage, []string{"Scala"}},
 		},
+	},
+	{
+		// Before java: a Kotlin build reports Gradle plus Kotlin as the
+		// dominant language. There is no Kotlin-specific package manager,
+		// so the language selector is the only route in.
+		Name:            "kotlin",
+		BaseProfile:     "java",
+		FallbackProfile: "java",
+		Detect:          []BriefMatch{{briefLanguage, []string{"Kotlin"}}},
 	},
 	{Name: "java", Detect: pm("Maven", "Gradle")},
 	{Name: "dotnet", Detect: pm("NuGet", "dotnet CLI")},
@@ -329,7 +338,9 @@ func DetectProfile(ctx context.Context, rt ContainerRuntime, runnerImage, srcDir
 	}
 	args := runtimeRunArgs(rt, "--rm",
 		"--network", "none",
-		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+	)
+	args = append(args, containerUserArgs()...)
+	args = append(args,
 		"-v", bindMount(absSrc, "/src", relabel, "ro"),
 		"--entrypoint", "brief",
 		runnerImage, "/src",

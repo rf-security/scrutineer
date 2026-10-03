@@ -130,8 +130,8 @@ func (s *Server) findingCSAF(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load finding references", http.StatusInternalServerError)
 		return
 	}
-	var pkgs []db.Package
-	if err := s.DB.Where("repository_id = ?", f.RepositoryID).Find(&pkgs).Error; err != nil {
+	pkgs, err := findingAdvisoryPackages(s.DB, f, nil)
+	if err != nil {
 		s.Log.Error("csaf packages", "finding", f.ID, "repository", f.RepositoryID, "err", err)
 		http.Error(w, "failed to load repository packages", http.StatusInternalServerError)
 		return

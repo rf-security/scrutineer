@@ -90,6 +90,11 @@ func TestMatchProfile(t *testing.T) {
 		{"composer case-insensitive", briefJSON("package_manager:composer"), "php"},
 		{"bundler matches ruby", briefJSON("package_manager:Bundler"), "ruby"},
 		{"bundler case-insensitive", briefJSON("package_manager:bundler"), "ruby"},
+		{"RubyGems matches ruby", briefJSON("package_manager:RubyGems"), "ruby"},
+		{"RubyGems case-insensitive", briefJSON("package_manager:rubygems"), "ruby"},
+		{"RubyGems with secondary Ruby matches ruby", `{"package_managers":[{"name":"RubyGems"}],"languages":[{"name":"Python"},{"name":"Ruby"}]}`, "ruby"},
+		{"RubyGems native extension matches ruby-ext", briefJSON("package_manager:RubyGems", "native_extension:mkmf"), "ruby-ext"},
+		{"RubyGems Rails app matches ruby-rails", briefJSON("package_manager:RubyGems", "build:Rails"), "ruby-rails"},
 		{"npm matches node", briefJSON("package_manager:npm"), "node"},
 		{"pnpm matches node", briefJSON("package_manager:pnpm"), "node"},
 		{"yarn matches node", briefJSON("package_manager:Yarn"), "node"},
@@ -155,6 +160,7 @@ func TestMatchProfile(t *testing.T) {
 
 		// language fallbacks
 		{"Scala language matches scala (belt-and-braces for a *.scala-only checkout)", briefJSON("language:Scala"), "scala"},
+		{"Kotlin language matches kotlin", briefJSON("language:Kotlin"), "kotlin"},
 		{"Perl language matches perl (belt-and-braces for a *.pl-only dist)", briefJSON("language:Perl"), "perl"},
 		{"C language matches c-cpp", briefJSON("language:C"), "c-cpp"},
 		{"C++ language matches c-cpp", briefJSON("language:C++"), "c-cpp"},
@@ -233,6 +239,19 @@ func TestMatchProfile(t *testing.T) {
 			"Gradle + Scala language picks scala over java",
 			briefJSON("package_manager:Gradle", "language:Scala"),
 			"scala",
+		},
+		{
+			"Gradle + Kotlin language picks kotlin over java",
+			briefJSON("package_manager:Gradle", "language:Kotlin"),
+			"kotlin",
+		},
+		{
+			// A Java-majority project with a build.gradle.kts and a few *.kt
+			// files reports Java as the dominant language, so the Kotlin
+			// language selector must not fire and Gradle routes to java.
+			"Java-dominant repo with secondary Kotlin picks java",
+			`{"languages":[{"name":"Java","category":"language"},{"name":"Kotlin","category":"language"}],"package_managers":[{"name":"Gradle"}]}`,
+			"java",
 		},
 
 		// no-match cases

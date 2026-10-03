@@ -58,6 +58,23 @@ identity_plugins:
 	}
 }
 
+func TestLoad_modelProxy(t *testing.T) {
+	c, err := Load(write(t, "model_proxy: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ModelProxy == nil || !*c.ModelProxy {
+		t.Errorf("model_proxy: %v", c.ModelProxy)
+	}
+	c, err = Load(write(t, "addr: 127.0.0.1:8080\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ModelProxy != nil {
+		t.Errorf("model_proxy unset in the file but parsed as %v", *c.ModelProxy)
+	}
+}
+
 func TestLoad_parsesFields(t *testing.T) {
 	path := write(t, `
 addr: 0.0.0.0:9000
@@ -517,5 +534,64 @@ func TestLoad_parsesEffort(t *testing.T) {
 	}
 	if c.Effort != "max" {
 		t.Errorf("effort=%q, want max", c.Effort)
+	}
+}
+
+func TestLoad_parsesEgressPolicies(t *testing.T) {
+	c, err := Load(write(t, `
+egress_policies:
+  metadata:
+    allow:
+      - API.Ecosyste.ms:443
+      - "*.example.com:8443"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.EgressPolicies["metadata"].Allow
+	if len(got) != 2 || got[0] != "API.Ecosyste.ms:443" || got[1] != "*.example.com:8443" {
+		t.Errorf("egress_policies.metadata.allow = %v", got)
+	}
+}
+
+func TestLoad_rejectsInvalidEgressPolicies(t *testing.T) {
+	entry := func(e string) string {
+		return "egress_policies:\n  metadata:\n    allow: ['" + e + "']\n"
+	}
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"missing port", entry("api.ecosyste.ms"), "host:port"},
+		{"scheme", entry("https://api.ecosyste.ms:443"), "without a scheme"},
+		{"path", entry("api.ecosyste.ms:443/x"), "without a scheme"},
+		{"userinfo", entry("user@api.ecosyste.ms:443"), "without a scheme"},
+		{"ipv4", entry("10.0.0.1:443"), "IP"},
+		{"ipv4 shorthand", entry("127.1:443"), "IP"},
+		{"ipv6", entry("[::1]:443"), "host:port"},
+		{"bare ipv6", entry("::1:443"), "host:port"},
+		{"localhost", entry("localhost:443"), "local or host"},
+		{"localhost suffix", entry("app.localhost:443"), "local or host"},
+		{"host gateway", entry("Host.Docker.Internal:8080"), "local or host"},
+		{"wildcard covering host gateway", entry("*.docker.internal:443"), "local or host"},
+		{"wildcard internal", entry("*.internal:443"), "local or host"},
+		{"wildcard localhost", entry("*.localhost:443"), "local or host"},
+		{"port zero", entry("api.ecosyste.ms:0"), "invalid port"},
+		{"port range", entry("api.ecosyste.ms:70000"), "invalid port"},
+		{"port text", entry("api.ecosyste.ms:https"), "invalid port"},
+		{"bad host", entry("bad_host.example.com:443"), "DNS hostname"},
+		{"empty skill", "egress_policies:\n  '':\n    allow: ['a.example.com:443']\n", "skill name"},
+		{"empty allow", "egress_policies:\n  metadata:\n    allow: []\n", "at least one"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(write(t, tc.yaml))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Load error = %v, want text %q", err, tc.want)
+			}
+			if !strings.Contains(err.Error(), "egress_policies.") && tc.name != "empty skill" {
+				t.Errorf("error %q lacks the egress_policies.<skill>.allow prefix", err)
+			}
+		})
 	}
 }

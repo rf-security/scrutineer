@@ -122,12 +122,14 @@ func (w *Worker) doExposure(ctx context.Context, scan *db.Scan, emit func(Event)
 	}
 
 	skillDir := w.Runner.SkillDir(workRoot, skill.Name)
-	// stageSkill clears skillDir, so it runs before stageContext, which
-	// writes context.json into that directory (#499).
 	if err := stageSkill(&skill, workRoot, skillDir); err != nil {
 		return "", fmt.Errorf("stage skill: %w", err)
 	}
-	if err := stageContext(workRoot, skillDir, w.apiBaseFor(skill.Name), w.ForkOrg, w.metadataDir(), scan, &scan.Repository); err != nil {
+	document, err := buildSkillContext(w.apiBaseFor(skill.Name), w.ForkOrg, w.metadataDir(), scan, &scan.Repository, nil, nil, nil)
+	if err != nil {
+		return "", fmt.Errorf("build context: %w", err)
+	}
+	if err := writeSkillContext(workRoot, skillDir, document); err != nil {
 		return "", fmt.Errorf("stage context: %w", err)
 	}
 
@@ -153,6 +155,7 @@ func (w *Worker) doExposure(ctx context.Context, scan *db.Scan, emit func(Event)
 		RequiresProfile: skill.RequiresProfile,
 	}
 	w.applyResume(scan, &sj, emit)
+	w.configureCapabilityPreflight(ctx, scan, &skill, &sj, document)
 	res, err := w.Runner.RunSkill(ctx, sj, emit)
 	w.applySkillResult(scan, res)
 	if err != nil {

@@ -204,6 +204,16 @@
 #   - artifactory.internal
 #   - "*.mycorp.net"
 
+# Per-skill egress under --hardened. egress_allow is ignored there, so grant a
+# named skill exact host:port pairs instead. The port is required and enforced;
+# every other skill keeps the strict allowlist. Needs hardened: true. See
+# docs/egress-policies.md.
+# egress_policies:
+#   metadata:
+#     allow:
+#       - packages.ecosyste.ms:443
+#       - repos.ecosyste.ms:443
+
 # Enrich repositories from ecosyste.ms: the per-repository cache refreshed
 # before each scan, the eager warm when a repository is added, and the PURL to
 # repository resolution behind SBOM and dependency import. false stops every
@@ -229,6 +239,9 @@
 # marked failed. Go duration syntax ("30m", "1h30m", "2h").
 # scan_timeout: 1h
 
+# Opt-in live backend probes consume tokens; cache successful checks for this duration.
+# backend_preflight_ttl: 1h
+
 # Global --max-turns passed to claude-code. 0 (default) defers to the
 # per-skill value (scrutineer.max_turns in SKILL.md metadata, default 30).
 # When set, acts as a fallback for skills that don't declare their own cap.
@@ -250,6 +263,11 @@
 # to the ANTHROPIC_BASE_URL environment variable when empty.
 # model_base_url: https://my-proxy.corp.com/v1
 
+# Keep ANTHROPIC_API_KEY on the host. Each container scan gets a short-lived
+# token for a host-side Anthropic API proxy instead of the key itself. Claude
+# backend with API-key auth only; see docs/model-proxy.md.
+# model_proxy: false
+
 # Claude subscription rate-limit auto-resume needs no configuration. Reset times
 # come from claude-code stream output; latest window status appears on /usage.
 
@@ -259,6 +277,12 @@
 # Off by default; only a subscription token reports overage, so it is inert on
 # an API key. The switch is logged and shown on the jobs page and /usage. Flag: -downgrade-on-overage.
 # downgrade_on_overage: false
+
+# Stop active model scans and pause queued work when Claude reports subscription
+# overage, instead of continuing on a cheaper model. Takes precedence over
+# downgrade_on_overage. Reliable resets auto-resume policy-paused work; missing
+# or implausible reset times require operator action. Flag: -pause-on-overage.
+# pause_on_overage: false
 
 # The model picker in the UI. Replacing this list replaces the built-in
 # set (Opus, Sonnet, Fable). Leave it out to keep the built-in list. tier:

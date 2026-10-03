@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/verification"
 )
 
 func TestVerificationFeedbackContextAndRecipe(t *testing.T) {
@@ -14,7 +16,11 @@ func TestVerificationFeedbackContextAndRecipe(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			scan := db.Scan{SkillName: name, FindingID: new(uint(1)), VerificationFeedback: "Check the first-party parser"}
 			dir := t.TempDir()
-			if err := stageContext(dir, "", "", "", "", &scan, &db.Repository{}); err != nil {
+			document, err := buildSkillContext("", "", "", &scan, &db.Repository{}, nil, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := writeSkillContext(dir, "", document); err != nil {
 				t.Fatal(err)
 			}
 			raw, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -37,6 +43,20 @@ func TestVerificationFeedbackContextAndRecipe(t *testing.T) {
 				if err := json.Unmarshal([]byte(raw), &recipe); err != nil || recipe.VerificationFeedback != scan.VerificationFeedback {
 					t.Fatalf("recipe dropped feedback: %s err=%v", raw, err)
 				}
+			}
+		})
+	}
+}
+
+func TestBuildSkillContextRejectsInvalidVerificationFeedback(t *testing.T) {
+	for name, feedback := range map[string]string{
+		"too long":     strings.Repeat("x", verification.MaxFeedbackBytes+1),
+		"invalid UTF8": string([]byte{0xff}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			scan := db.Scan{SkillName: verifySkillName, FindingID: new(uint(1)), VerificationFeedback: feedback}
+			if _, err := buildSkillContext("", "", "", &scan, &db.Repository{}, nil, nil, nil); err == nil {
+				t.Fatal("invalid verification feedback accepted")
 			}
 		})
 	}

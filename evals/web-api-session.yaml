@@ -1,0 +1,12 @@
+given: a cookie-authenticated account service updates contact email through a navigation endpoint
+fixture: fixtures/web-api-app
+skill: audit-web
+should_find:
+  - cwe: CWE-352
+    path: services/site/server.py
+    evidence_contains:
+      - /api/email
+      - SameSite
+    required: true
+should_not_find:
+  - finding: cross-site request forgery in the display-name update protected by Origin and a session-bound token

@@ -35,17 +35,30 @@ jobs:
       - name: Test runner image resolver
         run: scripts/wait-for-runner-image_test.sh
 
+      - name: Test build-command retries
+        run: scripts/retry-build-command_test.sh
+
+      - name: Test runner CLI version pins
+        run: scripts/check-runner-cli-version-pins_test.sh
+
   tests:
     name: tests (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
-        platform: ["ubuntu-24.04", "macos-26"]
+        platform: ["ubuntu-24.04", "macos-26", "windows-latest"]
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 30
     permissions:
       contents: read
     steps:
+      # Git for Windows refuses paths past 260 characters unless core.longpaths
+      # is on; the per-scan cache paths the worker tests build under TempDir go
+      # well past that.
+      - name: Configure Git for Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
       - name: Set up Git repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,11 +77,13 @@ jobs:
         id: go-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          # ~/.cache/go-build is Go's build cache on Linux; ~/Library/Caches/go-build
-          # is its macOS equivalent. Paths that don't exist on a platform are skipped.
+          # ~/.cache/go-build is Go's build cache on Linux, ~/Library/Caches/go-build
+          # its macOS equivalent and ~/AppData/Local/go-build the Windows one. Paths
+          # that don't exist on a platform are skipped.
           path: |
             ~/.cache/go-build
             ~/Library/Caches/go-build
+            ~/AppData/Local/go-build
             ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ github.job }}-${{ hashFiles('go.sum') }}
           restore-keys: |
@@ -102,6 +117,14 @@ jobs:
       - name: Vet podman integration tests
         run: go vet -tags podman ./...
 
+      # The release artifact for Windows is cross-compiled on Linux, so this is
+      # the only leg that runs scrutineer.exe on a Windows host at all.
+      - name: Smoke-test the Windows binary
+        if: runner.os == 'Windows'
+        run: |
+          go build -o "${RUNNER_TEMP}/scrutineer.exe" ./cmd/scrutineer
+          "${RUNNER_TEMP}/scrutineer.exe" --version | grep -F 'scrutineer '
+
       - name: Save Go caches
         if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -109,6 +132,7 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/Library/Caches/go-build
+            ~/AppData/Local/go-build
             ~/go/pkg/mod
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
 
@@ -183,7 +207,7 @@ jobs:
             ${{ runner.os }}-go-${{ github.job }}-
 
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+        run: sh scripts/retry-build-command.sh go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
       - name: Scan for known vulnerabilities
         run: govulncheck ./...
@@ -220,7 +244,7 @@ jobs:
   conclusion:
     name: conclusion
     needs: [release-logic, tests, lint, vuln, zizmor]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-slim
     timeout-minutes: 15
     permissions: {}

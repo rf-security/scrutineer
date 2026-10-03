@@ -105,9 +105,10 @@ func TestBuildRunArgsForProviderScopesEnvironmentAndState(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "unrelated-openai-secret")
 	t.Setenv("ANTHROPIC_API_KEY", "unrelated-anthropic-secret")
 	d := ContainerRunner{Harness: OpencodeHarness{}, SELinuxRelabel: true}
+	stateDir := filepath.Join(t.TempDir(), "kiro")
 	provider := opencodeProvider{
 		ID:         "kiro",
-		StateDir:   "/state/kiro",
+		StateDir:   stateDir,
 		Configured: true,
 		Env: map[string]string{
 			"KIRO_API_KEY":            "kiro-secret",
@@ -131,7 +132,7 @@ func TestBuildRunArgsForProviderScopesEnvironmentAndState(t *testing.T) {
 			t.Errorf("container args inherited unrelated key %s: %v", key, args)
 		}
 	}
-	if !hasAdjacent(args, "-v", "/state/kiro/opencode/auth.json:/harness-state/data/opencode/auth.json:z") {
+	if !hasAdjacent(args, "-v", filepath.Join(stateDir, "opencode", "auth.json")+":/harness-state/data/opencode/auth.json:z") {
 		t.Errorf("provider auth mount missing: %v", args)
 	}
 	if !hasAdjacent(args, "-e", "XDG_DATA_HOME=/harness-state/data") {
@@ -174,6 +175,7 @@ func TestEnsureOpencodeProviderStateRejectsOtherCredentials(t *testing.T) {
 }
 
 func TestEnsureOpencodeProviderStateRejectsBroadPermissions(t *testing.T) {
+	skipOnWindows(t, "directory modes carry no POSIX group/other bits on Windows")
 	state := t.TempDir()
 	if err := os.Chmod(state, 0o755); err != nil {
 		t.Fatal(err)
@@ -222,7 +224,7 @@ func TestConfigureOpencodeProviderEgressScopesHostProxyToSelectedProvider(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, cleanup, err := d.configureOpencodeProviderEgress(provider)
+	got, cleanup, err := d.configureOpencodeProviderEgress(provider, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +283,7 @@ func TestConfigureOpencodeProviderEgressOpensHostPort(t *testing.T) {
 	if provider.HostPort != hostPort || !provider.Configured {
 		t.Fatalf("resolved provider = %+v", provider)
 	}
-	got, cleanup, err := d.configureOpencodeProviderEgress(provider)
+	got, cleanup, err := d.configureOpencodeProviderEgress(provider, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +329,7 @@ func TestConfigureOpencodeProviderEgressScopesSidecarToSelectedProvider(t *testi
 		Configured:  true,
 		EgressHosts: []string{"runtime.us-east-1.kiro.dev"},
 	}
-	got, cleanup, err := d.configureOpencodeProviderEgress(provider)
+	got, cleanup, err := d.configureOpencodeProviderEgress(provider, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,7 +379,7 @@ func TestCheckOpencodeReadinessFindsExactModel(t *testing.T) {
 
 func TestCheckOpencodeReadinessProbesHostPort(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "invocations")
-	runtime := writeFakeRuntime(t, "#!/bin/sh\necho \"$*\" >> "+log+"\ncase \"$*\" in *host.docker.internal:11434*) exit 0;; *' opencode models '*) printf 'ollama/llama3.3\\n';; esac\n")
+	runtime := writeFakeRuntime(t, "#!/bin/sh\necho \"$*\" >> \""+filepath.ToSlash(log)+"\"\ncase \"$*\" in *host.docker.internal:11434*) exit 0;; *' opencode models '*) printf 'ollama/llama3.3\\n';; esac\n")
 	d := ContainerRunner{
 		Harness:           OpencodeHarness{},
 		Runtime:           ContainerRuntime{Bin: runtime},
@@ -445,7 +447,7 @@ func TestCheckOpencodeReadinessReportsMissingSupportingBinary(t *testing.T) {
 
 func TestCheckOpencodeReadinessProbesOncePerCheck(t *testing.T) {
 	log := filepath.Join(t.TempDir(), "invocations")
-	runtime := writeFakeRuntime(t, "#!/bin/sh\necho x >> "+log+"\ncase \"$*\" in *provider-readiness*) exit 0;; esac\nprintf 'kiro/auto\\n'\n")
+	runtime := writeFakeRuntime(t, "#!/bin/sh\necho x >> \""+filepath.ToSlash(log)+"\"\ncase \"$*\" in *provider-readiness*) exit 0;; esac\nprintf 'kiro/auto\\n'\n")
 	d := ContainerRunner{Harness: OpencodeHarness{}, Runtime: ContainerRuntime{Bin: runtime}}
 	provider := opencodeProvider{
 		ID:               "kiro",
@@ -508,11 +510,7 @@ func TestOpencodeStateLockSerialisesSharedStateDir(t *testing.T) {
 
 func writeFakeRuntime(t *testing.T, script string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "fake-runtime")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	return path
+	return writeFakeBin(t, t.TempDir(), "fake-runtime", script)
 }
 
 func TestClassifyOpencodeReadinessErrors(t *testing.T) {
@@ -596,9 +594,7 @@ func TestRunnerImageContentDigestParsesAppleInspectJSON(t *testing.T) {
 	// the digest is read from configuration.descriptor.digest with id as the
 	// fallback for locally built images.
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "container"), []byte("#!/bin/sh\ncase \"$*\" in *no-descriptor*) printf '[{\"id\":\"sha256:localid\"}]';; *) printf '[{\"id\":\"sha256:localid\",\"configuration\":{\"descriptor\":{\"digest\":\"sha256:def\"}}}]';; esac\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBin(t, dir, "container", "#!/bin/sh\ncase \"$*\" in *no-descriptor*) printf '[{\"id\":\"sha256:localid\"}]';; *) printf '[{\"id\":\"sha256:localid\",\"configuration\":{\"descriptor\":{\"digest\":\"sha256:def\"}}}]';; esac\n")
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	if got := runnerImageContentDigest(t.Context(), ContainerRuntime{Bin: runtimeApple}, "provider:1"); got != "sha256:def" {
 		t.Errorf("apple runner image digest = %q, want sha256:def", got)

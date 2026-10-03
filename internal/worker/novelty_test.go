@@ -15,6 +15,7 @@ import (
 	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/db/dbtest"
 	"scrutineer/internal/testutil"
 )
 
@@ -48,10 +49,14 @@ func TestNoveltyContextStagesBoundedChangedFileEvidence(t *testing.T) {
 	fixture.requirePersisted(t, db.FindingNoveltyUnclear, head)
 
 	scan := fixture.scan(head)
-	if err := stageContextWithInputs(
-		fixture.workRoot, "", "http://127.0.0.1:8080/api", "", DefaultMetadataDir,
+	document, err := buildSkillContext(
+		"http://127.0.0.1:8080/api", "", DefaultMetadataDir,
 		scan, &fixture.repo, nil, got, nil,
-	); err != nil {
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(fixture.workRoot, "", document); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(fixture.workRoot, "context.json"))
@@ -220,10 +225,7 @@ func newNoveltyFixture(t *testing.T) noveltyFixture {
 	}
 	base := gitCommit(t, src, "add vulnerable parser")
 
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "novelty.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "file://" + src, Name: "fixture"}
 	if err := gdb.Create(&repo).Error; err != nil {
 		t.Fatal(err)

@@ -112,8 +112,8 @@ func (s *Server) bundleEntriesAt(f *db.Finding, repo *db.Repository, generatedAt
 	if err := s.DB.Where("finding_id = ?", f.ID).Order("id desc").Find(&refs).Error; err != nil {
 		return nil, fmt.Errorf("load references: %w", err)
 	}
-	var pkgs []db.Package
-	if err := s.DB.Where("repository_id = ?", f.RepositoryID).Find(&pkgs).Error; err != nil {
+	pkgs, err := findingAdvisoryPackages(s.DB, *f, nil)
+	if err != nil {
 		return nil, fmt.Errorf("load packages: %w", err)
 	}
 	var fdRows []db.FindingDependent

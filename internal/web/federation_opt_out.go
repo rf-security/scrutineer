@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -77,10 +78,16 @@ func (s *Server) stopScansForOptOut(repoID uint) error {
 		Find(&running).Error; err != nil {
 		return err
 	}
+	// Attempt every running scan so one failed audit write does not leave the
+	// rest running, then report the failures: an opt-out whose sweep could not
+	// stop a scan must not be reported as complete.
+	var errs []error
 	for i := range running {
-		s.cancelScan(&running[i], worker.OptOutCancelReason)
+		if _, err := s.cancelScanWithAudit(&running[i], worker.OptOutCancelReason); err != nil {
+			errs = append(errs, fmt.Errorf("stop scan %d: %w", running[i].ID, err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // lockRepoFederation takes one repository's federation section and returns its

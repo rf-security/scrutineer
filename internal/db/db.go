@@ -110,6 +110,11 @@ type Repository struct {
 	Posture        string `gorm:"index"`
 	PostureSummary string
 
+	// BaselineLevel is the highest OpenSSF Baseline level (1-3) whose
+	// applicable controls all passed on the latest compliance run, 0 when
+	// none did or the skill has not run. Overwritten on each compliance run.
+	BaselineLevel int
+
 	// Health is the evidence-based maintenance classification: active, stale,
 	// abandoned, or zombie. Empty means there is not yet enough evidence to
 	// make a classification.
@@ -311,8 +316,8 @@ type Scan struct {
 	FocusArea string `gorm:"type:text"`
 
 	// TriageScanID identifies the triage invocation that requested this scan.
-	// ExplorationMode is empty for planned audits; random-dig audits choose
-	// ExplorationPath from the filtered checkout without using the threat model.
+	// ExplorationMode is empty for planned audits. ExplorationPath records the
+	// source directory selected for a random dig or adversarial sweep.
 	TriageScanID    *uint `gorm:"index"`
 	ExplorationMode string
 	ExplorationPath string
@@ -441,10 +446,9 @@ type Scan struct {
 	// Nil means a manual pause or an account pause without a reported reset.
 	PausedUntil *time.Time `gorm:"index"`
 
-	// ImportPayload carries the raw uploaded report for an ingest-skill
-	// run created by the /v1/import fallback. The worker stages it into
-	// the workspace at import/report before the skill starts. Empty for
-	// every other scan.
+	// ImportPayload carries an uploaded ingest report or a host-generated
+	// reflection transcript snapshot. The worker stages these immutable input
+	// bytes at import/report before the skill starts. Empty for other scans.
 	ImportPayload []byte
 
 	FindingsCount int
@@ -1293,28 +1297,47 @@ type AuditEvent struct {
 	CreatedAt   time.Time     `gorm:"index:idx_audit_events_kind_created_at,priority:2"`
 }
 
+// ScanPreflightReceipt pins a live probe to the immutable claim-time recipe.
+// Rows are append-only for the lifetime of the scan.
+type ScanPreflightReceipt struct {
+	ID           uint   `gorm:"primarykey"`
+	ScanID       uint   `gorm:"not null;uniqueIndex:idx_scan_preflight_probe"`
+	ProbeID      string `gorm:"not null;uniqueIndex:idx_scan_preflight_probe"`
+	RecipeSHA256 string
+	Report       string `gorm:"type:text;not null"`
+	CreatedAt    time.Time
+}
+
 // FindingReview is a structured human verdict against an automation
 // outcome. Verdict mirrors the revalidate skill's enum so reviewer
 // agreement with the model can be measured directly. AutomatedOutcome
 // snapshots what the automation said about this finding at the moment
 // of review (typically the last revalidate verdict; empty when no
-// automation has spoken yet). This is the data behind the audit queue
+// automation has spoken yet or the decision does not assess automation).
+// This is the data behind the audit queue
 // in internal/web/audit.go: surfacing recently auto-bucketed findings
 // without lasting marks of human review, so the TOC can confirm the
 // automation is calibrated and so the agreement rate is computable.
 type FindingReview struct {
-	ID        uint   `gorm:"primarykey"`
-	FindingID uint   `gorm:"index;not null"`
-	Verdict   string `gorm:"index"` // true_positive | false_positive | already_fixed | uncertain
-	Reason    string `gorm:"type:text"`
+	ID        uint   `gorm:"primarykey" json:"id"`
+	FindingID uint   `gorm:"index;not null" json:"finding_id"`
+	Verdict   string `gorm:"index" json:"verdict"` // true_positive | false_positive | already_fixed | uncertain
+	Reason    string `gorm:"type:text" json:"reason"`
 	// AutomatedOutcome is the automation verdict (revalidate's) the
 	// human is judging. Empty when revalidate has not run on this
-	// finding; agreement metrics ignore reviews with empty automated
+	// finding or the decision does not assess automation (rejection dialog);
+	// agreement metrics ignore reviews with empty automated
 	// outcomes since there is nothing to compare to.
-	AutomatedOutcome string `gorm:"index"`
-	Reviewer         string
+	AutomatedOutcome string `gorm:"index" json:"automated_outcome"`
+	Reviewer         string `json:"reviewer"`
+	// Snapshot the observation being reviewed; later rescans may move the case.
+	SourceScanID       uint   `json:"source_scan_id"`
+	SourceCommit       string `json:"source_commit"`
+	FindingFingerprint string `json:"finding_fingerprint"`
+	FindingPath        string `gorm:"index" json:"finding_path"`
+	CWE                string `json:"cwe"`
 
-	CreatedAt time.Time
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // FindingVerification is one immutable grading record produced by a
@@ -1464,6 +1487,10 @@ type Skill struct {
 	// never enqueued for the repo is treated as satisfied so gating
 	// decisions in triage do not deadlock dependent skills.
 	Requires string `gorm:"type:text"`
+	// Runtime capabilities checked before spending any model turns.
+	RequiresCommands string `gorm:"type:text"`
+	RequiresFeatures string `gorm:"type:text"`
+	DegradedMode     bool
 
 	Source     string // "bundled" | "local" | "remote" | "ui"
 	SourcePath string // directory on disk (bundled/local/remote) or empty (ui)
@@ -1659,19 +1686,32 @@ func OpenBackend(opts Options) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := migrateSchema(gdb); err != nil {
+		if sqldb, dbErr := gdb.DB(); dbErr == nil {
+			_ = sqldb.Close()
+		}
+		return nil, err
+	}
+	return gdb, nil
+}
+
+// migrateSchema brings gdb up to databaseSchemaVersion. The PRAGMA-based
+// schema version stamp is SQLite-only and is skipped on PostgreSQL.
+func migrateSchema(gdb *gorm.DB) error {
 	isSQLite := gdb.Name() != string(DialectPostgres)
 	foundSchemaVersion := databaseSchemaVersion
 	if isSQLite {
+		var err error
 		foundSchemaVersion, err = checkDatabaseSchemaVersion(gdb)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if err := preMigrate(gdb); err != nil {
-		return nil, fmt.Errorf("premigrate: %w", err)
+		return fmt.Errorf("premigrate: %w", err)
 	}
 	if err := migrate(gdb); err != nil {
-		return nil, fmt.Errorf("automigrate: %w", err)
+		return fmt.Errorf("automigrate: %w", err)
 	}
 	gdb.Exec(`CREATE INDEX IF NOT EXISTS idx_scans_priority_id ON scans (status_priority, id DESC)`)
 	// Subproject identity is (repository_id, path): the upsert in
@@ -1689,10 +1729,10 @@ func OpenBackend(opts Options) (*gorm.DB, error) {
 	}
 	if isSQLite && foundSchemaVersion < databaseSchemaVersion {
 		if err := gdb.Exec(fmt.Sprintf("PRAGMA user_version = %d", databaseSchemaVersion)).Error; err != nil {
-			return nil, fmt.Errorf("record database schema version: %w", err)
+			return fmt.Errorf("record database schema version: %w", err)
 		}
 	}
-	return gdb, nil
+	return nil
 }
 
 // models is the full set AutoMigrate manages, parents ahead of children.
@@ -1702,10 +1742,10 @@ func models() []any {
 	return []any{
 		&Repository{}, &Scan{},
 		&Finding{}, &FindingLabel{}, &FindingNote{},
-		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{}, &FindingVerification{}, &FindingAttackPath{},
+		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{}, &FindingVerification{}, &FindingAttackPath{}, &ScanPreflightReceipt{},
 		&RemediationAttempt{}, &RemediationValidation{}, &AuditEvent{},
 		&Dependency{}, &ExpectedFinding{}, &Package{}, &PackageAlternative{}, &Dependent{}, &FindingDependent{}, &Advisory{}, &AdvisoryAudit{},
-		&Maintainer{}, &Skill{}, &Subproject{},
+		&Maintainer{}, &Skill{}, &Subproject{}, &ComplianceControl{},
 		&SBOMUpload{}, &SBOMPackage{}, &CNA{}, &Setting{},
 		&Conversation{}, &ChatMessage{}, &InterchangeRecord{},
 	}
@@ -2107,6 +2147,34 @@ type CNA struct {
 	FetchedAt *time.Time
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// ComplianceControl is one OpenSSF Baseline control verdict from the latest
+// compliance run on a repository. The repository's set is replaced wholesale
+// on each run; Repository.BaselineLevel is derived from it at write time.
+type ComplianceControl struct {
+	ID           uint `gorm:"primarykey"`
+	RepositoryID uint `gorm:"index;not null"`
+	ScanID       uint `gorm:"index"`
+	// ControlID is the Baseline identifier, e.g. "OSPS-AC-01.01"; the
+	// category is its second segment.
+	ControlID string `gorm:"not null"`
+	Level     int
+	// Status is one of ComplianceStatuses. PENDING_LLM means darnit deferred
+	// the control to LLM analysis and the agent left it unresolved.
+	Status  string `gorm:"index"`
+	Details string `gorm:"type:text"`
+	// Source is "darnit" when the verdict is the tool's own and "agent" when
+	// the scan's model resolved a control darnit had deferred or could not
+	// verify.
+	Source    string
+	CreatedAt time.Time
+}
+
+// ComplianceStatuses is the closed set a ComplianceControl.Status may take,
+// mirroring darnit's sieve result statuses.
+var ComplianceStatuses = map[string]bool{
+	"PASS": true, "FAIL": true, "WARN": true, "NA": true, "ERROR": true, "PENDING_LLM": true,
 }
 
 // Subproject is a scannable unit the subprojects skill discovered inside

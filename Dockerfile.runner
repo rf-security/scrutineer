@@ -7,36 +7,40 @@
 # update the selected asset and checksum atomically. A mismatched tag/digest in
 # a Renovate PR fails sha256sum below and usually means asset identification
 # failed upstream.
-ARG CLAUDE_AMD64_LOCK=v2.1.266@sha256:80e04708880470c6d566a414fbc55c52059631feb7cc54537d1d4b39786b20d9
-ARG CLAUDE_ARM64_LOCK=v2.1.266@sha256:88b299b5854d00a2788131d312f06c436fac5e58a014e06c7566587d759bb4f8
+ARG CLAUDE_AMD64_LOCK=v2.1.282@sha256:2972e823268974dd084734d5f69fedc227eb4cb3bc9c398ceb7776280e836991
+ARG CLAUDE_ARM64_LOCK=v2.1.282@sha256:62ed261b4ad0838eac468f119524ba58502bc09da8152eddce9194229ba20ac3
 
-ARG CODEX_AMD64_LOCK=rust-v0.154.0@sha256:fc6e3e3b85f2cf7d664520ee5c66a7fe4aa12bae7d46834f47e2f165fd0d6f78
-ARG CODEX_ARM64_LOCK=rust-v0.154.0@sha256:97d93e11df72d3c26772db019e6ea8bb72c246500d46b98c760839f3240355e6
+ARG CODEX_AMD64_LOCK=rust-v0.156.1@sha256:8b711520beddf385467b8da4d2c93736637c6ba1e46811cf0d8606b7c490b6f6
+ARG CODEX_ARM64_LOCK=rust-v0.156.1@sha256:fdd47ed6aade0360796fd3f6f95a45096f327c15e19e8c7339f9dc5633041786
 
-ARG OPENCODE_AMD64_LOCK=v1.18.30@sha256:55007246858165496ff85ba1c2b648f7421e8e2013bf4189a680c9ff8e699d17
-ARG OPENCODE_ARM64_LOCK=v1.18.30@sha256:4111a55c2a02c0fac314bd51e9a2330280e6d29d2b85b9554fff6d62612566ed
+ARG OPENCODE_AMD64_LOCK=v1.18.32@sha256:3046e0404fdc60fb80307e7a47824ba07477364178a4d09baa8548496dd6d43b
+ARG OPENCODE_ARM64_LOCK=v1.18.32@sha256:568461b7d4d8c19865c97e9a1102e613049c6039d01fe772154de873c1865840
 
-ARG COPILOT_AMD64_LOCK=v1.0.83@sha256:ffbe1c429664b8a05efed67ecdb467123e40fcaa3c6c14ef9a98ba74da4687b7
-ARG COPILOT_ARM64_LOCK=v1.0.83@sha256:213b3a267042dbac3cd8ae22c82f5ea04ff3cabc008108c0f895055d46be4473
+ARG COPILOT_AMD64_LOCK=v1.0.88@sha256:42f40c08ff8a8ff78522161e4b5e2b86340ad8bb0853a5f1aa64ce65b48d007b
+ARG COPILOT_ARM64_LOCK=v1.0.88@sha256:e263f5f9eb0db5dddf5775ac98c437e27743857ce0ba310f08f2338aebd1107d
 
-ARG SEMGREP_VERSION=1.176.1
+ARG SEMGREP_VERSION=1.178.0
 
 ARG BANDIT_VERSION=1.9.4
+ARG DARNIT_VERSION=0.1.0
 
-FROM golang:1.27.1-trixie@sha256:9baa6b4187bbb98d240372a8a235ac0bb6b5ddd52bba1431dc2f7c0705862728 AS go-tools
+FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183 AS go-tools
 
-RUN GOBIN=/out go install github.com/git-pkgs/git-pkgs@v0.20.0
+COPY scripts/retry-build-command.sh /usr/local/bin/retry-build-command.sh
+# Go proxy/checksum requests can fail transiently.
+ARG BETTERLEAKS_VERSION=v1.8.1
+RUN GOBIN=/out CGO_ENABLED=0 sh /usr/local/bin/retry-build-command.sh go install -ldflags "-X=github.com/betterleaks/betterleaks/version.Version=${BETTERLEAKS_VERSION}" github.com/betterleaks/betterleaks@${BETTERLEAKS_VERSION}
+RUN GOBIN=/out sh /usr/local/bin/retry-build-command.sh go install github.com/git-pkgs/git-pkgs@v0.20.0
+RUN GOBIN=/out sh /usr/local/bin/retry-build-command.sh go install github.com/git-pkgs/brief/cmd/brief@v0.14.0
 
-RUN GOBIN=/out go install github.com/git-pkgs/brief/cmd/brief@v0.13.0
-
-FROM rust:1.98-trixie@sha256:bf5a9aa29062a6cb03c49bd59a46eb55e3cc770caf598a221a7866e500be3082 AS zizmor-build
+FROM rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS zizmor-build
 ENV CARGO_HTTP_MULTIPLEXING=false
 RUN cargo install --locked --root /out zizmor@1.30.1
 
 # The runner image carries the proxy commands used by Scrutineer and by
 # harness/container consumers. Both are built CGO-free so they can be copied
 # into the slim runtime without a glibc dependency.
-FROM golang:1.27.1-trixie@sha256:9baa6b4187bbb98d240372a8a235ac0bb6b5ddd52bba1431dc2f7c0705862728 AS scrutineer-build
+FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183 AS scrutineer-build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -55,6 +59,7 @@ ARG COPILOT_AMD64_LOCK
 ARG COPILOT_ARM64_LOCK
 ARG SEMGREP_VERSION
 ARG BANDIT_VERSION
+ARG DARNIT_VERSION
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -71,12 +76,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && apt-get update && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
 
-# semgrep and bandit in venvs so PEP 668 doesn't require
-# --break-system-packages. They get one each rather than sharing: the two are
+# semgrep, bandit and darnit in venvs so PEP 668 doesn't require
+# --break-system-packages. They get one each rather than sharing: the three are
 # pinned and bumped independently, and a shared environment would let a
-# semgrep bump drag bandit's dependencies with it.
-# Smoke-test required CLIs at build time so missing packages or broken venv
-# symlinks fail the image build instead of later scan jobs.
+# semgrep bump drag the others' dependencies with it.
+# darnit-mcp is a metapackage whose dependencies carry no version, so the
+# packages the audit runs (darnit-core, darnit-baseline) are pinned with it.
+# darnit's 0.1.0 wheel ships without openssf-baseline.toml, which
+# get_framework_config_path resolves two directories above the package (three
+# above its own module file), next to the templates/ the TOML loads relative
+# to itself; the release sdist carries both, so they are taken from there.
+# cel-python's c7nlib imports packaging without declaring it.
+# Smoke-test required CLIs at build time so missing packages, broken venv
+# symlinks or a misplaced framework TOML fail the image build instead of
+# later scan jobs.
 RUN python3 -m venv /opt/semgrep && \
     /opt/semgrep/bin/pip install --no-cache-dir "semgrep==${SEMGREP_VERSION}" "setuptools<81" && \
     ln -s /opt/semgrep/bin/semgrep /usr/local/bin/semgrep && \
@@ -84,6 +97,15 @@ RUN python3 -m venv /opt/semgrep && \
     python3 -m venv /opt/bandit && \
     /opt/bandit/bin/pip install --no-cache-dir "bandit==${BANDIT_VERSION}" && \
     ln -s /opt/bandit/bin/bandit /usr/local/bin/bandit && \
+    python3 -m venv /opt/darnit && \
+    /opt/darnit/bin/pip install --no-cache-dir "darnit-mcp==${DARNIT_VERSION}" "darnit-core==${DARNIT_VERSION}" "darnit-baseline==${DARNIT_VERSION}" packaging && \
+    ln -s /opt/darnit/bin/darnit /usr/local/bin/darnit && \
+    darnit_lib="$(/opt/darnit/bin/python -c 'import darnit_baseline, pathlib; print(pathlib.Path(darnit_baseline.__file__).parent.parent.parent)')" && \
+    /opt/darnit/bin/pip download --no-cache-dir --no-deps --no-binary :all: -d /tmp/darnit-sdist "darnit-baseline==${DARNIT_VERSION}" && \
+    tar -xzf "/tmp/darnit-sdist/darnit_baseline-${DARNIT_VERSION}.tar.gz" -C "${darnit_lib}" --strip-components=1 \
+        "darnit_baseline-${DARNIT_VERSION}/openssf-baseline.toml" "darnit_baseline-${DARNIT_VERSION}/templates" && \
+    rm -rf /tmp/darnit-sdist && \
+    darnit validate "${darnit_lib}/openssf-baseline.toml" && \
     python3 --version && \
     jq --version && \
     jsonschema --version && \
@@ -91,7 +113,8 @@ RUN python3 -m venv /opt/semgrep && \
     gh --version && \
     semgrep --version && \
     pysemgrep --version && \
-    bandit --version
+    bandit --version && \
+    darnit --version
 
 ARG TARGETARCH
 RUN set -eux; \

@@ -18,11 +18,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"scrutineer/internal/egressgrant"
 )
 
 const DefaultRunnerImage = "ghcr.io/alpha-omega-security/scrutineer-runner:latest"
@@ -60,7 +62,7 @@ type ContainerRunner struct {
 	// read-only rootfs, no-new-privileges, and the post-clone workspace cap --
 	// WITHOUT the per-scan --internal network. This is the fallback when a host
 	// cannot support the sidecar needed for full --hardened. The always-on
-	// baseline (--cap-drop ALL, non-root --user, the /tmp tmpfs) applies
+	// baseline (--cap-drop ALL, the /tmp tmpfs, --user except on Windows) applies
 	// regardless of this field. --hardened already implies all of these. The
 	// read-only rootfs can break
 	// custom profile images that write outside /work and /tmp.
@@ -86,6 +88,9 @@ type ContainerRunner struct {
 	// a short-lived in-process proxy for one configured OpenCode provider. The
 	// process-wide proxy never receives provider-specific hosts.
 	ProviderProxy ScopedEgressProxyConfig
+	// EgressPolicies are the per-skill egress grants, keyed by skill name.
+	// They come from operator config only and apply under --hardened.
+	EgressPolicies map[string][]EgressGrant
 	// OpencodeProviders contains provider-scoped images, credentials, state,
 	// config, and egress resolved from the operator's YAML configuration.
 	OpencodeProviders map[string]OpencodeProviderConfig
@@ -95,6 +100,15 @@ type ContainerRunner struct {
 	// Its semaphore serializes Codex execution because the CLI can rotate
 	// auth.json.
 	CodexAccountAuth *CodexAccountAuth
+	// ModelProxy, when set, keeps ANTHROPIC_API_KEY on the host. Each RunSkill
+	// issues a scan token the container presents to ModelProxyURL instead.
+	ModelProxy *ModelProxy
+	// ModelProxyURL is the base URL containers use to reach ModelProxy through
+	// the egress proxy.
+	ModelProxyURL string
+	// modelProxyToken is this scan's proxy token, set by issueModelProxyToken
+	// and threaded into the container's ANTHROPIC_API_KEY by containerProcessEnv.
+	modelProxyToken string
 	// detectProfile lets tests stub profile auto-detection without a container
 	// runtime. nil means DetectProfile.
 	detectProfile func(ctx context.Context, rt ContainerRuntime, runnerImage, srcDir string, relabel bool) Profile
@@ -120,6 +134,10 @@ type EgressSidecarConfig struct {
 	// reach the host skill API. Required: an empty value means the sidecar
 	// cannot reach the host, so setupHardenedNetwork fails the scan closed.
 	GatewayIP string
+	// Grants are the per-skill egress grants for this scan. The sidecar reaches
+	// each granted host on its declared ports only. Set per scan by
+	// applyEgressPolicy on a copy of the runner, never on the shared config.
+	Grants []EgressGrant
 }
 
 // ScopedEgressProxyConfig is the non-secret startup information needed to
@@ -265,21 +283,55 @@ func (s containerRunErrorState) failure(provider opencodeProvider, runtimeName s
 	return fmt.Errorf("%s exited: %w", runtimeName, waitErr)
 }
 
+// prepareExecution runs RunSkill's setup steps that each carry their own
+// cleanup (the OpenCode provider proxy, the skill's egress policy and, when
+// configured, the model proxy token) then merges them into a single cleanup
+// func that releases them in reverse order. Split out of RunSkill so its own
+// top level only threads through one setup call and one error check for all
+// of them, keeping RunSkill's cognitive complexity down as these toggles
+// accumulate.
+func (d ContainerRunner) prepareExecution(ctx context.Context, sj SkillJob, emit func(Event)) (ContainerRunner, opencodeProvider, SkillResult, func(), error) {
+	noop := func() {}
+	// With an egress policy, applyEgressPolicy starts the single scoped proxy,
+	// so the OpenCode step only widens the allowlists.
+	d, provider, result, cleanupProviderProxy, err := d.prepareOpencodeExecution(ctx, sj.Model, len(d.EgressPolicies[sj.Name]) > 0)
+	if err != nil {
+		return d, provider, result, noop, err
+	}
+	d, cleanupPolicy, err := d.applyEgressPolicy(sj, emit)
+	if err != nil {
+		cleanupProviderProxy()
+		return d, provider, result, noop, err
+	}
+	d, revokeModelToken, err := d.issueModelProxyToken(ctx)
+	if err != nil {
+		cleanupPolicy()
+		cleanupProviderProxy()
+		return d, provider, result, noop, err
+	}
+	return d, provider, result, func() {
+		revokeModelToken()
+		cleanupPolicy()
+		cleanupProviderProxy()
+	}, nil
+}
+
 // RunSkill runs a skill inside an ephemeral container. The whole workspace
 // (clone + staged .claude/skills + context.json + output) is mounted at
 // /work read-write so claude can read the skill files and write its output.
 // Egress is routed through scrutineer's allowlisting proxy on the host;
 // see EgressProxy. tmpfs/cap-drop rules mirror the local runner's intent.
 func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Event)) (SkillResult, error) {
+	stableProxy := d.ProxyURL
 	if HarnessName(d.harness()) == "codex" && d.CodexAccountAuth != nil && sj.StateDir == "" {
 		return SkillResult{}, errors.New("codex account auth requires a per-job state directory")
 	}
 
-	d, provider, result, cleanupProviderProxy, err := d.prepareOpencodeExecution(ctx, sj.Model)
+	d, provider, result, cleanupExecution, err := d.prepareExecution(ctx, sj, emit)
 	if err != nil {
 		return result, err
 	}
-	defer cleanupProviderProxy()
+	defer cleanupExecution()
 
 	var src string
 	if sj.SrcReady {
@@ -340,18 +392,23 @@ func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Ev
 	}
 	defer unlockCodexAuth()
 
-	logLine := "$ " + runtimeBin(d.Runtime) + " run --rm " + image + " <skill:" + sj.Name + ">"
-	if d.ModelBaseURL != "" {
-		logLine += " [MODEL_BASE_URL=" + redactURLUserinfo(d.ModelBaseURL) + "]"
+	probeBase := append([]string{runtimeBin(d.Runtime)}, d.buildContainerBaseArgs(absWork, hnet, "/work")...)
+	probeBase = append(probeBase, "--", image)
+	if err := sj.checkCapabilities(ctx, probeBase, d.ProxyURL != "" || hnet.proxyEndpoint != "", emit); err != nil {
+		return result, err
 	}
-	emit(Event{Kind: KindText, Text: logLine})
+	if err := d.checkBackendPreflight(ctx, sj, image, hnet, provider, stableProxy); err != nil {
+		return result, err
+	}
+
+	emit(Event{Kind: KindText, Text: d.runLogLine(image, sj.Name)})
 
 	runErrors := containerRunErrorState{}
 	wrappedEmit := func(e Event) {
 		runErrors.observe(e, h, provider.ID)
 		emit(e)
 	}
-	hitMaxTurns, sessionID, waitErr := d.runContainerOnce(ctx, runBase, sj, provider.Env, wrappedEmit)
+	hitMaxTurns, sessionID, waitErr := d.runContainerOnce(ctx, runBase, sj, d.containerProcessEnv(provider.Env), wrappedEmit)
 
 	if waitErr != nil && sj.ResumeSessionID != "" && sessionID == "" && runErrors.resumeRetryable() {
 		if sj.ResumePrompt != "" && sj.Prompt == "" {
@@ -368,7 +425,7 @@ func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Ev
 		emit(Event{Kind: KindText, Text: "resume of session " + sj.ResumeSessionID + " failed; restarting fresh"})
 		fresh := sj
 		fresh.ResumeSessionID = ""
-		hitMaxTurns, sessionID, waitErr = d.runContainerOnce(ctx, runBase, fresh, provider.Env, wrappedEmit)
+		hitMaxTurns, sessionID, waitErr = d.runContainerOnce(ctx, runBase, fresh, d.containerProcessEnv(provider.Env), wrappedEmit)
 	}
 
 	res := result
@@ -385,6 +442,21 @@ func (d ContainerRunner) RunSkill(ctx context.Context, sj SkillJob, emit func(Ev
 	return res, nil
 }
 
+// runLogLine builds RunSkill's announcement line for a scan: the runtime
+// invocation plus, when set, the redacted model base URL and whether a model
+// proxy is in play. Split out so its own branches (currently two, more as
+// toggles accumulate) don't count against RunSkill's cognitive complexity.
+func (d ContainerRunner) runLogLine(image, skillName string) string {
+	line := "$ " + runtimeBin(d.Runtime) + " run --rm " + image + " <skill:" + skillName + ">"
+	if d.ModelBaseURL != "" {
+		line += " [MODEL_BASE_URL=" + redactURLUserinfo(d.ModelBaseURL) + "]"
+	}
+	if d.ModelProxy != nil {
+		line += " [model proxy]"
+	}
+	return line
+}
+
 // runContainerOnce launches one container for the given skill job, appending
 // the in-container `claude` command to runBase, streaming its output
 // through emit, and reporting the wait error, whether the run hit the
@@ -395,7 +467,6 @@ func (d ContainerRunner) runContainerOnce(ctx context.Context, runBase []string,
 	runArgs := append(append([]string{}, runBase...), d.harnessArgv(sj)...)
 
 	cmd := exec.CommandContext(ctx, runtimeBin(d.Runtime), runArgs...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = environmentWith(os.Environ(), processEnv)
 
 	stdout, err := cmd.StdoutPipe()
@@ -403,9 +474,11 @@ func (d ContainerRunner) runContainerOnce(ctx context.Context, runBase []string,
 		return false, "", err
 	}
 	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
+	terminate, err := startSupervised(cmd)
+	if err != nil {
 		return false, "", fmt.Errorf("start container: %w", err)
 	}
+	defer terminate()
 
 	wrappedEmit := func(e Event) {
 		switch {
@@ -418,9 +491,6 @@ func (d ContainerRunner) runContainerOnce(ctx context.Context, runBase []string,
 	}
 	h.ParseStream(stdout, wrappedEmit)
 	waitErr = cmd.Wait()
-	if cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
-	}
 	return hitMaxTurns, sessionID, waitErr
 }
 
@@ -430,6 +500,112 @@ func (d ContainerRunner) runContainerOnce(ctx context.Context, runBase []string,
 // complexity manageable as new toggles (hardened mode, proxy, profiles)
 // accumulate.
 func (d ContainerRunner) buildRunArgsForProvider(absWork, image string, hnet hardenedNet, harnessStateDir string, provider opencodeProvider, workdir string) []string {
+	args := d.buildContainerBaseArgs(absWork, hnet, workdir)
+	// Agent credentials and resumable state are deliberately absent from probes.
+	args = append(args, d.harnessEnvArgs(provider)...)
+	keys := make([]string, 0, len(provider.Env))
+	for key := range provider.Env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, "-e", key)
+	}
+	if harnessStateDir != "" {
+		args = append(args, "-v", bindMount(harnessStateDir, "/harness-state", d.SELinuxRelabel))
+		for _, e := range d.harness().StateEnv("/harness-state") {
+			args = append(args, "-e", e)
+		}
+		args = d.appendCodexAccountAuthArgs(args)
+	}
+	if HarnessName(d.harness()) == "opencode" {
+		args = d.appendOpencodeStateArgs(args, harnessStateDir, provider)
+	}
+	return append(args, "--", image)
+}
+
+// harnessEnvArgs returns the -e flags for the active harness's own env
+// (Harness.Env), skipping an OpenCode-inherited credential when a provider is
+// configured. When a ModelProxy is set, the claude credential and base-url
+// keys are skipped entirely and replaced with the proxy's own base URL plus a
+// bare ANTHROPIC_API_KEY passthrough; containerProcessEnv is what fills that
+// passthrough with the scan's proxy token instead of the host's real key.
+func (d ContainerRunner) harnessEnvArgs(provider opencodeProvider) []string {
+	var args []string
+	for _, e := range d.harness().Env(d.ModelBaseURL) {
+		if provider.Configured && opencodeInheritedCredential(e) {
+			continue
+		}
+		if d.ModelProxy != nil && modelProxyStripsKey(e) {
+			continue
+		}
+		args = append(args, "-e", e)
+	}
+	if d.ModelProxy != nil {
+		args = append(args, "-e", "ANTHROPIC_BASE_URL="+d.ModelProxyURL, "-e", "ANTHROPIC_API_KEY")
+	}
+	return args
+}
+
+// modelProxyCredentialEnv lists the claude credential and base-url env keys a
+// model-proxy scan must never receive from the harness's own Env():
+// harnessEnvArgs substitutes its own ANTHROPIC_BASE_URL and a bare
+// ANTHROPIC_API_KEY. CLAUDE_CODE_OAUTH_TOKEN and ANTHROPIC_AUTH_TOKEN have no
+// substitute because account/OAuth auth is out of scope for -model-proxy.
+var modelProxyCredentialEnv = []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
+
+// modelProxyStripsKey reports whether entry (a bare "KEY" or "KEY=VALUE"
+// harness env assignment) names a credential model-proxy mode withholds.
+func modelProxyStripsKey(entry string) bool {
+	key, _, _ := strings.Cut(entry, "=")
+	return slices.Contains(modelProxyCredentialEnv, key)
+}
+
+// issueModelProxyToken issues this scan's short-lived proxy token when a
+// ModelProxy is configured; the returned ContainerRunner carries the token,
+// and the caller must defer the revoke func so the token stops working the
+// moment the scan ends. Without a ModelProxy this is a no-op passthrough. With
+// one but no ModelProxyURL to reach it through, the scan is refused rather
+// than silently handing the container the real key.
+func (d ContainerRunner) issueModelProxyToken(ctx context.Context) (ContainerRunner, func(), error) {
+	noop := func() {}
+	if d.ModelProxy == nil {
+		return d, noop, nil
+	}
+	if d.ModelProxyURL == "" {
+		return d, noop, errors.New("model proxy is configured but ModelProxyURL is empty; refusing to run without a way to reach it")
+	}
+	var expires time.Time
+	if deadline, ok := ctx.Deadline(); ok {
+		expires = deadline
+	}
+	token, revoke := d.ModelProxy.Issue(expires)
+	d.modelProxyToken = token
+	return d, revoke, nil
+}
+
+// containerProcessEnv is the map runContainerOnce, the backend preflight probe
+// and the OpenCode readiness probe merge onto os.Environ() before starting
+// the runtime process. In model-proxy mode this is what stops the
+// runtime CLI copying the host's real ANTHROPIC_API_KEY into the bare
+// "-e ANTHROPIC_API_KEY" harnessEnvArgs appended: the override replaces it
+// with this scan's proxy token, or "" when none was issued, which fails
+// closed instead of falling back to the host key.
+func (d ContainerRunner) containerProcessEnv(providerEnv map[string]string) map[string]string {
+	if d.ModelProxy == nil {
+		return providerEnv
+	}
+	env := make(map[string]string, len(providerEnv)+1)
+	for k, v := range providerEnv {
+		env[k] = v
+	}
+	env["ANTHROPIC_API_KEY"] = d.modelProxyToken
+	return env
+}
+
+// buildContainerBaseArgs shares isolation, workspace, and network policy without
+// passing model credentials or mounting the agent's authentication/session store.
+func (d ContainerRunner) buildContainerBaseArgs(absWork string, hnet hardenedNet, workdir string) []string {
 	gwTarget := "host-gateway"
 	if d.Hardened {
 		// setupHardenedNetwork resolved the gateway once against this per-scan
@@ -445,29 +621,15 @@ func (d ContainerRunner) buildRunArgsForProvider(absWork, image string, hnet har
 	args := runtimeRunArgs(d.Runtime,
 		"--rm",
 		"--cap-drop", "ALL",
-		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+	)
+	args = append(args, containerUserArgs()...)
+	args = append(args,
 		"-e", "HOME=/tmp",
 		"-e", "SEMGREP_SEND_METRICS=off",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
 		"-v", bindMount(absWork, "/work", d.SELinuxRelabel),
 		"-w", workdir,
 	)
-	// Harness-specific env: model-API credential, base URL, and the
-	// harness's own telemetry / autoupdate suppressors.
-	for _, e := range d.harness().Env(d.ModelBaseURL) {
-		if provider.Configured && opencodeInheritedCredential(e) {
-			continue
-		}
-		args = append(args, "-e", e)
-	}
-	keys := make([]string, 0, len(provider.Env))
-	for key := range provider.Env {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		args = append(args, "-e", key)
-	}
 	if supportsHostGatewayAddHost(d.Runtime) {
 		args = append(args, "--add-host", HostGatewayAlias+":"+gwTarget)
 	}
@@ -478,30 +640,14 @@ func (d ContainerRunner) buildRunArgsForProvider(absWork, image string, hnet har
 		// user back to the invoking host uid so output stays host-owned.
 		args = append(args, "--userns=keep-id")
 	}
-	if harnessStateDir != "" {
-		// Persist the harness's resumable session store outside the
-		// container. Without this it lands in the /tmp tmpfs and dies
-		// with the container, so a retry could not resume the agent
-		// loop. The bind mount stays writable even under hardened
-		// mode's --read-only rootfs. The mountpoint is fixed; each
-		// harness points its own state env var(s) at it via StateEnv.
-		args = append(args, "-v", bindMount(harnessStateDir, "/harness-state", d.SELinuxRelabel))
-		for _, e := range d.harness().StateEnv("/harness-state") {
-			args = append(args, "-e", e)
-		}
-		args = d.appendCodexAccountAuthArgs(args)
-	}
-	if HarnessName(d.harness()) == "opencode" {
-		args = d.appendOpencodeStateArgs(args, harnessStateDir, provider)
-	}
 	if d.Hardened || d.HardenedRuntimeOnly {
 		// Read-only rootfs + no-new-privileges close the residual paths a
 		// hostile skill could use to escalate inside the container. /work
 		// stays writable (skill output) and /tmp is the tmpfs declared above
 		// with HOME=/tmp redirecting claude session storage. These options have
 		// no network dependency, so --hardened-runtime-only can apply them
-		// without the verified network path. --cap-drop ALL and the non-root
-		// --user are already set in every mode.
+		// without the verified network path. --cap-drop ALL and, except on
+		// Windows, the non-root --user are already set in every mode.
 		args = append(args,
 			"--read-only",
 		)
@@ -548,7 +694,7 @@ func (d ContainerRunner) buildRunArgsForProvider(absWork, image string, hnet har
 	} else if !d.Hardened {
 		args = append(args, "--network", "none")
 	}
-	return append(args, "--", image)
+	return args
 }
 
 func (d ContainerRunner) appendCodexAccountAuthArgs(args []string) []string {
@@ -1065,8 +1211,11 @@ func (d ContainerRunner) proxySidecarRunArgs(name, network string) []string {
 	for _, e := range EgressSidecarEnv(d.Egress, SidecarListenFirstIface+":"+proxySidecarPort) {
 		args = append(args, "-e", e)
 	}
-	return append(args, "--", d.image(), "scrutineer", "proxy",
-		"--require-capability="+ProxyCapabilityDenyAPIConnect)
+	capability := ProxyCapabilityDenyAPIConnect
+	if len(d.Egress.Grants) > 0 {
+		capability += "," + ProxyCapabilityEgressPortGrants
+	}
+	return append(args, "--", d.image(), "scrutineer", "proxy", "--require-capability="+capability)
 }
 
 // EgressSidecarEnv returns the SCRUTINEER_PROXY_* environment assignments the
@@ -1078,7 +1227,7 @@ func (d ContainerRunner) proxySidecarRunArgs(name, network string) []string {
 // --internal address at startup (the host cannot know it before the container
 // exists).
 func EgressSidecarEnv(cfg EgressSidecarConfig, listen string) []string {
-	return []string{
+	env := []string{
 		"SCRUTINEER_PROXY_TOKEN=" + cfg.Token,
 		"SCRUTINEER_PROXY_ALLOW=" + strings.Join(cfg.Allow, ","),
 		"SCRUTINEER_PROXY_API_HOST=" + cfg.GatewayIP,
@@ -1086,6 +1235,10 @@ func EgressSidecarEnv(cfg EgressSidecarConfig, listen string) []string {
 		"SCRUTINEER_PROXY_HOST_PORTS=" + strings.Join(cfg.HostPorts, ","),
 		"SCRUTINEER_PROXY_LISTEN=" + listen,
 	}
+	if len(cfg.Grants) > 0 {
+		env = append(env, "SCRUTINEER_PROXY_GRANTS="+egressgrant.Format(cfg.Grants))
+	}
+	return env
 }
 
 // teardownHardenedScan runs at the end of a hardened scan: it forwards the
@@ -1138,11 +1291,13 @@ func noteworthyProxyLogLine(line string) bool {
 // present locally yet (the first scan pulls it and the actual sidecar command
 // enforces the same capability), matching container.VerifyKeepID.
 // Only meaningful on the sidecar path; the caller checks the runtime trait.
-func VerifyProxyBinary(ctx context.Context, rt ContainerRuntime, image string) error {
+// The extra capabilities, such as ProxyCapabilityEgressPortGrants when the
+// operator configured egress policies, are required on top of the base one.
+func VerifyProxyBinary(ctx context.Context, rt ContainerRuntime, image string, extra ...string) error {
 	if image == "" || !imageExistsLocally(ctx, rt, image) {
 		return nil
 	}
-	args := proxyBinaryCheckArgs(rt, image)
+	args := proxyBinaryCheckArgs(rt, image, extra...)
 	out, err := exec.CommandContext(ctx, runtimeBin(rt), args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("runner image %q does not support the hardened egress proxy policy "+
@@ -1152,10 +1307,11 @@ func VerifyProxyBinary(ctx context.Context, rt ContainerRuntime, image string) e
 	return nil
 }
 
-func proxyBinaryCheckArgs(rt ContainerRuntime, image string) []string {
+func proxyBinaryCheckArgs(rt ContainerRuntime, image string, extra ...string) []string {
+	caps := append([]string{ProxyCapabilityDenyAPIConnect}, extra...)
 	return runtimeRunArgs(rt, "--rm", "--pull", "never",
 		"--", image, "scrutineer", "proxy",
-		"--require-capability="+ProxyCapabilityDenyAPIConnect, "-h")
+		"--require-capability="+strings.Join(caps, ","), "-h")
 }
 
 // verifyHardenedNetwork fails closed when the per-scan --internal network does

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,10 +22,10 @@ type fakeGit struct {
 
 func fakeGitOnPath(t *testing.T, body string) *fakeGit {
 	t.Helper()
-	if _, err := exec.LookPath("sh"); err != nil {
-		t.Skip("needs a POSIX shell to stub git")
-	}
 	f := &fakeGit{t: t, dir: t.TempDir()}
+	// The shell reads these paths, so they are written with forward slashes
+	// rather than the host separator.
+	calls, env := filepath.ToSlash(f.callsPath()), filepath.ToSlash(f.envPath())
 	script := fmt.Sprintf(`#!/bin/sh
 echo "$@" >> %q
 printf 'GIT_TERMINAL_PROMPT=%%s GIT_PROTOCOL_FROM_USER=%%s\n' \
@@ -34,10 +33,8 @@ printf 'GIT_TERMINAL_PROMPT=%%s GIT_PROTOCOL_FROM_USER=%%s\n' \
 n=$(wc -l < %q | tr -d ' ')
 dst=$(eval echo \${$#})
 %s
-`, f.callsPath(), f.envPath(), f.callsPath(), body)
-	if err := os.WriteFile(filepath.Join(f.dir, "git"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+`, calls, env, calls, body)
+	writeFakeBin(t, f.dir, "git", script)
 	t.Setenv("PATH", f.dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return f
 }
@@ -310,15 +307,9 @@ exit 128
 // background sleeper holding stdout; without WaitDelay, CombinedOutput would
 // block on that sleeper for its full lifetime.
 func TestGitWithEnvBoundsLingeringChild(t *testing.T) {
-	if _, err := exec.LookPath("sh"); err != nil {
-		t.Skip("needs a POSIX shell to stub git")
-	}
 	bin := t.TempDir()
 	// The parent exits immediately; `sleep 30 &` inherits and holds stdout.
-	script := "#!/bin/sh\nsleep 30 &\nexit 0\n"
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeBin(t, bin, "git", "#!/bin/sh\nsleep 30 &\nexit 0\n")
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	prev := gitWaitDelay

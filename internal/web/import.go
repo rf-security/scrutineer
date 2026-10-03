@@ -152,7 +152,13 @@ func (s *Server) importFallback(w http.ResponseWriter, r *http.Request, body []b
 // ensureImportRepo resolves a repository URL from an import request to a
 // Repository row, creating it on first sight.
 func (s *Server) ensureImportRepo(repoURL string) (db.Repository, error) {
-	return ensureImportRepoWith(s.DB, repoURL)
+	var repo db.Repository
+	err := s.DB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		repo, err = ensureImportRepoWith(tx, repoURL)
+		return err
+	})
+	return repo, err
 }
 
 func ensureImportRepoWith(database *gorm.DB, repoURL string) (db.Repository, error) {
@@ -181,7 +187,7 @@ func ensureImportRepoWith(database *gorm.DB, repoURL string) (db.Repository, err
 	if input.Owner != "" {
 		repo.FullName = input.Owner + "/" + input.Name
 	}
-	if err := database.Where(db.Repository{URL: input.CloneURL}).FirstOrCreate(&repo).Error; err != nil {
+	if _, err := insertRepositoryWithAudit(database, &repo); err != nil {
 		return db.Repository{}, err
 	}
 	return repo, nil

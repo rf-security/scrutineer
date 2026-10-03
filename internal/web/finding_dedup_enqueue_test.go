@@ -396,7 +396,9 @@ func TestCancelledQueuedSiblingSettlesBatch(t *testing.T) {
 	}{{
 		name: "per-row cancel",
 		cancel: func(s *Server, _ uint, queued *db.Scan) {
-			s.cancelScan(queued, "cancelled by user")
+			if _, err := s.cancelScanWithAudit(queued, "cancelled by user"); err != nil {
+				t.Fatalf("cancelScanWithAudit: %v", err)
+			}
 		},
 	}, {
 		name: "federation opt-out sweep",

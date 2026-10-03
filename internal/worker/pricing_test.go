@@ -7,17 +7,25 @@ import (
 	"github.com/alpha-omega-security/harness"
 )
 
-func TestCostFromUsage_gpt6Astra(t *testing.T) {
+func TestCostFromUsage_gpt6Family(t *testing.T) {
 	usage := Usage{
 		InputTokens:      1_000_000,
 		OutputTokens:     1_000_000,
 		CacheReadTokens:  100_000,
 		CacheWriteTokens: 200_000,
 	}
-	const want = 59.60
-	for _, model := range []string{modelGPT6AstraID, "openai/gpt-6-astra[1m]"} {
-		if got := CostFromUsage(model, usage); math.Abs(got-want) > 1e-9 {
-			t.Errorf("CostFromUsage(%q) = %v, want %v", model, got, want)
+	for _, tt := range []struct {
+		models []string
+		want   float64
+	}{
+		{[]string{modelGPT6AstraID, "openai/gpt-6-astra[1m]"}, 59.60},
+		{[]string{modelGPT6SolID, "openai/gpt-6-sol[1m]"}, 11.92},
+		{[]string{modelGPT6LunaID, "openai/gpt-6-luna[1m]"}, 0.596},
+	} {
+		for _, model := range tt.models {
+			if got := CostFromUsage(model, usage); math.Abs(got-tt.want) > 1e-9 {
+				t.Errorf("CostFromUsage(%q) = %v, want %v", model, got, tt.want)
+			}
 		}
 	}
 }

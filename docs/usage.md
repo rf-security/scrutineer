@@ -19,3 +19,7 @@ Correlations are calculated independently per skill over positive-cost runs. A r
 The outlier table lists every positive-cost scan whose cost is at least ten times the positive-cost median for that skill. Each row links to the scan and repository and includes model, runner profile, turns and any matched driver measurements. Inspect the linked scan's transcript, report and runtime settings before assigning a cause; common explanations include a larger-than-usual analysis surface, a large sink inventory, repeated tool work, retries or a different model configuration.
 
 Zero-cost rows are retained in the normal usage totals but excluded from correlation and outlier baselines. This prevents historical rows without captured billing data and genuinely free runs from forcing the outlier median to zero.
+
+## Pausing on subscription overage
+
+Set `pause_on_overage: true` in `scrutineer.yaml` or pass `-pause-on-overage` to pause active and queued model scans when Claude reports paid subscription overage, preserving their resume state. It defaults to false and takes precedence over `downgrade_on_overage`. Work resumes after the latest reliable reset plus the auto-resume buffer; missing or implausible reset times require manual action. To permit overage, disable the option, restart Scrutineer and resume the scans. This relies on provider signals, not a hard monetary budget.

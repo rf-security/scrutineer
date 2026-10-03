@@ -10,6 +10,22 @@
     "has_python":    { "type": "boolean" },
     "has_workflows": { "type": "boolean" },
     "has_embedded_native": { "type": "boolean" },
+    "modes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "evidence"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
     "brief": {
       "type": "object",
       "description": "Subset of brief --json the gates were derived from.",

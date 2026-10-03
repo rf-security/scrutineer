@@ -17,11 +17,23 @@ const severityField = "severity"
 
 func newTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	gdb, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	gdb, err := Open(filepath.Join(t.TempDir(), "t.db") + "?_pragma=synchronous(OFF)")
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeOnCleanup(t, gdb)
 	return gdb
+}
+
+// closeOnCleanup closes gdb before TempDir is removed: Windows refuses to
+// delete a database file that still has an open handle.
+func closeOnCleanup(t *testing.T, gdb *gorm.DB) {
+	t.Helper()
+	t.Cleanup(func() {
+		if sqldb, _ := gdb.DB(); sqldb != nil {
+			_ = sqldb.Close()
+		}
+	})
 }
 
 func seedFinding(t *testing.T, gdb *gorm.DB) Finding {
@@ -999,7 +1011,7 @@ func TestSetFindingLabels_replacesSet(t *testing.T) {
 	gdb := newTestDB(t)
 	f := seedFinding(t, gdb)
 
-	if err := SetFindingLabels(gdb, f.ID, []string{"wontfix", "needs-info"}); err != nil {
+	if err := SetFindingLabels(gdb, f.ID, []string{"wontfix", "needs-info"}, SourceAnalyst, ""); err != nil {
 		t.Fatal(err)
 	}
 	var refreshed Finding
@@ -1008,7 +1020,7 @@ func TestSetFindingLabels_replacesSet(t *testing.T) {
 		t.Fatalf("labels len = %d, want 2", len(refreshed.Labels))
 	}
 
-	if err := SetFindingLabels(gdb, f.ID, []string{"duplicate"}); err != nil {
+	if err := SetFindingLabels(gdb, f.ID, []string{"duplicate"}, SourceAnalyst, ""); err != nil {
 		t.Fatal(err)
 	}
 	var again Finding

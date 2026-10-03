@@ -1011,7 +1011,7 @@ paths:
         '400': { description: Invalid repository id }
         '403': { description: Host header is not localhost }
         '404': { description: Repository not found }
-        '409': { description: Repository has queued, running, or paused scans }
+        '409': { description: Repository has queued or running scans, or a linked paused scan on another repository }
         '500': { description: Delete failed }
 
   /v1/repositories/{id}/findings:
@@ -1375,6 +1375,7 @@ components:
         fork:           { type: string, description: 'owner/name of the staging fork in fork_org, when one exists.' }
         posture:        { type: string, enum: [ready, partial, unprepared], description: 'Disclosure-readiness tier from the posture skill. Empty when posture has not run.' }
         posture_summary: { type: string }
+        baseline_level: { type: integer, description: 'Highest OpenSSF Baseline level (1-3) whose applicable controls all passed on the latest compliance run. 0 when none did or when compliance has not run.' }
         health:            { type: string, enum: [active, stale, abandoned, zombie], description: 'Evidence-based maintenance classification. Empty when evidence is incomplete.' }
 
     RepositoryExport:
@@ -1443,11 +1444,11 @@ components:
           description: Triage invocation that requested this pipeline scan.
         exploration_mode:
           type: string
-          enum: ['', random-dig]
-          description: Empty or omitted for planned scans. Random-dig scans have no threat-model context and may only validate their own report through the callback API.
+          enum: ['', random-dig, adversarial-sweep]
+          description: Empty or omitted for planned scans. Exploratory scans may only validate their own report through the callback API; random digs receive no threat-model context, while adversarial sweeps challenge one recorded exclusion.
         exploration_path:
           type: string
-          description: Repository-relative directory selected for a random dig, or dot for root-level source. Empty until the worker selects a target.
+          description: Repository-relative source directory selected for an exploratory audit, or dot for root-level random source. Empty until a target is selected.
         diff_base_scan_id:
           type: integer
           format: int64
@@ -1471,7 +1472,7 @@ components:
           description: Immutable gated patch attempt pinned to a re-attack scan at enqueue time.
         coverage:
           type: string
-          description: JSON coverage metadata, including diff fallback reasons and threat-model update decisions.
+          description: JSON coverage metadata, including diff fallback reasons, threat-model update decisions, and optional worker-owned capability preflight (static status ready/degraded/blocked, missing entries, degraded boolean and error). When enabled, preflight.backend records probe_id, receipt_id, config_hash, status ready/blocked, sanitized error, rate_limited, optional rate_limit_reset_at, checked_at, expires_at, reused, cost_usd and token counters. Probe usage is included once in the originating scan's totals. The receipt links the probe to the immutable claim-time recipe. Static shortfalls or a blocked live probe keep completeness partial.
         skill_name:           { type: string }
         skill_version:        { type: integer, description: Snapshot of the Skill row version at enqueue time. }
         skill_schema_version: { type: integer, description: Snapshot of metadata.scrutineer.version at enqueue time. }
@@ -1641,9 +1642,6 @@ components:
         resolution:    { type: string, enum: [fix, migrate, workaround, adopt, wontfix, ""] }
         assignee:      { type: string }
         exploited_in_wild: { type: string, enum: [yes, no, ""], description: "Analyst's call on whether this finding is being exploited in the wild. Empty means unknown. Automation never sets this." }
-        exploited_in_wild_evidence: { type: string }
-        mitigation:    { type: string, description: "Markdown body of operational mitigation guidance from the mitigate skill: workarounds, detection, optionally a semgrep rule (see mitigation_semgrep)." }
-        mitigation_semgrep: { type: string, description: "Optional YAML semgrep rule from the mitigate skill. Empty when no rule was warranted." }
         dup_check:     { type: string, description: "Audit agent's one-sentence rationale for why this finding is distinct from the siblings already filed under the same scan_group. Empty for findings from skills that do not emit it." }
         novelty:       { type: string, enum: [unfixed, fixed, unclear, not_checked, ""], description: "Latest upstream novelty state. A touched file remains unclear until revalidate classifies the staged history." }
         production_viability: { type: string, enum: [VIABLE, NON_VIABLE, SAMPLE_OR_TEST, CONDITIONAL_VIABLE, ""], description: "Latest critic assessment of whether the finding can affect a real release build. Empty before assessment." }
@@ -1665,6 +1663,9 @@ components:
             disclosure_draft: { type: string }
             disclosure_title: { type: string, description: "The disclose skill's drafted GHSA summary; may differ from the finding's own title." }
             suggested_recipients: { type: string, description: "File-level owners for the finding's location, from CODEOWNERS or recent non-bot committers." }
+            exploited_in_wild_evidence: { type: string, description: "Evidence supporting the analyst's exploitation status." }
+            mitigation:    { type: string, description: "Markdown body of operational mitigation guidance from the mitigate skill: workarounds, detection, optionally a semgrep rule (see mitigation_semgrep)." }
+            mitigation_semgrep: { type: string, description: "Optional YAML semgrep rule from the mitigate skill. Empty when no rule was warranted." }
             sub_path:         { type: string, description: "Monorepo sub-folder the producing scan was scoped to. The finding's location is relative to it; empty means the repo root." }
             verification:
               allOf:
@@ -2038,8 +2039,13 @@ components:
         finding_id:        { type: integer, format: int64 }
         verdict:           { type: string, enum: [true_positive, false_positive, already_fixed, uncertain] }
         reason:            { type: string }
-        automated_outcome: { type: string, description: Automation verdict snapshotted at review time, empty when no revalidate run had spoken. }
+        automated_outcome: { type: string, description: "Automation verdict snapshotted at review time. Empty when no revalidate run had spoken or the decision does not assess automation (such as a rejection-dialog decision); excluded from agreement metrics when empty." }
         reviewer:          { type: string }
+        source_scan_id:    { type: integer, description: Observation scan at review time; zero on legacy reviews. }
+        source_commit:     { type: string }
+        finding_fingerprint: { type: string }
+        finding_path:      { type: string, description: Repository-relative path at review time. }
+        cwe:               { type: string }
         created_at:        { type: string, format: date-time }
 
     FindingCommunication:

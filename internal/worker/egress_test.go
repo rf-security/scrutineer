@@ -2,7 +2,9 @@ package worker
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -290,4 +292,74 @@ func connectThroughProxy(t *testing.T, proxyAddr, token, requestTarget, host str
 		t.Fatalf("read CONNECT response: %v", err)
 	}
 	return resp, conn
+}
+
+// TestEgressProxyStreamsForwardedAPIResponses covers the -model-proxy hop: the
+// scan reaches the host API by an inspected forward request while the harness
+// forward path never flushes. The upstream withholds its second event until
+// the client has read the first, so a buffered proxy deadlocks into a timeout.
+func TestEgressProxyStreamsForwardedAPIResponses(t *testing.T) {
+	firstSeen := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: one\ndata: {}\n\n")
+		_ = http.NewResponseController(w).Flush()
+		select {
+		case <-firstSeen:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, "event: two\ndata: {}\n\n")
+	}))
+	defer upstream.Close()
+	upstreamHost, apiPort, err := net.SplitHostPort(upstream.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const proxyToken = "scan-proxy-token"
+	proxyPort, cleanup, err := StartScopedEgressProxy(&EgressProxy{
+		Allow:           []string{HostGatewayAlias},
+		Token:           proxyToken,
+		APIPort:         apiPort,
+		GatewayDialHost: upstreamHost,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	proxyURL, err := url.Parse(ProxyURLForHost(proxyToken, "127.0.0.1", proxyPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://"+net.JoinHostPort(HostGatewayAlias, apiPort)+"/model-proxy/anthropic/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("forward request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	reader := bufio.NewReader(resp.Body)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("first event did not stream through the egress proxy: %v", err)
+	}
+	if line != "event: one\n" {
+		t.Fatalf("first line = %q, want event: one", line)
+	}
+	close(firstSeen)
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read rest of stream: %v", err)
+	}
+	if !strings.Contains(string(rest), "event: two") {
+		t.Fatalf("stream missing second event: %q", rest)
+	}
 }

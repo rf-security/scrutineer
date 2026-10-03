@@ -162,12 +162,13 @@ func TestHarnessDefaultModels_registryEntriesAreComplete(t *testing.T) {
 
 func TestDefaultModelsFor_codexMatchesPinnedCatalog(t *testing.T) {
 	want := []ModelDefault{
-		{Name: "GPT-5.6 Sol", ID: "gpt-5.6-sol", Tier: "high"},
-		{Name: "GPT-5.6 Terra", ID: "gpt-5.6-terra"},
-		{Name: "GPT-5.6 Luna", ID: "gpt-5.6-luna", Tier: "mid"},
+		{Name: "GPT-6 Sol", ID: "gpt-6-sol", Tier: "high"},
+		{Name: "GPT-6 Luna", ID: "gpt-6-luna", Tier: "mid"},
 		{Name: "GPT-6 Astra", ID: modelGPT6AstraID, Tier: "max"},
+		{Name: "GPT-5.6 Sol", ID: "gpt-5.6-sol"},
+		{Name: "GPT-5.6 Terra", ID: "gpt-5.6-terra"},
+		{Name: "GPT-5.6 Luna", ID: "gpt-5.6-luna"},
 		{Name: "GPT-5.5", ID: "gpt-5.5"},
-		{Name: "GPT-5.2", ID: "gpt-5.2"},
 	}
 	if got := DefaultModelsFor(CodexHarness{}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Codex defaults = %+v, want %+v", got, want)

@@ -89,6 +89,12 @@ type Server struct {
 	Worker *worker.Worker
 	tmpl   *template.Template
 
+	// ModelProxy, when set (-model-proxy), serves worker.ModelProxyPathPrefix
+	// for scan containers. It shares the scan-facing /api/ exemption from the
+	// browser checks: securityHeaders rejects the host.docker.internal Host
+	// every container request carries.
+	ModelProxy *worker.ModelProxy
+
 	// SkillsRepoSHA pins the commit of -skills-repo loaded at startup. Set
 	// once by main after loadSkills resolves it; stamped onto every Scan
 	// row enqueueSkillWith creates so two runs a week apart can be told
@@ -98,7 +104,9 @@ type Server struct {
 
 	// Version is the Scrutineer release version shown on the settings page.
 	// Release builds inject CalVer at link time; development builds use "dev".
-	Version string
+	Version    string
+	Commit     string
+	CommitDate string
 
 	// MonorepoAttribution mirrors worker.Worker.MonorepoAttribution on the
 	// web side so handlers can gate per-subproject attribution (packages,
@@ -437,6 +445,7 @@ func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *work
 		"findingDisclosureMarkdownFilename": func(repo db.Repository, f db.Finding) string {
 			return findingDisclosureMarkdownFilename(&repo, &f)
 		},
+		"focus": scanFocus,
 	}
 	t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, "templates/*.html")
 	if err != nil {
@@ -630,6 +639,9 @@ func (s *Server) Handler() http.Handler {
 	// openAPISpecHandler.
 	root.Handle("GET /api/openapi.yaml", s.openAPISpecHandler())
 	root.Handle("/api/", s.apiHandler())
+	if s.ModelProxy != nil {
+		root.Handle(worker.ModelProxyPathPrefix+"/", s.ModelProxy)
+	}
 	root.Handle("/", securityHeaders(mux))
 	return logRequests(s.Log, root)
 }
@@ -1587,6 +1599,10 @@ func (s *Server) findingStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := db.FindingLifecycle(r.FormValue(statusKey))
+	if status == db.FindingRejected {
+		s.rejectFinding(w, r, f.ID)
+		return
+	}
 	if status == db.FindingReady && strings.TrimSpace(f.DisclosureDraft) == "" {
 		http.Error(w, "a saved disclosure draft is required before marking ready", http.StatusUnprocessableEntity)
 		return
@@ -2274,8 +2290,8 @@ func (s *Server) repoBulkCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 // createOrTriageRepo is the shared path for both single-add and bulk-add.
-// It FirstOrCreates the Repository row and, when the row is new and triage
-// is true, enqueues the default skill. isNew reports whether the repo was
+// It creates the Repository row and its audit event, then enqueues the default
+// skill when the row is new and triage is true. isNew reports whether the repo was
 // actually created (so callers can distinguish "queued" from "already present").
 func (s *Server) createOrTriageRepo(ctx context.Context, input RepoInput, model string, triage bool) (db.Repository, bool, error) {
 	if input.Local {
@@ -2296,8 +2312,6 @@ func (s *Server) createOrTriageRepo(ctx context.Context, input RepoInput, model 
 		return db.Repository{}, false, err
 	}
 	input.SubPath = cleanedSub
-	existing := int64(0)
-	s.DB.Model(&db.Repository{}).Where("url = ?", input.CloneURL).Count(&existing)
 	// Owner, FullName, and HTMLURL seed from ParseRepoInput so the orgs
 	// view groups newly added repos and finding-location links work before
 	// the metadata job has run; the metadata job later overwrites them
@@ -2311,10 +2325,10 @@ func (s *Server) createOrTriageRepo(ctx context.Context, input RepoInput, model 
 	if input.Owner != "" {
 		repo.FullName = input.Owner + "/" + input.Name
 	}
-	if err := s.DB.Where(db.Repository{URL: input.CloneURL}).FirstOrCreate(&repo).Error; err != nil {
+	isNew, err := s.createRepositoryWithAudit(ctx, &repo)
+	if err != nil {
 		return repo, false, err
 	}
-	isNew := existing == 0
 	// Eagerly warm the ecosyste.ms cache for a freshly added remote repo, in
 	// parallel with the triage enqueue below. Local repos have no
 	// upstream entry; the goroutine is best-effort and detached from ctx.
@@ -2454,6 +2468,7 @@ type repoShowView struct {
 	Inventory        repoInventoryView
 	Subprojects      repoSubprojectView
 	Maintainers      []db.Maintainer
+	Compliance       []db.ComplianceControl
 	Alternatives     []db.PackageAlternative
 	ShowAlternatives bool
 	IgnoredPaths     []string
@@ -2484,6 +2499,8 @@ func (s *Server) loadRepoShowView(
 	deps := s.loadRepoDependencyView(repo.ID, query.Get("deps") == "all")
 	inventory := s.loadRepoInventoryView(repo.ID, deps.Groups)
 	maintainers := s.repoMaintainers(repo.ID)
+	var compliance []db.ComplianceControl
+	s.DB.Where("repository_id = ?", repo.ID).Order("level, control_id").Find(&compliance)
 	evidenceComplete, err := db.RepositoryHealthEvidenceComplete(s.DB, repo.ID)
 	if err != nil {
 		s.Log.Error("repository health evidence", "repo", repo.ID, "err", err)
@@ -2510,6 +2527,7 @@ func (s *Server) loadRepoShowView(
 		Inventory:          inventory,
 		Subprojects:        s.loadRepoSubprojectView(repo.ID),
 		Maintainers:        maintainers,
+		Compliance:         compliance,
 		Alternatives:       alternatives,
 		ShowAlternatives:   showPackageAlternatives(repo, alternatives),
 		IgnoredPaths:       ignoredPaths,
@@ -2561,6 +2579,7 @@ func (v repoShowView) renderData() map[string]any {
 		"AdvisoriesTotal":    v.Inventory.AdvisoriesTotal,
 		"AdvisoryAudits":     v.Inventory.AdvisoryAudits,
 		"Maintainers":        v.Maintainers,
+		"Compliance":         v.Compliance,
 		"Alternatives":       v.Alternatives,
 		"ShowAlternatives":   v.ShowAlternatives,
 		"IgnoredPaths":       v.IgnoredPaths,
@@ -2626,7 +2645,7 @@ func loadRepoLatestScans(gdb *gorm.DB, repoID uint) []db.Scan {
 // prompt) they don't. TestRepoScansFragment_rowMatchesTheFullPage fails if this
 // projection ever falls behind the template.
 const scanRowColumns = `s.id, s.repository_id, s.skill_id, s.skill_name, s.kind, s.ref,
-	s.sub_path, s.rescan_mode, s.status, s.max_turns_hit, s.refusal_audit_warning,
+	s.sub_path, s.focus_area, s.scan_group, s.rescan_mode, s.status, s.max_turns_hit, s.refusal_audit_warning,
 	s.findings_count, s.model, s.cost_usd, s."commit", s.started_at, s.finished_at`
 
 // loadRepoLatestScanRows is loadRepoLatestScans projected down to what the Scans
@@ -2640,16 +2659,15 @@ func loadRepoLatestScanRows(gdb *gorm.DB, repoID uint) []db.Scan {
 
 func loadRepoLatestScansSelect(gdb *gorm.DB, repoID uint, columns string) []db.Scan {
 	var scans []db.Scan
-	// Per (skill_name, sub_path) we want just the latest scan — the repo
-	// page should read like "this is the state of each job on this repo",
-	// not a scroll of every historical attempt. Older runs are still
-	// reachable via /scans/{id} and the global /scans index.
+	// Show the latest attempt per skill, sub-path and focus area. Separate
+	// areas in a batch are independent jobs, not retries of one another.
 	gdb.Raw(`
 		SELECT `+columns+` FROM scans s
 		JOIN (
-			SELECT COALESCE(skill_name, '') AS sn, COALESCE(sub_path, '') AS sp, MAX(id) AS max_id
+			SELECT COALESCE(skill_name, '') AS sn, COALESCE(sub_path, '') AS sp,
+			       COALESCE(focus_area, '') AS fa, MAX(id) AS max_id
 			FROM scans WHERE repository_id = ?
-			GROUP BY sn, sp
+			GROUP BY sn, sp, fa
 		) latest ON latest.max_id = s.id
 		ORDER BY s.id DESC
 	`, repoID).Scan(&scans)
@@ -2789,9 +2807,6 @@ func (s *Server) loadRepoSubprojectView(repoID uint) repoSubprojectView {
 }
 
 func countFailedScans(scans []db.Scan) int {
-	// Count failed scans in the latest-per-skill set: same scope as the
-	// retry-failed handler would act on for this repo. Drives the
-	// "Retry failed" button on the Scans tab.
 	total := 0
 	for _, sc := range scans {
 		if sc.Status == db.ScanFailed {
@@ -2871,8 +2886,8 @@ func (s *Server) repoDiffScan(w http.ResponseWriter, r *http.Request, repo db.Re
 var errDeepDiveMissing = errors.New(deepDiveSkillName + " skill is not installed")
 
 // enqueueDiffRescanGroup enqueues recon, history, embedded-native, threat-model,
-// and semgrep as one diff-rescan group. A completed threat-model fans out the
-// deep-dive scans.
+// semgrep, and betterleaks as one diff-rescan group. A completed threat-model
+// fans out the deep-dive scans.
 // Missing auxiliary skills are tolerated; a missing deep-dive is
 // errDeepDiveMissing, checked before the first enqueue so the group is
 // all-or-nothing. Shared by the "Diff rescan" button and the scheduler.
@@ -2883,7 +2898,7 @@ func (s *Server) enqueueDiffRescanGroup(ctx context.Context, repoID uint, model,
 	}
 	group := uuid.NewString()
 	queued := 0
-	for _, name := range []string{reconSkillName, historySkillName, "embedded-native", threatModelSkillName, "semgrep"} {
+	for _, name := range []string{reconSkillName, historySkillName, "embedded-native", threatModelSkillName, "semgrep", "betterleaks"} {
 		var skill db.Skill
 		if err := s.DB.Where("name = ? AND active = ?", name, true).First(&skill).Error; err != nil {
 			continue
@@ -2998,11 +3013,19 @@ func (s *Server) repoDelete(w http.ResponseWriter, r *http.Request) {
 
 	deleted, err := s.deleteRepository(repo)
 	if err != nil {
-		if errors.Is(err, errRepositoryDeleteInFlight) {
-			http.Error(w, err.Error(), http.StatusConflict)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			setFlash(w, Flash{Category: warningKey, Title: "Repository not found", Description: "The repository has already been deleted."})
+			s.redirect(w, r, "/")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		message := "The repository could not be deleted. Check the server logs for details."
+		if errors.Is(err, errRepositoryDeleteInFlight) {
+			message = err.Error()
+		} else {
+			s.Log.Error("delete repository", "repo", repo.ID, "err", err)
+		}
+		setFlash(w, Flash{Category: errorKey, Title: "Repository not deleted", Description: message})
+		s.redirect(w, r, fmt.Sprintf("/repositories/%d", repo.ID))
 		return
 	}
 	s.removeRepositoryArtifacts(deleted)
@@ -3018,24 +3041,18 @@ type deletedRepository struct {
 	ConversationIDs []uint
 }
 
-var errRepositoryDeleteInFlight = errors.New("repository has queued, running, or paused scans")
+var errRepositoryDeleteInFlight = errors.New("repository has queued or running scans, or a linked paused scan on another repository")
 
 func (s *Server) deleteRepository(repo db.Repository) (deletedRepository, error) {
 	deleted := deletedRepository{Repo: repo}
 
 	err := s.DB.Transaction(func(tx *gorm.DB) error {
-		// Match scans by the *finding's* repo, not the scan's own: a finding-
-		// scoped scan can in principle live on a different repository_id than
-		// the finding it points at, and any scan referencing a doomed finding
-		// must have its NO ACTION link cleared or the finding delete 787s.
-		var inFlight int64
-		if err := tx.Model(&db.Scan{}).
-			Where("(repository_id = ? OR "+findingsOfRepo+") AND status IN ?", repo.ID, repo.ID, inFlightScanStatuses()).
-			Count(&inFlight).Error; err != nil {
+		if err := tx.Where("id = ?", repo.ID).First(&repo).Error; err != nil {
 			return err
 		}
-		if inFlight > 0 {
-			return fmt.Errorf("%w; cancel or wait for %d linked scan(s) before deleting", errRepositoryDeleteInFlight, inFlight)
+		deleted.Repo = repo
+		if err := checkRepositoryDeleteInFlight(tx, repo.ID); err != nil {
+			return err
 		}
 		// Collected before the transaction deletes the scan rows: each scan's
 		// per-scan workspace and claude session store under DataDir are reclaimed
@@ -3056,9 +3073,17 @@ func (s *Server) deleteRepository(repo db.Repository) (deletedRepository, error)
 		if err := deleteFindingChildren(tx, repo.ID); err != nil {
 			return err
 		}
+		if err := tx.Where("sbom_upload_id IN (SELECT id FROM sbom_uploads WHERE repository_id = ?)", repo.ID).
+			Delete(&db.SBOMPackage{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("scan_id IN (SELECT id FROM scans WHERE repository_id = ?)", repo.ID).Delete(&db.ScanPreflightReceipt{}).Error; err != nil {
+			return err
+		}
 		for _, child := range []any{
 			&db.Finding{}, &db.Scan{}, &db.Subproject{}, &db.Dependency{},
-			&db.Dependent{}, &db.Package{}, &db.Advisory{}, &db.SBOMUpload{},
+			&db.Dependent{}, &db.Package{}, &db.Advisory{}, &db.AdvisoryAudit{}, &db.SBOMUpload{},
+			&db.PackageAlternative{}, &db.ExpectedFinding{}, &db.ComplianceControl{},
 		} {
 			if err := tx.Where("repository_id = ?", repo.ID).Delete(child).Error; err != nil {
 				return err
@@ -3080,12 +3105,35 @@ func (s *Server) deleteRepository(repo db.Repository) (deletedRepository, error)
 		if err := reopenRepoInterchangeRecords(tx, repo.ID); err != nil {
 			return err
 		}
-		return tx.Delete(&repo).Error
+		return deleteRepositoryWithAudit(tx, repo)
 	})
 	if err != nil {
 		return deletedRepository{}, err
 	}
 	return deleted, nil
+}
+
+// checkRepositoryDeleteInFlight matches scans by the *finding's* repo, not the
+// scan's own: a finding-scoped scan can in principle live on a different
+// repository_id than the finding it points at, and any scan referencing a
+// doomed finding must have its NO ACTION link cleared or the finding delete 787s.
+//
+// Paused scans owned by this repo are removed in this transaction.
+// Resume uses a conditional UPDATE, so it cannot resurrect a deleted
+// scan. A paused scan on another repo survives this deletion and must
+// retain its finding until it finishes, just like other in-flight work.
+func checkRepositoryDeleteInFlight(tx *gorm.DB, repoID uint) error {
+	var inFlight int64
+	if err := tx.Model(&db.Scan{}).
+		Where("(repository_id = ? OR "+findingsOfRepo+") AND status IN ?", repoID, repoID, inFlightScanStatuses()).
+		Where("NOT (repository_id = ? AND status = ?)", repoID, db.ScanPaused).
+		Count(&inFlight).Error; err != nil {
+		return err
+	}
+	if inFlight > 0 {
+		return fmt.Errorf("%w; finish or cancel active scans (resume paused scans first) before deleting; %d linked scan(s) remain", errRepositoryDeleteInFlight, inFlight)
+	}
+	return nil
 }
 
 func (s *Server) removeRepositoryArtifacts(deleted deletedRepository) {
@@ -3133,10 +3181,7 @@ func (s *Server) deleteFinding(finding db.Finding) (deletedFinding, error) {
 		if err := tx.Exec("DELETE FROM finding_labels_join WHERE finding_id = ?", finding.ID).Error; err != nil {
 			return err
 		}
-		for _, child := range []any{
-			&db.FindingNote{}, &db.FindingCommunication{}, &db.FindingReference{},
-			&db.FindingHistory{}, &db.FindingDependent{}, &db.FindingReview{},
-		} {
+		for _, child := range findingChildModels() {
 			if err := tx.Where("finding_id = ?", finding.ID).Delete(child).Error; err != nil {
 				return err
 			}
@@ -3170,22 +3215,32 @@ func (s *Server) removeFindingArtifacts(deleted deletedFinding) {
 const findingsOfRepo = "finding_id IN (SELECT id FROM findings WHERE repository_id = ?)"
 
 // deleteFindingChildren removes the rows hanging off a repository's findings.
-// notes/comms/refs/history cascade from the finding delete, but are removed
-// explicitly too so the cleanup stays correct even when foreign_keys happens
-// to be off on the connection serving the delete.
+// These normally cascade from the finding delete, but are removed explicitly
+// so cleanup stays correct even when foreign_keys happens to be off on the
+// connection serving the delete.
 func deleteFindingChildren(tx *gorm.DB, repoID uint) error {
 	if err := tx.Exec("DELETE FROM finding_labels_join WHERE "+findingsOfRepo, repoID).Error; err != nil {
 		return err
 	}
-	for _, child := range []any{
-		&db.FindingNote{}, &db.FindingCommunication{}, &db.FindingReference{},
-		&db.FindingHistory{}, &db.FindingDependent{}, &db.FindingReview{},
-	} {
+	for _, child := range findingChildModels() {
 		if err := tx.Where(findingsOfRepo, repoID).Delete(child).Error; err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// findingChildModels is shared by repository and individual finding deletion
+// so both paths remain complete when a new finding-owned table is introduced.
+// Validations precede attempts because they reference them independently of
+// the finding relationship.
+func findingChildModels() []any {
+	return []any{
+		&db.FindingNote{}, &db.FindingCommunication{}, &db.FindingReference{},
+		&db.FindingHistory{}, &db.FindingDependent{}, &db.FindingReview{},
+		&db.FindingVerification{}, &db.FindingAttackPath{},
+		&db.RemediationValidation{}, &db.RemediationAttempt{},
+	}
 }
 
 // deleteRepoConversations removes a repository's chat conversations and their
@@ -3284,6 +3339,8 @@ func (s *Server) repoScheduleUpdate(w http.ResponseWriter, r *http.Request) {
 // enqueue signature from drifting into an unreadable positional list as
 // new options (SubPath, FindingID, Model) accumulate.
 type ScanOpts struct {
+	// AuditRetry marks operator retries only, not automatic child scans or reruns.
+	AuditRetry  bool
 	Model       string
 	Effort      string
 	FindingID   *uint
@@ -3331,9 +3388,8 @@ type ScanOpts struct {
 	// rerun chain stays walkable hop by hop. Nil on a first-time enqueue.
 	ParentScanID         *uint
 	VerificationFeedback string
-	// ImportPayload is the raw uploaded report for an ingest-skill run
-	// created by the /v1/import fallback; the worker stages it into the
-	// workspace at import/report. Empty for every other enqueue.
+	// ImportPayload is an ingest report or a retained reflection snapshot;
+	// the worker stages it at import/report. Empty for other enqueues.
 	ImportPayload []byte
 }
 
@@ -3498,6 +3554,9 @@ func (s *Server) enqueueSkillWith(ctx context.Context, repoID, skillID uint, opt
 		if live.FederationOptedOut() {
 			return ErrRepoFederationOptOut
 		}
+		if opts.AuditRetry {
+			return logScanControl(tx, db.AuditEventScanRetryRequested, scan, retryLineage(scan), "", db.ScanQueued, db.SourceAnalyst)
+		}
 		return nil
 	}); err != nil {
 		return 0, err
@@ -3507,17 +3566,7 @@ func (s *Server) enqueueSkillWith(ctx context.Context, repoID, skillID uint, opt
 		prio = worker.PrioFinding
 	}
 	if err := s.Queue.Enqueue(ctx, kind, scan.ID, prio); err != nil {
-		enqueueErr := fmt.Errorf("enqueue scan %d: %w", scan.ID, err)
-		now := time.Now()
-		if markErr := s.DB.Model(&db.Scan{}).Where("id = ?", scan.ID).Updates(map[string]any{
-			"status":          db.ScanFailed,
-			"status_priority": db.StatusPriorityFor(db.ScanFailed),
-			"error":           enqueueErr.Error(),
-			"finished_at":     &now,
-		}).Error; markErr != nil {
-			return 0, errors.Join(enqueueErr, fmt.Errorf("mark scan failed: %w", markErr))
-		}
-		return 0, enqueueErr
+		return 0, s.scanEnqueueFailure(scan, err, opts.AuditRetry)
 	}
 	s.DB.Model(&db.Repository{}).Where("id = ?", repoID).Update("updated_at", time.Now())
 	// Published without the scan ID on purpose: no open page holds a row for a

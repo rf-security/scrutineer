@@ -150,6 +150,7 @@ func TestHandleImport_multiResultFailureRollsBackAllRows(t *testing.T) {
 		"repositories": &db.Repository{},
 		"scans":        &db.Scan{},
 		"findings":     &db.Finding{},
+		"audit_events": &db.AuditEvent{},
 	} {
 		var count int64
 		if err := s.DB.Model(model).Count(&count).Error; err != nil {

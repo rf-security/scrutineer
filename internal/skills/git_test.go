@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -186,7 +188,52 @@ func TestCloneOrPull_rejectsNonHTTPS(t *testing.T) {
 	}
 }
 
+// The helper is a POSIX shell script with no extension, which Go's exec cannot
+// launch on Windows at all: Git resolves the shebang itself, against the shell
+// it ships. Only a real git run answers whether the helper works there, so this
+// one drives the credential exchange git performs on a private fetch.
+func TestCloneOrPull_askpassAnswersRealGit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("needs git to run the askpass helper")
+	}
+	const token = "private-skills-token"
+	var filled string
+	retry := clone.Retry{
+		Attempts: 1,
+		Run: func(_ context.Context, _ string, env []string, _ ...string) (string, error) {
+			if !slices.Contains(env, "GIT_TERMINAL_PROMPT=0") {
+				return "", nil
+			}
+			cmd := exec.Command("git", "-c", "credential.helper=", "credential", "fill")
+			cmd.Env = append(os.Environ(), env...)
+			cmd.Stdin = strings.NewReader("protocol=https\nhost=skills.test\n\n")
+			out, err := cmd.Output()
+			if err != nil {
+				return "", fmt.Errorf("git credential fill: %w", err)
+			}
+			filled = string(out)
+			return "", errors.New("stop after the credential exchange")
+		},
+	}
+
+	dst := filepath.Join(t.TempDir(), "skills-cache", "checkout")
+	_, err := cloneOrPullWithRetry(context.Background(), retry,
+		"https://skills.test/org/private-skills", "", dst, false, token)
+	if err == nil {
+		t.Fatal("expected the inspecting runner to stop the clone")
+	}
+	if !strings.Contains(filled, "password="+token+"\n") {
+		t.Fatalf("git credential fill = %q (%v), want the configured token", filled, err)
+	}
+}
+
 func TestCloneOrPull_tokenUsesAskPassWithoutArgvLeak(t *testing.T) {
+	// Git for Windows runs the helper through its own parse_interpreter, which
+	// resolves the shebang against the sh.exe it ships; the stub below runs it
+	// with exec.Command, and CreateProcess launches no shebang file.
+	if runtime.GOOS == "windows" {
+		t.Skip("the stub runs the askpass helper the way Go execs, not the way Git does")
+	}
 	const token = "private-skills-token"
 	var (
 		askpassPath string

@@ -37,9 +37,11 @@ Select another installed runtime explicitly:
 
 The existing source-checkout command remains supported:
 
-    go run ./cmd/scrutineer -skills ./skills
+    go run -buildvcs=true ./cmd/scrutineer -skills ./skills
 
 Then open http://127.0.0.1:8080. The explicit `-skills ./skills` directory makes the checkout command useful while developing skills because it overrides the copies embedded in the binary. It is optional for ordinary use because Scrutineer ships its built-in skills and per-ecosystem runner profiles inside the executable.
+
+The `-buildvcs=true` flag includes the source commit in `go run` builds. Settings > About shows that commit, with a `-dirty` suffix for local changes, and its commit date. Ordinary `go build` commands include this metadata automatically in a Git checkout.
 
 You can also build a checkout-independent executable and run it from another directory:
 
@@ -64,7 +66,7 @@ To onboard a whole GitHub org at once, open **Add multiple** → **Import a whol
 
 You can also scan a directory on disk, useful before pushing, or for code not hosted on a git forge. Paste an absolute path (`/path/to/project`) in the same **Add repository** field. Scrutineer copies the directory into a per-scan workspace and runs the default skill set; skills that need a forge URL or ecosyste.ms enrichment (`advisories`, `exposure`, `fork`, `maintainers`, `metadata`, `packages`, `public-issue`, `report-upstream`) are skipped automatically. Symlinks are recreated as-is rather than dereferenced during the copy; in container mode their targets then resolve inside the container, so host files reached only through such a link are not visible to skills. Under `--no-container`, and for the skills listed in `host_skills`, the kernel dereferences them normally, so only point scrutineer at trees you trust.
 
-The optional analysis tools (semgrep, bandit, zizmor, git-pkgs, brief) are bundled in the runner image, so you don't need them installed locally when the container runner is in use.
+The optional analysis tools (semgrep, bandit, zizmor, betterleaks, darnit, git-pkgs, brief) are bundled in the runner image, so you don't need them installed locally when the container runner is in use.
 
 ## Git authentication
 
@@ -134,7 +136,7 @@ When the containerised runner is active (the default when a container runtime is
 - **Skill HTTP API** -- running skills can call back into scrutineer to list prior scans and enqueue further skills; see the [HTTP API overview](docs/api.md) for authentication boundaries and [openapi.yaml](openapi.yaml) for the full route specification
 - **Live updates** -- SSE streaming of scan logs and status changes, pushed rather than polled; the jobs list, the repositories list and a repository's Scans tab refresh their own table when a scan starts, finishes, or is cancelled, paused, resumed or queued, keeping the current scroll, filters and sort. Elapsed times ("started 3m ago") count up on their own, recomputed in the page rather than fetched
 - **Organisation rollup** -- repos, findings, and maintainers grouped by owning org, with per-org markdown exports
-- **Usage tracking** -- per-scan token and cost figures plus a `/usage` page totalling spend per skill, correlating cost with repository workload proxies and linking runs that cost at least ten times their skill median; see [docs/usage.md](docs/usage.md). On a Claude subscription token, a rate-limit wall auto-pauses the batch and resumes it after the reported reset, with per-window status shown on `/usage`. Optionally (`downgrade_on_overage`), once the account crosses into overage the model tier falls back from max/high to the mid tier for new scans until overage clears (typically when the window resets) -- announced in the log, on the jobs page, and on `/usage`
+- **Usage tracking** -- per-scan token and cost figures plus a `/usage` page totalling spend per skill, correlating cost with repository workload proxies and linking runs that cost at least ten times their skill median; see [docs/usage.md](docs/usage.md). On a Claude subscription token, a rate-limit wall auto-pauses the batch and resumes it after the reported reset, with per-window status shown on `/usage`. Optionally (`downgrade_on_overage`), once the account crosses into overage the model tier falls back from max/high to the mid tier for new scans until overage clears (typically when the window resets) -- announced in the log, on the jobs page, and on `/usage`. Set `pause_on_overage: true` to pause model scans instead; this takes precedence over downgrading and preserves resumable work.
 - **Themes** -- six colour themes plus a light/dark/system toggle, set on the Settings page
 
 ## The default pipeline
@@ -144,6 +146,7 @@ Adding a repo enqueues the `triage` skill, whose SKILL.md lists the further skil
 | Skill | What it does |
 |-------|--------------|
 | `triage` | Orchestrates the default scan set via the scrutineer API |
+| `reflect` | Records tool failures and working entrypoints from a finished scan set into the threat model |
 | `metadata` | Fetches repo metadata from repos.ecosyste.ms |
 | `packages` | Looks up published packages from packages.ecosyste.ms |
 | `advisories` | Fetches known security advisories |
@@ -158,6 +161,7 @@ Adding a repo enqueues the `triage` skill, whose SKILL.md lists the further skil
 | `threat-model` | Derives the project's security contract (components, entry-point trust table, claimed and disclaimed properties) for the deep-dive to load |
 | `semgrep` | Static analysis mapped into findings shape |
 | `bandit` | Python-only static analysis mapped into findings shape, carrying bandit's own confidence level; runs alongside `semgrep` on repositories with Python |
+| `betterleaks` | Secret scanning across the available Git history, with raw secret values removed before findings are written |
 | `vuln-scan` | High-recall model-backed static candidate scan adapted from Anthropic's defending-code reference harness |
 | `zizmor` | GitHub Actions workflow audit enriched with bundled trust-boundary, credential, and supply-chain guidance |
 | `ingest` | Normalizes external reports in arbitrary formats into findings when `/v1/import` cannot recognise the payload |
@@ -177,6 +181,7 @@ Adding a repo enqueues the `triage` skill, whose SKILL.md lists the further skil
 | `reachability` | Traces dependency sinks through application code to determine which are reachable from trust boundaries |
 | `cna-match` | Matches a repository to its CVE Numbering Authority so disclosures route to the right contact |
 | `posture` | Records the repo's security posture (reporting policy, response history, hardening) on the Repository row |
+| `compliance` | Audits the repo against the 62 OpenSSF Baseline controls with `darnit`, resolves the controls darnit defers to LLM analysis or could not verify without a forge token, and records per-control verdicts and the attained Baseline level on the Compliance tab |
 | `forensics` | Read-only compromise timeline and evidence bundle from local Git history and public forge/archive records |
 | `variants` | Starting from one confirmed finding, searches the current repository for distinct, high-confidence sibling instances of the same root cause |
 | `audit-injection` | Opt-in static audit for command/code execution, unsafe deserialization, and server-side template injection with ecosystem-specific references |
@@ -184,6 +189,9 @@ Adding a repo enqueues the `triage` skill, whose SKILL.md lists the further skil
 | `audit-authz` | Opt-in static audit for IDOR, tenant isolation, fail-open guards, privilege escalation, and authorization decisions based on unverified claims |
 | `audit-pii` | Opt-in static audit for real personal or customer-identifying data committed to source or exposed through logs, URLs, telemetry, exports, and responses |
 | `audit-memory` | Opt-in static audit for reachable memory corruption in first-party C, C++, unsafe Rust, native extensions, and FFI boundaries |
+| `audit-package-manager` | Static audit of package manager clients, registries, and proxies against a bundled threat model; triage enqueues it when source evidence shows the repository implements one |
+| `audit-web` | Reviews web sessions, browser origins, uploads and business workflows when triage finds an implemented web application or API |
+| `audit-embedded` | Reviews firmware updates, boot chain, provisioning, device credentials and debug interfaces when triage finds device firmware |
 
 Edit `skills/triage/SKILL.md` to change what gets run by default. Drop new skill directories in `skills/` to add scan types; no code changes needed. See [docs/skills.md](docs/skills.md) for the frontmatter reference, the `scrutineer.*` metadata keys, the `context.json` shape, output kinds, schema validation, and the skill-facing HTTP API.
 
@@ -201,7 +209,7 @@ SARIF 2.1.0, CSV, markdown, and a minimal JSON shape are all accepted; the forma
 
 Every index page has a search box plus filter and sort dropdowns; the specifics vary by page. The sidebar sections:
 
-- **Repositories** -- your scanned repos with language, last-scan status, and finding counts. Click into one for tabs covering Summary, Findings, Threat Model, Packages, Dependencies, Dependents, Advisories, Maintainers, Data, Scans, and Chat, plus an "Export report" button for a markdown rollup.
+- **Repositories** -- your scanned repos with language, last-scan status, and finding counts. Click into one for tabs covering Summary, Findings, Threat Model, Compliance, Packages, Dependencies, Dependents, Advisories, Maintainers, Data, Scans, and Chat, plus an "Export report" button for a markdown rollup.
 - **Organizations** -- repos, findings, and maintainers grouped by owning org, with per-org markdown exports.
 - **Findings** -- every vulnerability across all repos. A finding page shows the six-step analysis (trace, boundary, validation, prior art, reach, rating), scoring fields, notes, communications log, references, labels, and a change history.
 - **Packages** -- registry entries discovered across all repos.
@@ -212,7 +220,7 @@ Every index page has a search box plus filter and sort dropdowns; the specifics 
 - **Scans** -- every scan that has run. Queued scans can be paused/resumed, running or queued scans can be cancelled and failed ones retried.
 - **Skills** -- installed skills from disk and from the UI; view, edit, or run any of them.
 - **Usage** -- token and cost totals across all scans, broken down by skill.
-- **Reporting** -- corpus-wide activity over a rolling window (24 hours, 7 days, 30 days, or all time) with a minimum-severity floor on findings: repositories scanned, runs started and completed, findings, a per-day breakdown, and the per-scan cost and token averages beside their all-time figures. Downloadable as CSV or JSON.
+- **Reporting** -- corpus-wide activity over a rolling window (24 hours, 7 days, 30 days, or all time) with a minimum-severity floor on findings: repositories scanned, runs started and completed, findings, a per-day breakdown, and the per-scan cost and token averages beside their all-time figures. Downloadable as CSV or JSON; JSON exports pulled from several discrete scanner instances can be combined into one corpus-wide report with `go run ./scripts/merge-reports a/report.json b/report.json`; see [docs/reporting.md](docs/reporting.md).
 - **Settings** -- theme, colour scheme, model tiers, runner concurrency (restarts the runner to apply, cancelling in-flight scans) and default turn cap (applied to the next scan), plus system stats (record counts, DB size, paths). The chat pool is sized at half the concurrency the server started with and is not resized here, so a change only takes effect for chat after a restart.
 
 ## Finding workflow
@@ -244,7 +252,7 @@ The same applies to the Dependents tab -- you can import any dependent's reposit
 
 ## Docker
 
-    docker build -t scrutineer .
+    docker build --build-arg COMMIT="$(git rev-parse HEAD)" -t scrutineer .
     docker run -p 127.0.0.1:8080:8080 -v scrutineer-data:/data \
       -e ANTHROPIC_API_KEY=sk-ant-api03-... \
       -e ANTHROPIC_BASE_URL=https://... \
@@ -262,12 +270,19 @@ Always bind to `127.0.0.1`: the UI has no authentication, so binding to `0.0.0.0
 
 If a container runtime (docker, rootless podman, or Apple's `container`) is available on the host, scrutineer runs each scan in an ephemeral container for isolation. The runner image is published to GHCR as a multi-arch manifest (`linux/amd64` and `linux/arm64`) and pulled automatically on first use:
 
-    go run ./cmd/scrutineer -skills ./skills
+    go run -buildvcs=true ./cmd/scrutineer -skills ./skills
 
 Use `--runtime podman` to run scans under podman instead of docker (see [Podman (rootless)](#podman-rootless) below), `--runtime apple` to run scans under Apple's `container` runtime on macOS (see [Apple container (experimental)](#apple-container-experimental) below), `--no-container` to disable containerised execution entirely, or `--runner-image` to specify a different image. To build the runner locally instead of pulling from GHCR (use `podman build` or `container build` instead if you run scans under those runtimes):
 
     docker build -t scrutineer-runner -f Dockerfile.runner .
-    go run ./cmd/scrutineer -skills ./skills --runner-image scrutineer-runner
+    go run -buildvcs=true ./cmd/scrutineer -skills ./skills --runner-image scrutineer-runner
+
+The runner's bundled Claude Code only moves when a maintainer merges Renovate's update, and Renovate waits until a Claude Code release is seven days old, so a model that needs a newer CLI takes at least a week to become usable. It takes longer on a release binary, whose default runner image only changes with the next scrutineer release. To run a newer Claude Code without falling back to `--no-container`, build the runner from a checkout of the scrutineer version you run and override the `CLAUDE_*_LOCK` build arguments with the Claude Code tag and the SHA-256 of `claude-linux-x64.tar.gz` and `claude-linux-arm64.tar.gz` from that Claude Code release's `SHASUMS256.txt`. Per-ecosystem profile images are cached by a locally built runner's tag alone, so give each version its own tag to have them rebuilt on top of it:
+
+    docker build -t scrutineer-runner:claude-2.1.284 -f Dockerfile.runner --build-arg CLAUDE_AMD64_LOCK=v2.1.284@sha256:<x64 digest> --build-arg CLAUDE_ARM64_LOCK=v2.1.284@sha256:<arm64 digest> .
+    go run -buildvcs=true ./cmd/scrutineer -skills ./skills --runner-image scrutineer-runner:claude-2.1.284
+
+The staleness check below never flags a locally built runner, so drop `--runner-image` once the published runner carries the Claude Code release you need.
 
 The runner image is not auto-updated, so the analysis toolchain stays on whatever digest you pulled until you pull again. To keep that drift visible, scrutineer checks the registry once at startup (in the background, and failing silently if the registry is unreachable) and flags the runner image when it is more than seven days behind the published `:latest` -- both in the boot log and as a banner on the Settings page. Update with:
 
@@ -289,7 +304,7 @@ When the container runner is active, scrutineer auto-detects a per-ecosystem **p
 |---------|---------------|------|
 | `php` / `php-ext` | `package_manager:Composer` / `tools.native_extension:phpize` | PHP; `php-ext` builds PHP debug + ASan/UBSan for C extensions |
 | `python` / `python-ext` | `package_manager:pip` / `Pipenv` / `Poetry` / `uv` / `PDM` / `setuptools`; `python-ext` when `tools.native_extension:setuptools Extension` is present | CPython; `python-ext` builds CPython debug + ASan/UBSan |
-| `ruby` | Bundler | Ruby 3.4 + Bundler; metaprogramming / dynamic-dispatch guidance, plus a tripwire that flags an un-instrumented native extension |
+| `ruby` | Bundler or RubyGems | Ruby 3.4 + Bundler; metaprogramming / dynamic-dispatch guidance, plus a tripwire that flags an un-instrumented native extension |
 | `ruby-ext` | `tools.native_extension:mkmf` | A **superset** of `ruby`: adds an ASan/UBSan Ruby (the default interpreter), valgrind on the stock interpreter, Rust nightly for rb-sys gems, and Brakeman |
 | `ruby-rails` | `tools.build:Rails` | A superset of `ruby` plus **Brakeman**, Rails-specific SAST |
 | `node` | npm/pnpm/Yarn/Bun | Node.js |
@@ -337,6 +352,17 @@ Requirements and notes:
 
 The `docker build` commands shown for the runner image and profiles can be run as `container build` when you use this runtime. See [docs/apple.md](docs/apple.md) for the full parity matrix, the VM-isolation security model, and how hardened mode works.
 
+## Windows
+
+Scrutineer builds and runs on Windows hosts: every release ships a `windows-amd64` archive, and `go build ./cmd/scrutineer` produces `scrutineer.exe`. Scans run under Docker Desktop with the default `--runtime docker`. `--runtime apple` is macOS-only and `--runtime podman` has not been tested there. What differs from Linux and macOS:
+
+- **Container user**: Windows has no host uid/gid to map, so the runner omits `--user` and each scan runs as the image's own `USER`. The bundled runner and profile images end with `USER runner`. A custom `--runner-image` or profile image that sets no `USER` runs the scan as root, where Linux and macOS would still map it to your uid.
+- **Local directory scans**: paste a drive-letter path (`C:\path\to\project`) in the **Add repository** field. Recreating the symlinks of a copied tree needs the symlink privilege, so enable Developer Mode or run as administrator if a local scan fails on one.
+- **Git**: run `git config --global core.longpaths true` and keep the data directory path short. The per-scan cache nests a 64-character content hash under it, and while `core.longpaths` lifts the 260-character limit for regular files, Git for Windows still refuses a submodule whose `.git/modules` directory sits past it (`fatal: '$GIT_DIR' too big`).
+- **Cancellation**: cancelling a scan (from the UI, the scan timeout or Ctrl+C) terminates the process scrutineer started and every descendant it left behind. Windows has no signalable process group, so each scan process is created suspended, assigned to a job object limited to kill-on-close and only then resumed, which the kernel also closes if scrutineer itself dies. A scan whose job cannot be set up does not start.
+- **`--no-container`**: `claude` must resolve to the native `claude.exe` (native installer or WinGet). An npm install puts a `claude.cmd` shim on `PATH`, which `PATHEXT` resolution finds but `CreateProcess` cannot launch, so every scan fails to start with `%1 is not a valid Win32 application`.
+- **Credential file modes**: the owner-only permission checks on the OpenCode `state_dir` and on `codex.auth_file` are skipped, since Go file modes carry no ACL on Windows and every file reads back as `0666`. Each `auth.json` inherits the ACL of its parent directory, so keep both under a path only your account can read.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -357,9 +383,11 @@ The `docker build` commands shown for the runner image and profiles can be run a
 | `-concurrency` | `4` | Number of scans to run in parallel. Chat turns run from a separate pool sized at half this value, so a busy host can reach 1.5x this many agent containers. With `codex.auth_file`, scans and chat turns share one execution slot |
 | `-clone` | `shallow` | Clone depth: `shallow` (`--depth 1`) or `full` |
 | `-scan-timeout` | `1h` | Wall-clock limit per scan; exceeded scans fail |
+| `-backend-preflight-ttl` | `0` | Opt-in live backend probe cache lifetime, e.g. `1h`; probes consume model tokens. YAML: `backend_preflight_ttl`. |
 | `-max-turns` | `0` | Per-scan turn cap (0 = unlimited); claude and copilot backends only, codex and opencode have no turn cap |
 | `-schema-strict` | `false` | Fail a scan when its `report.json` does not validate against the skill's `schema.json` (default: warn in the scan log and parse anyway) |
 | `-model-base-url` | - | Custom model API base URL for the active backend (env fallback: `ANTHROPIC_BASE_URL` for claude). `-anthropic-base-url` is a deprecated alias. |
+| `-model-proxy` | false | Keep `ANTHROPIC_API_KEY` off scan containers: each scan gets a per-scan token for a host-side Anthropic API proxy. Claude backend with API-key auth only, requires the containerised runner. See [docs/model-proxy.md](docs/model-proxy.md). |
 | `-ecosystems-enrichment` | `true` | Enrich repositories from ecosyste.ms: the per-repository cache, the warm on repo add, and the PURL-to-repository resolution behind SBOM and dependency import. `=false` stops every lookup scrutineer's own process makes, leaves `egress_allow` untouched (the bundled skills still fetch ecosyste.ms themselves), and leaves the Dependents tab and dependent-exposure analysis with no data |
 | `-recipients-file` | - | Age recipients file (public keys) for encrypted export |
 | `-identity-file` | - | Age identity file or SSH private key for decrypting imports and encrypted federation feeds |
@@ -405,7 +433,7 @@ Skills resolve to a model through a tier: `high` by default, unless the skill's 
 Scrutineer can drive OpenAI's [codex](https://github.com/openai/codex) CLI instead of claude-code. The runner image bundles the `codex` binary, so switching is the flag (or `backend: codex` in `scrutineer.yaml`) plus a credential:
 
     export CODEX_API_KEY=sk-...
-    go run ./cmd/scrutineer -skills ./skills -backend codex
+    go run -buildvcs=true ./cmd/scrutineer -skills ./skills -backend codex
 
 It can also use a ChatGPT subscription login without consuming Platform API
 credits. Create an isolated file-backed login:
@@ -445,7 +473,7 @@ Anthropic and OpenAI keep their existing setup. Other providers can use `opencod
 Scrutineer can drive [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli) instead of claude-code. The runner image bundles the `copilot` binary, so switching is the flag (or `backend: copilot` in `scrutineer.yaml`) plus a credential -- a GitHub token with Copilot access. Copilot CLI rejects classic (`ghp_`) PATs, so use a fine-grained PAT or the OAuth token `gh auth login` already stored:
 
     export GH_TOKEN=$(gh auth token)
-    go run ./cmd/scrutineer -skills ./skills -backend copilot
+    go run -buildvcs=true ./cmd/scrutineer -skills ./skills -backend copilot
 
 The container, egress proxy, language profiles and skill staging stay the same; only the agent CLI inside the container changes. The default egress allowlist is entirely GitHub infrastructure (`github.com`, `api.github.com`, `api.mcp.github.com`, `*.githubcopilot.com`), since Copilot CLI proxies every model through GitHub's own API; setting `-model-base-url` overrides that endpoint and adds the override host to the allowlist. The model pick list defaults to Copilot's own catalog (Claude and GPT models) with tier tags already set; override with `models:` in the config for a different set. Unlike codex and opencode, `-max-turns` is honoured by this backend. The copilot backend requires the containerised runner; `--no-container` with `-backend copilot` is rejected at startup. See [docs/copilot.md](docs/copilot.md) for the full credential and event-mapping details.
 
@@ -453,7 +481,7 @@ The container, egress proxy, language profiles and skill staging stay the same; 
 
 In `--no-container` mode, and for the skills listed in `host_skills`, the `claude` subprocess inherits your `~/.claude/settings.json`, so [sandbox settings](https://code.claude.com/docs/en/sandboxing) that restrict network or filesystem access there will fail skills that need them. Point `claude` at a separate config directory just for scrutineer runs:
 
-    CLAUDE_CONFIG_DIR=~/.claude-scrutineer go run ./cmd/scrutineer -skills ./skills
+    CLAUDE_CONFIG_DIR=~/.claude-scrutineer go run -buildvcs=true ./cmd/scrutineer -skills ./skills
 
 Copy your `settings.json` into that directory and drop the sandbox keys; your normal Claude Code config is untouched. Container mode is not affected for the skills that stay in the container: there `claude` runs inside the container with its own environment regardless of the host config.
 
@@ -468,6 +496,7 @@ See [SECURITY.md](SECURITY.md) for the reporting policy and [threatmodel.md](thr
 - [docs/api.md](docs/api.md) -- HTTP API surfaces, callers, authentication boundaries, and links to the full [OpenAPI specification](openapi.yaml)
 - [docs/database.md](docs/database.md) -- full database schema reference
 - [docs/usage.md](docs/usage.md) -- per-skill cost ranges, workload correlations and 10x-median outliers
+- [docs/reporting.md](docs/reporting.md) -- the Reporting page's CSV/JSON exports and merging exports from several instances
 - [docs/backup.md](docs/backup.md) -- backing up and restoring the database (built-in `scrutineer backup`/`restore`, `sqlite3`, Litestream)
 - [docs/development.md](docs/development.md) -- project layout, regenerating embedded data, running tests
 - [docs/encrypted-sharing.md](docs/encrypted-sharing.md) -- encrypted findings sharing between contributors (age + SSH keys, team keyring management)

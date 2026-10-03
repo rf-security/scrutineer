@@ -101,8 +101,8 @@ func (s *Server) findingOSV(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to load finding references", http.StatusInternalServerError)
 		return
 	}
-	var pkgs []db.Package
-	if err := s.DB.Select("name, ecosystem, p_url").Where("repository_id = ?", f.RepositoryID).Find(&pkgs).Error; err != nil {
+	pkgs, err := findingAdvisoryPackages(s.DB, f, []string{"name", "ecosystem", "p_url"})
+	if err != nil {
 		s.Log.Error("osv packages", "finding", f.ID, "repository", f.RepositoryID, "err", err)
 		http.Error(w, "failed to load repository packages", http.StatusInternalServerError)
 		return

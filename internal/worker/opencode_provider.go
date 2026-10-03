@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -167,7 +168,13 @@ func (d ContainerRunner) resolveOpencodeProvider(model string) (opencodeProvider
 	return resolved, nil
 }
 
-func (d ContainerRunner) configureOpencodeProviderEgress(provider opencodeProvider) (ContainerRunner, func(), error) {
+// configureOpencodeProviderEgress widens the allowlists for the selected
+// provider and, on the host-proxy path, starts a scoped proxy for the scan.
+// When proxyDeferred is set the skill has egress grants and applyEgressPolicy
+// starts the single scoped proxy afterwards, from the allowlists widened here,
+// so this function must not start a second one. A refusal there fails the scan,
+// so deferring never lets a scan run without a proxy.
+func (d ContainerRunner) configureOpencodeProviderEgress(provider opencodeProvider, proxyDeferred bool) (ContainerRunner, func(), error) {
 	noop := func() {}
 	if !provider.Configured {
 		return d, noop, nil
@@ -181,7 +188,7 @@ func (d ContainerRunner) configureOpencodeProviderEgress(provider opencodeProvid
 				"provider", provider.ID, "port", provider.HostPort)
 		}
 	}
-	if d.usesEgressSidecar() {
+	if proxyDeferred || d.usesEgressSidecar() {
 		return d, noop, nil
 	}
 	if d.ProviderProxy.ContainerHost == "" {
@@ -203,7 +210,7 @@ func (d ContainerRunner) configureOpencodeProviderEgress(provider opencodeProvid
 	return d, cleanup, nil
 }
 
-func (d ContainerRunner) prepareOpencodeExecution(ctx context.Context, model string) (ContainerRunner, opencodeProvider, SkillResult, func(), error) {
+func (d ContainerRunner) prepareOpencodeExecution(ctx context.Context, model string, proxyDeferred bool) (ContainerRunner, opencodeProvider, SkillResult, func(), error) {
 	noop := func() {}
 	provider, err := d.resolveOpencodeProvider(model)
 	result := SkillResult{Backend: HarnessName(d.harness())}
@@ -229,7 +236,7 @@ func (d ContainerRunner) prepareOpencodeExecution(ctx context.Context, model str
 	// Provider images are bases for the existing language profiles, so replace
 	// the copied runner's default image before profile resolution.
 	d.Image = provider.RunnerImage
-	d, closeProxy, err := d.configureOpencodeProviderEgress(provider)
+	d, closeProxy, err := d.configureOpencodeProviderEgress(provider, proxyDeferred)
 	if err != nil {
 		unlock()
 		return d, provider, result, noop, err
@@ -307,7 +314,10 @@ func ensureOpencodeProviderState(provider opencodeProvider) error {
 	if !info.IsDir() {
 		return fmt.Errorf("OpenCode provider %q state path is not a directory", provider.ID)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	// Windows reports a directory as 0o777 (0o555 with the read-only
+	// attribute): its ACLs never surface as POSIX bits, so there is nothing
+	// for this check to read there.
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		return fmt.Errorf("OpenCode provider %q state directory permissions %04o expose credentials; require 0700 or stricter", provider.ID, info.Mode().Perm())
 	}
 	authPath := opencodeProviderAuthPath(provider.StateDir)
@@ -403,7 +413,7 @@ func (d ContainerRunner) checkOpencodeReadiness(ctx context.Context, provider op
 	probe := func(argv ...string) ([]byte, error) {
 		args := d.buildRunArgsForProvider(absWork, image, hnet, harnessStateDir, provider, "/tmp")
 		cmd := exec.CommandContext(ctx, runtimeBin(d.Runtime), append(args, argv...)...)
-		cmd.Env = environmentWith(os.Environ(), provider.Env)
+		cmd.Env = environmentWith(os.Environ(), d.containerProcessEnv(provider.Env))
 		return cmd.CombinedOutput()
 	}
 	cacheKey := image + "\x00" + provider.Model + "\x00" + provider.Env["OPENCODE_CONFIG_CONTENT"] + "\x00" + provider.StateDir + "\x00" + provider.HostPort + "\x00" + strings.Join(provider.RequiredBinaries, "\x00") + "\x00" + strings.Join(provider.EgressHosts, "\x00")

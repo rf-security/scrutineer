@@ -7,22 +7,6 @@
     "dockerfile",
     "custom.regex"
   ],
-  "customDatasources": {
-    "codex-linux-amd64": {
-      "description": "Read Codex x86_64 package-asset digests from GitHub metadata without downloading the assets",
-      "defaultRegistryUrlTemplate": "https://api.github.com/repos/openai/codex/releases?per_page=50",
-      "transformTemplates": [
-        "{\"releases\": $append([], $map($[draft = false and assets[name = \"codex-package-x86_64-unknown-linux-musl.tar.gz\"].digest], function($release) {($asset := $release.assets[name = \"codex-package-x86_64-unknown-linux-musl.tar.gz\"][0]; {\"version\": $release.tag_name, \"releaseTimestamp\": $release.published_at, \"digest\": $substringAfter($asset.digest, \"sha256:\"), \"isStable\": $not($release.prerelease)})})), \"sourceUrl\": \"https://github.com/openai/codex\"}"
-      ]
-    },
-    "codex-linux-arm64": {
-      "description": "Read Codex aarch64 package-asset digests from GitHub metadata without downloading the assets",
-      "defaultRegistryUrlTemplate": "https://api.github.com/repos/openai/codex/releases?per_page=50",
-      "transformTemplates": [
-        "{\"releases\": $append([], $map($[draft = false and assets[name = \"codex-package-aarch64-unknown-linux-musl.tar.gz\"].digest], function($release) {($asset := $release.assets[name = \"codex-package-aarch64-unknown-linux-musl.tar.gz\"][0]; {\"version\": $release.tag_name, \"releaseTimestamp\": $release.published_at, \"digest\": $substringAfter($asset.digest, \"sha256:\"), \"isStable\": $not($release.prerelease)})})), \"sourceUrl\": \"https://github.com/openai/codex\"}"
-      ]
-    }
-  },
   "automerge": false,
   "internalChecksFilter": "strict",
   "customManagers": [
@@ -40,26 +24,14 @@
     },
     {
       "customType": "regex",
-      "description": "Update the Codex CLI x86_64 release asset and SHA-256 pin",
+      "description": "Update Codex CLI package assets using the release's codex-package_SHA256SUMS manifest",
       "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
       "matchStrings": [
-        "ARG CODEX_AMD64_LOCK=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
+        "ARG CODEX_(?:AMD64|ARM64)_LOCK=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
       ],
       "packageNameTemplate": "openai/codex",
       "depNameTemplate": "openai/codex",
-      "datasourceTemplate": "custom.codex-linux-amd64",
-      "versioningTemplate": "regex:^rust-v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-(?<prerelease>.+))?$"
-    },
-    {
-      "customType": "regex",
-      "description": "Update the Codex CLI aarch64 release asset and SHA-256 pin",
-      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
-      "matchStrings": [
-        "ARG CODEX_ARM64_LOCK=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
-      ],
-      "packageNameTemplate": "openai/codex",
-      "depNameTemplate": "openai/codex",
-      "datasourceTemplate": "custom.codex-linux-arm64",
+      "datasourceTemplate": "github-release-attachments",
       "versioningTemplate": "regex:^rust-v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-(?<prerelease>.+))?$"
     },
     {
@@ -159,6 +131,18 @@
     },
     {
       "customType": "regex",
+      "description": "Update the darnit runner-image pin",
+      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "matchStrings": [
+        "ARG DARNIT_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "darnit-mcp",
+      "depNameTemplate": "darnit-mcp",
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
       "description": "Update the zizmor container-image pins",
       "managerFilePatterns": [
         "/^Dockerfile$/",
@@ -170,6 +154,21 @@
       "packageNameTemplate": "zizmor",
       "depNameTemplate": "zizmor",
       "datasourceTemplate": "crate",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Update the betterleaks container-image pins",
+      "managerFilePatterns": [
+        "/^Dockerfile$/",
+        "/^Dockerfile\\.runner$/"
+      ],
+      "matchStrings": [
+        "ARG BETTERLEAKS_VERSION=(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "packageNameTemplate": "github.com/betterleaks/betterleaks",
+      "depNameTemplate": "betterleaks",
+      "datasourceTemplate": "go",
       "versioningTemplate": "semver"
     },
     {
@@ -256,6 +255,12 @@
       "minimumGroupSize": 2
     },
     {
+      "description": "Keep both container-image betterleaks pins synchronized",
+      "matchPackageNames": ["github.com/betterleaks/betterleaks"],
+      "groupName": "betterleaks",
+      "minimumGroupSize": 2
+    },
+    {
       "description": "Keep the workflow and container-image zizmor pins synchronized",
       "matchPackageNames": ["zizmor"],
       "groupName": "zizmor",
@@ -269,7 +274,7 @@
       "minimumReleaseAge": "7 days"
     },
     {
-      "description": "Keep both Codex CLI assets on one release; digests come from GitHub release metadata",
+      "description": "Keep both Codex CLI package assets on one release; digests come from its checksum manifest",
       "matchPackageNames": ["openai/codex"],
       "groupName": "Codex CLI",
       "minimumGroupSize": 2

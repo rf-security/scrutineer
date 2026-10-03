@@ -10,6 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/db/dbtest"
 	"scrutineer/internal/threatmodel"
 )
 
@@ -49,10 +50,7 @@ func newControlsFixture(t *testing.T, model, location string) controlsFixture {
 // changed"). The verify scan that later reads it has no SubPath of its own.
 func newControlsFixtureInSubPath(t *testing.T, model, location, subPath string) controlsFixture {
 	t.Helper()
-	gdb, err := db.Open(filepath.Join(t.TempDir(), "controls.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	gdb := dbtest.Open(t)
 	repo := db.Repository{URL: "file:///fixture", Name: "fixture", ThreatModel: model}
 	if err := gdb.Create(&repo).Error; err != nil {
 		t.Fatal(err)
@@ -237,10 +235,14 @@ func TestControlsContextStagesIntoContextJSON(t *testing.T) {
 
 	dir := t.TempDir()
 	scan := &db.Scan{ID: 11, RepositoryID: fixture.repo.ID, APIToken: "tok"}
-	if err := stageContextWithInputs(
-		dir, "", "http://127.0.0.1:8080/api", "", DefaultMetadataDir,
+	document, err := buildSkillContext(
+		"http://127.0.0.1:8080/api", "", DefaultMetadataDir,
 		scan, &fixture.repo, nil, nil, got,
-	); err != nil {
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(dir, "", document); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "context.json"))
@@ -274,10 +276,14 @@ func TestStagedContextOmitsControlsWhenUnresolved(t *testing.T) {
 	dir := t.TempDir()
 	repo := db.Repository{URL: "file:///fixture", ThreatModel: controlsModel}
 	scan := &db.Scan{ID: 12, RepositoryID: 3, APIToken: "tok"}
-	if err := stageContextWithInputs(
-		dir, "", "http://127.0.0.1:8080/api", "", DefaultMetadataDir,
+	document, err := buildSkillContext(
+		"http://127.0.0.1:8080/api", "", DefaultMetadataDir,
 		scan, &repo, nil, nil, nil,
-	); err != nil {
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSkillContext(dir, "", document); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "context.json"))

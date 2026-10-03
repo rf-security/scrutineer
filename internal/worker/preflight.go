@@ -41,12 +41,22 @@ import (
 // queue); or fail the scan when a prereq has irrecoverably failed
 // (true, nil).
 func (w *Worker) preflightSkill(ctx context.Context, scan *db.Scan, attempt int) (bool, error) {
-	if scan.SkillID == nil || scan.ExplorationMode == ExplorationRandomDig {
+	if scan.SkillID == nil || scan.ExplorationMode != "" {
 		return false, nil
 	}
 	var skill db.Skill
 	if err := w.DB.First(&skill, *scan.SkillID).Error; err != nil {
 		return false, fmt.Errorf("load skill %d for preflight: %w", *scan.SkillID, err)
+	}
+	if skill.Name == "reflect" {
+		pending, err := w.prepareReflection(scan)
+		if err != nil {
+			w.failScanPrereqs(scan, skill.Name, err.Error(), nil)
+			return true, nil
+		}
+		if pending {
+			return w.deferSkillPrereqs(ctx, scan, &skill, attempt, []string{"triage cohort"})
+		}
 	}
 	requires := skills.SplitPatterns(skill.Requires)
 	if len(requires) == 0 {
@@ -61,7 +71,10 @@ func (w *Worker) preflightSkill(ctx context.Context, scan *db.Scan, attempt int)
 	if len(pending) == 0 {
 		return false, nil
 	}
+	return w.deferSkillPrereqs(ctx, scan, &skill, attempt, pending)
+}
 
+func (w *Worker) deferSkillPrereqs(ctx context.Context, scan *db.Scan, skill *db.Skill, attempt int, pending []string) (bool, error) {
 	maxAttempts := w.MaxPrereqAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = DefaultMaxPrereqAttempts
@@ -192,16 +205,23 @@ func (w *Worker) prereqStatus(where string, args []any, inFlight []db.ScanStatus
 
 func (w *Worker) failScanPrereqs(scan *db.Scan, skillName, msg string, missing []string) {
 	now := time.Now()
+	result := w.DB.Model(&db.Scan{}).Where("id = ? AND status = ?", scan.ID, db.ScanQueued).Updates(map[string]any{
+		"status": db.ScanFailed, "status_priority": db.StatusPriorityFor(db.ScanFailed),
+		errorColumn: msg, "started_at": now, "finished_at": now,
+	})
+	if result.Error != nil {
+		w.Log.Error("save failed-prereq scan",
+			"scan", scan.ID, "skill", skillName, "err", result.Error)
+		return
+	}
+	if result.RowsAffected == 0 {
+		return
+	}
 	scan.Status = db.ScanFailed
 	scan.StatusPriority = db.StatusPriorityFor(db.ScanFailed)
 	scan.Error = msg
 	scan.StartedAt = &now
 	scan.FinishedAt = &now
-	if err := w.DB.Save(scan).Error; err != nil {
-		w.Log.Error("save failed-prereq scan",
-			"scan", scan.ID, "skill", skillName, "err", err)
-		return
-	}
 	w.publish(scan.ID, scan.RepositoryID, "scan-status", string(scan.Status))
 	w.Log.Warn("scan failed: prereqs not satisfied",
 		"scan", scan.ID, "skill", skillName, "missing", missing)

@@ -31,6 +31,12 @@ func operatorCookieName(token string) string {
 // sent as a bearer by scripts or as the cookie /login sets for a browser.
 func (s *Server) requireOperator(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The sharing portal authenticates and authorizes its GET allow-list
+		// before attaching this server-side scope. Its visitors are not operators.
+		if r.Method == http.MethodGet && isReadOnly(r) {
+			h.ServeHTTP(w, r)
+			return
+		}
 		token := bearer(r.Header.Get("Authorization"))
 		if c, err := r.Cookie(operatorCookieName(s.OperatorToken)); token == "" && err == nil {
 			token = c.Value

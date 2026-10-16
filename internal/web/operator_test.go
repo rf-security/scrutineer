@@ -197,3 +197,30 @@ func TestUnauthorizedNamesTokenFile(t *testing.T) {
 		t.Errorf("status %d body %q, want 401 naming %s", w.Code, w.Body.String(), s.OperatorTokenFile)
 	}
 }
+
+func TestRequireOperatorSharingScope(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	s.OperatorToken = ""
+	for _, tc := range []struct {
+		name, method string
+		scope        *ViewScope
+		want         int
+	}{
+		{"unscoped visitor", "GET", nil, http.StatusUnauthorized},
+		{"authorized portal visitor", "GET", &ViewScope{ReadOnly: true}, http.StatusOK},
+		{"writable scope", "GET", &ViewScope{}, http.StatusUnauthorized},
+		{"portal write", "POST", &ViewScope{ReadOnly: true}, http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(tc.method, "/", nil)
+			r.Host = testHost
+			if tc.scope != nil {
+				r = r.WithContext(WithViewScope(r.Context(), *tc.scope))
+			}
+			if w := serve(s, r); w.Code != tc.want {
+				t.Fatalf("status %d, want %d", w.Code, tc.want)
+			}
+		})
+	}
+}

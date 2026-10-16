@@ -1,12 +1,14 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -157,6 +159,66 @@ func TestDoRetryCapsRetryAfter(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if len(delays) != 1 || delays[0] != time.Millisecond {
 		t.Fatalf("delays = %v, want [1ms]", delays)
+	}
+}
+
+func TestDoRetryIdempotentPostReplaysBodyAndRespectsRetryAfter(t *testing.T) {
+	const payload = `{"query":"{ viewer { login } }"}`
+	var (
+		hits   int
+		bodies []string
+		delays []time.Duration
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		bodies = append(bodies, string(body))
+		if hits == 1 {
+			w.Header().Set("Retry-After", "2")
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(srv.Close)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, bytes.NewBufferString(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := testRetryOptions(func(_ context.Context, delay time.Duration) error {
+		delays = append(delays, delay)
+		return nil
+	})
+	opts.MaxDelay = 5 * time.Second
+	resp, err := DoRetryIdempotentPost(req, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if hits != 2 {
+		t.Fatalf("hits = %d, want 2", hits)
+	}
+	if len(bodies) != 2 || bodies[0] != payload || bodies[1] != payload {
+		t.Fatalf("bodies = %q, want payload replayed twice", bodies)
+	}
+	if len(delays) != 1 || delays[0] != 2*time.Second {
+		t.Fatalf("delays = %v, want [2s]", delays)
+	}
+}
+
+func TestDoRetryIdempotentPostRejectsNonReplayableBody(t *testing.T) {
+	body := io.LimitReader(strings.NewReader("payload"), 7)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://127.0.0.1/", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = DoRetryIdempotentPost(req, testRetryOptions(nil))
+	if err == nil || !strings.Contains(err.Error(), "replayable request body") {
+		t.Fatalf("err = %v, want replayable-body error", err)
 	}
 }
 

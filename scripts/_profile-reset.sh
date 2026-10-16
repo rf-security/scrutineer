@@ -12,7 +12,7 @@
 # /bin/bash Apple ships) and BSD userland. Do NOT "modernise" it:
 #   * No arrays / mapfile: an empty "${arr[@]}" is an "unbound variable" error
 #     under `set -u` on bash < 4.4 (incl. macOS 3.2). Image ids are held in a
-#     newline string and intentionally word-split into rmi.
+#     newline string and intentionally word-split while removing them.
 #   * No `xargs -r`: -r is a GNU extension that BSD/macOS xargs rejects; the
 #     `[ -n "$ids" ]` guard is the portable equivalent.
 #   * `pipefail` (bash 3.0+) and `read -rp` (bash 3.2+) are safe.
@@ -35,6 +35,33 @@ done
 rt=podman
 command -v docker >/dev/null && rt=docker
 
+report_blocking_children() {
+  target_ids=$1
+  all_ids=$("$rt" images --no-trunc -aq | sort -u)
+  found=0
+
+  for target_id in $target_ids; do
+    for candidate_id in $all_ids; do
+      [ "$candidate_id" = "$target_id" ] && continue
+      parent_id=$("$rt" image inspect --format '{{.Parent}}' "$candidate_id" 2>/dev/null || true)
+      if [ "$parent_id" = "$target_id" ]; then
+        if [ "$found" -eq 0 ]; then
+          printf 'dependent child image(s) outside the selected profile references:\n' >&2
+        fi
+        if ! "$rt" image inspect \
+          --format '  {{.Id}} tags={{json .RepoTags}}' "$candidate_id" >&2; then
+          printf '  %s\n' "$candidate_id" >&2
+        fi
+        found=1
+      fi
+    done
+  done
+
+  if [ "$found" -eq 0 ]; then
+    printf 'Docker did not expose the dependent child through image Parent metadata; run `docker image ls -a --no-trunc` to inspect it.\n' >&2
+  fi
+}
+
 if [ "$force" -ne 1 ]; then
   read -rp "Remove $desc images via $rt and pull the latest runner? [y/N] " ans || true
   case "${ans:-}" in
@@ -43,7 +70,30 @@ if [ "$force" -ne 1 ]; then
   esac
 fi
 
-ids=$("$rt" images -qf reference="$glob")
-# shellcheck disable=SC2086 # intentional word-split: rmi takes each image id as a separate arg
-[ -n "$ids" ] && "$rt" rmi -f $ids
+ids=$("$rt" images --no-trunc -qf reference="$glob" | sort -u)
+while [ -n "$ids" ]; do
+  removed=0
+  # Some profiles build FROM another profile image (ruby-rails FROM ruby).
+  # Runtime image listings are not dependency-ordered, and even `rmi -f`
+  # refuses to remove a parent while a child exists. Try every target
+  # individually, then repeat: removing any leaf makes its parents removable
+  # on a later pass.
+  for id in $ids; do
+    if "$rt" rmi -f "$id" 2>/dev/null; then
+      removed=1
+    fi
+  done
+
+  ids=$("$rt" images --no-trunc -qf reference="$glob" | sort -u)
+  if [ -n "$ids" ] && [ "$removed" -eq 0 ]; then
+    printf 'unable to remove the remaining %s image(s):\n%s\n' "$desc" "$ids" >&2
+    report_blocking_children "$ids"
+    # Re-run once without suppressing stderr so the runtime explains the
+    # out-of-scope child image or other blocker to the operator.
+    for id in $ids; do
+      "$rt" rmi -f "$id" || true
+    done
+    exit 1
+  fi
+done
 "$rt" pull ghcr.io/alpha-omega-security/scrutineer-runner:latest

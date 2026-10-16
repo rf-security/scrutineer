@@ -13,8 +13,9 @@ import (
 
 // user is the authenticated identity attached to a request context.
 type user struct {
-	Login   string
-	RepoIDs map[uint]struct{}
+	GitHubUserID int64
+	Login        string
+	RepoIDs      map[uint]struct{}
 }
 
 type userKey struct{}
@@ -78,7 +79,7 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	login, err := fetchUser(r.Context(), tok.AccessToken)
+	identity, err := fetchUser(r.Context(), tok.AccessToken)
 	if err != nil {
 		s.log.Warn("fetch github user failed", "err", err)
 		http.Error(w, "could not read GitHub identity", http.StatusBadGateway)
@@ -86,9 +87,10 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sealed, err := s.cfg.seal(session{
-		Login:     login,
-		Token:     tok.AccessToken,
-		ExpiresAt: time.Now().Add(sessionTTL).Unix(),
+		GitHubUserID: identity.ID,
+		Login:        identity.Login,
+		Token:        tok.AccessToken,
+		ExpiresAt:    time.Now().Add(sessionTTL).Unix(),
 	})
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -103,7 +105,7 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
-	s.log.Info("sharing login", "login", login)
+	s.log.Info("sharing login", "login", identity.Login, "github_user_id", identity.ID)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 

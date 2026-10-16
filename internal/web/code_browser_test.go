@@ -114,7 +114,12 @@ func TestHighlightLang(t *testing.T) {
 // resolve, with two commits so `git show <commit>:<path>` works for both.
 func seedRepoCache(t *testing.T, dataDir, url string) (commit1, commit2 string) {
 	t.Helper()
-	cacheSrc := filepath.Join(worker.RepoCacheRoot(dataDir, url), "src")
+	return seedGitRepo(t, filepath.Join(worker.RepoCacheRoot(dataDir, url), "src"))
+}
+
+// seedGitRepo makes a real git repo at dir with two commits of hello.go.
+func seedGitRepo(t *testing.T, cacheSrc string) (commit1, commit2 string) {
+	t.Helper()
 	if err := os.MkdirAll(cacheSrc, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -470,5 +475,103 @@ func TestRepoBlob_rendersForgeLinkInMissingState(t *testing.T) {
 	}
 	if !strings.Contains(body, "https://github.com/owner/repo/commit/abc123") {
 		t.Errorf("body missing forge commit link:\n%s", body)
+	}
+}
+
+func repoBlobRequest(s *Server, repoID uint, commit, path string) *httptest.ResponseRecorder {
+	id := strconv.FormatUint(uint64(repoID), 10)
+	req := localReq("GET", "/repositories/"+id+"/blob/"+commit+"/"+path)
+	req.SetPathValue("id", id)
+	req.SetPathValue("commit", commit)
+	req.SetPathValue("path", path)
+	rec := httptest.NewRecorder()
+	s.repoBlob(rec, req)
+	return rec
+}
+
+func TestRepoBlob_readsLocalRepositoryHistory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	s, done := newTestServer(t)
+	defer done()
+	// An empty data dir proves the blob is not read from the repo cache.
+	s.Worker = &worker.Worker{DataDir: t.TempDir()}
+
+	local := t.TempDir()
+	c1, c2 := seedGitRepo(t, local)
+	// An uncommitted edit stands in for a dirty checkout at scan time.
+	if err := os.WriteFile(filepath.Join(local, "hello.go"), []byte("package main\n\n// uncommitted edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "file://" + local, Name: "local"}
+	s.DB.Create(&repo)
+
+	for commit, want := range map[string]string{c1: "func main() {}", c2: "println"} {
+		rec := repoBlobRequest(s, repo.ID, commit, "hello.go")
+		if rec.Code != 200 {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q for commit %s:\n%s", want, commit, body)
+		}
+		if strings.Contains(body, "uncommitted edit") {
+			t.Errorf("body rendered working-tree content for commit %s:\n%s", commit, body)
+		}
+		if strings.Contains(body, "No local clone") {
+			t.Errorf("body rendered the cache notice for a local repository:\n%s", body)
+		}
+		if !strings.Contains(body, "Local repositories show committed content") {
+			t.Errorf("body missing the committed-content note:\n%s", body)
+		}
+	}
+}
+
+func TestRepoBlob_localRepositoryWithoutGitExplainsWhy(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	s.Worker = &worker.Worker{DataDir: t.TempDir()}
+
+	local := t.TempDir()
+	if err := os.WriteFile(filepath.Join(local, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo := db.Repository{URL: "file://" + local, Name: "plain"}
+	s.DB.Create(&repo)
+
+	rec := repoBlobRequest(s, repo.ID, "abc123", "a.go")
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "no longer exists or is no longer a git repository") {
+		t.Errorf("body missing the missing-repository notice:\n%s", body)
+	}
+	if strings.Contains(body, "No local clone") {
+		t.Errorf("body rendered the cache notice for a local repository:\n%s", body)
+	}
+}
+
+func TestRepoBlob_localRepositoryMissingCommitExplainsWhy(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	s, done := newTestServer(t)
+	defer done()
+	s.Worker = &worker.Worker{DataDir: t.TempDir()}
+
+	local := t.TempDir()
+	seedGitRepo(t, local)
+	repo := db.Repository{URL: "file://" + local, Name: "local"}
+	s.DB.Create(&repo)
+
+	rec := repoBlobRequest(s, repo.ID, "0123456789abcdef0123456789abcdef01234567", "hello.go")
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Could not load this file") || !strings.Contains(body, "may no longer exist") {
+		t.Errorf("body missing the missing-commit explanation:\n%s", body)
 	}
 }

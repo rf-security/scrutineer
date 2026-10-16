@@ -1024,7 +1024,7 @@ func TestImportedModelCannotInjectCSVFormula(t *testing.T) {
 	body := `{"repository":"https://example.test/injected","findings":[
 		{"title":"t","severity":"high","location":"a.go:1","model":"=1+1"}]}`
 	r := httptest.NewRequest("POST", "/api/v1/import", strings.NewReader(body))
-	r.Host = testHost
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != 201 {

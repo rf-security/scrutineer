@@ -50,7 +50,8 @@ func ValidateExploration(scan *db.Scan, skill string) error {
 }
 
 // ValidateExplorationRunner rejects host execution, where an agent can bypass
-// callback-token restrictions through the unauthenticated loopback exports.
+// callback-token restrictions through the loopback exports, whose operator
+// token sits in the data directory a host process can read.
 func (w *Worker) ValidateExplorationRunner(skill string) error {
 	runner := w.Runner
 	for {

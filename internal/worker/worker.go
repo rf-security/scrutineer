@@ -561,12 +561,18 @@ func (w *Worker) scanEmitter(scan *db.Scan) (func(Event), func()) {
 		if e.Kind == KindSession {
 			if e.SessionID != "" && e.SessionID != scan.SessionID {
 				scan.SessionID = e.SessionID
-				w.DB.Model(&db.Scan{}).Where("id = ?", scan.ID).Update("session_id", e.SessionID)
+				scan.SessionCostUSD = 0
+				w.DB.Model(&db.Scan{}).Where("id = ?", scan.ID).Updates(map[string]any{
+					"session_id": e.SessionID, "session_cost_usd": 0,
+				})
 			}
 			return
 		}
 		if e.Kind == KindRateLimit && e.RateLimit != nil {
 			w.recordRateLimit(*e.RateLimit)
+		}
+		if e.Kind == KindResult {
+			e = w.recordScanResult(scan, e)
 		}
 		line := FormatEvent(e)
 		logBuilder.WriteString(line)
@@ -576,23 +582,35 @@ func (w *Worker) scanEmitter(scan *db.Scan) (func(Event), func()) {
 			w.DB.Model(&db.Scan{}).Where("id = ?", scan.ID).Update("log", scan.Log)
 			lastFlush = w.now()
 		}
-		if e.Kind == KindResult {
-			// Claude reports total_cost_usd in its result event; harnesses
-			// that only report token counts (codex) get the cost computed
-			// from list prices so /usage and the scan row show a real
-			// figure instead of $0.
-			if e.CostUSD == 0 {
-				e.CostUSD = CostFromUsage(scan.Model, e.Usage)
-			}
-			scan.CostUSD += e.CostUSD
-			scan.Turns += e.Turns
-			scan.InputTokens += e.Usage.InputTokens
-			scan.OutputTokens += e.Usage.OutputTokens
-			scan.CacheReadTokens += e.Usage.CacheReadTokens
-			scan.CacheWriteTokens += e.Usage.CacheWriteTokens
-		}
 		w.publish(scan.ID, scan.RepositoryID, "scan-log", line+"\n")
 	}, snapshot
+}
+
+func (w *Worker) recordScanResult(scan *db.Scan, e Event) Event {
+	if e.SessionCostUSD > 0 {
+		e.CostUSD = max(e.SessionCostUSD-scan.SessionCostUSD, 0)
+		scan.SessionCostUSD = max(e.SessionCostUSD, scan.SessionCostUSD)
+	} else if e.CostUSD == 0 {
+		e.CostUSD = CostFromUsage(scan.Model, e.Usage)
+	}
+	scan.CostUSD += e.CostUSD
+	scan.Turns += e.Turns
+	scan.InputTokens += e.Usage.InputTokens
+	scan.OutputTokens += e.Usage.OutputTokens
+	scan.CacheReadTokens += e.Usage.CacheReadTokens
+	scan.CacheWriteTokens += e.Usage.CacheWriteTokens
+	if e.SessionCostUSD > 0 {
+		// Save the total and its charged increment together before a crash can resume it.
+		if err := w.DB.Model(&db.Scan{}).Where("id = ?", scan.ID).Updates(map[string]any{
+			"cost_usd": scan.CostUSD, "session_cost_usd": scan.SessionCostUSD,
+			"turns": scan.Turns, "input_tokens": scan.InputTokens,
+			"output_tokens": scan.OutputTokens, "cache_read_tokens": scan.CacheReadTokens,
+			"cache_write_tokens": scan.CacheWriteTokens,
+		}).Error; err != nil {
+			w.Log.Warn("save scan cost", "scan", scan.ID, "err", err)
+		}
+	}
+	return e
 }
 
 // clearSessionStore wipes a finished scan's resume state so its next
@@ -679,6 +697,15 @@ func (w *Worker) loadQueuedScan(scanID uint) (*db.Scan, error) {
 	if scan.Status != db.ScanQueued {
 		w.Log.Info("dropping stale job", "scan", scan.ID, "status", scan.Status)
 		return nil, nil
+	}
+	if scan.SessionID != "" && scan.SessionCostUSD == 0 && scan.ParentScanID != nil {
+		var parent db.Scan
+		err := w.DB.Select("session_cost_usd").
+			Where("id = ? AND session_id = ?", *scan.ParentScanID, scan.SessionID).Find(&parent).Error
+		if err != nil {
+			return nil, fmt.Errorf("load parent session cost for scan %d: %w", scan.ID, err)
+		}
+		scan.SessionCostUSD = parent.SessionCostUSD
 	}
 	return &scan, nil
 }

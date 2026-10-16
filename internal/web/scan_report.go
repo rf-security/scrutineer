@@ -86,6 +86,12 @@ func renderScanReport(gdb *gorm.DB, scan *db.Scan, skill *db.Skill) string {
 	var b strings.Builder
 	writeScanReportHeader(&b, scan)
 	writeScanReportMetadata(&b, scan, skill)
+	if report := scanInvestigationReport(*scan); report != nil {
+		fmt.Fprintf(&b, "## Investigation\n\n%s\n\n", report.Notes)
+		for _, assessment := range report.Assessments {
+			fmt.Fprintf(&b, "### %s\n\nOutcome: %s\n\n%s\n\n", assessment.Claim, assessment.Outcome, assessment.Evidence)
+		}
+	}
 	switch kind {
 	case "findings", "advisory_audit":
 		// advisory_audit persists ordinary Finding rows alongside its

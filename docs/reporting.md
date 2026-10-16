@@ -2,8 +2,8 @@
 
 The **Reporting** page (`/reporting`) shows corpus-wide activity over a rolling window -- repositories scanned, runs started and completed, findings, per-day and per-model breakdowns, and per-scan cost and token averages beside their all-time figures -- and exports the same snapshot as CSV or JSON:
 
-    curl -sSfOJ 'http://127.0.0.1:8080/reporting/report.json?interval=week'
-    curl -sSfOJ 'http://127.0.0.1:8080/reporting/report.csv?interval=month&severity=high'
+    curl -sSfOJ -H "Authorization: Bearer $(cat data/operator-token)" 'http://127.0.0.1:8080/reporting/report.json?interval=week'
+    curl -sSfOJ -H "Authorization: Bearer $(cat data/operator-token)" 'http://127.0.0.1:8080/reporting/report.csv?interval=month&severity=high'
 
 `interval` is `day`, `week`, `month` or `all` (the default). `severity` is a minimum floor on the findings count -- `low`, `medium` (or `moderate`), `high`, `critical`, any case -- and never touches the scan counts. The JSON shape is `reporting.Export` in `internal/reporting/export.go`: `filters.minimum_severity` is `null` for an unfiltered export and `period.starts_at` is `null` for `interval=all`.
 

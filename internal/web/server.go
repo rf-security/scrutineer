@@ -28,6 +28,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"scrutineer/internal/akrites"
 	"scrutineer/internal/db"
 	"scrutineer/internal/queue"
 	"scrutineer/internal/repoconfig"
@@ -95,6 +96,13 @@ type Server struct {
 	// every container request carries.
 	ModelProxy *worker.ModelProxy
 
+	// OperatorToken is the credential the browser UI and /api/v1 require on
+	// top of the loopback Host check. Empty refuses every such request.
+	OperatorToken string
+	// OperatorTokenFile is where OperatorToken is stored, named in the 401
+	// so an operator without the cookie can find it.
+	OperatorTokenFile string
+
 	// SkillsRepoSHA pins the commit of -skills-repo loaded at startup. Set
 	// once by main after loadSkills resolves it; stamped onto every Scan
 	// row enqueueSkillWith creates so two runs a week apart can be told
@@ -139,9 +147,11 @@ type Server struct {
 	// VINCE holds the config-file-only API credential and reporter defaults
 	// for native CERT/CC submissions. vinceHTTPClient is injectable so tests
 	// can use httptest without changing the credential-bearing config shape.
-	VINCE           vince.Config
-	vinceHTTPClient *http.Client
-	vinceSubmitMu   sync.Mutex
+	VINCE             vince.Config
+	vinceHTTPClient   *http.Client
+	vinceSubmitMu     sync.Mutex
+	Akrites           akrites.Config
+	akritesHTTPClient *http.Client
 	// FederationPublicFeed and FederationMembersFeed are the git remotes
 	// the export job pushes each tier to; FederationImportFeeds are the
 	// peer remotes the import job pulls; all three empty leaves the
@@ -534,11 +544,12 @@ func (s *Server) ecosystemsPrefetch(repoID uint) {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("GET /static/", http.FileServerFS(staticFS))
 	mux.HandleFunc("GET /events", s.events)
 	mux.HandleFunc("GET /{$}", s.index)
 	mux.HandleFunc("GET /repositories", s.repoList)
 	mux.HandleFunc("GET /repositories/new", s.repoNew)
+	mux.HandleFunc("GET /investigations/new", s.investigationNew)
+	mux.HandleFunc("POST /investigations", s.investigationCreate)
 	mux.HandleFunc("GET /repositories/branches", s.repoBranches)
 	mux.HandleFunc("POST /repositories", s.repoCreate)
 	mux.HandleFunc("POST /repositories/bulk", s.repoBulkCreate)
@@ -587,6 +598,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /findings/{id}/disclosure.html", s.findingDisclosureHTML)
 	mux.HandleFunc("GET /findings/{id}/vince", s.findingVINCEPreview)
 	mux.HandleFunc("POST /findings/{id}/vince", s.findingVINCESubmit)
+	mux.HandleFunc("GET /findings/{id}/akrites", s.findingAkritesPreview)
+	mux.HandleFunc("POST /findings/{id}/akrites", s.findingAkritesSubmit)
 	mux.HandleFunc("POST /findings/{id}/status", s.findingStatus)
 	mux.HandleFunc("POST /findings/{id}/exploited-in-wild", s.findingExploitedInWild)
 	mux.HandleFunc("POST /findings/{id}/verify", s.findingVerify)
@@ -619,10 +632,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /packages/{id}", s.packageShow)
 	mux.HandleFunc("GET /advisories", s.advisoriesList)
 	mux.HandleFunc("GET /advisories/{id}/certificate.json", s.advisoryCertificateDownload)
-	// No method in the pattern: the handler 404s non-POST itself so a
-	// federation-capable build cannot be fingerprinted by the 405 the
-	// mux would otherwise answer.
-	mux.HandleFunc("/claim-check", s.claimCheck)
 	mux.HandleFunc("GET /scans/{id}", s.scanShow)
 	mux.HandleFunc("GET /scans/{id}/report.md", s.scanReport)
 	mux.HandleFunc("POST /scans/{id}/retry", s.scanRetry)
@@ -658,10 +667,19 @@ func (s *Server) Handler() http.Handler {
 
 	// API routes get bearer-auth middleware and skip the browser CSRF checks;
 	// skills call these from inside a scan workspace, not from a browser.
-	// /api/v1/* are unauthenticated JSONL export endpoints sharing the
-	// browser's host-only boundary; see threatmodel.md.
+	// /api/v1/* are the operator's export, import and delete endpoints and
+	// share the browser's boundary: loopback Host plus the operator token;
+	// see threatmodel.md.
 	root := http.NewServeMux()
-	root.Handle("/api/v1/", securityHeaders(s.AllowRemote, http.StripPrefix(exportPrefix, s.exportHandler())))
+	root.Handle("/api/v1/", securityHeaders(s.AllowRemote, s.requireOperator(http.StripPrefix(exportPrefix, s.exportHandler()))))
+	// Reachable without the operator token: the login page has to be, and
+	// claim-check is called by federation peers through a reverse proxy.
+	root.Handle("GET /static/", securityHeaders(s.AllowRemote, http.FileServerFS(staticFS)))
+	root.Handle("GET /login", securityHeaders(s.AllowRemote, http.HandlerFunc(s.login)))
+	// No method in the pattern: the handler 404s non-POST itself so a
+	// federation-capable build cannot be fingerprinted by the 405 the
+	// mux would otherwise answer.
+	root.Handle("/claim-check", securityHeaders(s.AllowRemote, http.HandlerFunc(s.claimCheck)))
 	// More specific than "/api/", so it wins the mux match and gets its own
 	// access rule rather than the scan-token auth apiHandler applies; see
 	// openAPISpecHandler.
@@ -670,7 +688,7 @@ func (s *Server) Handler() http.Handler {
 	if s.ModelProxy != nil {
 		root.Handle(worker.ModelProxyPathPrefix+"/", s.ModelProxy)
 	}
-	root.Handle("/", securityHeaders(s.AllowRemote, mux))
+	root.Handle("/", securityHeaders(s.AllowRemote, s.requireOperator(mux)))
 	return logRequests(s.Log, root)
 }
 
@@ -953,12 +971,12 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 	if lang != "" {
 		// languages is a ", "-joined list; wrapping both sides lets one
 		// LIKE match start/middle/end/only without four OR clauses.
-		q = q.Where("(', ' || languages || ', ') LIKE ?", "%, "+lang+", %")
+		q = q.Where("LOWER(', ' || languages || ', ') LIKE LOWER(?)", "%, "+lang+", %")
 	}
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
 	if search != "" {
 		like := "%" + search + "%"
-		q = q.Where("name LIKE ? OR url LIKE ? OR full_name LIKE ? OR description LIKE ?",
+		q = q.Where("LOWER(name) LIKE LOWER(?) OR LOWER(url) LIKE LOWER(?) OR LOWER(full_name) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?)",
 			like, like, like, like)
 	}
 
@@ -1263,17 +1281,9 @@ func loadRepoFindings(gdb *gorm.DB, repoID uint, category string) repoFindings {
 			scanIDs = append(scanIDs, f.ScanID)
 		}
 	}
-	var rows []struct {
-		ID        uint
-		SkillName string
-		Commit    string
-	}
-	// "commit" is quoted because it is a reserved word; double quotes are the
-	// SQL-standard identifier quote both SQLite and PostgreSQL accept (and the
-	// input resolves to the column, not a string literal, because the column
-	// exists). The output alias stays "commit" so GORM maps it onto the
-	// struct's Commit field.
-	gdb.Raw(`SELECT id, COALESCE(skill_name, '') AS skill_name, COALESCE("commit", '') AS "commit" FROM scans WHERE id IN ?`, scanIDs).Scan(&rows)
+	// GORM quotes the reserved commit column for the selected backend.
+	var rows []db.Scan
+	gdb.Select("id", "skill_name", "commit").Where("id IN ?", scanIDs).Find(&rows)
 	for _, row := range rows {
 		rf.ScanSkill[row.ID] = row.SkillName
 		rf.ScanCommit[row.ID] = row.Commit
@@ -1398,7 +1408,7 @@ func (s *Server) findingsIndexQuery(r *http.Request, includeScanners, includeMis
 	}
 	if search := strings.TrimSpace(r.URL.Query().Get("q")); search != "" {
 		like := "%" + search + "%"
-		q = q.Where("title LIKE ? OR location LIKE ? OR cwe LIKE ? OR cve_id LIKE ? OR ghsa_id LIKE ? OR affected LIKE ?",
+		q = q.Where("LOWER(title) LIKE LOWER(?) OR LOWER(location) LIKE LOWER(?) OR LOWER(cwe) LIKE LOWER(?) OR LOWER(cve_id) LIKE LOWER(?) OR LOWER(ghsa_id) LIKE LOWER(?) OR LOWER(affected) LIKE LOWER(?)",
 			like, like, like, like, like, like)
 	}
 	// Restrict to the request's allow-listed repositories when a view scope is
@@ -1480,7 +1490,7 @@ func findingIndexWhereSQL(r *http.Request, includeScanners, includeMissed bool) 
 	}
 	if search := strings.TrimSpace(r.URL.Query().Get("q")); search != "" {
 		like := "%" + search + "%"
-		where = append(where, "(title LIKE ? OR location LIKE ? OR cwe LIKE ? OR cve_id LIKE ? OR ghsa_id LIKE ? OR affected LIKE ?)")
+		where = append(where, "(LOWER(title) LIKE LOWER(?) OR LOWER(location) LIKE LOWER(?) OR LOWER(cwe) LIKE LOWER(?) OR LOWER(cve_id) LIKE LOWER(?) OR LOWER(ghsa_id) LIKE LOWER(?) OR LOWER(affected) LIKE LOWER(?))")
 		args = append(args, like, like, like, like, like, like)
 	}
 	// Restrict to the request's allow-listed repositories when a view scope is
@@ -1635,7 +1645,7 @@ var (
 	// rather than able to break out (see TestDeepDiveSkillNameSafeForSplicing).
 	// Parenthesised so it can be embedded in larger expressions without
 	// precedence surprises.
-	findingsBucketSkillSQL = "(skill_name IN (" + db.SQLStringLiteral(deepDiveSkillName) + ", " + db.SQLStringLiteral(vulnScanSkillName) + ", " + db.SQLStringLiteral(advisoryDeepDiveSkillName) + ") OR skill_name = '' OR skill_name IS NULL OR kind = 'import')"
+	findingsBucketSkillSQL = "(skill_name IN (" + db.SQLStringLiteral(deepDiveSkillName) + ", " + db.SQLStringLiteral(vulnScanSkillName) + ", " + db.SQLStringLiteral(advisoryDeepDiveSkillName) + ", " + db.SQLStringLiteral(investigateSkillName) + ") OR skill_name = '' OR skill_name IS NULL OR kind = 'import')"
 	// nonScannerScanFilter selects findings whose parent scan populates the
 	// Findings bucket (findingsBucketSkillSQL) — every finding the UI shows by
 	// default. scannerScanFilter is its structural inverse: the cheap tool
@@ -1681,7 +1691,7 @@ func findingsScanIDs(gdb *gorm.DB) *gorm.DB {
 // llmAuditSkillNames are the curated model-driven audits: the skills whose
 // findings are a repository's working set rather than scanner output.
 func llmAuditSkillNames() []string {
-	return []string{deepDiveSkillName, vulnScanSkillName, advisoryDeepDiveSkillName}
+	return []string{deepDiveSkillName, vulnScanSkillName, advisoryDeepDiveSkillName, investigateSkillName}
 }
 
 func isLLMAuditSkill(skillName string) bool {
@@ -1866,6 +1876,7 @@ func (s *Server) runFindingSkill(w http.ResponseWriter, r *http.Request, name st
 		}
 	}
 	opts.FindingID = new(f.ID)
+	opts.AuditDisclosure = externalReportingSkill(name)
 	if name == verifySkillName {
 		opts.VerificationFeedback = r.PostForm.Get("feedback")
 	}
@@ -2005,7 +2016,7 @@ func (s *Server) packages(w http.ResponseWriter, r *http.Request) {
 	if search != "" {
 		like := "%" + search + "%"
 		// GORM maps the PURL struct field to the `p_url` column.
-		q = q.Where("name LIKE ? OR p_url LIKE ? OR licenses LIKE ?", like, like, like)
+		q = q.Where("LOWER(name) LIKE LOWER(?) OR LOWER(p_url) LIKE LOWER(?) OR LOWER(licenses) LIKE LOWER(?)", like, like, like)
 	}
 
 	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
@@ -2071,7 +2082,7 @@ func (s *Server) advisoriesList(w http.ResponseWriter, r *http.Request) {
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
 	if search != "" {
 		like := "%" + search + "%"
-		q = q.Where("title LIKE ? OR packages LIKE ? OR classification LIKE ? OR uuid LIKE ?",
+		q = q.Where("LOWER(title) LIKE LOWER(?) OR LOWER(packages) LIKE LOWER(?) OR LOWER(classification) LIKE LOWER(?) OR LOWER(uuid) LIKE LOWER(?)",
 			like, like, like, like)
 	}
 
@@ -2261,7 +2272,7 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 	vinceReason := "VINCE API key is not configured"
 	vinceReady := false
 	if s.VINCE.Enabled() {
-		if err := vinceEligibility(f, notes, refs); err != nil {
+		if err := vinceEligibility(f, notes); err != nil {
 			vinceReason = err.Error()
 		} else {
 			vinceReady = true
@@ -2270,6 +2281,13 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 	}
 	data["VINCEReady"] = vinceReady
 	data["VINCEReason"] = vinceReason
+	akritesLink := s.Akrites.Enabled()
+	if !akritesLink {
+		var submissions int64
+		s.DB.Model(&db.DisclosureSubmission{}).Where("finding_id = ? AND channel = ?", f.ID, db.DisclosureChannelAkrites).Count(&submissions)
+		akritesLink = submissions > 0
+	}
+	data["AkritesLink"] = akritesLink
 	if id, c, ok := LookupCWE(f.CWE); ok {
 		data["CWE"] = map[string]any{"ID": id, "Name": c.Name, "Description": c.Description}
 	}
@@ -2921,8 +2939,8 @@ func (s *Server) loadRepoSubprojectView(repoID uint) repoSubprojectView {
 		SubPath string
 		N       int
 	}, 0)
-	s.DB.Raw(`SELECT sub_path, COUNT(*) AS n FROM scans
-		WHERE repository_id = ? AND sub_path != '' GROUP BY sub_path`,
+	s.DB.Raw(`SELECT COALESCE(sub_path, '') AS sub_path, COUNT(*) AS n FROM scans
+		WHERE repository_id = ? GROUP BY COALESCE(sub_path, '')`,
 		repoID).Scan(&rows)
 	for _, r := range rows {
 		view.ScanCount[r.SubPath] = r.N
@@ -2950,14 +2968,14 @@ func (s *Server) latestDepsCommit(repoID uint) string {
 	var commits []string
 	s.DB.Model(&db.Scan{}).
 		Joins("JOIN skills ON skills.id = scans.skill_id").
-		Where(`scans.repository_id = ? AND skills.output_kind = ? AND scans.status = ? AND scans."commit" <> ''`,
+		Where("scans.repository_id = ? AND skills.output_kind = ? AND scans.status = ?",
 			repoID, "dependencies", db.ScanDone).
 		// Not(map) lets GORM's dialector quote the reserved-word column
 		// against the model's table instead of hardcoding scans.`commit`.
 		Not(map[string]any{"commit": ""}).
 		Order("scans.id DESC").
 		Limit(1).
-		Pluck(`scans."commit"`, &commits)
+		Pluck("scans.commit", &commits)
 	if len(commits) > 0 {
 		return commits[0]
 	}
@@ -3067,10 +3085,12 @@ func (s *Server) repoScanAll(w http.ResponseWriter, r *http.Request) {
 	group := uuid.NewString()
 	var queued, skipped, errored int
 	for _, sub := range subprojects {
+		subPath := sub.ScanSubPath()
 		var inflight int64
 		s.DB.Model(&db.Scan{}).
 			Where("repository_id = ? AND sub_path = ? AND skill_id = ? AND status IN ?",
-				repo.ID, sub.Path, skill.ID, []db.ScanStatus{db.ScanQueued, db.ScanRunning}).
+				repo.ID, subPath, skill.ID, []db.ScanStatus{db.ScanQueued, db.ScanRunning}).
+			Where("COALESCE(focus_area, '') = '' AND COALESCE(exploration_mode, '') = ''").
 			Count(&inflight)
 		if inflight > 0 {
 			skipped++
@@ -3078,7 +3098,7 @@ func (s *Server) repoScanAll(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, err := s.enqueueSkillWith(r.Context(), repo.ID, skill.ID, ScanOpts{
 			Model:     model,
-			SubPath:   sub.Path,
+			SubPath:   subPath,
 			ScanGroup: group,
 		}); err != nil {
 			errored++
@@ -3305,6 +3325,9 @@ func (s *Server) deleteFinding(finding db.Finding) (deletedFinding, error) {
 		if err := tx.Exec("DELETE FROM finding_labels_join WHERE finding_id = ?", finding.ID).Error; err != nil {
 			return err
 		}
+		if err := deleteReviewConfirmations(tx, "finding_id = ?", finding.ID); err != nil {
+			return err
+		}
 		for _, child := range findingChildModels() {
 			if err := tx.Where("finding_id = ?", finding.ID).Delete(child).Error; err != nil {
 				return err
@@ -3346,12 +3369,24 @@ func deleteFindingChildren(tx *gorm.DB, repoID uint) error {
 	if err := tx.Exec("DELETE FROM finding_labels_join WHERE "+findingsOfRepo, repoID).Error; err != nil {
 		return err
 	}
+	if err := deleteReviewConfirmations(tx, findingsOfRepo, repoID); err != nil {
+		return err
+	}
 	for _, child := range findingChildModels() {
 		if err := tx.Where(findingsOfRepo, repoID).Delete(child).Error; err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// deleteReviewConfirmations removes confirmations that rely on the reviews of
+// the findings matched by where. A confirmation's finding_id is the revalidated
+// finding, not the reviewed one, so deleting children by finding_id alone would
+// orphan confirmations that point at a deleted review. It must run before the
+// reviews themselves are deleted.
+func deleteReviewConfirmations(tx *gorm.DB, where string, args ...any) error {
+	return tx.Exec("DELETE FROM feedback_confirmations WHERE review_id IN (SELECT id FROM finding_reviews WHERE "+where+")", args...).Error
 }
 
 // findingChildModels is shared by repository and individual finding deletion
@@ -3361,8 +3396,8 @@ func deleteFindingChildren(tx *gorm.DB, repoID uint) error {
 func findingChildModels() []any {
 	return []any{
 		&db.FindingNote{}, &db.FindingCommunication{}, &db.FindingReference{},
-		&db.FindingHistory{}, &db.FindingDependent{}, &db.FindingReview{},
-		&db.FindingVerification{}, &db.FindingAttackPath{},
+		&db.FindingHistory{}, &db.FindingDependent{}, &db.FindingReview{}, &db.FeedbackConfirmation{}, &db.DisclosureSubmission{},
+		&db.FindingVerification{}, &db.FindingAttackPath{}, &db.FindingPoC{},
 		&db.RemediationValidation{}, &db.RemediationAttempt{},
 	}
 }
@@ -3407,7 +3442,7 @@ func (s *Server) repoDisclosureChannel(w http.ResponseWriter, r *http.Request) {
 	// Not trimmed here: SetDisclosureChannel trims, and it has to, since the
 	// comparison that decides whether to re-stamp the route record's
 	// verified_at is made against the trimmed value.
-	if err := db.SetDisclosureChannel(s.DB, repo.ID, r.FormValue("disclosure_channel")); err != nil {
+	if err := db.SetDisclosureChannel(s.DB, repo.ID, r.FormValue("disclosure_channel"), db.SourceAnalyst, ""); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -3464,7 +3499,12 @@ func (s *Server) repoScheduleUpdate(w http.ResponseWriter, r *http.Request) {
 // new options (SubPath, FindingID, Model) accumulate.
 type ScanOpts struct {
 	// AuditRetry marks operator retries only, not automatic child scans or reruns.
-	AuditRetry  bool
+	AuditRetry bool
+	// AuditDisclosure marks launches of the external-reporting skills (disclose,
+	// report-upstream and public-issue) from the browser or the skill API.
+	AuditDisclosure bool
+	// AuditSource is who launched an audited run; empty means the analyst.
+	AuditSource db.FindingSource
 	Model       string
 	Effort      string
 	FindingID   *uint
@@ -3678,10 +3718,7 @@ func (s *Server) enqueueSkillWith(ctx context.Context, repoID, skillID uint, opt
 		if live.FederationOptedOut() {
 			return ErrRepoFederationOptOut
 		}
-		if opts.AuditRetry {
-			return logScanControl(tx, db.AuditEventScanRetryRequested, scan, retryLineage(scan), "", db.ScanQueued, db.SourceAnalyst)
-		}
-		return nil
+		return logScanCreated(ctx, tx, scan, opts)
 	}); err != nil {
 		return 0, err
 	}

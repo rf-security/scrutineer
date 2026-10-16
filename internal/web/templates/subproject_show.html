@@ -4,7 +4,7 @@
   {{template "crumbs" (crumbs "Repositories" "/" .Repo.Name (printf "/repositories/%d" .Repo.ID) .Sub.Name "")}}
   <h2 class="text-2xl font-semibold mt-1 flex items-center gap-2">
     <i data-lucide="package"></i> {{.Sub.Name}}
-    <span class="text-muted-foreground font-normal text-lg">{{.Repo.Name}} / <code>{{.Sub.Path}}</code></span>
+    <span class="text-muted-foreground font-normal text-lg">{{.Repo.Name}} / <code>{{if eq .Sub.Path "."}}root{{else}}{{.Sub.Path}}{{end}}</code></span>
   </h2>
   <div class="flex items-center gap-2 mt-1">
     {{if .Sub.Kind}}<span class="badge-outline text-xs">{{.Sub.Kind}}</span>{{end}}
@@ -15,8 +15,8 @@
 
 <div class="flex flex-wrap gap-2 mb-6">
   <form method="post" action="/repositories/{{.Repo.ID}}/scan" hx-post="/repositories/{{.Repo.ID}}/scan" hx-swap="none">
-    <input type="hidden" name="sub_path" value="{{.Sub.Path}}">
-    <button type="submit" class="btn-sm-outline"><i data-lucide="play"></i> Scan this sub-package</button>
+    <input type="hidden" name="sub_path" value="{{.Sub.ScanSubPath}}">
+    <button type="submit" class="btn-sm-outline"><i data-lucide="play"></i> Scan this project</button>
   </form>
   <a class="btn-sm-outline" href="/api/v1/repositories/{{.Repo.ID}}/findings?sub_path={{.Sub.Path}}"><i data-lucide="download"></i> Export findings</a>
 </div>

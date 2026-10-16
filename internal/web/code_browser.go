@@ -21,7 +21,9 @@ import (
 const maxBrowserBytes = 2 << 20
 
 // repoBlob reads one file at <commit>:<path> from the worker's repo-cache,
-// so historical commits resolve even after rescans move HEAD.
+// so historical commits resolve even after rescans move HEAD. Local (file://)
+// repositories never populate the cache because scans copy them straight from
+// disk, so their blobs are read from the local checkout's own history.
 func (s *Server) repoBlob(w http.ResponseWriter, r *http.Request) {
 	id64, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -50,36 +52,46 @@ func (s *Server) repoBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheSrc := filepath.Join(worker.RepoCacheRoot(s.Worker.DataDir, repo.URL), "src")
-	if _, err := os.Stat(filepath.Join(cacheSrc, ".git")); err != nil {
+	local := repo.IsLocal()
+	repoDir := filepath.Join(worker.RepoCacheRoot(s.Worker.DataDir, repo.URL), "src")
+	if local {
+		repoDir = repo.LocalPath()
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
 		s.render(w, r, "code_browser.html", map[string]any{
 			"Repo":      repo,
 			"Commit":    commit,
 			"Path":      cleanPath,
 			"Highlight": parseHighlight(r.URL.Query().Get("line")),
+			"Local":     local,
 			"Missing":   true,
 		})
 		return
 	}
 
-	if err := s.Worker.EnsureCommit(r.Context(), repo.URL, commit); err != nil {
-		s.render(w, r, "code_browser.html", map[string]any{
-			"Repo":      repo,
-			"Commit":    commit,
-			"Path":      cleanPath,
-			"Highlight": parseHighlight(r.URL.Query().Get("line")),
-			"Error":     err.Error(),
-		})
-		return
+	// EnsureCommit deepens the shallow cache clone; a local checkout already
+	// carries its own history and is never fetched into.
+	if !local {
+		if err := s.Worker.EnsureCommit(r.Context(), repo.URL, commit); err != nil {
+			s.render(w, r, "code_browser.html", map[string]any{
+				"Repo":      repo,
+				"Commit":    commit,
+				"Path":      cleanPath,
+				"Highlight": parseHighlight(r.URL.Query().Get("line")),
+				"Error":     err.Error(),
+			})
+			return
+		}
 	}
 
-	blob, err := gitShowBlob(r.Context(), cacheSrc, commit, cleanPath)
+	blob, err := gitShowBlob(r.Context(), repoDir, commit, cleanPath)
 	if err != nil {
 		s.render(w, r, "code_browser.html", map[string]any{
 			"Repo":      repo,
 			"Commit":    commit,
 			"Path":      cleanPath,
 			"Highlight": parseHighlight(r.URL.Query().Get("line")),
+			"Local":     local,
 			"Error":     err.Error(),
 		})
 		return
@@ -99,6 +111,7 @@ func (s *Server) repoBlob(w http.ResponseWriter, r *http.Request) {
 		"Truncated":   blob.Truncated,
 		"Content":     content,
 		"Language":    highlightLang(cleanPath, blob.Detection.Format),
+		"Local":       local,
 	})
 }
 

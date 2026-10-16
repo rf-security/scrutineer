@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gorm.io/gorm"
 )
@@ -32,7 +33,19 @@ const (
 	AuditEventScanResumeRequested     = "scan.resume_requested"
 	AuditEventScanResumeEnqueueFailed = "scan.resume_enqueue_failed"
 	AuditEventScanCancelRequested     = "scan.cancel_requested"
+
+	AuditEventDisclosureRequested             = "disclosure.requested"
+	AuditEventDisclosureVINCESubmitted        = "disclosure.vince_submitted"
+	AuditEventDisclosureAkritesSubmitted      = "disclosure.akrites_submitted"
+	AuditEventDisclosurePVRSubmitted          = "disclosure.pvr_submitted"
+	AuditEventDisclosureDraftUpdated          = "disclosure.draft_updated"
+	AuditEventDisclosureCommunicationRecorded = "disclosure.communication_recorded"
+	AuditEventDisclosureChannelChanged        = "disclosure.channel_changed"
 )
+
+// AuditKeyRepositoryID is the payload key audit events use for the repository
+// they belong to.
+const AuditKeyRepositoryID = "repository_id"
 
 type auditScanKey struct{}
 
@@ -47,32 +60,55 @@ func WithAuditScan(ctx context.Context, scanID uint, skillName string) context.C
 	return context.WithValue(ctx, auditScanKey{}, auditScanActor{ID: scanID, SkillName: skillName})
 }
 
-func logFindingMutation(tx *gorm.DB, finding *Finding, field string, oldValue, newValue any, source FindingSource, by string) error {
-	var kind string
+// AuditScanAttribution attributes an event to the authenticated scan carried
+// by ctx. It adds scan_id and skill_name to payload and returns the actor text
+// that replaces by. Without a scan in ctx it returns by unchanged.
+func AuditScanAttribution(ctx context.Context, by string, payload map[string]any) string {
+	scan, ok := ctx.Value(auditScanKey{}).(auditScanActor)
+	if !ok {
+		return by
+	}
+	payload["scan_id"] = scan.ID
+	payload["skill_name"] = scan.SkillName
+	if scan.SkillName != "" {
+		return fmt.Sprintf("%s (scan %d)", scan.SkillName, scan.ID)
+	}
+	return fmt.Sprintf("scan %d", scan.ID)
+}
+
+// findingMutationPayload builds the event for a finding field write. The
+// disclosure draft is free text, so only its length before and after is kept.
+func findingMutationPayload(finding *Finding, field string, oldValue, newValue any) (string, map[string]any, bool) {
+	payload := map[string]any{AuditKeyRepositoryID: finding.RepositoryID, "field": field}
 	switch field {
 	case "status":
-		kind = AuditEventFindingStatusChanged
+		payload["old_value"], payload["new_value"] = oldValue, newValue
+		return AuditEventFindingStatusChanged, payload, true
 	case "severity":
-		kind = AuditEventFindingSeverityChanged
+		payload["old_value"], payload["new_value"] = oldValue, newValue
+		return AuditEventFindingSeverityChanged, payload, true
 	case "labels":
-		kind = AuditEventFindingLabelsChanged
+		payload["old_value"], payload["new_value"] = oldValue, newValue
+		return AuditEventFindingLabelsChanged, payload, true
+	case "disclosure_draft":
+		payload["old_length"], payload["new_length"] = runeLength(oldValue), runeLength(newValue)
+		return AuditEventDisclosureDraftUpdated, payload, true
 	default:
+		return "", nil, false
+	}
+}
+
+func runeLength(v any) int {
+	s, _ := v.(string)
+	return utf8.RuneCountInString(s)
+}
+
+func logFindingMutation(tx *gorm.DB, finding *Finding, field string, oldValue, newValue any, source FindingSource, by string) error {
+	kind, payload, ok := findingMutationPayload(finding, field, oldValue, newValue)
+	if !ok {
 		return nil
 	}
-	payload := map[string]any{
-		"repository_id": finding.RepositoryID,
-		"field":         field,
-		"old_value":     oldValue,
-		"new_value":     newValue,
-	}
-	if scan, ok := tx.Statement.Context.Value(auditScanKey{}).(auditScanActor); ok {
-		by = fmt.Sprintf("scan %d", scan.ID)
-		if scan.SkillName != "" {
-			by = fmt.Sprintf("%s (scan %d)", scan.SkillName, scan.ID)
-		}
-		payload["scan_id"] = scan.ID
-		payload["skill_name"] = scan.SkillName
-	}
+	by = AuditScanAttribution(tx.Statement.Context, by, payload)
 	return LogEvent(tx, AuditEventInput{
 		Kind: kind, SubjectType: AuditSubjectFinding, SubjectID: finding.ID,
 		Source: source, Actor: by, Payload: payload,

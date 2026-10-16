@@ -20,13 +20,23 @@
   {{end}}
 </header>
 
-{{if .Missing}}
+{{if and .Local (not .Missing)}}
+  <p class="mb-2 text-xs text-muted-foreground">
+    Local repositories show committed content at <code>{{short .Commit}}</code>. Edits that were not committed when the repository was scanned are not shown, so line numbers may differ.
+  </p>
+{{end}}
+{{if and .Missing .Local}}
+  <div class="rounded border border-dashed p-6 text-sm text-muted-foreground">
+    <code>{{.Repo.LocalPath}}</code> no longer exists or is no longer a git repository, so the code browser cannot show its committed content.
+  </div>
+{{else if .Missing}}
   <div class="rounded border border-dashed p-6 text-sm text-muted-foreground">
     No local clone yet for <code>{{.Repo.URL}}</code>. Run a scan to populate the cache.
   </div>
 {{else if .Error}}
   <div class="rounded border border-destructive/40 bg-destructive/5 p-4 text-sm">
     <p class="font-medium mb-1">Could not load this file at <code>{{short .Commit}}</code>.</p>
+    {{if .Local}}<p class="mb-1">The commit may no longer exist in <code>{{.Repo.LocalPath}}</code>, for example after a rebase.</p>{{end}}
     <pre class="whitespace-pre-wrap text-xs">{{.Error}}</pre>
   </div>
 {{else if .Unsupported}}

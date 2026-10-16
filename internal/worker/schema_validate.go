@@ -8,6 +8,8 @@ import (
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 
+	"scrutineer/internal/poc"
+	"scrutineer/internal/skills"
 	"scrutineer/internal/verification"
 )
 
@@ -29,11 +31,44 @@ const maxSchemaErrors = 8
 // ValidateSkillReport validates both a skill's JSON Schema and any
 // skill-specific semantic contract. Schema validation always runs first so a
 // malformed report keeps the established JSON/schema error path.
-func ValidateSkillReport(skillName, schemaJSON, report string) string {
+func ValidateSkillReport(skillName, schemaJSON, pocField, report string) string {
 	if detail := ValidateReportSchema(schemaJSON, report); detail != "" {
 		return detail
 	}
+	if detail := validateReportPoC(pocField, report); detail != "" {
+		return detail
+	}
 	return ValidateReportSemantics(skillName, report)
+}
+
+// validateReportPoC checks the report field a skill names in
+// scrutineer.poc_field.
+func validateReportPoC(pocField, report string) string {
+	if pocField == "" {
+		return ""
+	}
+	var parsed struct {
+		Findings []struct {
+			Validation string `json:"validation"`
+		} `json:"findings"`
+		Reproducer string `json:"reproducer"`
+	}
+	if err := json.Unmarshal([]byte(report), &parsed); err != nil {
+		return "report.json is not valid JSON: " + err.Error()
+	}
+	if pocField == skills.PoCFieldReproducer {
+		if err := poc.Validate(parsed.Reproducer); err != nil {
+			return "/reproducer: " + err.Error()
+		}
+		return ""
+	}
+	var errs []string
+	for i, finding := range parsed.Findings {
+		if err := poc.Validate(finding.Validation); err != nil {
+			errs = append(errs, fmt.Sprintf("/findings/%d/validation: %s", i, err))
+		}
+	}
+	return formatSemanticValidationErrors(errs)
 }
 
 // ValidateReportSemantics checks report invariants that JSON Schema cannot

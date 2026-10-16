@@ -1,0 +1,13 @@
+given: a task runner imports every Python plugin found in the workspace before running a task, with no trust check or opt-in
+fixture: fixtures/build-tool-runner
+skill: audit-build-tooling
+should_find:
+  - path: taskrun/plugins.py
+    evidence_contains:
+      - load_plugins
+      - exec_module
+    required: true
+should_not_find:
+  - path: taskrun/cache.py
+    evidence_contains:
+      - restore_entry

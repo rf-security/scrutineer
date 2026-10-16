@@ -20,7 +20,7 @@ func TestAPIStreamFinding_persistsAndIsVisibleToSiblings(t *testing.T) {
 	body := `{"id":"F1","title":"streamed bug","severity":"High","location":"main.go:10",
 		"dup_check":"compared against F0; distinct sink"}`
 	post := httptest.NewRequest("POST", fmt.Sprintf("/api/repositories/%d/findings", repo.ID), strings.NewReader(body))
-	post.Host = testHost
+	asOperator(post)
 	post.Header.Set("Authorization", "Bearer "+auth.APIToken)
 	pw := httptest.NewRecorder()
 	s.Handler().ServeHTTP(pw, post)
@@ -34,7 +34,7 @@ func TestAPIStreamFinding_persistsAndIsVisibleToSiblings(t *testing.T) {
 	}
 
 	get := httptest.NewRequest("GET", fmt.Sprintf("/api/repositories/%d/findings?scan_group=grp-1", repo.ID), nil)
-	get.Host = testHost
+	asOperator(get)
 	get.Header.Set("Authorization", "Bearer "+auth.APIToken)
 	gw := httptest.NewRecorder()
 	s.Handler().ServeHTTP(gw, get)
@@ -57,7 +57,7 @@ func TestAPIStreamFinding_rejectsOtherRepo(t *testing.T) {
 
 	body := `{"title":"t","severity":"High","location":"a.go:1"}`
 	r := httptest.NewRequest("POST", fmt.Sprintf("/api/repositories/%d/findings", other.ID), strings.NewReader(body))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+auth.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -82,7 +82,7 @@ func TestAPIStreamFinding_rejectsInvalidBody(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := httptest.NewRequest("POST", fmt.Sprintf("/api/repositories/%d/findings", repo.ID), strings.NewReader(body))
-			r.Host = testHost
+			asOperator(r)
 			r.Header.Set("Authorization", "Bearer "+auth.APIToken)
 			w := httptest.NewRecorder()
 			s.Handler().ServeHTTP(w, r)

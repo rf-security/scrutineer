@@ -6,7 +6,7 @@ Scrutineer records model usage on each scan and aggregates completed and failed 
 
 The **Cost drivers** view compares scan cost with three inexpensive workload proxies:
 
-- **SLOC** is `lines.total_lines` from the latest successful `repo-overview` report for the repository.
+- **SLOC** (source lines of code) is `lines.total_lines` from the latest successful `repo-overview` report for the repository.
 - **Dependency manifests** is the current number of distinct non-empty `Dependency.ManifestPath` values stored for the repository.
 - **Phase 1 sinks** is the number of entries in the latest positive-cost completed `security-deep-dive` report for the repository.
 

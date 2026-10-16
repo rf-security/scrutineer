@@ -2592,7 +2592,7 @@ func TestParseDependencies_subPathScanLeavesRepoLevelRows(t *testing.T) {
 	for _, e := range events {
 		joined += e.Text + "\n"
 	}
-	if !strings.Contains(joined, "sub-path scan") {
+	if !strings.Contains(joined, "subpath scan") {
 		t.Errorf("events missing sub-path skip message:\n%s", joined)
 	}
 }
@@ -2944,7 +2944,7 @@ func TestParseComplianceOutput_leavesRepositoryUnchanged(t *testing.T) {
 	}{
 		{"wrapper error", "", `{"schema_version":1,"framework":"openssf-baseline","total":0,"controls":[],"error":"darnit not found on PATH"}`, "darnit not found on PATH"},
 		{"empty controls", "", `{"schema_version":1,"framework":"openssf-baseline","total":0,"controls":[]}`, "no controls in report"},
-		{"sub-path scan", "packages/cli", `{"total":1,"controls":[{"id":"OSPS-AC-01.01","level":1,"status":"FAIL","details":"x","source":"darnit"}]}`, "sub-path scan"},
+		{"sub-path scan", "packages/cli", `{"total":1,"controls":[{"id":"OSPS-AC-01.01","level":1,"status":"FAIL","details":"x","source":"darnit"}]}`, "subpath scan"},
 	} {
 		gdb, repo, scan := seedComplianceRepo(t, 2, tc.subPath)
 		w := &Worker{DB: gdb, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}

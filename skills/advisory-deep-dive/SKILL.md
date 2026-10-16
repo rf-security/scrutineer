@@ -1,6 +1,6 @@
 ---
 name: advisory-deep-dive
-description: Re-audit every past GHSA/CVE advisory published against this repository, anchored on each advisory's fix commit, for four failure modes, a regression of the original bug, a bypass of the fix, an incomplete fix that left a path open, and the same class of bug in sibling code the fix never touched. Records one verdict per advisory (fixed, bypass, variant or regressed) with standalone evidence, opening findings for anything that did not hold, and a fixed verdict backs a public fix-audit certificate. Use when you want to prove that prior fixes actually held rather than trusting that a shipped patch closed the hole. The target is this codebase's own first-party source, not its dependencies.
+description: Re-audit every past GitHub Security Advisory (GHSA) or CVE advisory published against this repository, anchored on each advisory's fix commit, for four failure modes, a regression of the original bug, a bypass of the fix, an incomplete fix that left a path open, and the same class of bug in sibling code the fix never touched. Records one verdict per advisory (fixed, bypass, variant or regressed) with standalone evidence, opening findings for anything that did not hold, and a fixed verdict backs a public fix-audit certificate. Use when you want to prove that prior fixes actually held rather than trusting that a shipped patch closed the hole. The target is this codebase's own first-party source, not its dependencies.
 license: MIT
 compatibility: Needs the cloned repo with full git history in ./src, the scrutineer API for advisory and mined-history inputs, and network access to read advisory pages. Uses `git` and may use Claude subagents.
 allowed-tools: Read,Write,Bash,Grep,Glob,WebFetch,Task
@@ -8,6 +8,7 @@ metadata:
   scrutineer.version: 1
   scrutineer.output_file: report.json
   scrutineer.output_kind: advisory_audit
+  scrutineer.poc_field: validation
   scrutineer.max_turns: 100
   scrutineer.model: max
   scrutineer.requires_remote: true
@@ -90,7 +91,7 @@ For every candidate from Step 3, apply the `security-deep-dive` six steps in ord
 
 1. **Trace** the value from the sink back to a trust boundary.
 2. **Boundary** — is the input actually attacker-controlled in this project's threat model, or a trusted developer/operator choice? Check any existing mitigation the project already has before concluding the input reaches unguarded.
-3. **Validate** — write a reproduction and run it against current HEAD. Paste the script verbatim and its output into `validation`. A bypass or incomplete-fix candidate that cannot be reproduced at HEAD is not a finding: the fix held.
+3. **Validate:** write a reproduction and run it against current HEAD. Write and run the files in `./poc/<finding-id>/`, outside `./src`, using the report-local finding ID such as `F001`. Include `README.md` with prerequisites and expected output, plus `run.sh` with the exact build/run commands and an explicit target checkout or executable argument. Finish running before publishing the finding, then leave those files unchanged: Scrutineer retains the first successful capture until the finding is deleted. Keep at most 64 regular files, 1 MiB per file and 2 MiB total, with no links, credentials, dependencies, caches or unrelated build products. Also paste every script and input verbatim into `validation`, each in a closed Markdown fence with `language filename=relative/path` on the opening line, such as `python filename=probe.py`. Use unique paths relative to the reproduction directory with no spaces, absolute paths, or `.` or `..` components. Reserve `README.md` for bundle instructions. Put build/run commands in a `sh filename=run.sh` fence, and observed output and quoted source excerpts in separate unnamed `text` or `console` fences. Close fences on their own lines; do not use `--- FILENAME ---` delimiters. A bypass or incomplete-fix candidate that cannot be reproduced at HEAD is not a finding: the fix held.
 4. **Prior art** — cite the advisory (`uuid`, `url`) or history-only fix commit this candidate descends from. Check issues and PRs for whether a maintainer already considered and declined this variant. Set `discovered_via` to `advisory` for a published advisory, `source` for a history-only fix, or `issue-tracker` when the variant was actually described by an open issue you found while checking.
 5. **Reach** — is the candidate reachable from a public entry point in the shipped artefact? Record `reachable`, `harness_only`, or `unclear`.
 6. **Rate** severity and confidence given everything above.

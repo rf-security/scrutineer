@@ -15,9 +15,12 @@
     {{template "finding-status" (fstatus $f.Status)}}
   </h2>
   <div class="flex gap-2 shrink-0">
+    {{if .AkritesLink}}
+    <a href="/findings/{{$f.ID}}/akrites" class="btn-outline">Akrites submission</a>
+    {{end}}
     {{if .VINCEReady}}
     <a href="/findings/{{$f.ID}}/vince" class="btn-outline">
-      <i data-lucide="send"></i> Submit to VINCE
+      <i data-lucide="send"></i> Submit to <abbr title="Vulnerability Information and Coordination Environment, run by CERT/CC">VINCE</abbr>
     </a>
     {{else}}
     <button type="button" class="btn-outline" disabled title="{{.VINCEReason}}">
@@ -145,7 +148,7 @@
     </dd>
   </div>
   <div>
-    <dt class="text-muted-foreground">CWE</dt>
+    <dt class="text-muted-foreground"><abbr title="Common Weakness Enumeration">CWE</abbr></dt>
     <dd>{{if $f.CWE}}{{$f.CWE}}{{else}}-{{end}}</dd>
   </div>
   <div>
@@ -202,7 +205,7 @@
   {{end}}
   {{with .LatestAttackPath}}
   <div>
-    <dt class="text-muted-foreground">Production viability</dt>
+    <dt class="text-muted-foreground">Release viability</dt>
     <dd><a href="/scans/{{.ScanID}}" class="badge-outline hover:underline">{{.ProductionViability}}</a></dd>
   </div>
   {{end}}
@@ -250,14 +253,14 @@
   {{end}}
   {{if $f.GHSAID}}
   <div>
-    <dt class="text-muted-foreground">GHSA</dt>
+    <dt class="text-muted-foreground"><abbr title="GitHub Security Advisory">GHSA</abbr></dt>
     <dd><a class="hover:underline" href="{{if $repo.HTMLURL}}{{$repo.HTMLURL}}/security/advisories/{{$f.GHSAID}}{{else}}https://github.com/advisories/{{$f.GHSAID}}{{end}}"
       rel="noopener" target="_blank"><code>{{$f.GHSAID}}</code></a></dd>
   </div>
   {{end}}
   {{if $f.CVSSVector}}
   <div class="col-span-2">
-    <dt class="text-muted-foreground">CVSS v3</dt>
+    <dt class="text-muted-foreground"><abbr title="Common Vulnerability Scoring System">CVSS</abbr> v3</dt>
     <dd><code>{{$f.CVSSVector}}</code>{{if $f.CVSSScore}} ({{$f.CVSSScore}}){{end}}</dd>
   </div>
   {{end}}
@@ -932,7 +935,7 @@ git commit -m "fix: {{$f.Title}}"</pre>
   <details open class="group border-b">
     <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
       <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
-        Production viability history <span class="text-muted-foreground ml-auto mr-2 text-xs">{{len .AttackPaths}}</span>
+        Release viability history <span class="text-muted-foreground ml-auto mr-2 text-xs">{{len .AttackPaths}}</span>
         <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
       </h3>
     </summary>
@@ -1133,7 +1136,7 @@ git commit -m "fix: {{$f.Title}}"</pre>
       <ul class="grid gap-1 text-xs text-muted-foreground">
       {{range .History}}
         <li class="font-mono">
-          [{{.CreatedAt.Format "2006-01-02 15:04"}}] {{.Source}}{{if .By}} ({{.By}}){{end}}:
+          [{{.CreatedAt.Format "2006-01-02 15:04"}}] {{with .Source}}<span class="opacity-50">provenance</span> {{.}}{{end}}{{if .By}} ({{.By}}){{end}}:
           <code>{{.Field}}</code> = <code>{{.NewValue}}</code>
           {{if .OldValue}}<span class="opacity-50">was <code>{{.OldValue}}</code></span>{{end}}
         </li>

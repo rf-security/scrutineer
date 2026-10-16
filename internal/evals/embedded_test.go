@@ -105,22 +105,7 @@ func runEmbeddedModeCase(t *testing.T, tc embeddedModeCase) {
 			t.Errorf("%s enqueued=%t want=%t; report=%s", skill, got, want, report)
 		}
 	}
-	var parsed struct {
-		Modes []struct {
-			Name     string   `json:"name"`
-			Evidence []string `json:"evidence"`
-		} `json:"modes"`
-	}
-	if err := json.Unmarshal([]byte(report), &parsed); err != nil {
-		t.Fatal(err)
-	}
-	modes := make(map[string]bool)
-	for _, mode := range parsed.Modes {
-		if modes[mode.Name] || len(mode.Evidence) == 0 {
-			t.Errorf("duplicate or unevidenced mode=%+v", mode)
-		}
-		modes[mode.Name] = true
-	}
+	modes := triageReportModes(t, report)
 	if modes["embedded-iot"] != tc.embedded || modes["web-api"] != tc.web {
 		t.Fatalf("modes=%v want embedded=%t web=%t", modes, tc.embedded, tc.web)
 	}

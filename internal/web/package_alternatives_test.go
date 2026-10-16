@@ -98,7 +98,7 @@ func TestAPIListPackageAlternatives(t *testing.T) {
 	}
 
 	r := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/repositories/%d/alternatives", repo.ID), nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)

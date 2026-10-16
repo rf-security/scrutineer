@@ -1,6 +1,6 @@
 ---
 name: advisories
-description: Fetch published GHSA and CVE advisories affecting any package this repository produces, via advisories.ecosyste.ms.
+description: Fetch published GitHub Security Advisory (GHSA) and CVE advisories affecting any package this repository produces, via advisories.ecosyste.ms.
 license: MIT
 compatibility: Prefers the scrutineer API's cached ecosyste.ms payload; needs network access to advisories.ecosyste.ms only when nothing is cached.
 metadata:

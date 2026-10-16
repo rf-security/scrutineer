@@ -7,31 +7,31 @@
 # update the selected asset and checksum atomically. A mismatched tag/digest in
 # a Renovate PR fails sha256sum below and usually means asset identification
 # failed upstream.
-ARG CLAUDE_AMD64_LOCK=v2.1.282@sha256:2972e823268974dd084734d5f69fedc227eb4cb3bc9c398ceb7776280e836991
-ARG CLAUDE_ARM64_LOCK=v2.1.282@sha256:62ed261b4ad0838eac468f119524ba58502bc09da8152eddce9194229ba20ac3
+ARG CLAUDE_AMD64_LOCK=v2.1.295@sha256:cf9cfb714ded1f27c1d3b7fb274faef50d72312c4b14525a74659188f59bd8b1
+ARG CLAUDE_ARM64_LOCK=v2.1.295@sha256:a22d704eca7f241476445dfeb001c1848c1ebb6251e583be3dccfbfb1a5fd4aa
 
-ARG CODEX_AMD64_LOCK=rust-v0.156.1@sha256:8b711520beddf385467b8da4d2c93736637c6ba1e46811cf0d8606b7c490b6f6
-ARG CODEX_ARM64_LOCK=rust-v0.156.1@sha256:fdd47ed6aade0360796fd3f6f95a45096f327c15e19e8c7339f9dc5633041786
+ARG CODEX_AMD64_LOCK=rust-v0.162.0@sha256:4f573944c1d2059109d75a2f4d0cc9c03697288224a5e407717a9de98fc010c5
+ARG CODEX_ARM64_LOCK=rust-v0.162.0@sha256:d47a5fa21e037a1b85729b88c238ff3da8a956fc9fb5ad3976714428e7fb2bda
 
-ARG OPENCODE_AMD64_LOCK=v1.18.32@sha256:3046e0404fdc60fb80307e7a47824ba07477364178a4d09baa8548496dd6d43b
-ARG OPENCODE_ARM64_LOCK=v1.18.32@sha256:568461b7d4d8c19865c97e9a1102e613049c6039d01fe772154de873c1865840
+ARG OPENCODE_AMD64_LOCK=v1.18.35@sha256:c8f888b451f5494a18f858fffb0e0b68f4e4baa9c241761c5f206884f0fa640d
+ARG OPENCODE_ARM64_LOCK=v1.18.35@sha256:f7f2ba59ee8aa94d388f9696575a32d20e71c2ee48def9f80fc693a60fec6c72
 
-ARG COPILOT_AMD64_LOCK=v1.0.88@sha256:42f40c08ff8a8ff78522161e4b5e2b86340ad8bb0853a5f1aa64ce65b48d007b
-ARG COPILOT_ARM64_LOCK=v1.0.88@sha256:e263f5f9eb0db5dddf5775ac98c437e27743857ce0ba310f08f2338aebd1107d
+ARG COPILOT_AMD64_LOCK=v1.0.94@sha256:0acaff842900357f4734c768b8933b1c5c8ce65e1bf74f15573f5cedd650b240
+ARG COPILOT_ARM64_LOCK=v1.0.94@sha256:8d763b46fa5f30151ad03b94aefee513e9312ecfa2d485b02e356ff1a3955e61
 
-ARG SEMGREP_VERSION=1.178.0
+ARG SEMGREP_VERSION=1.180.0
 
 ARG BANDIT_VERSION=1.9.4
-ARG DARNIT_VERSION=0.1.0
+ARG DARNIT_VERSION=0.1.1
 
-FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183 AS go-tools
+FROM golang:1.27.2-trixie@sha256:e58d6f83b3416618d8bcac2b3dde1b7f7e3c4a77d25e88637f8bbae81536c48d AS go-tools
 
 COPY scripts/retry-build-command.sh /usr/local/bin/retry-build-command.sh
 # Go proxy/checksum requests can fail transiently.
-ARG BETTERLEAKS_VERSION=v1.8.1
+ARG BETTERLEAKS_VERSION=v1.9.0
 RUN GOBIN=/out CGO_ENABLED=0 sh /usr/local/bin/retry-build-command.sh go install -ldflags "-X=github.com/betterleaks/betterleaks/version.Version=${BETTERLEAKS_VERSION}" github.com/betterleaks/betterleaks@${BETTERLEAKS_VERSION}
-RUN GOBIN=/out sh /usr/local/bin/retry-build-command.sh go install github.com/git-pkgs/git-pkgs@v0.20.0
-RUN GOBIN=/out sh /usr/local/bin/retry-build-command.sh go install github.com/git-pkgs/brief/cmd/brief@v0.14.0
+RUN GOBIN=/out sh /usr/local/bin/retry-build-command.sh go install github.com/git-pkgs/git-pkgs@v0.21.0
+RUN GOBIN=/out sh /usr/local/bin/retry-build-command.sh go install github.com/git-pkgs/brief/cmd/brief@v0.14.1
 
 FROM rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS zizmor-build
 ENV CARGO_HTTP_MULTIPLEXING=false
@@ -40,7 +40,7 @@ RUN cargo install --locked --root /out zizmor@1.30.1
 # The runner image carries the proxy commands used by Scrutineer and by
 # harness/container consumers. Both are built CGO-free so they can be copied
 # into the slim runtime without a glibc dependency.
-FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183 AS scrutineer-build
+FROM golang:1.27.2-trixie@sha256:e58d6f83b3416618d8bcac2b3dde1b7f7e3c4a77d25e88637f8bbae81536c48d AS scrutineer-build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -82,10 +82,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # semgrep bump drag the others' dependencies with it.
 # darnit-mcp is a metapackage whose dependencies carry no version, so the
 # packages the audit runs (darnit-core, darnit-baseline) are pinned with it.
-# darnit's 0.1.0 wheel ships without openssf-baseline.toml, which
-# get_framework_config_path resolves two directories above the package (three
-# above its own module file), next to the templates/ the TOML loads relative
-# to itself; the release sdist carries both, so they are taken from there.
 # cel-python's c7nlib imports packaging without declaring it.
 # Smoke-test required CLIs at build time so missing packages, broken venv
 # symlinks or a misplaced framework TOML fail the image build instead of
@@ -100,12 +96,7 @@ RUN python3 -m venv /opt/semgrep && \
     python3 -m venv /opt/darnit && \
     /opt/darnit/bin/pip install --no-cache-dir "darnit-mcp==${DARNIT_VERSION}" "darnit-core==${DARNIT_VERSION}" "darnit-baseline==${DARNIT_VERSION}" packaging && \
     ln -s /opt/darnit/bin/darnit /usr/local/bin/darnit && \
-    darnit_lib="$(/opt/darnit/bin/python -c 'import darnit_baseline, pathlib; print(pathlib.Path(darnit_baseline.__file__).parent.parent.parent)')" && \
-    /opt/darnit/bin/pip download --no-cache-dir --no-deps --no-binary :all: -d /tmp/darnit-sdist "darnit-baseline==${DARNIT_VERSION}" && \
-    tar -xzf "/tmp/darnit-sdist/darnit_baseline-${DARNIT_VERSION}.tar.gz" -C "${darnit_lib}" --strip-components=1 \
-        "darnit_baseline-${DARNIT_VERSION}/openssf-baseline.toml" "darnit_baseline-${DARNIT_VERSION}/templates" && \
-    rm -rf /tmp/darnit-sdist && \
-    darnit validate "${darnit_lib}/openssf-baseline.toml" && \
+    /opt/darnit/bin/python -c 'import sys; from darnit.config import load_framework_config, validate_framework_config; from darnit_baseline.implementation import OSPSBaselineImplementation; errors = validate_framework_config(load_framework_config(OSPSBaselineImplementation().get_framework_config_path())); sys.exit("\n".join(map(str, errors)) if errors else 0)' && \
     python3 --version && \
     jq --version && \
     jsonschema --version && \

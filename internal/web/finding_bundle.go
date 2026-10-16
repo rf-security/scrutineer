@@ -36,6 +36,7 @@ type bundleManifest struct {
 	Status       string            `json:"status"`
 	Contents     map[string]string `json:"contents"`
 	Note         string            `json:"note,omitempty"`
+	Warnings     []string          `json:"warnings,omitempty"`
 }
 
 // findingBundleDownload writes a tar.gz containing every per-finding
@@ -169,9 +170,26 @@ func (s *Server) bundleEntriesAt(f *db.Finding, repo *db.Repository, generatedAt
 		contents["patch.diff"] = "Suggested unified diff; applied to commit recorded in the OSV affected[] git range"
 	}
 
-	if poc := bundlePoC(f.Validation); len(poc) > 0 {
+	var warnings []string
+	poc, captured, err := s.findingPoCEntries(f)
+	if errors.Is(err, errCapturedPoC) {
+		warnings = append(warnings, fmt.Sprintf("%v. poc/ is rebuilt from the validation text.", err))
+	} else if err != nil {
+		return nil, fmt.Errorf("build PoC: %w", err)
+	}
+	if !captured {
+		poc, err = bundlePoC(f.Validation)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("poc/ omitted: %v. Original validation is preserved in report.md.", err))
+		}
+	}
+	if len(poc) > 0 {
 		entries = append(entries, poc...)
 		contents["poc/"] = "Runnable reproduction: run.sh plus probe/input files extracted from the finding's Validation step; README.md carries the verbatim prose"
+		if captured {
+			contents["poc/"] = "PoC files captured from the scan workspace, preserved verbatim"
+			contents["poc-manifest.json"] = "Capture provenance, file sizes and SHA-256 checksums"
+		}
 	}
 
 	manifest := bundleManifest{
@@ -185,6 +203,7 @@ func (s *Server) bundleEntriesAt(f *db.Finding, repo *db.Repository, generatedAt
 		Aliases:      aliases,
 		Status:       string(f.Status),
 		Contents:     contents,
+		Warnings:     warnings,
 		Note:         "Bundle composed from data already on the finding; the per-file exports are the same bytes the corresponding /findings/{id}/{file} endpoint serves directly.",
 	}
 	manifestRaw, err := json.MarshalIndent(manifest, "", "  ")

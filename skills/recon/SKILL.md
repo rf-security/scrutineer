@@ -1,6 +1,6 @@
 ---
 name: recon
-description: Map distinct externally reachable input-processing subsystems into focus areas for the threat-model skill to carry into later security audits. This is a short, read-only orientation pass, not a vulnerability scan.
+description: Find the parts of the repository that handle outside input and group them into focus areas for the threat-model skill to carry into later security audits. This is a short, read-only orientation pass, not a vulnerability scan.
 license: MIT
 compatibility: Reads ./src and context.json only. Does not execute project code, install dependencies, contact external services, or report vulnerabilities.
 allowed-tools: Read,Write,Grep,Glob

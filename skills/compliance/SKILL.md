@@ -1,8 +1,8 @@
 ---
 name: compliance
-description: Audit the repository against the OpenSSF Baseline with darnit, resolve the controls darnit defers to LLM analysis or could not verify, and record per-control verdicts plus the attained Baseline level.
+description: Audit the repository against the Open Source Security Foundation (OpenSSF) Baseline with darnit, resolve the controls darnit defers to large language model (LLM) analysis or could not verify, and record per-control verdicts plus the attained Baseline level.
 license: MIT
-compatibility: Requires `darnit` (https://github.com/kusari-oss/darnit) and `python3` on PATH; the runner image ships it, the all-in-one image does not because darnit pins a tree-sitter-language-pack range with no musl wheel. 20 of the 62 controls shell out to `gh`, which needs a `GH_TOKEN` the scan container does not carry, so they come back `WARN` and are resolved with unauthenticated calls to api.github.com where the endpoint is public. Needs network access to api.github.com.
+compatibility: Requires `darnit` (https://github.com/kusari-oss/darnit) and `python3` on PATH; the runner image ships it, the all-in-one image does not because darnit pins a tree-sitter-language-pack range with no musl wheel. Some controls shell out to `gh`, which needs a `GH_TOKEN` the scan container does not carry, so they come back `WARN` and are resolved with unauthenticated calls to api.github.com where the endpoint is public. Needs network access to api.github.com.
 allowed-tools: Read,Write,Bash
 metadata:
   scrutineer.version: 1
@@ -20,7 +20,7 @@ metadata:
 
 # compliance
 
-Run darnit's OpenSSF Baseline audit (62 controls across access control, build and release, documentation, governance, legal, quality, security assessment and vulnerability management) against `./src`, then finish the job darnit's CLI cannot: a control it defers to LLM analysis comes back as `PENDING_LLM`, and a control it could not verify (its `gh api` calls have no token here) comes back as `WARN`. You are the LLM. This is not a code audit and produces no findings; a failed control is a project-hygiene gap ("no SECURITY.md", "releases unsigned"), never a vulnerability.
+Run darnit's OpenSSF Baseline audit (controls across access control, build and release, documentation, governance, legal, quality, security assessment and vulnerability management) against `./src`, then finish the job darnit's CLI cannot: a control it defers to LLM analysis comes back as `PENDING_LLM`, and a control it could not verify (its `gh api` calls have no token here) comes back as `WARN`. You are the LLM. This is not a code audit and produces no findings; a failed control is a project-hygiene gap ("no SECURITY.md", "releases unsigned"), never a vulnerability.
 
 ## Workspace
 

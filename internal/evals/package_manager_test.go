@@ -117,7 +117,7 @@ func serveTriageValidateReport(t *testing.T, w http.ResponseWriter, r *http.Requ
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return true
 	}
-	if detail := worker.ValidateSkillReport(skill.Name, skill.SchemaJSON, string(body)); detail != "" {
+	if detail := worker.ValidateSkillReport(skill.Name, skill.SchemaJSON, skill.PoCField, string(body)); detail != "" {
 		_ = json.NewEncoder(w).Encode(map[string]any{"valid": false, "errors": detail})
 		return true
 	}

@@ -8,6 +8,7 @@ metadata:
   scrutineer.version: 1
   scrutineer.output_file: report.json
   scrutineer.output_kind: findings
+  scrutineer.poc_field: validation
   scrutineer.max_turns: 48
   scrutineer.model: high
   scrutineer.min_confidence: high

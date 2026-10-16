@@ -24,22 +24,15 @@
 # data: ./data
 
 # Database backend. Omit the block to use the embedded SQLite file at
-# <data>/scrutineer.db (the default, zero-config). Set driver: postgres with
-# a dsn to store everything in an external PostgreSQL server instead — useful
-# for multi-instance or backed-up-elsewhere deployments. The schema is created
-# automatically (GORM AutoMigrate) on first connect, same as SQLite.
-#
-# To move an existing SQLite database into postgres, run the one-shot
-# migrator before switching over:
-#   go run ./scripts/migrate-sqlite-to-postgres \
-#     -sqlite ./data/scrutineer.db -postgres postgres://user:pass@host:5432/db
+# <data>/scrutineer.db by default. For a new instance, set driver: postgres
+# and a dsn. Scrutineer creates the schema on first connect.
 #
 # NOTE: the `scrutineer backup` / `scrutineer restore` subcommands are
 # SQLite-only. Under postgres, back up with your own tooling (pg_dump /
 # pg_restore or your provider's managed snapshots).
 # database:
 #   driver: postgres
-#   dsn: postgres://scrutineer:scrutineer@db:5432/scrutineer?sslmode=disable
+#   dsn: postgres://scrutineer:scrutineer@127.0.0.1:5432/scrutineer?sslmode=disable
 
 # Settings for the external maintainer portal (cmd/sharing). Optional; anything
 # omitted here falls back to the matching root config. By default the portal
@@ -371,6 +364,13 @@
 #     email: ""
 #     phone: ""
 #     pgp_key: ""
+
+# Submit reviewed findings to Akrites and poll their saved receipts.
+# Keep the token in this owner-only config file. Empty disables submission.
+# akrites:
+#   base_url: https://intake.tap.akrites.dev
+#   submission_token: ""
+#   email: ""
 
 # Secret shared out of band between federation members, mixed into
 # interchange finding hashes so members derive matching hashes without

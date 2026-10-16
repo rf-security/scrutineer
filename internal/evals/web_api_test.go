@@ -22,8 +22,9 @@ func TestWebAPIFixtureBehavior(t *testing.T) {
 	if err != nil {
 		t.Skip("python3 is needed to exercise the fixture")
 	}
-	const script = `import runpy
+	const script = `import runpy, sys
 from http.cookies import SimpleCookie
+sys.path.insert(0, '../../evals/fixtures/web-api-app/services/site')
 m = runpy.run_path('../../evals/fixtures/web-api-app/services/site/server.py')
 dispatch = m['dispatch']
 assert dispatch('GET', '/api/email?email=attacker@example.test', {})[0] == 401
@@ -203,7 +204,9 @@ func runTriageModeCase(t *testing.T, scan triageScan) (map[string]int, string) {
 	return counts, result.Report
 }
 
-func assertWebModeReport(t *testing.T, tc webModeCase, raw string) {
+// triageReportModes returns the modes a triage report selected, failing the
+// test for a mode listed twice or without evidence.
+func triageReportModes(t *testing.T, raw string) map[string]bool {
 	t.Helper()
 	var report struct {
 		Modes []struct {
@@ -221,6 +224,12 @@ func assertWebModeReport(t *testing.T, tc webModeCase, raw string) {
 		}
 		modes[mode.Name] = true
 	}
+	return modes
+}
+
+func assertWebModeReport(t *testing.T, tc webModeCase, raw string) {
+	t.Helper()
+	modes := triageReportModes(t, raw)
 	if modes["web-api"] != tc.web || modes["package-manager"] != tc.registry {
 		t.Fatalf("modes=%v want web=%t registry=%t", modes, tc.web, tc.registry)
 	}

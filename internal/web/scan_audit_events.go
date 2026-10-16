@@ -49,9 +49,9 @@ func retryLineage(scan db.Scan) scanLineage {
 // comes from the explicit argument.
 func logScanControl(tx *gorm.DB, kind string, scan db.Scan, lineage scanLineage, oldStatus, newStatus db.ScanStatus, source db.FindingSource) error {
 	payload := map[string]any{
-		scanAuditRepositoryID: scan.RepositoryID,
-		"old_status":          oldStatus,
-		"new_status":          newStatus,
+		db.AuditKeyRepositoryID: scan.RepositoryID,
+		"old_status":            oldStatus,
+		"new_status":            newStatus,
 	}
 	if lineage.parentScanID != nil {
 		payload["parent_scan_id"] = *lineage.parentScanID

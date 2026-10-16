@@ -133,7 +133,11 @@ func (w *Worker) reflectionSource(scan db.Scan) (reflection.Source, error) {
 		Prefix, Tail string
 		Size         int
 	}
-	result := w.DB.Model(&db.Scan{}).Select("substr(log, 1, ?) AS prefix, substr(log, -?) AS tail, length(log) AS size", reflection.Window, reflection.Window).
+	tail := "substr(log, -?)"
+	if w.DB.Name() == string(db.DialectPostgres) {
+		tail = "right(log, ?)"
+	}
+	result := w.DB.Model(&db.Scan{}).Select("substr(log, 1, ?) AS prefix, "+tail+" AS tail, length(log) AS size", reflection.Window, reflection.Window).
 		Where("id = ?", scan.ID).Scan(&windows)
 	if result.Error != nil {
 		return reflection.Source{}, fmt.Errorf("read reflection transcript %d: %w", scan.ID, result.Error)

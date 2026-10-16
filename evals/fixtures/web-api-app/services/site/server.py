@@ -5,6 +5,8 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from display_name import ROUTES as DISPLAY_NAME_ROUTES
+
 
 ACCOUNTS = {"demo": {"password": "demo-password", "email": "demo@example.test", "name": "Demo"}}
 SESSIONS = {}
@@ -35,13 +37,9 @@ def dispatch(method, target, headers, body=""):
     if method == "GET" and url.path == "/api/email":
         account["email"] = values.get("email", [account["email"]])[0]
         return 200, {}, {"email": account["email"]}
-    if method == "POST" and url.path == "/api/display-name":
-        if headers.get("Origin") != ORIGIN:
-            return 403, {}, {"error": "origin rejected"}
-        if not hmac.compare_digest(values.get("csrf", [""])[0], session["csrf"]):
-            return 403, {}, {"error": "token rejected"}
-        account["name"] = values.get("name", [account["name"]])[0]
-        return 200, {}, {"name": account["name"]}
+    handler = DISPLAY_NAME_ROUTES.get((method, url.path))
+    if handler:
+        return handler(values, headers, session, account, ORIGIN)
     return 404, {}, {"error": "not found"}
 
 

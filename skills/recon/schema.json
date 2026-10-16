@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "recon report",
-  "description": "A short, read-only map of input-processing subsystems consumed by threat-model when it proposes repository scan-config focus areas.",
+  "description": "A short, read-only map of the focus areas that handle outside input, consumed by threat-model when it proposes repository scan-config focus areas.",
   "type": "object",
   "required": ["focus_areas", "notes"],
   "additionalProperties": false,

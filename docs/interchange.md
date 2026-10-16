@@ -4,7 +4,7 @@ Scrutineer instances (and non-scrutineer tools) can exchange a small set of
 federation records without ever exchanging finding bodies. This page documents
 the record envelope, the shipped JSON schema, the on-disk record layout, the
 salted finding hash, the claim-check endpoint in both directions, and the two
-feed tiers with the export and import jobs that keep them in sync. Sigstore
+feed tiers with the export and import syncs that keep them current. Sigstore
 signing for the public tier is future work and not described here.
 
 ## Records
@@ -16,11 +16,11 @@ envelope: `_type`, `subject`, `predicateType`, `predicate`. The
 
 | Kind | `predicateType` | Meaning |
 |------|-----------------|---------|
-| certificate | `.../scrutineer/interchange/certificate/v1` | An advisory's advertised fix was re-audited on the named repository and held. `status` is pinned to `fixed`. The local `GET /advisories/{id}/certificate.json` download attests the same audit but in a different, richer format (severity, CVSS, evidence) that is NOT an interchange record and must never be fed into a federation feed. |
+| certificate | `.../scrutineer/interchange/certificate/v1` | An advisory's advertised fix was re-audited on the named repository and held. `status` is pinned to `fixed`. The local `GET /advisories/{id}/certificate.json` download attests the same audit but in a different, richer format (severity, Common Vulnerability Scoring System (CVSS) score, evidence) that is NOT an interchange record and must never be fed into a federation feed. |
 | certificate | `.../scrutineer/interchange/certificate/v2` | Same shape, verdict widened to `bypass`, `variant` or `regressed`: the advertised fix did NOT hold. |
 | claim | `.../scrutineer/interchange/claim/v1` | The publishing instance holds a finding whose salted hash is the subject digest, plus a contact to coordinate through. |
 | optout | `.../scrutineer/interchange/optout/v1` | The repository's maintainer asked federated instances to neither scan the repository nor contact them about it. |
-| route | `.../scrutineer/interchange/route/v1` | The validated disclosure route for a repository (email, GHSA URL, registry owner handle, or SECURITY.md URL), so other instances can skip re-deriving it. |
+| route | `.../scrutineer/interchange/route/v1` | The validated disclosure route for a repository (email, GitHub Security Advisory (GHSA) URL, registry owner handle, or SECURITY.md URL), so other instances can skip re-deriving it. |
 
 Certificates carry two revisions because the verdict decides which tier may
 carry the record, so the split has to be visible in the `predicateType`
@@ -194,8 +194,9 @@ The client refuses redirects. A claim-check answer is a boolean and a
 contact, so it never legitimately redirects, and following one would let a
 peer aim this instance's own POST anywhere: a `307` to
 `http://127.0.0.1:8080/repositories/1/delete` would replay the request
-against the admin UI, whose only authorization is the loopback `Host` check
-and a `Sec-Fetch-Site` check that a redirected Go request satisfies.
+against the admin UI, past the loopback `Host` check and a `Sec-Fetch-Site`
+check that a redirected Go request satisfies, leaving the operator token as
+the only thing in its way.
 
 ## Feeds
 
@@ -221,10 +222,10 @@ channel with no `disclosure_channel_at` is skipped too: `verified_at` has to
 be a timestamp that only moves when the channel does, or every export would
 rewrite the whole feed.
 
-### Export and import jobs
+### Export and import syncs
 
 Both run hourly from one goroutine, starting with an immediate pass so a
-freshly configured feed populates without waiting out a tick. The job is
+freshly configured feed populates without waiting out a tick. The sync is
 dormant when no feed is configured. The import runs first: an opt-out landing
 this pass withdraws its repository from the `route` and `certificate` records,
 and exporting first would keep publishing the disclosure route of a repository
@@ -321,7 +322,7 @@ at least one decryption source from `identity_file` or `identity_plugins`,
 never match theirs), any peer that is not an `http(s)` URL with a host and
 nothing else, the two tiers sharing one git remote (each would prune what the
 other publishes), and any feed remote or peer carrying credentials: those
-strings reach the job's error messages and log fields, so a token in one would
+strings reach the sync's error messages and log fields, so a token in one would
 end up in the logs. Configure a git credential helper on the host instead. The
 refusal itself names the remote with its userinfo replaced, since that message
 is what the startup logger prints.
@@ -336,7 +337,7 @@ leaves its existing ciphertext untouched rather than silently replacing it.
 
 Feed remotes are pushed with the ambient git credentials and
 `GIT_TERMINAL_PROMPT=0`, so a remote whose credentials are missing fails the
-job fast instead of blocking it on a prompt nobody can answer, and under
+sync fast instead of blocking it on a prompt nobody can answer, and under
 `GIT_ALLOW_PROTOCOL=https:ssh:file`, so an ambient `url.<base>.insteadOf` on
 the host cannot rewrite a validated feed remote onto a transport (`ext::`,
 which hands git a shell command) that startup never approved.

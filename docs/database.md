@@ -1,8 +1,42 @@
 # Database schema
 
-SQLite with WAL mode. GORM handles migrations on startup. The queue table (`goqite`) is managed separately with an embedded SQL schema.
+SQLite with WAL mode is the default. PostgreSQL is also supported. GORM handles migrations on startup, and the queue table (`goqite`) uses an embedded schema for the selected backend.
 
-See [backup.md](backup.md) for backing up and restoring this file: WAL mode means a plain `cp` can be inconsistent, so use `scrutineer backup`/`restore` or one of the documented strategies.
+For a new PostgreSQL instance (13 or later), create an empty database, give Scrutineer's role `USAGE` and `CREATE` on its `public` schema, and add its connection details to `scrutineer.yaml`:
+
+```yaml
+database:
+  driver: postgres
+  dsn: postgres://scrutineer:password@localhost:5432/scrutineer?sslmode=require
+```
+
+Start Scrutineer with `scrutineer -config scrutineer.yaml`. The database stores application records and queued jobs; the local data directory still stores scan workspaces and caches. Changing the connection does not copy records from an existing SQLite database.
+
+For local development, run the database example from the repository root:
+
+```sh
+docker compose -f docker/postgresdb/docker-compose.yaml up -d
+```
+
+Its default connection is `postgres://scrutineer:scrutineer@127.0.0.1:5432/scrutineer?sslmode=disable`. The example binds to loopback and stores database files in a named volume. If you set `POSTGRES_PASSWORD`, use that password in the connection string too.
+
+PostgreSQL backups use `pg_dump` and `pg_restore`, or your provider's backup service. The `scrutineer backup` and `restore` commands support SQLite; see [backup.md](backup.md) for those instructions.
+
+## Moving an existing SQLite instance to PostgreSQL
+
+Use the same Scrutineer revision for the SQLite instance and the migrator. Finish or cancel queued and running scans, drain the job queue, then stop Scrutineer. Keep both the source and destination instances stopped until the copy finishes. Create an empty PostgreSQL database owned by the account in the connection string and add it to `scrutineer.yaml` as `database.dsn`, leaving `database.driver` unset for now. Then run this command from the repository root:
+
+```sh
+go run ./scripts/migrate-sqlite-to-postgres -config scrutineer.yaml
+```
+
+The source is `scrutineer.db` in the config's data directory unless you pass `-sqlite`. The command refuses to start while something answers on the config's `addr`.
+
+The tool copies a temporary SQLite snapshot without running SQLite schema migrations, leaving the source data and schema unchanged. Missing tables or columns cause an error asking you to upgrade the SQLite instance first. Allow temporary disk space roughly equal to the SQLite database size; set `TMPDIR` to choose another disk. Rows are streamed in batches of 200, including scan history, findings, chat, and association tables. Text containing NUL bytes or invalid UTF-8 is cleaned for PostgreSQL, with affected row counts in the output. Binary uploads are copied unchanged.
+
+The destination must contain no application data. Schema creation, including PostgreSQL's schema-version setting, is allowed. The copy runs in one transaction, validates foreign keys, and advances ID sequences before committing. It requires table ownership rather than superuser access. A failed copy rolls back imported rows; fix the reported problem and rerun the command against the empty destination. Unknown source tables or columns cause an error so records are not silently omitted. Queued jobs are not copied.
+
+After a successful copy, set `database.driver` to `postgres` and restart Scrutineer. Keep the existing data directory for scan workspaces and caches, and retain the SQLite database as a backup. Check repository pages, scan history, and findings before resuming scans.
 
 ## repositories
 
@@ -39,7 +73,7 @@ The central entity. One row per git URL.
 | ecosystems_issues_fetched_at | datetime | When `ecosystems_issues_data` was last refreshed. TTL 7 days. |
 | ecosystems_dependents_data | text | Cached dependents, chained off the packages lookup (per-package top dependents, capped). |
 | ecosystems_dependents_fetched_at | datetime | When `ecosystems_dependents_data` was last refreshed. TTL 30 days. |
-| disclosure_channel | text | Preferred reporting vector (email, GHSA URL, registry owner handle, SECURITY.md URL). Written by `maintainers`/`cna-match`, or by the interchange import job from a peer's `route` record when this instance has none of its own, or when the value stored is that same feed's own unstamped hint and the peer has corrected it (suffixed with the peer feed so the provenance is visible, the way `cna-match` appends the CNA name); analyst-editable. |
+| disclosure_channel | text | Preferred reporting vector (email, GHSA URL, registry owner handle, SECURITY.md URL). Written by `maintainers`/`cna-match`, or by the interchange import sync from a peer's `route` record when this instance has none of its own, or when the value stored is that same feed's own unstamped hint and the peer has corrected it (suffixed with the peer feed so the provenance is visible, the way `cna-match` appends the CNA name); analyst-editable. |
 | disclosure_channel_at | datetime | When `disclosure_channel` last changed, and the `verified_at` of the interchange `route` record. Only moves on a real change, so an unchanged `maintainers` re-run does not republish the record. Null for channels written before this column existed, which keeps them off the feed rather than stamping an invented timestamp. |
 | federation_opt_out_at | datetime | Non-null means the maintainer asked federated instances neither to scan this repository nor to contact them. Blocks every scan enqueue, refuses the job at worker dispatch and on the resume paths, stops the scheduler before it makes any network call (no upstream mirror push, no remote HEAD lookup), withdraws the repository from the `route` and `certificate` feed records, and publishes an `optout` record on the public feed. Recording it also cancels the repository's queued, running and paused scans. Set from the repo page or by an `optout` record imported from a peer feed. |
 | federation_opt_out_reason | text | Optional reason the maintainer gave; it travels with the `optout` record. |
@@ -60,12 +94,12 @@ The central entity. One row per git URL.
 
 ## audit_events
 
-Append-only audit trail for scan lifecycle, scan-control actions, finding mutations and operator-initiated repository creation/deletion. It coexists with `finding_histories`, which remains the specialised per-field change history for findings. `payload` is JSON stored portably as text.
+Append-only audit trail for scan lifecycle, scan-control actions, finding mutations, disclosure actions and operator-initiated repository creation/deletion. It coexists with `finding_histories`, which remains the specialised per-field change history for findings. `payload` is JSON stored portably as text.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | integer PK | |
-| kind | text | Event name: `scan.started`, `scan.finished`, `scan.failed`, `scan.cancelled`, `scan.paused`, `scan.retry_requested`, `scan.retry_enqueue_failed`, `scan.resume_requested`, `scan.resume_enqueue_failed`, `scan.cancel_requested`, `finding.status_changed`, `finding.severity_changed`, `finding.labels_changed`, `repo.created`, or `repo.deleted`. Indexed with `created_at` for chronological dashboards. |
+| kind | text | Event name: `scan.started`, `scan.finished`, `scan.failed`, `scan.cancelled`, `scan.paused`, `scan.retry_requested`, `scan.retry_enqueue_failed`, `scan.resume_requested`, `scan.resume_enqueue_failed`, `scan.cancel_requested`, `finding.status_changed`, `finding.severity_changed`, `finding.labels_changed`, `disclosure.requested`, `disclosure.vince_submitted`, `disclosure.akrites_submitted`, `disclosure.pvr_submitted`, `disclosure.draft_updated`, `disclosure.communication_recorded`, `disclosure.channel_changed`, `repo.created`, or `repo.deleted`. Indexed with `created_at` for chronological dashboards. |
 | subject_type | text | Polymorphic subject type: `scan`, `finding`, or `repository`. Part of the timeline index with `subject_id`. |
 | subject_id | integer | ID of the subject row, for example `scans.id`, `findings.id`, or `repositories.id`. Not a foreign key: events survive subject deletion. |
 | actor | text | Scan lifecycle events use the skill name or scan kind. Finding mutations use the helper's `by` value; browser edits leave it empty because there is no session user. Authenticated skill API mutations instead identify the scan and its skill from the bearer-token lookup, not client-supplied text. Repository events leave it empty rather than inventing an operator identity. |
@@ -82,6 +116,18 @@ Scan-control events cover single/bulk operator retries, resumes, queued pauses a
 `scan.retry_requested` commits with the new retry row and `scan.resume_requested` with the paused-to-queued transition. Neither certifies delivery to the queue or execution. Queue writes remain outside these database transactions. If enqueueing fails, `scan.retry_enqueue_failed` commits with marking the new row failed, or `scan.resume_enqueue_failed` with restoring the existing row to paused. A failed recovery transaction leaves both the state and its event unchanged and returns an error; request events remain append-only. `scan.started` is still emitted only by the worker when it claims a scan. Automatic enqueues do not create operator retry events.
 
 Queued pauses and direct cancellations write `scan.paused` or `scan.cancelled` in the same transaction as the guarded state update, only for affected rows. An in-flight cancellation instead records `scan.cancel_requested` before signalling the runner; it does not claim a terminal outcome. Repeated requests with the same reason for that in-flight attempt do not add another request event. The worker continues to record the eventual lifecycle outcome separately. Audit-write failures prevent the state change or cancellation signal. Bulk database updates and their events commit or roll back together; later per-scan queue operations and running-scan cancellation requests may succeed or fail independently.
+
+Disclosure events cover the actions around reporting a finding. All carry `repository_id` and none copy draft text, message bodies, contact names, attachment names or tokens.
+
+- `disclosure.requested` (subject `finding`) records a launch of an external-reporting skill: `disclose`, `report-upstream` or `public-issue`. It commits with the new scan row and carries `scan_id` and `skill_name`. A launch from the browser uses source `analyst` with an empty actor. A launch through the skill API, such as a skill chaining a disclosure, uses the same source as other skill API writes. Its actor names the calling scan. The payload records that scan as `caller_scan_id` and `caller_skill_name`, keeping `scan_id` and `skill_name` for the launched scan. Launches rejected before a scan exists (such as a pending federation claim) write nothing. Like retry events it does not certify queue delivery or that a draft was produced.
+- `disclosure.vince_submitted` (subject `finding`, source `analyst`) commits with the VINCE submission row, reference, communication and `reported` status write. The payload holds `submission_id`, `vrf_id` and a boolean `attachment`, not the attachment name.
+- `disclosure.akrites_submitted` (subject `finding`, source `analyst`) commits with the Akrites communication and `reported` status write once intake returns a receipt. The payload holds `submission_id` and the number of `attachments`, never the receipt, which grants access to intake status.
+- `disclosure.pvr_submitted` (subject `finding`) commits with the PVR submission row, `ghsa-upstream` reference, communication and `reported` status write that `report-upstream` records through the skill API, attributed like other skill API writes. The payload holds `submission_id`, `ghsa_id` and `url`.
+- `disclosure.draft_updated` (subject `finding`) is written by `WriteFindingField` for the `disclosure_draft` field, so analyst edits and skill-written drafts are both covered, with skill API writes attributed to the scan like other finding events. The payload holds `field` plus `old_length` and `new_length` in characters, never the draft. A save that leaves the draft unchanged writes nothing.
+- `disclosure.communication_recorded` (subject `finding`) is written by `AddFindingCommunication` in the same transaction as the communication row. The source is `analyst` for the form, `model_suggested` or `analyst` for the skill API (matching finding field writes) and `system` for the VINCE submission. The payload holds `communication_id`, `channel`, `direction` and a boolean `offered_help`, not the body or the free-text actor. Skill API calls identify the scan and skill from the bearer token.
+- `disclosure.channel_changed` (subject `repository`) records a changed disclosure channel, only when the trimmed value differs from the stored one. The payload holds `scope` (`repository` or `subproject`), `old_value` and `new_value`, plus `subproject_id` and `subproject_path` for a subproject. Channels are published security contacts rather than secrets, so both values are kept. Analyst edits use source `analyst` with an empty actor. The maintainers skill uses `model_suggested` with the skill name as actor. A channel imported from a federation feed uses source `system` with the feed as actor. The import only replaces a channel that still holds the value it read, so an address written in the meantime is kept and no event is written for it.
+
+Each disclosure event commits or rolls back with the write it describes. Direct SQL that bypasses these helpers is not covered and existing rows are not backfilled.
 
 ## package_alternatives
 
@@ -144,7 +190,8 @@ One row per skill execution or external import. `skill_name` / `skill_version` p
 | commit | text | Git HEAD at scan time. |
 | started_at | datetime | |
 | finished_at | datetime | |
-| cost_usd | real | From claude's `total_cost_usd` in stream-json result. |
+| cost_usd | real | Cost charged to this scan. Repeated cumulative totals add nothing, and resumed sessions subtract previously recorded spend. Backends without reported costs use token-price estimates. |
+| session_cost_usd | real | Highest reported cumulative cost of the agent session. Retries reuse the immediate parent's value when the session matches; a fresh session starts at zero. Defaults to zero on older scans, whose historical costs remain unchanged. |
 | turns | integer | Number of claude turns. |
 | input_tokens | integer | Input tokens billed. |
 | output_tokens | integer | Output tokens billed. |
@@ -214,6 +261,7 @@ One row per installed skill. Loaded from `skills/` directories on disk or the UI
 | requires_commands | text | Newline-joined executable names checked on the runner's PATH before model execution. Empty means no command requirements. |
 | requires_features | text | Newline-joined runtime feature names checked before model execution: `network-egress`, `docker-in-docker`, or `fuse`. Requirements do not grant capabilities. |
 | degraded_mode | boolean | Allows missing declared capabilities to produce a degraded run with partial coverage instead of blocking. Defaults to false; probe execution failures always block. |
+| poc_field | text | `validation`, `reproducer`, or empty. Set via `scrutineer.poc_field`; names the report field whose PoC Markdown is validated before ingestion. |
 | paths | text | Newline-joined shell-glob allow-list from `scrutineer.paths`. When non-empty, the skill sees only matching files inside the workspace `src/` and the builtin skip list is bypassed. |
 | ignore_paths | text | Newline-joined shell-glob deny-list from `scrutineer.ignore_paths`. Always layered on top of the active include set. |
 | source | text | `bundled`, `local`, `remote`, or `ui`. |
@@ -346,6 +394,43 @@ findings that already have a row here.
 
 Browser rejection records a review and the lifecycle change in one transaction. The analyst selects false positive, already fixed, or other/not actionable (`uncertain`); only the latest false-positive review on a still-rejected finding is eligible for skill feedback. Legacy reviews without observation snapshots are excluded rather than attributed retroactively. Reviewer names are operator-supplied labels, not authenticated identities.
 
+### Promotion
+
+The host can promote a surviving decision into the repository threat model's `known_non_findings`. A finalized `revalidate` scan with verdict `false_positive` that lists a review in its structured `analyst_feedback_ids` records a confirmation when that review is currently eligible for the finding's repository and file and belongs to a different finding. Other verdicts, IDs mentioned only in the free-text `reason` and ineligible IDs record nothing.
+
+A diff-mode `security-deep-dive` scan is the second confirmation source. A review ID in a `ruled_out` entry's structured `analyst_feedback_ids` records a confirmation at the scan's commit when the review is currently eligible and at least one of that entry's `sinks` resolves, through the report's inventory, to a `location` in the review's repository-relative file. IDs mentioned in `reason`, findings or anywhere else, full-mode deep dives, entries whose sinks are all in other files and ineligible or unknown IDs record nothing. A review is confirmed at most once per scan however many entries cite it. The confirmation uses the review's own finding as `finding_id`.
+
+A decision is promoted once its confirmations from both sources span at least 3 distinct commits, not counting the review's own `source_commit`, so a deep dive and a revalidate at the same commit count once. At least one of those confirmations must come from `revalidate` at a commit other than `source_commit`: deep-dive confirmations alone never promote however many commits they span. It must also still be eligible. The host merges one entry into the existing threat-model JSON object with `reported_as`, `why_safe` (the analyst's reason) and a host-owned `promoted_from` object (`review_id`, `finding_id`, `source_commit` and the confirming `scan_id`/`commit` pairs). A repository without a threat-model object is skipped silently and a later confirmation retries. Staging filters the contract against current eligibility before writing `threat_model.json`, so a reopened or superseded decision never suppresses anything. The `threat-model` skill itself is staged a contract with every promotion stripped, so it cannot re-emit one without `promoted_from` and launder it into a model-authored entry. A refresh carries over only the promotions whose decision is still eligible, so a retired one leaves the stored contract at the next refresh. A threat-model refresh strips any `promoted_from` the model wrote and carries the host's promoted entries over from the previous contract. It rejects a report whose `known_non_findings` is not an array but carries `promoted_from`, keeping the previous contract. Promotions live only in the repository contract: the copy of a raw threat-model scan report that skills read through `GET /scans/{id}` and the `old_threat_model.json` staged for diff threat-model runs both have every promoted entry stripped, so a stale copy cannot keep suppressing findings after retirement. Deleting a finding also deletes confirmations that relied on its reviews.
+
+## feedback_confirmations
+
+One row per revalidate or diff-mode deep-dive scan that relied on an analyst decision. Used only to count independent confirmations for promotion.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| review_id | integer, indexed | The `finding_reviews` row that was cited. Unique with `scan_id`, so retried scans never double-count. |
+| scan_id | integer | The confirming scan. |
+| finding_id | integer | The finding that scan revalidated or, for a deep dive, the finding the cited review belongs to. Rows are removed when that finding is deleted. |
+| commit | text | Commit the confirming scan audited. |
+| source | text | `revalidate` or `security-deep-dive`. Rows that predate the column read as `revalidate`. |
+| created_at | datetime | |
+
+## finding_pocs
+
+Stores the first successful PoC capture for each finding. Captures survive scan cleanup and are deleted with the finding; later observations and verification runs do not replace them.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| finding_id | integer FK, unique | References `findings.id`; cascade delete. |
+| scan_id | integer | ID of the scan that captured the files; no foreign key. |
+| commit | text | Source commit recorded by the capturing scan. |
+| files | blob | JSON array of files, each with `path`, base64-encoded `data`, `sha256`, and optional `executable`. |
+| created_at | datetime | Capture time. |
+
+Each capture holds at most 64 regular files, with limits of 1 MiB per file and 2 MiB total. Capture rejects links, special files, unsafe paths, filename conflicts, and files whose path or contents include the capturing scan's API token, a model proxy token, or a host credential from an environment variable ending in `_API_KEY`, `_TOKEN`, `_AUTH_CONTENT` or `_SECRET`. Disclosure bundles and verification workspaces receive the captured bytes with a provenance and checksum manifest.
+
 ## finding_verifications
 
 Append-only grading records produced by finding-scoped `verify` scans. The complete rubric report remains immutable in `report`; `status` and `score` are promoted for display and filtering. The finding page derives its current verification result from the newest row rather than overwriting prior runs. Current reports also contain a non-scored control-bypass gate whose IDs and optional resolution-failure reason are checked against the context resolved by the host for that finding, plus typed severity prerequisites used by deterministic calibration rules.
@@ -419,6 +504,29 @@ External interactions about a finding: emails, GHSA submissions, issue replies, 
 | offered_help | text | `pr`, `funding`, `adoption`, or empty. |
 | at | datetime | When the interaction happened. |
 | created_at | datetime | When the row was inserted. |
+
+## disclosure_submissions
+
+Reports sent to outside recipients: VINCE, Akrites and GitHub PVR. A finding can have any number, on one channel or several; a second submission on the same channel needs the analyst to confirm it on the submission page, and the `report-upstream` skill checks for an earlier `ghsa-upstream` reference before filing. Rows are kept out of finding exports because an Akrites receipt grants access to intake status.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| finding_id | integer FK | Cascade delete. Indexed with `channel`. |
+| channel | text | `vince`, `akrites` or `pvr`. |
+| endpoint | text | Where the report was sent. |
+| external_id | text | The recipient's identifier: VINCE VRF ID, Akrites receipt or GHSA ID. Empty while a submission is uncertain. |
+| url | text | Where the recipient shows the report, when it has a page for it. |
+| status | text | `submitted` for VINCE and PVR. Akrites moves through `queued`, `processing` and `done` as intake reports, or `not_found` when intake answers 404 for the receipt. `uncertain` means the request may have been accepted and needs reconciling with the recipient. |
+| status_at | datetime | Last status change reported by the recipient. |
+| next_poll_at | datetime | When the Akrites poller next checks the status; null once polling has stopped. Indexed. |
+| poll_attempts | integer | Status polls so far, which set the backoff. |
+| last_error | text | The last submission or poll error. |
+| actor | text | `analyst` for the submission pages, the skill name for PVR. |
+| request | text | The payload exactly as sent, JSON-encoded: the Akrites report with its attachments, the VINCE form fields and attachment bytes (base64), or the PVR `/reports` body. |
+| response | text | The recipient's acceptance response where it carries more than the identifier. |
+| created_at | datetime | |
+| updated_at | datetime | |
 
 ## finding_references
 
@@ -597,7 +705,7 @@ Join table. No extra columns.
 
 ## subprojects
 
-Monorepo sub-paths discovered by the `subprojects` skill.
+Monorepo subpaths discovered by the `subprojects` skill.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -716,7 +824,7 @@ One turn in a `conversations` row: a user prompt or the assistant's reply.
 
 ## interchange_records
 
-Federation records imported from peer feeds by the import job, stored verbatim so re-validating or re-applying one never depends on how the running version of scrutineer happened to interpret it. Unique per `(feed, predicate_type, subject_digest)`: a peer refreshing a record replaces its own row, while two peers publishing conflicting verdicts for the same subject each keep theirs instead of one silently winning. Nothing this instance publishes is stored here; the export job derives every outgoing record from `repositories` and `advisory_audits` on each run. See [interchange.md](interchange.md).
+Federation records imported from peer feeds by the import sync, stored verbatim so re-validating or re-applying one never depends on how the running version of scrutineer happened to interpret it. Unique per `(feed, predicate_type, subject_digest)`: a peer refreshing a record replaces its own row, while two peers publishing conflicting verdicts for the same subject each keep theirs instead of one silently winning. Nothing this instance publishes is stored here; the export sync derives every outgoing record from `repositories` and `advisory_audits` on each run. See [interchange.md](interchange.md).
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -727,7 +835,7 @@ Federation records imported from peer feeds by the import job, stored verbatim s
 | record | text | The raw in-toto statement as published. |
 | applied_at | datetime | When the import last acted on this record, or established there was nothing local to act on. Null re-opens it on the next pass, and a changed `record` clears it, so a peer's correction is re-applied and an `optout` published before its repository was imported here still lands once that repository exists. An unchanged record keeps its stamp, which is what stops the hourly pass reinstating what an operator deliberately cleared. |
 | applied_repository_id | integer | The `repositories` row `applied_at` was written against, 0 for the kinds that act on nothing local (`certificate`, `claim`). Deleting that repository clears both columns, so a still-standing `optout` lands again on the row a re-added repository gets instead of staying closed against a row that no longer exists. |
-| received_at | datetime | When the import job last read this record. |
+| received_at | datetime | When the import sync last read this record. |
 
 ## goqite
 

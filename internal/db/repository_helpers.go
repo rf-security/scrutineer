@@ -39,7 +39,11 @@ func (r Repository) FederationOptedOut() bool { return r.FederationOptOutAt != n
 // over whatever the model emitted, so an answer that differs from the stored
 // one only by a trailing newline would otherwise read as a change, re-stamp
 // the timestamp, and republish the route record it exists to hold still.
-func SetDisclosureChannel(gdb *gorm.DB, repoID uint, value string) error {
+//
+// A change appends a disclosure.channel_changed event in the same transaction.
+// Channels are published security contacts rather than secrets so both values
+// are kept in the payload.
+func SetDisclosureChannel(gdb *gorm.DB, repoID uint, value string, source FindingSource, actor string) error {
 	value = strings.TrimSpace(value)
 	return gdb.Transaction(func(tx *gorm.DB) error {
 		var repo Repository
@@ -47,10 +51,72 @@ func SetDisclosureChannel(gdb *gorm.DB, repoID uint, value string) error {
 			return err
 		}
 		updates := map[string]any{"disclosure_channel": value}
-		if repo.DisclosureChannel != value {
+		changed := repo.DisclosureChannel != value
+		if changed {
 			now := time.Now().UTC()
 			updates["disclosure_channel_at"] = &now
 		}
-		return tx.Model(&Repository{}).Where("id = ?", repoID).Updates(updates).Error
+		if err := tx.Model(&Repository{}).Where("id = ?", repoID).Updates(updates).Error; err != nil {
+			return err
+		}
+		if !changed {
+			return nil
+		}
+		return logDisclosureChannelChange(tx, repoID, map[string]any{"scope": "repository"}, repo.DisclosureChannel, value, source, actor)
+	})
+}
+
+// ImportDisclosureChannel replaces the repository channel with one imported
+// from a federation feed, but only while the stored channel still equals
+// expected: an analyst or the maintainers skill may have written it since the
+// caller read it. Their address must win. The timestamp is cleared because
+// a peer's hint is not a route this instance verified. A replacement that
+// changes the channel appends a disclosure.channel_changed event in the same
+// transaction. It reports whether the stored channel was replaced.
+func ImportDisclosureChannel(gdb *gorm.DB, repoID uint, expected, value string, source FindingSource, actor string) (bool, error) {
+	applied := false
+	err := gdb.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&Repository{}).Where("id = ? AND disclosure_channel = ?", repoID, expected).
+			Updates(map[string]any{"disclosure_channel": value, "disclosure_channel_at": nil})
+		if res.Error != nil {
+			return res.Error
+		}
+		applied = res.RowsAffected > 0
+		if !applied || expected == value {
+			return nil
+		}
+		return logDisclosureChannelChange(tx, repoID, map[string]any{"scope": "repository"}, expected, value, source, actor)
+	})
+	return applied, err
+}
+
+// SetSubprojectDisclosureChannel writes a sub-package's own disclosure channel
+// and appends a disclosure.channel_changed event, on the repository, only when
+// the trimmed value differs from the stored one.
+func SetSubprojectDisclosureChannel(gdb *gorm.DB, subprojectID uint, value string, source FindingSource, actor string) error {
+	value = strings.TrimSpace(value)
+	return gdb.Transaction(func(tx *gorm.DB) error {
+		var sub Subproject
+		if err := tx.Select("id, repository_id, path, disclosure_channel").First(&sub, subprojectID).Error; err != nil {
+			return err
+		}
+		if sub.DisclosureChannel == value {
+			return nil
+		}
+		if err := tx.Model(&Subproject{}).Where("id = ?", sub.ID).Update("disclosure_channel", value).Error; err != nil {
+			return err
+		}
+		scope := map[string]any{"scope": "subproject", "subproject_id": sub.ID, "subproject_path": sub.Path}
+		return logDisclosureChannelChange(tx, sub.RepositoryID, scope, sub.DisclosureChannel, value, source, actor)
+	})
+}
+
+func logDisclosureChannelChange(tx *gorm.DB, repoID uint, payload map[string]any, oldValue, newValue string, source FindingSource, actor string) error {
+	payload[AuditKeyRepositoryID] = repoID
+	payload["old_value"] = oldValue
+	payload["new_value"] = newValue
+	return LogEvent(tx, AuditEventInput{
+		Kind: AuditEventDisclosureChannelChanged, SubjectType: AuditSubjectRepository, SubjectID: repoID,
+		Source: source, Actor: actor, Payload: payload,
 	})
 }

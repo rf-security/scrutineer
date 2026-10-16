@@ -107,7 +107,7 @@ func TestVerifyFeedbackInvalidInput(t *testing.T) {
 		s, done := newTestServer(t)
 		f := seedVerificationFeedback(t, s)
 		r := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/findings/%d/verify", f.ID), strings.NewReader(body))
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)
@@ -206,7 +206,7 @@ func TestVerifyFeedbackHTMXRedirect(t *testing.T) {
 	var location string
 	for range 2 {
 		r := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/findings/%d/verify", f.ID), strings.NewReader(url.Values{"feedback": {feedback}}.Encode()))
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		r.Header.Set("HX-Request", "true")
 		w := httptest.NewRecorder()

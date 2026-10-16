@@ -13,8 +13,7 @@ import (
 // A caller on the host -- the browser UI, curl, a tool discovering the API --
 // gets it unauthenticated. It has no running scan to borrow a bearer token
 // from, so requiring one would defeat the point of serving the spec at all;
-// the Host check is what keeps a DNS-rebound browser out, the same boundary
-// the /api/v1 export surface relies on (see threatmodel.md).
+// the Host check is what keeps a DNS-rebound browser out (see threatmodel.md).
 //
 // A skill inside the runner container cannot satisfy that check. context.json
 // advertises the runtime's host endpoint (host.docker.internal for

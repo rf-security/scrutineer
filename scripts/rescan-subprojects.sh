@@ -9,8 +9,8 @@
 # skips whatever is already current at HEAD), so a cron job or systemd timer
 # covers the gap.
 #
-# The enqueue endpoint is localhost-only and rejects cross-site *browser* POSTs,
-# but a header-less client like curl is allowed, so no token is needed.
+# The enqueue endpoint is localhost-only and requires the operator token, read
+# from SCRUTINEER_TOKEN_FILE (default ./data/operator-token).
 #
 # Usage:   scripts/rescan-subprojects.sh LIST_FILE [BASE_URL]
 # Example: scripts/rescan-subprojects.sh subprojects.txt http://127.0.0.1:8080
@@ -38,6 +38,7 @@ set -euo pipefail
 
 list_file=${1:?usage: rescan-subprojects.sh LIST_FILE [BASE_URL]}
 base_url=${2:-http://127.0.0.1:8080}
+token=$(<"${SCRUTINEER_TOKEN_FILE:-./data/operator-token}")
 
 # Drop comments and blank lines; the bulk endpoint would reject a '#'-comment as
 # an invalid URL. --data-urlencode keeps the '#sub/dir' fragment intact (it
@@ -50,6 +51,7 @@ fi
 
 count=$(printf '%s\n' "$urls" | grep -c .)
 echo "enqueueing $count sub-package scan(s) at $base_url"
-curl -fsS -X POST "$base_url/repositories/bulk" \
-	--data-urlencode "urls=$urls" >/dev/null
+# The header goes through stdin so the token stays out of the process list.
+printf 'Authorization: Bearer %s\n' "$token" | curl -fsS -X POST "$base_url/repositories/bulk" \
+	-H @- --data-urlencode "urls=$urls" >/dev/null
 echo "done; watch progress in the UI or the Scans tab"

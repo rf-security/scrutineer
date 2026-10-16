@@ -45,13 +45,25 @@ func newTestServerWith(t testing.TB, opts ...Option) (*Server, func()) {
 	s.resolvePURL = func(context.Context, string) string { return "" }
 	s.resolveSync = true
 	s.prefetchEcosystems = func(uint) {}
+	s.OperatorToken = testOperatorToken
 	return s, func() { _ = sqldb.Close() }
 }
 
+const testOperatorToken = "test-operator-token"
+
+var testOperatorCookie = operatorCookieName(testOperatorToken)
+
 func localReq(method, path string) *http.Request {
 	r := httptest.NewRequest(method, path, nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	return r
+}
+
+// asOperator makes r a loopback request carrying the operator cookie, which
+// leaves the Authorization header free for scan bearer tokens.
+func asOperator(r *http.Request) {
+	r.Host = testHost
+	r.AddCookie(&http.Cookie{Name: testOperatorCookie, Value: testOperatorToken})
 }
 
 func requireRepoListRow(t *testing.T, body string, repoID uint) string {
@@ -354,7 +366,7 @@ func TestRepoNew_fallbackPages(t *testing.T) {
 		{"/sboms/new", "Upload SBOM"},
 	} {
 		req := httptest.NewRequest("GET", tc.path, nil)
-		req.Host = testHost
+		asOperator(req)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
@@ -372,7 +384,7 @@ func TestRepoCreate_htmxInvalidURL_rendersInlineAlert(t *testing.T) {
 
 	form := url.Values{"url": {"not-a-url"}}
 	r := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Sec-Fetch-Site", "same-origin")
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.Header.Set("HX-Request", "true")
@@ -416,8 +428,8 @@ func TestFlash_roundtrip(t *testing.T) {
 	setFlash(rec, Flash{Category: "success", Title: "Imported", Description: "3 added"})
 
 	req := httptest.NewRequest("GET", "/", nil)
-	req.Host = testHost
 	req.Header.Set("Cookie", rec.Header().Get("Set-Cookie"))
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 
@@ -459,7 +471,7 @@ func TestSidebar_rendersAriaCurrent(t *testing.T) {
 	defer done()
 
 	req := httptest.NewRequest("GET", "/findings", nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -506,7 +518,7 @@ func TestMaintainerDoNotContactToggle(t *testing.T) {
 	post := func(value string) {
 		form := url.Values{"value": {value}}
 		r := httptest.NewRequest("POST", fmt.Sprintf("/maintainers/%d/do-not-contact", m.ID), strings.NewReader(form.Encode()))
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Sec-Fetch-Site", "same-origin")
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		w := httptest.NewRecorder()
@@ -537,7 +549,7 @@ func TestRepoDisclosureChannel_setAndClear(t *testing.T) {
 	post := func(v string) {
 		form := url.Values{"disclosure_channel": {v}}
 		r := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/disclosure-channel", repo.ID), strings.NewReader(form.Encode()))
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Sec-Fetch-Site", "same-origin")
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		w := httptest.NewRecorder()
@@ -2603,7 +2615,7 @@ func TestCreateRepoEnqueuesTriageSkill(t *testing.T) {
 
 	form := url.Values{"url": {"https://github.com/foo/bar.git"}}
 	req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -2642,7 +2654,7 @@ func TestFindingDiscloseEnqueuesDiscloseSkill(t *testing.T) {
 	s.DB.Create(&disclose)
 
 	req := httptest.NewRequest("POST", "/findings/1/disclose", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -2689,7 +2701,7 @@ func TestFindingPublicIssueEnqueuesPublicIssueSkill(t *testing.T) {
 	s.DB.Create(&publicIssue)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/findings/%d/public-issue", finding.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -2727,7 +2739,7 @@ func TestFindingVerifySkipsOpenVerifyScan(t *testing.T) {
 	s.DB.Create(&openScan)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/findings/%d/verify", finding.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -2760,7 +2772,7 @@ func TestFindingPatchRunEnqueuesPatchSkill(t *testing.T) {
 	s.DB.Create(&patch)
 
 	req := httptest.NewRequest("POST", "/findings/1/patch", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -2793,7 +2805,7 @@ func TestFindingReattackRunPinsLatestRemediationAttempt(t *testing.T) {
 	s.DB.Create(&skill)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/findings/%d/reattack", finding.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -2820,7 +2832,7 @@ func TestFindingReattackRunRequiresGatedPatch(t *testing.T) {
 	s.DB.Create(&finding)
 	s.DB.Create(&db.Skill{Name: reattackSkillName, Body: "b", OutputFile: "report.json", OutputKind: "reattack", Active: true})
 	req := httptest.NewRequest("POST", fmt.Sprintf("/findings/%d/reattack", finding.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -3130,7 +3142,7 @@ func TestRepoVerifyAll(t *testing.T) {
 		SkillName: "verify", SkillID: new(verify.ID), FindingID: new(skipF.ID)})
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/verify-all", repo.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 
@@ -3180,7 +3192,7 @@ func TestRepoVerifyAll_respectsCategoryFilter(t *testing.T) {
 
 	// The action enqueues only the filtered category's finding.
 	req := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/verify-all?category=Injection", repo.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 
@@ -3203,7 +3215,7 @@ func TestRepoVerifyAll_skillNotInstalled(t *testing.T) {
 		FindingID: "N1", Title: "x", Severity: "High", Status: db.FindingNew})
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/verify-all", repo.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 
@@ -3236,7 +3248,7 @@ func TestRepoScanAll(t *testing.T) {
 		SkillName: deepDiveSkillName, SkillID: new(deepDive.ID), SubPath: "skipme"})
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/scan-all", repo.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 
@@ -3278,7 +3290,7 @@ func TestRepoScan_setsScanGroup(t *testing.T) {
 	s.DB.Create(&deepDive)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/scan", repo.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	s.Handler().ServeHTTP(httptest.NewRecorder(), req)
 
 	var sc db.Scan
@@ -3304,7 +3316,7 @@ func TestRepoScan_diffRescanQueuesGroupedSkills(t *testing.T) {
 	body := strings.NewReader("rescan_mode=diff")
 	req := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/scan", repo.ID), body)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 
@@ -3348,7 +3360,7 @@ func TestRepoScanAll_skillNotInstalled(t *testing.T) {
 	s.DB.Create(&db.Subproject{RepositoryID: repo.ID, Path: "a", Name: "a"})
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/scan-all", repo.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 
@@ -3386,7 +3398,7 @@ func TestFindingPatchDownload(t *testing.T) {
 	s.DB.Create(&patchScan)
 
 	req := httptest.NewRequest("GET", "/findings/1/patch.diff", nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -3403,7 +3415,7 @@ func TestFindingPatchDownload(t *testing.T) {
 	}
 
 	req = httptest.NewRequest("GET", "/findings/1", nil)
-	req.Host = testHost
+	asOperator(req)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	body := w.Body.String()
@@ -3433,7 +3445,7 @@ func TestFindingPatchDownload_404WhenNoPatch(t *testing.T) {
 	s.DB.Create(&finding)
 
 	req := httptest.NewRequest("GET", "/findings/1/patch.diff", nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -3453,7 +3465,7 @@ func TestFindingDisclose404WhenSkillMissing(t *testing.T) {
 	s.DB.Create(&finding)
 
 	req := httptest.NewRequest("POST", "/findings/1/disclose", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -3474,7 +3486,7 @@ func TestFindingPublicIssue404WhenSkillMissing(t *testing.T) {
 	s.DB.Create(&finding)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/findings/%d/public-issue", finding.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -3757,7 +3769,7 @@ func TestDependentScan_dedupesAgainstNormalisedRepo(t *testing.T) {
 	s.DB.Create(&dep)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/dependents/%d/scan", dep.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusSeeOther {
@@ -3789,7 +3801,7 @@ func TestBulkImport_dedupesNormalisedURLs(t *testing.T) {
 	}, "\n")
 	form := url.Values{"urls": {urls}}
 	req := httptest.NewRequest("POST", "/repositories/bulk", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -3818,7 +3830,7 @@ func TestBulkImport_createsAndEnqueues(t *testing.T) {
 	urls := "https://github.com/foo/one.git\nhttps://github.com/foo/two.git\n"
 	form := url.Values{"urls": {urls}}
 	req := httptest.NewRequest("POST", "/repositories/bulk", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -3853,7 +3865,7 @@ func TestBulkImport_branchFromTreeURL(t *testing.T) {
 	urls := "https://github.com/symfony/symfony/tree/7.2\nhttps://github.com/spf13/cobra\n"
 	form := url.Values{"urls": {urls}}
 	req := httptest.NewRequest("POST", "/repositories/bulk", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -3893,7 +3905,7 @@ func TestBulkImport_skipsDuplicates(t *testing.T) {
 
 	form := url.Values{"urls": {"https://github.com/foo/one.git\nhttps://github.com/foo/two.git"}}
 	req := httptest.NewRequest("POST", "/repositories/bulk", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -3925,7 +3937,7 @@ func TestBulkImport_subPathQueuesOnExistingRepo(t *testing.T) {
 	// a scoped scan rather than being a no-op re-add.
 	form := url.Values{"urls": {"https://github.com/rails/rails#activesupport"}}
 	req := httptest.NewRequest("POST", "/repositories/bulk", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -3960,7 +3972,7 @@ func TestBulkImport_rejectsNonHTTPS(t *testing.T) {
 		"ext::nope\n"
 	form := url.Values{"urls": {lines}}
 	req := httptest.NewRequest("POST", "/repositories/bulk", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -3984,7 +3996,7 @@ func TestBulkImport_emptyIs422(t *testing.T) {
 	defer done()
 	form := url.Values{"urls": {"  \n\n\t\n"}}
 	req := httptest.NewRequest("POST", "/repositories/bulk", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4023,7 +4035,7 @@ func TestCreateRepo_parsesGitHubTreeURL(t *testing.T) {
 
 	form := url.Values{"url": {"https://github.com/apache/airflow/tree/main/airflow-core"}}
 	req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4060,7 +4072,7 @@ func TestCreateRepo_branchPrecedence(t *testing.T) {
 
 			form := url.Values{"url": {"https://github.com/symfony/symfony/tree/6.4"}, "ref": {c.ref}}
 			req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-			req.Host = testHost
+			asOperator(req)
 			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			w := httptest.NewRecorder()
 			s.Handler().ServeHTTP(w, req)
@@ -4406,7 +4418,7 @@ func TestRetry_preservesScanFields(t *testing.T) {
 			s.DB.Create(&orig)
 
 			req := httptest.NewRequest("POST", fmt.Sprintf("/scans/%d/retry", orig.ID), nil)
-			req.Host = testHost
+			asOperator(req)
 			req.Header.Set("Sec-Fetch-Site", "same-origin")
 			w := httptest.NewRecorder()
 			s.Handler().ServeHTTP(w, req)
@@ -4437,7 +4449,7 @@ func TestRetry_maxTurnsDoneScanResumesSession(t *testing.T) {
 	s.DB.Create(&orig)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/scans/%d/retry", orig.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4479,7 +4491,7 @@ func TestRetry_preservesPinnedInputs(t *testing.T) {
 	s.DB.Create(&orig)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/scans/%d/retry", orig.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4500,7 +4512,7 @@ func TestRetry_preservesPinnedInputs(t *testing.T) {
 	// payload column too.
 	s.DB.Where("id != ?", orig.ID).Delete(&db.Scan{})
 	req = httptest.NewRequest("POST", "/scans/retry-failed", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4547,7 +4559,7 @@ func TestScansRetryFailed(t *testing.T) {
 	doneDeep := mk(db.ScanDone, "skill", "deep-dive", &skill.ID, "other")
 
 	req := httptest.NewRequest("POST", "/scans/retry-failed", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4624,7 +4636,7 @@ func TestScansRetryFailed_preservesScanFields(t *testing.T) {
 			s.DB.Create(&orig)
 
 			req := httptest.NewRequest("POST", "/scans/retry-failed", nil)
-			req.Host = testHost
+			asOperator(req)
 			req.Header.Set("Sec-Fetch-Site", "same-origin")
 			w := httptest.NewRecorder()
 			s.Handler().ServeHTTP(w, req)
@@ -4697,7 +4709,7 @@ func TestScansRetryFailed_skipsAlreadyRetried(t *testing.T) {
 	}
 
 	req := httptest.NewRequest("POST", "/scans/retry-failed", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4752,7 +4764,7 @@ func TestScansRetryFailed_filtersBySkill(t *testing.T) {
 	mk("bravo", b.ID, "")
 
 	req := httptest.NewRequest("POST", "/scans/retry-failed?skill=alpha", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4780,7 +4792,7 @@ func TestScansRetryFailed_emptyAndButtonHidden(t *testing.T) {
 	defer done()
 
 	req := httptest.NewRequest("POST", "/scans/retry-failed", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4912,7 +4924,7 @@ func TestScansRetryFailed_repositoryScopeRedirects(t *testing.T) {
 
 	req := httptest.NewRequest("POST",
 		fmt.Sprintf("/scans/retry-failed?repository=%d", rA.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -4983,7 +4995,7 @@ func TestScanCancel_queued(t *testing.T) {
 	s.DB.Create(&scan)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/scans/%d/cancel", scan.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -5014,7 +5026,7 @@ func TestScanCancel_terminalRejected(t *testing.T) {
 	s.DB.Create(&scan)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/scans/%d/cancel", scan.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -5035,7 +5047,7 @@ func TestScansPauseQueued(t *testing.T) {
 	s.DB.Create(&running)
 
 	req := httptest.NewRequest("POST", "/scans/pause-queued", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -5076,7 +5088,7 @@ func TestScanResumePaused(t *testing.T) {
 	s.DB.Create(&scan)
 
 	req := httptest.NewRequest("POST", fmt.Sprintf("/scans/%d/resume", scan.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -5136,7 +5148,7 @@ func TestSubprojectsRenderedOnRepoPage(t *testing.T) {
 	s.DB.Create(&db.Subproject{RepositoryID: repo.ID, Path: "providers/amazon", Kind: "python-package", Description: "AWS provider"})
 
 	req := httptest.NewRequest("GET", fmt.Sprintf("/repositories/%d", repo.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	body := w.Body.String()
@@ -5270,7 +5282,7 @@ func TestSettingsUpdateTheme_setsCookie(t *testing.T) {
 
 	form := url.Values{"theme": {"catppuccin"}}
 	req := httptest.NewRequest("POST", "/settings/theme", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -5295,7 +5307,7 @@ func TestSettingsUpdateTheme_rejectsInvalid(t *testing.T) {
 
 	form := url.Values{"theme": {"nope"}}
 	req := httptest.NewRequest("POST", "/settings/theme", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5311,7 +5323,7 @@ func TestSettingsUpdateColorScheme_setsCookie(t *testing.T) {
 
 	form := url.Values{"color_scheme": {"dark"}}
 	req := httptest.NewRequest("POST", "/settings/color-scheme", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -5336,7 +5348,7 @@ func TestSettingsUpdateColorScheme_rejectsInvalid(t *testing.T) {
 
 	form := url.Values{"color_scheme": {"sepia"}}
 	req := httptest.NewRequest("POST", "/settings/color-scheme", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5391,7 +5403,7 @@ func TestSettingsUpdateEffort_setsDefault(t *testing.T) {
 
 	form := url.Values{"effort": {"max"}}
 	req := httptest.NewRequest("POST", "/settings/effort", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -5409,7 +5421,7 @@ func TestSettingsUpdateEffort_rejectsInvalid(t *testing.T) {
 
 	form := url.Values{"effort": {"extreme"}}
 	req := httptest.NewRequest("POST", "/settings/effort", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5640,7 +5652,7 @@ func TestRepoCreate_seedsOwnerAndFullNameFromURL(t *testing.T) {
 
 	form := url.Values{"url": {"https://github.com/simonw/datasette"}}
 	req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5672,7 +5684,7 @@ func TestRepoCreate_branchURLTriggersTriageWithRef(t *testing.T) {
 
 	form := url.Values{"url": {"https://github.com/apache/httpd/tree/2.4.x"}}
 	req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5699,7 +5711,7 @@ func TestRepoCreate_localDirectoryStoredAsFileURL(t *testing.T) {
 	dir := t.TempDir()
 	form := url.Values{"url": {dir}}
 	req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5727,7 +5739,7 @@ func TestRepoCreate_localDirectorySkipsRequiresRemoteDefaultSkill(t *testing.T) 
 	dir := t.TempDir()
 	form := url.Values{"url": {dir}}
 	req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5753,7 +5765,7 @@ func TestRepoCreate_missingLocalPathRejected(t *testing.T) {
 
 	form := url.Values{"url": {"/does/not/exist/scrutineer-test-xyz"}}
 	req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5772,7 +5784,7 @@ func TestRepoCreate_existingRepoWithBranchEnqueuesScan(t *testing.T) {
 
 	form := url.Values{"url": {"https://github.com/apache/httpd/tree/2.4.x"}}
 	req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5799,7 +5811,7 @@ func TestRepoCreate_existingRepoWithoutBranchDoesNotEnqueue(t *testing.T) {
 
 	form := url.Values{"url": {"https://github.com/apache/httpd"}}
 	req := httptest.NewRequest("POST", "/repositories", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -5815,7 +5827,7 @@ func TestRepoCreate_existingRepoWithoutBranchDoesNotEnqueue(t *testing.T) {
 	}
 }
 
-// The workflow card must say which actions enqueue a model job and which only
+// The workflow card must say which actions enqueue a model scan and which only
 // record a decision, so a regression to the ambiguous Verify and Triage labels
 // fails here rather than on an operator's token bill.
 func TestFindingShow_workflowActionsStateTheirEffect(t *testing.T) {
@@ -5829,7 +5841,7 @@ func TestFindingShow_workflowActionsStateTheirEffect(t *testing.T) {
 	}
 	s.DB.Create(&db.Dependent{RepositoryID: lib.ID, Name: "downstream", Ecosystem: "npm"})
 
-	triagedCost := "Draft disclosure, Reassess viability, Propose patch and Draft mitigation each start a model job and use tokens"
+	triagedCost := "Draft disclosure, Reassess viability, Propose patch and Draft mitigation each start a model scan and use tokens"
 	cases := []struct {
 		name    string
 		repo    db.Repository
@@ -5839,10 +5851,10 @@ func TestFindingShow_workflowActionsStateTheirEffect(t *testing.T) {
 		gone    []string
 	}{
 		{"new", app, db.FindingNew, []string{"verify", "status"},
-			[]string{"Run verification", "Mark triaged", "starts a model job to check this finding and uses tokens", "mark it triaged to save your review decision"},
+			[]string{"Run verification", "Mark triaged", "starts a model scan to check this finding and uses tokens", "mark it triaged to save your review decision"},
 			[]string{"Skip to triage"}},
 		{"enriched", app, db.FindingEnriched, []string{"critic", "status"},
-			[]string{"Mark triaged", "Assess viability", "Mark triaged saves your review decision", "Assess viability starts a model job and uses tokens"},
+			[]string{"Mark triaged", "Assess viability", "Mark triaged saves your review decision", "Assess viability starts a model scan and uses tokens"},
 			[]string{"</i> Triage\n"}},
 		{"triaged with dependents", lib, db.FindingTriaged, []string{"disclose", "critic", "patch", "mitigate"},
 			[]string{"Draft disclosure", "Review and edit the generated draft", triagedCost},

@@ -16,7 +16,7 @@ import (
 func postForm(t *testing.T, s *Server, path string, form url.Values) *httptest.ResponseRecorder {
 	t.Helper()
 	r := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -96,7 +96,7 @@ func TestSettingsShow_rendersRunnerControls(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/settings", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
@@ -120,7 +120,7 @@ func TestSettingsShow_rendersStaleRunnerBanner(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/settings", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
@@ -145,7 +145,7 @@ func TestSettingsShow_noBannerWhenFresh(t *testing.T) {
 	// must not render.
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/settings", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", w.Code, w.Body)

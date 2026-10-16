@@ -451,15 +451,12 @@ func (s *Server) applyImportedRecord(rec interchange.Statement, repoIDs map[stri
 		// unpublished draft gets mailed. Zero rows means someone else owns the
 		// channel now, so the record stays open and the next pass decides
 		// again on what is actually stored.
-		res := s.DB.Model(&db.Repository{}).Where("id = ? AND disclosure_channel = ?", repo.ID, repo.DisclosureChannel).
-			Updates(map[string]any{
-				"disclosure_channel":    strings.TrimSpace(p.Channel) + viaFeed(feed),
-				"disclosure_channel_at": nil,
-			})
-		if res.Error != nil {
-			return 0, false, res.Error
+		applied, err := db.ImportDisclosureChannel(s.DB, repo.ID, repo.DisclosureChannel,
+			strings.TrimSpace(p.Channel)+viaFeed(feed), db.SourceSystem, feed)
+		if err != nil {
+			return 0, false, err
 		}
-		return repo.ID, res.RowsAffected > 0, nil
+		return repo.ID, applied, nil
 	}
 	return 0, true, nil
 }

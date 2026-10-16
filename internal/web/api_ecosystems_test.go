@@ -15,7 +15,7 @@ import (
 func ecosystemsRawReq(t *testing.T, s *Server, token string, repoID uint, source string) *httptest.ResponseRecorder {
 	t.Helper()
 	r := httptest.NewRequest("GET", "/api/repositories/"+strconv.FormatUint(uint64(repoID), 10)+"/ecosystems/"+source+"/raw", nil)
-	r.Host = testHost
+	asOperator(r)
 	if token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	}

@@ -465,9 +465,22 @@ func (d ContainerRunner) runLogLine(image, skillName string) string {
 func (d ContainerRunner) runContainerOnce(ctx context.Context, runBase []string, sj SkillJob, processEnv map[string]string, emit func(Event)) (hitMaxTurns bool, sessionID string, waitErr error) {
 	h := d.harness()
 	runArgs := append(append([]string{}, runBase...), d.harnessArgv(sj)...)
+	// Killing the runtime CLI on cancellation leaves a --rm container running,
+	// so the scan container is named and force-removed once this run ends.
+	name := "scrutineer-scan-" + randomProbeID()
+	if delimiter := slices.Index(runArgs, "--"); delimiter >= 0 {
+		runArgs = slices.Insert(runArgs, delimiter, "--name", name)
+	}
 
 	cmd := exec.CommandContext(ctx, runtimeBin(d.Runtime), runArgs...)
 	cmd.Env = environmentWith(os.Environ(), processEnv)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), backendProbeCleanupTimeout)
+		defer cancel()
+		rm := exec.CommandContext(cleanupCtx, runtimeBin(d.Runtime), "rm", "--force", name)
+		rm.Env = cmd.Env
+		_ = rm.Run()
+	}()
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1028,10 +1041,12 @@ func hardenedNetworkCreateArgs(rt ContainerRuntime, name string) []string {
 // EnsureHardenedNetwork creates an internal container network with the
 // given name if it does not already exist. --internal blocks routes
 // to external networks; the container can still reach the host via
-// the bridge gateway, so the egress proxy on the host remains the only
-// path out. The function is idempotent: a retry of a scan that crashed
-// after the network was created (but before the post-scan rm ran) will
-// reuse the existing network instead of failing.
+// the bridge gateway, which is how it reaches the host egress proxy, and on
+// Docker Engine it also reaches every host service bound to all interfaces,
+// which is why HardeningSupportError refuses --hardened there. The function
+// is idempotent: a retry of a scan that crashed after the network was created
+// (but before the post-scan rm ran) will reuse the existing network instead
+// of failing.
 func EnsureHardenedNetwork(rt ContainerRuntime, name string) error {
 	if out, err := exec.Command(runtimeBin(rt), "network", "inspect", "--", name).Output(); err == nil && len(out) > 0 {
 		return nil
@@ -1110,9 +1125,10 @@ func (d ContainerRunner) setupHardenedNetwork(sj SkillJob, image string) (harden
 		hn.proxyName = proxySidecarName(sj.isolationKey())
 	}
 
-	// Docker Engine's bridge --internal is trusted, as is rootful podman's bridge
-	// in the host network namespace. Docker Desktop, rootless podman, and Apple
-	// need per-scan proof; see NeedsHardenedNetVerify.
+	// Rootful podman's bridge in the host network namespace is trusted, and
+	// Docker Engine never gets here because it refuses --hardened. Docker
+	// Desktop, rootless podman, and Apple need per-scan proof; see
+	// NeedsHardenedNetVerify.
 	if d.Runtime.NeedsHardenedNetVerify() {
 		if err := d.verifyHardenedNetwork(hn, image); err != nil {
 			cleanup()

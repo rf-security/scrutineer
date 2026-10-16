@@ -19,6 +19,49 @@ func write(t *testing.T, content string) string {
 	return path
 }
 
+func TestLoadDatabase(t *testing.T) {
+	for _, tc := range []struct {
+		name, block, driver string
+		wantError           bool
+	}{
+		{name: "default", block: "{}"},
+		{name: "sqlite", block: "database: {driver: sqlite}", driver: "sqlite"},
+		{name: "postgres", block: "database: {driver: postgres, dsn: 'host=localhost dbname=scrutineer'}", driver: "postgres"},
+		{name: "missing dsn", block: "database: {driver: postgres}", wantError: true},
+		{name: "unknown driver", block: "database: {driver: mysql}", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(write(t, tc.block))
+			if (err != nil) != tc.wantError {
+				t.Fatalf("Load error = %v", err)
+			}
+			if err == nil && cfg.Database.Driver != tc.driver {
+				t.Fatalf("driver = %q, want %q", cfg.Database.Driver, tc.driver)
+			}
+		})
+	}
+}
+
+func TestLoadAkrites(t *testing.T) {
+	c, err := Load(write(t, "akrites:\n  submission_token: secret\n  base_url: https://intake.example\n  email: reporter@example.com\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := c.Akrites.Endpoint()
+	if err != nil || !c.Akrites.Enabled() || endpoint != "https://intake.example/v1/reports" || c.Akrites.Email != "reporter@example.com" {
+		t.Fatalf("incorrect Akrites config, endpoint=%q err=%v", endpoint, err)
+	}
+	for _, base := range []string{"http://intake.example", "http://localhost", "https://user:password@intake.example", "https://intake.example/path", "https://intake.example?token=secret", "https://intake.example#fragment", "://invalid"} {
+		if _, err := Load(write(t, "akrites:\n  base_url: "+base+"\n")); err == nil {
+			t.Errorf("accepted base_url %q", base)
+		}
+	}
+	c, err = Load(write(t, "akrites: {}\n"))
+	if err != nil || c.Akrites.Enabled() {
+		t.Fatalf("empty config enabled, err=%v", err)
+	}
+}
+
 func TestLoad_absentDefaultPathIsNoError(t *testing.T) {
 	// ./scrutineer.yaml doesn't exist in a t.TempDir CWD. Switch into one.
 	cwd, err := os.Getwd()

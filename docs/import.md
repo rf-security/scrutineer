@@ -2,11 +2,11 @@
 
 Scrutineer can ingest vulnerability reports produced by external scanners or written by hand and turn them into the same `Repository`, `Scan`, and `Finding` rows a native scan produces. Imported findings carry through the rest of the workflow unchanged: `verify`, `reachability`, `patch`, `disclose`, and the dedup-on-rescan machinery all treat them as first-class.
 
-The endpoint is `POST /api/v1/import` on the localhost-only `/api/v1` surface, so no bearer token is required and the host-header check applies. The body is sniffed; the format is not in the URL.
+The endpoint is `POST /api/v1/import` on the operator `/api/v1` surface, so the request needs the operator token as a bearer and a loopback `Host` (see [the API overview](api.md#operator-api-apiv1)). The body is sniffed; the format is not in the URL.
 
 ## Using it
 
-    curl --data-binary @report.sarif http://127.0.0.1:8080/api/v1/import
+    curl -H "Authorization: Bearer $(cat data/operator-token)" --data-binary @report.sarif http://127.0.0.1:8080/api/v1/import
 
 The request body is the report itself, up to 16 MiB. The response is JSON:
 
@@ -35,7 +35,7 @@ The request body is the report itself, up to 16 MiB. The response is JSON:
 
 When the report carries no repository (most pentest writeups, the minimal-JSON shape with `repository: ""`), pass `?repo=<https-url>`:
 
-    curl --data-binary @pentest.md "http://127.0.0.1:8080/api/v1/import?repo=https://github.com/example/widget"
+    curl -H "Authorization: Bearer $(cat data/operator-token)" --data-binary @pentest.md "http://127.0.0.1:8080/api/v1/import?repo=https://github.com/example/widget"
 
 `?repo=` always wins over any provenance in the body, so it doubles as an override when a CodeQL run reports the wrong URL.
 
@@ -74,7 +74,7 @@ An imported `file://` repository is usable only when that exact local directory 
 
 To import without priming this funnel, pass `?revalidate=false`:
 
-    curl --data-binary @bundle.json "http://127.0.0.1:8080/api/v1/import?revalidate=false"
+    curl -H "Authorization: Bearer $(cat data/operator-token)" --data-binary @bundle.json "http://127.0.0.1:8080/api/v1/import?revalidate=false"
 
 The findings still land and no finding-level work is enqueued. A remote repository may still receive the single metadata onboarding run described above. The natural use is ingesting findings that have already been through an audit elsewhere — a trusted [sharing bundle](encrypted-sharing.md) arrives carrying the producer's full audit narrative (`boundary`, `validation`, `prior_art`, `reach`, `rating`), so re-running even the cheap classifier on it is redundant spend. The default is `revalidate=true`; a value that is neither `true`/`false` nor `1`/`0` is rejected with `400` rather than silently treated as on, so a caller that meant to disable the funnel is never billed for it by a typo. (The toggle has no effect on the unrecognised-format fallback below: those findings come from the `ingest` skill asynchronously and are not put through the import-time enqueue.)
 
@@ -114,9 +114,9 @@ Per-result mapping:
 |---|---|
 | `title` | `rule.shortDescription.text`, falling back to `rule.name`, then `result.message.text`, then `ruleId`. |
 | `description` | `result.message.text`, falling back to `rule.fullDescription.text`. |
-| `severity` | `rule.properties.security-severity` interpreted as a CVSS v3 base score (>=9 critical, >=7 high, >=4 medium, >0 low), falling back to `result.level` (`error` -> high, `warning` -> medium, `note`/`none` -> low). |
+| `severity` | `rule.properties.security-severity` interpreted as a Common Vulnerability Scoring System (CVSS) v3 base score (>=9 critical, >=7 high, >=4 medium, >0 low), falling back to `result.level` (`error` -> high, `warning` -> medium, `note`/`none` -> low). |
 | `confidence` | `rule.properties.precision` (`very-high`/`high` -> high, `medium` -> medium, `low` -> low). Empty when absent. |
-| `cwe` | First matching `cwe` tag in `rule.properties.tags`. Matches `CWE-79`, `cwe-79`, and `external/cwe/cwe-079`. |
+| `cwe` | First matching Common Weakness Enumeration (CWE) `cwe` tag in `rule.properties.tags`. Matches `CWE-79`, `cwe-79`, and `external/cwe/cwe-079`. |
 | `location` | `result.locations[0].physicalLocation`: `artifactLocation.uri` plus `region.startLine` (and `startColumn` when present). |
 | `suggested_fix` | `result.fixes[0].description.text` when present. |
 
@@ -207,7 +207,7 @@ The flow is the same regardless of format:
 2. **Bound raw scanner output.** A result parsed from a raw scanner format (SARIF, the code-scanning CSV export or the hosted-scanner markdown export) is trimmed to the per-rule and per-result caps before anything is written; every other format passes through whole. See [Bounded scanner imports](#bounded-scanner-imports) above.
 3. **Resolve the repository.** `?repo=` if present, otherwise `Result.RepoURL`. The URL is normalised through `ParseRepoInput` (the same path the UI uses) and a `Repository` row is created on first sight.
 4. **Create the scan row.** One per `Result`, with `kind = import`, `status = done`, `skill_name = <tool>`, `findings_count = len(findings)` (the accepted findings, after any capping). The scan's `commit` is `Result.Commit` when the format carried one (SARIF `versionControlProvenance`, minimal-JSON `commit`).
-5. **Upsert findings.** Each parsed finding is fingerprinted with the tool name in the skill-name slot and its sub-path (`db.FingerprintFinding(tool, sub_path, cwe, location, title)`), then matched against existing rows by `(repository_id, fingerprint)`. The sub-path is empty for every format except scrutineer's own bundle, so their fingerprints are unchanged; carrying it keeps two findings at the same location in different monorepo sub-projects from collapsing onto one fingerprint. Match found: `last_seen_scan_id`, `last_seen_commit`, `seen_count` are updated and a `FindingHistory` row is written. No match: a new `Finding` row is created with `imported_from = <tool>`. Whatever fix an ingest carries — the `suggested_fix` a parser extracted from a SARIF/markdown report, or the minimal/bundle `patch` — is folded into the finding's trace prose, not written to the `suggested_fix` column, which is reserved for diffs a `patch` run has put through the applicability gate. An `include=all` bundle also carries `notes`, `communications` and `references`; these are attached to the finding after it is created (or, on a re-import onto an existing finding, appended only where an identical record does not already exist). References are matched on their URL alone rather than on their whole content, because `(finding_id, url)` is unique: a bundle naming a URL the finding already carries leaves the stored row alone whatever tags or summary it puts on it, and a bundle naming one URL twice writes it once.
+5. **Upsert findings.** Each parsed finding is fingerprinted with the tool name in the skill-name slot and its subpath (`db.FingerprintFinding(tool, sub_path, cwe, location, title)`), then matched against existing rows by `(repository_id, fingerprint)`. The subpath is empty for every format except scrutineer's own bundle, so their fingerprints are unchanged; carrying it keeps two findings at the same location in different monorepo sub-projects from collapsing onto one fingerprint. Match found: `last_seen_scan_id`, `last_seen_commit`, `seen_count` are updated and a `FindingHistory` row is written. No match: a new `Finding` row is created with `imported_from = <tool>`. Whatever fix an ingest carries — the `suggested_fix` a parser extracted from a SARIF/markdown report, or the minimal/bundle `patch` — is folded into the finding's trace prose, not written to the `suggested_fix` column, which is reserved for diffs a `patch` run has put through the applicability gate. An `include=all` bundle also carries `notes`, `communications` and `references`; these are attached to the finding after it is created (or, on a re-import onto an existing finding, appended only where an identical record does not already exist). References are matched on their URL alone rather than on their whole content, because `(finding_id, url)` is unique: a bundle naming a URL the finding already carries leaves the stored row alone whatever tags or summary it puts on it, and a bundle naming one URL twice writes it once.
 6. **Prime the funnel.** Each newly-created finding is enqueued for `revalidate` (which chains into `verify` on a confirmed High/Critical), unless `?revalidate=false` was passed. See [Revalidation on import](#revalidation-on-import) above.
 
 The full column set is in [database.md](database.md); the `Finding.ImportedFrom` field is what distinguishes imported findings from native ones. The scans index filters on `kind = import` to show only imports, and imported findings appear in the main Findings list by default, alongside audit findings. An import is operator-submitted rather than a scanner this instance runs on its own schedule, so it is not hidden behind the scanners toggle. A raw scanner export is bounded before it gets there: SARIF, the code-scanning CSV and the hosted-scanner markdown are trimmed to the per-rule and per-result caps ([Bounded scanner imports](#bounded-scanner-imports)) before anything is written, so the list shows a rule's first few hits rather than every hit it produced.

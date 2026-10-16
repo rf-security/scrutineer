@@ -34,7 +34,7 @@ func TestFindingShowRendersAttackPathAndBlocksDisclosure(t *testing.T) {
 		t.Fatalf("GET status = %d: %s", w.Code, w.Body)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"Production viability history", "NON_VIABLE", "Release path ruled out", "release target excludes", "Disclosure blocked"} {
+	for _, want := range []string{"Release viability history", "NON_VIABLE", "Release path ruled out", "release target excludes", "Disclosure blocked"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("finding page missing %q", want)
 		}

@@ -39,9 +39,11 @@ The existing source-checkout command remains supported:
 
     go run -buildvcs=true ./cmd/scrutineer -skills ./skills
 
-Then open http://127.0.0.1:8080. The explicit `-skills ./skills` directory makes the checkout command useful while developing skills because it overrides the copies embedded in the binary. It is optional for ordinary use because Scrutineer ships its built-in skills and per-ecosystem runner profiles inside the executable.
+Then open the `http://127.0.0.1:8080/login?token=...` link Scrutineer logs at startup, which signs the browser in. The link is logged on every start, and the token stays in `data/operator-token` for scripts calling `/api/v1` (see [docs/api.md](docs/api.md#operator-api-apiv1)). The explicit `-skills ./skills` directory makes the checkout command useful while developing skills because it overrides the copies embedded in the binary. It is optional for ordinary use because Scrutineer ships its built-in skills and per-ecosystem runner profiles inside the executable.
 
 The `-buildvcs=true` flag includes the source commit in `go run` builds. Settings > About shows that commit, with a `-dirty` suffix for local changes, and its commit date. Ordinary `go build` commands include this metadata automatically in a Git checkout.
+
+Scrutineer uses SQLite by default. For a new instance backed by PostgreSQL, follow the [database setup instructions](docs/database.md).
 
 You can also build a checkout-independent executable and run it from another directory:
 
@@ -67,6 +69,8 @@ To onboard a whole GitHub org at once, open **Add multiple** → **Import a whol
 You can also scan a directory on disk, useful before pushing, or for code not hosted on a git forge. Paste an absolute path (`/path/to/project`) in the same **Add repository** field. Scrutineer copies the directory into a per-scan workspace and runs the default skill set; skills that need a forge URL or ecosyste.ms enrichment (`advisories`, `exposure`, `fork`, `maintainers`, `metadata`, `packages`, `public-issue`, `report-upstream`) are skipped automatically. Symlinks are recreated as-is rather than dereferenced during the copy; in container mode their targets then resolve inside the container, so host files reached only through such a link are not visible to skills. Under `--no-container`, and for the skills listed in `host_skills`, the kernel dereferences them normally, so only point scrutineer at trees you trust.
 
 The optional analysis tools (semgrep, bandit, zizmor, betterleaks, darnit, git-pkgs, brief) are bundled in the runner image, so you don't need them installed locally when the container runner is in use.
+
+To check a research lead, choose **Investigate a report** in the sidebar, enter the repository URL and paste the report. An optional branch, tag or commit selects the revision to check. This queues one focused investigation without the default scan pipeline. The scan retains the submitted text and records an assessment of each claim, with zero or more findings. Reproduced behaviour with unestablished security impact remains inconclusive; new High/Critical findings enter the existing revalidation workflow.
 
 ## Git authentication
 
@@ -134,9 +138,9 @@ When the containerised runner is active (the default when a container runtime is
 
 - **Containerised runner** -- optional per-scan container isolation with read-only source mounts, dropped capabilities, and an authenticated egress allowlist proxy
 - **Skill HTTP API** -- running skills can call back into scrutineer to list prior scans and enqueue further skills; see the [HTTP API overview](docs/api.md) for authentication boundaries and [openapi.yaml](openapi.yaml) for the full route specification
-- **Live updates** -- SSE streaming of scan logs and status changes, pushed rather than polled; the jobs list, the repositories list and a repository's Scans tab refresh their own table when a scan starts, finishes, or is cancelled, paused, resumed or queued, keeping the current scroll, filters and sort. Elapsed times ("started 3m ago") count up on their own, recomputed in the page rather than fetched
+- **Live updates** -- SSE streaming of scan logs and status changes, pushed rather than polled; the Scans page, the repositories list and a repository's Scans tab refresh their own table when a scan starts, finishes, or is cancelled, paused, resumed or queued, keeping the current scroll, filters and sort. Elapsed times ("started 3m ago") count up on their own, recomputed in the page rather than fetched
 - **Organisation rollup** -- repos, findings, and maintainers grouped by owning org, with per-org markdown exports
-- **Usage tracking** -- per-scan token and cost figures plus a `/usage` page totalling spend per skill, correlating cost with repository workload proxies and linking runs that cost at least ten times their skill median; see [docs/usage.md](docs/usage.md). On a Claude subscription token, a rate-limit wall auto-pauses the batch and resumes it after the reported reset, with per-window status shown on `/usage`. Optionally (`downgrade_on_overage`), once the account crosses into overage the model tier falls back from max/high to the mid tier for new scans until overage clears (typically when the window resets) -- announced in the log, on the jobs page, and on `/usage`. Set `pause_on_overage: true` to pause model scans instead; this takes precedence over downgrading and preserves resumable work.
+- **Usage tracking** -- per-scan token and cost figures plus a `/usage` page totalling spend per skill, correlating cost with repository workload proxies and linking runs that cost at least ten times their skill median; see [docs/usage.md](docs/usage.md). On a Claude subscription token, a rate-limit wall auto-pauses the batch and resumes it after the reported reset, with per-window status shown on `/usage`. Optionally (`downgrade_on_overage`), once the account crosses into overage the model tier falls back from max/high to the mid tier for new scans until overage clears (typically when the window resets) -- announced in the log, on the Scans page, and on `/usage`. Set `pause_on_overage: true` to pause model scans instead; this takes precedence over downgrading and preserves resumable work.
 - **Themes** -- six colour themes plus a light/dark/system toggle, set on the Settings page
 
 ## The default pipeline
@@ -155,8 +159,8 @@ Adding a repo enqueues the `triage` skill, whose SKILL.md lists the further skil
 | `maintainers` | Model-backed analysis identifying real maintainers and contact routes |
 | `repo-overview` | Runs `brief --json` for a structured project summary |
 | `embedded-native` | Runs `brief --json` at the repository root and each initialized shallow submodule to map native languages, extension bridges, build tools, manifests, and dependencies |
-| `subprojects` | Enumerates monorepo packages/workspaces so deep-dives can be scoped to a sub-path |
-| `recon` | Maps distinct externally reachable input-processing subsystems into focus areas; after threat-model completes, those areas fan out into parallel deep-dive audits |
+| `subprojects` | Enumerates monorepo packages/workspaces so deep-dives can be scoped to a subpath |
+| `recon` | Finds the parts of the repository that handle outside input and groups them into focus areas; after threat-model completes, those areas fan out into parallel deep-dive audits |
 | `history` | Mines Git history for security fixes that never received an advisory, with ancestry-checked incremental caching and explicit partial-history reporting |
 | `threat-model` | Derives the project's security contract (components, entry-point trust table, claimed and disclaimed properties) for the deep-dive to load |
 | `semgrep` | Static analysis mapped into findings shape |
@@ -173,7 +177,7 @@ Adding a repo enqueues the `triage` skill, whose SKILL.md lists the further skil
 | `revalidate` | Cheap read-only classifier (prose + `git log`, no PoC execution) that emits true / false positive / already-fixed / uncertain; auto-enqueued for High/Critical from `security-deep-dive` and for every imported finding. Every `true_positive` chains to `critic`, and High/Critical true positives also chain to `verify` |
 | `breaking-change` | Static breaking-change check on the suggested-fix diff; records `breaking`/`non_breaking`/`unknown` with rationale and the affected dependents |
 | `release-watch` | After a finding reaches `fixed`, watches the upstream for a release containing the fix commit; records release tag, URL, and timestamp on the finding |
-| `disclose` | Drafts a GHSA-shaped advisory (title, description, CVSS, CWEs, references) for one finding |
+| `disclose` | Drafts a GHSA-shaped advisory (title, description, CVSS, CWEs, references) for one finding, shaped to the upstream's custom vulnerability report form when it defines one |
 | `patch` | Proposes a unified diff fixing one finding; a diff that passes the applicability gate is stored on the finding as its suggested fix |
 | `reattack` | Applies one immutable gated patch to a fresh checkout and independently exercises three root-cause variants plus a benign control; records a bypass, verified resistance, or incomplete verification without overwriting prior attempts |
 | `report-upstream` | Files one finding on the upstream repository via GitHub PVR with the proposed patch attached; the action that moves a finding to `reported` |
@@ -181,27 +185,32 @@ Adding a repo enqueues the `triage` skill, whose SKILL.md lists the further skil
 | `reachability` | Traces dependency sinks through application code to determine which are reachable from trust boundaries |
 | `cna-match` | Matches a repository to its CVE Numbering Authority so disclosures route to the right contact |
 | `posture` | Records the repo's security posture (reporting policy, response history, hardening) on the Repository row |
-| `compliance` | Audits the repo against the 62 OpenSSF Baseline controls with `darnit`, resolves the controls darnit defers to LLM analysis or could not verify without a forge token, and records per-control verdicts and the attained Baseline level on the Compliance tab |
+| `compliance` | Audits the repo against the OpenSSF Baseline controls with `darnit`, resolves the controls darnit defers to LLM analysis or could not verify without a forge token, and records per-control verdicts and the attained Baseline level on the Compliance tab |
 | `forensics` | Read-only compromise timeline and evidence bundle from local Git history and public forge/archive records |
 | `variants` | Starting from one confirmed finding, searches the current repository for distinct, high-confidence sibling instances of the same root cause |
 | `audit-injection` | Opt-in static audit for command/code execution, unsafe deserialization, and server-side template injection with ecosystem-specific references |
 | `audit-exfil` | Opt-in static audit for SSRF, path traversal, XXE, and response or diagnostic leakage with ecosystem-specific references |
-| `audit-authz` | Opt-in static audit for IDOR, tenant isolation, fail-open guards, privilege escalation, and authorization decisions based on unverified claims |
+| `audit-authz` | Opt-in static audit for insecure direct object references (IDOR), tenant isolation, fail-open guards, privilege escalation, and authorization decisions based on unverified claims |
 | `audit-pii` | Opt-in static audit for real personal or customer-identifying data committed to source or exposed through logs, URLs, telemetry, exports, and responses |
 | `audit-memory` | Opt-in static audit for reachable memory corruption in first-party C, C++, unsafe Rust, native extensions, and FFI boundaries |
 | `audit-package-manager` | Static audit of package manager clients, registries, and proxies against a bundled threat model; triage enqueues it when source evidence shows the repository implements one |
 | `audit-web` | Reviews web sessions, browser origins, uploads and business workflows when triage finds an implemented web application or API |
 | `audit-embedded` | Reviews firmware updates, boot chain, provisioning, device credentials and debug interfaces when triage finds device firmware |
+| `audit-build-tooling` | Reviews untrusted-workspace execution, configuration precedence, build caches, plugin resolution and secret exposure when triage finds a build system or developer tool |
 
 Edit `skills/triage/SKILL.md` to change what gets run by default. Drop new skill directories in `skills/` to add scan types; no code changes needed. See [docs/skills.md](docs/skills.md) for the frontmatter reference, the `scrutineer.*` metadata keys, the `context.json` shape, output kinds, schema validation, and the skill-facing HTTP API.
 
 Before each scan, lockfiles, minified bundles, and generated trees are stripped from the workspace so the skill doesn't waste turns on them. The builtin skip list covers `node_modules`, `dist`, `generated`, `__generated__`, `*.min.js`/`*.min.css`, and the common lockfiles (`pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `Cargo.lock`, `go.sum`, `Gemfile.lock`, `poetry.lock`, `composer.lock`). Skills can override this with `scrutineer.paths` (allow-list) and layer `scrutineer.ignore_paths` on top; see [docs/skills.md](docs/skills.md#path-filtering).
 
+Skills can retain reproductions by writing and running their files in `./poc/<finding-id>/`, where the ID matches the report's finding ID, such as `F001`. The directory should contain source, crafted inputs, a `run.sh` accepting the target checkout or executable path, and a `README.md` with prerequisites and expected output. Finish the reproduction before publishing a finding mid-scan, then leave its files unchanged. Scrutineer stores the first successful capture in the database with its source scan, commit and file checksums, independently of workspace cleanup.
+
+Each capture is limited to 64 regular files, 1 MiB per file and 2 MiB total. Links, special files and unsafe paths are refused; a capture error is reported while the finding itself is retained. Captures remain until the finding is deleted and are included in database backups. Verification stages these files beside a fresh target checkout, and disclosure bundles prefer them over text extraction. Existing findings without a capture continue to use their validation text. A `poc-manifest.json` accompanies captured files with their provenance and SHA-256 checksums.
+
 ## Importing findings from other tools
 
 Scrutineer can ingest findings produced elsewhere so they enter the same triage and disclosure workflow:
 
-    curl --data-binary @report.sarif http://127.0.0.1:8080/api/v1/import
+    curl -H "Authorization: Bearer $(cat data/operator-token)" --data-binary @report.sarif http://127.0.0.1:8080/api/v1/import
 
 SARIF 2.1.0, CSV, markdown, and a minimal JSON shape are all accepted; the format is sniffed from the body. See [docs/import.md](docs/import.md) for the full request and response shape, the per-format field mapping, and how to add support for a new format.
 
@@ -228,8 +237,8 @@ Every index page has a search box plus filter and sort dropdowns; the specifics 
 Each finding from the `security-deep-dive` skill starts at **new** and moves through a guided workflow:
 
 1. **new** -- just identified. High/Critical from `security-deep-dive` and every imported finding auto-enqueue a `revalidate` pass first, which records `true_positive` / `false_positive` / `already_fixed` / `uncertain` on the finding. Every true positive chains into the release-build `critic`; High/Critical true positives also chain into `verify`. Outside that path: click "Run verification" to start independent confirmation using model tokens, "Mark triaged" if you have already verified it independently, or "Reject"
-2. **enriched** -- verification ran. Review and click "Mark triaged" to save your decision
-3. **triaged** -- confirmed real. Review the critic's release-build assessment, then click "Draft disclosure" (a model job) to generate the draft. An exact `NON_VIABLE` assessment blocks private disclosure, public issues, and upstream reporting; `VIABLE`, `SAMPLE_OR_TEST`, `CONDITIONAL_VIABLE`, and unassessed findings remain analyst decisions
+2. **enriched** -- verification confirmed it, or revalidation classed it as a true positive. Review and click "Mark triaged" to save your decision
+3. **triaged** -- confirmed real. Review the critic's release-build assessment, then click "Draft disclosure" (a model scan) to generate the draft. An exact `NON_VIABLE` assessment blocks private disclosure, public issues, and upstream reporting; `VIABLE`, `SAMPLE_OR_TEST`, `CONDITIONAL_VIABLE`, and unassessed findings remain analyst decisions
 4. **ready** -- draft prepared. Run the `report-upstream` skill to file it via GitHub PVR (github.com only, requires `gh` auth), run `public-issue` for reviewed low-severity hardening findings that are safe to file publicly, or click "Mark as reported" after sending it yourself. When upstream has no PVR, follow the runbook in [docs/disclosure-fallback.md](docs/disclosure-fallback.md): route to a CNA when `cna-match` names one, otherwise contact the channel `maintainers` returned. With `federation_peers` configured, every route out of this state (the button, the `report-upstream` and `public-issue` skills, and the VINCE submission) first asks each peer whether it already holds the same finding and, on a match, names their contact so you coordinate before proceeding (see [docs/interchange.md](docs/interchange.md))
 5. **reported** -- sent to maintainer. Click "Acknowledged" when they respond
 6. **acknowledged** -- maintainer working on fix. Click "Mark fixed" when it ships
@@ -266,7 +275,7 @@ Or with a Claude Code OAuth token instead of an API key:
 
 For codex or opencode, pass `-e CODEX_API_KEY=...` / `-e OPENAI_API_KEY=...` (or `ANTHROPIC_API_KEY` for opencode with an Anthropic model) and add `-backend codex` / `-backend opencode` to the command. For copilot, pass `-e GH_TOKEN=...` (a fine-grained PAT or `gh auth token` value; classic `ghp_` PATs are rejected by Copilot CLI) and add `-backend copilot`.
 
-Always bind to `127.0.0.1`: the UI has no authentication, so binding to `0.0.0.0` exposes your findings database to anyone on the network.
+Always bind to `127.0.0.1`: the operator token is the only credential on the UI, so binding to `0.0.0.0` leaves your findings database one leaked token away from anyone on the network. The first-run login link is in `docker logs`, and `docker exec <container> cat /data/operator-token` prints the token later.
 
 If a container runtime (docker, rootless podman, or Apple's `container`) is available on the host, scrutineer runs each scan in an ephemeral container for isolation. The runner image is published to GHCR as a multi-arch manifest (`linux/amd64` and `linux/arm64`) and pulled automatically on first use:
 
@@ -294,7 +303,7 @@ If you would rather update automatically, run [watchtower](https://github.com/co
 
 When the container runner is active, scrutineer starts an authenticated egress proxy on the host and points `HTTPS_PROXY`/`HTTP_PROXY` inside the container at it. The proxy only permits an allowlist of hosts: the active model API, `*.ecosyste.ms`, the major forges (GitHub, GitLab, Codeberg, Bitbucket), common package registries (npm, PyPI, RubyGems, crates.io, Go module proxy, Packagist, Hex, NuGet), advisory sources (semgrep.dev, OSV, NVD, cwe.mitre.org), and the runtime's host endpoint (`host.docker.internal` for docker/podman, the default gateway IP for Apple's `container`) for the local skill API. That API port accepts inspected HTTP proxy requests but refuses raw `CONNECT` tunnels; separately configured host-local model ports remain tunnelable. Requests to anything else get a 403 and are logged. Extend the list with `egress_allow` in the config file. When `-model-base-url` is set (or, for Claude, falls back to the `ANTHROPIC_BASE_URL` env var), its hostname is automatically added to the allowlist. The proxy uses a per-process random token so it isn't an open relay; tools that ignore the proxy env are not blocked at the network layer (see `threatmodel.md`).
 
-For deployments that treat skill prompts as untrusted, pass `--hardened` (or `hardened: true` in the config). The flag forces the container runner (`--no-container` is rejected), trims the egress allowlist to the active backend's model API hosts plus the host skill API (so `egress_allow` is ignored, drop the flag if you need to widen it), mounts the container rootfs read-only with `no-new-privileges`, attaches each scan to its own ephemeral network created with `--internal` (removed when the scan ends) so a process that ignores `HTTPS_PROXY` has no route out and concurrent scans cannot reach each other, and refuses scans whose workspace footprint exceeds 2 GiB once the clone completes. The 2 GiB check is post-clone: it bounds what hardened mode accepts, not what can land on disk during the clone itself; use OS-level disk quotas if you need a clone-time guarantee. Bundled skills that hit ecosyste.ms or a package registry directly will fail under hardened mode unless they route through the host skill API. Per-ecosystem runner profiles still apply, but profile images that need writable paths beyond `/work` and `/tmp` are incompatible. Under Docker Desktop and rootless podman the proxy runs as a per-scan sidecar container on the `--internal` network because the host proxy is unreachable there; see [docs/podman.md](docs/podman.md) for the rootless podman path. These runtimes verify that each hardened network blocks external egress while still reaching the sidecar, and refuse the scan if that cannot be confirmed, so the sandbox never silently weakens.
+For deployments that treat skill prompts as untrusted, pass `--hardened` (or `hardened: true` in the config). The flag forces the container runner (`--no-container` is rejected), trims the egress allowlist to the active backend's model API hosts plus the host skill API (so `egress_allow` is ignored, drop the flag if you need to widen it), mounts the container rootfs read-only with `no-new-privileges`, attaches each scan to its own ephemeral network created with `--internal` (removed when the scan ends) so a process that ignores `HTTPS_PROXY` has no route out and concurrent scans cannot reach each other, and refuses scans whose workspace footprint exceeds 2 GiB once the clone completes. The 2 GiB check is post-clone: it bounds what hardened mode accepts, not what can land on disk during the clone itself; use OS-level disk quotas if you need a clone-time guarantee. Bundled skills that hit ecosyste.ms or a package registry directly will fail under hardened mode unless they route through the host skill API. Per-ecosystem runner profiles still apply, but profile images that need writable paths beyond `/work` and `/tmp` are incompatible. Under Docker Desktop and rootless podman the proxy runs as a per-scan sidecar container on the `--internal` network because the host proxy is unreachable there; see [docs/podman.md](docs/podman.md) for the rootless podman path. These runtimes verify that each hardened network blocks external egress while still reaching the sidecar, and refuse the scan if that cannot be confirmed, so the sandbox never silently weakens. Docker Engine refuses `--hardened` at startup, because a scan on its `--internal` network reaches every host service bound to all interfaces through the network gateway without going through the proxy; use `--hardened-runtime-only` there for the non-network half.
 
 ## Runner profiles
 
@@ -335,7 +344,7 @@ Requirements:
 - **`skopeo` (optional)** -- used in place of `docker buildx` to detect when a moved `:latest` runner tag should rebuild per-ecosystem profile images. Without it, profiles still build but key their cache on the image ref alone.
 - **SELinux** -- on an SELinux-enabled host (the Fedora/RHEL/Rocky/Alma default) the runner relabels its bind mounts with `:z` so the container can read the clone and write its output; without it every scan fails with permission errors. This is handled automatically: `--selinux auto` (the default) detects the host, and a startup smoke test verifies a real relabeled mount works. Use `--selinux off` if you pre-label paths yourself, or `--selinux on` to force it. See [docs/podman.md](docs/podman.md#selinux-and-bind-mount-file-passing) for the `:z`-vs-`:Z` rationale.
 
-Under **rootless podman** with `--hardened` (verified fail-closed per scan), the scan can't route to a host proxy across the network-namespace boundary, so the egress proxy runs as a **per-scan sidecar container** on the `--internal` network to keep enforced egress working. It requires a network backend that forwards host-gateway to the host loopback (modern pasta, default in podman ≥ 5.0, or slirp4netns with host-loopback); where that isn't available the sidecar can't reach the host skill API and the scan is refused (fail closed). Fall back to `--hardened-runtime-only` for the non-network half (read-only rootfs + `no-new-privileges` + the 2 GiB post-clone workspace cap), or use rootful podman or Docker Engine for `--hardened` without the host-loopback-forwarding requirement -- the always-on `--cap-drop ALL` / non-root user / `/tmp` tmpfs / SELinux `:z` baseline applies in every mode regardless. See [docs/podman.md](docs/podman.md) for the full security model and [docs/egress-sidecar.md](docs/egress-sidecar.md) for the operator validation checklist.
+Under **rootless podman** with `--hardened` (verified fail-closed per scan), the scan can't route to a host proxy across the network-namespace boundary, so the egress proxy runs as a **per-scan sidecar container** on the `--internal` network to keep enforced egress working. It requires a network backend that forwards host-gateway to the host loopback (modern pasta, default in podman ≥ 5.0, or slirp4netns with host-loopback); where that isn't available the sidecar can't reach the host skill API and the scan is refused (fail closed). Fall back to `--hardened-runtime-only` for the non-network half (read-only rootfs + `no-new-privileges` + the 2 GiB post-clone workspace cap), or use rootful podman for `--hardened` without the host-loopback-forwarding requirement -- the always-on `--cap-drop ALL` / non-root user / `/tmp` tmpfs / SELinux `:z` baseline applies in every mode regardless. See [docs/podman.md](docs/podman.md) for the full security model and [docs/egress-sidecar.md](docs/egress-sidecar.md) for the operator validation checklist.
 
 The `docker build` / `docker run` commands shown in this repo -- for the runner image and the per-ecosystem profile images under `docker/profiles/` -- are CLI-compatible with podman; substitute `podman` for `docker`.
 
@@ -491,6 +500,7 @@ See [SECURITY.md](SECURITY.md) for the reporting policy and [threatmodel.md](thr
 
 ## Further documentation
 
+- [docs/glossary.md](docs/glossary.md) -- terminology used in scans, findings, and disclosure
 - [docs/skills.md](docs/skills.md) -- bundled skills, writing your own, frontmatter and output-kind reference
 - [docs/import.md](docs/import.md) -- importing findings from other tools (SARIF, CSV, markdown, minimal JSON) and adding new formats
 - [docs/api.md](docs/api.md) -- HTTP API surfaces, callers, authentication boundaries, and links to the full [OpenAPI specification](openapi.yaml)
@@ -500,9 +510,10 @@ See [SECURITY.md](SECURITY.md) for the reporting policy and [threatmodel.md](thr
 - [docs/backup.md](docs/backup.md) -- backing up and restoring the database (built-in `scrutineer backup`/`restore`, `sqlite3`, Litestream)
 - [docs/development.md](docs/development.md) -- project layout, regenerating embedded data, running tests
 - [docs/encrypted-sharing.md](docs/encrypted-sharing.md) -- encrypted findings sharing between contributors (age + SSH keys, team keyring management)
+- [docs/sarif-export.md](docs/sarif-export.md) -- exporting a repository's findings as SARIF 2.1.0 and handing them to OSS-CRS as bug candidates
+- [docs/interchange.md](docs/interchange.md) -- federation interchange format: in-toto record envelope, salted finding hashes, the claim-check endpoint, the public and members-only feeds with their export/import syncs (threat surface: T14 in [threatmodel.md](threatmodel.md))
+- [docs/codex.md](docs/codex.md) -- the codex backend: what differs from claude, sandbox interaction, adding another backend
 - [docs/sharing.md](docs/sharing.md) -- external maintainer portal, GitHub authorization, and explicit read-only repository grants
-- [docs/interchange.md](docs/interchange.md) -- federation interchange format: in-toto record envelope, salted finding hashes, the claim-check endpoint, the public and members-only feeds with their export/import jobs (threat surface: T14 in [threatmodel.md](threatmodel.md))
-- [docs/codex.md](docs/codex.md) -- the codex backend: what differs from claude, sandbox interaction, adding another harness
 - [docs/opencode.md](docs/opencode.md) -- OpenCode provider credentials, images, auth state, readiness, and egress
 - [docs/copilot.md](docs/copilot.md) -- the copilot backend: GitHub token credential handling and egress
 - [docs/podman.md](docs/podman.md) -- security model and known gaps for the podman / rootless runtime (sandbox isolation, hardened-mode verification)

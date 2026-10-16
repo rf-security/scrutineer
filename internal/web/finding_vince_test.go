@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -19,7 +20,7 @@ import (
 	"scrutineer/internal/vince"
 )
 
-func seedVINCEFinding(t *testing.T, s *Server) vinceFindingContext {
+func seedVINCEFinding(t *testing.T, s *Server) disclosureFindingContext {
 	t.Helper()
 	repo := db.Repository{
 		URL:      "https://github.com/acme/widget.git",
@@ -92,7 +93,7 @@ func seedVINCEFinding(t *testing.T, s *Server) vinceFindingContext {
 	if err := s.DB.Create(&comm).Error; err != nil {
 		t.Fatal(err)
 	}
-	return vinceFindingContext{
+	return disclosureFindingContext{
 		Finding: finding, Repository: repo, Scan: scan,
 		Packages: []db.Package{pkg}, References: []db.FindingReference{ref},
 		Communications: []db.FindingCommunication{comm},
@@ -192,33 +193,36 @@ func TestMapVINCEReport(t *testing.T) {
 
 func TestVINCEEligibility(t *testing.T) {
 	base := db.Finding{Status: db.FindingReady, DisclosureDraft: "reviewed"}
-	if err := vinceEligibility(base, nil, nil); err != nil {
+	if err := vinceEligibility(base, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, status := range []db.FindingLifecycle{
-		db.FindingReported, db.FindingAcknowledged, db.FindingFixed,
-		db.FindingPublished, db.FindingRejected, db.FindingDuplicate,
+		db.FindingFixed, db.FindingPublished, db.FindingRejected, db.FindingDuplicate,
 	} {
 		finding := base
 		finding.Status = status
-		if err := vinceEligibility(finding, nil, nil); err == nil {
+		if err := vinceEligibility(finding, nil); err == nil {
 			t.Errorf("status %q accepted", status)
 		}
 	}
 	finding := base
 	finding.DisclosureDraft = " "
-	if err := vinceEligibility(finding, nil, nil); err == nil {
+	if err := vinceEligibility(finding, nil); err == nil {
 		t.Error("empty disclosure draft accepted")
 	}
 	if err := vinceEligibility(base, []db.FindingNote{{
 		Body: "finding-dedup: subsumed by finding #12\nreason",
-	}}, nil); err == nil {
+	}}); err == nil {
 		t.Error("subsumed finding accepted")
 	}
-	if err := vinceEligibility(base, nil, []db.FindingReference{{
-		Tags: "coordinator, VINCE",
-	}}); err == nil {
-		t.Error("existing VINCE reference accepted")
+	// A reported finding can go to another recipient, and an earlier VINCE
+	// submission asks for confirmation instead of blocking.
+	for _, status := range []db.FindingLifecycle{db.FindingReported, db.FindingAcknowledged} {
+		finding := base
+		finding.Status = status
+		if err := vinceEligibility(finding, nil); err != nil {
+			t.Errorf("status %q: %v", status, err)
+		}
 	}
 }
 
@@ -231,7 +235,7 @@ func TestVINCEEligibilityProductionViability(t *testing.T) {
 			finding := db.Finding{
 				Status: db.FindingTriaged, DisclosureDraft: "reviewed", ProductionViability: viability,
 			}
-			err := vinceEligibility(finding, nil, nil)
+			err := vinceEligibility(finding, nil)
 			if viability == db.ProductionViabilityNonViable {
 				if !errors.Is(err, db.ErrFindingNonViable) {
 					t.Fatalf("eligibility error = %v, want ErrFindingNonViable", err)
@@ -303,7 +307,7 @@ func TestFindingVINCENonViableBlockedBeforeSubmission(t *testing.T) {
 	}
 }
 
-func assertVINCEBlockedStateUnchanged(t *testing.T, s *Server, ctx vinceFindingContext, status db.FindingLifecycle) {
+func assertVINCEBlockedStateUnchanged(t *testing.T, s *Server, ctx disclosureFindingContext, status db.FindingLifecycle) {
 	t.Helper()
 	var finding db.Finding
 	if err := s.DB.First(&finding, ctx.Finding.ID).Error; err != nil {
@@ -441,12 +445,26 @@ func TestFindingVINCESubmitSuccessAndDuplicatePrevention(t *testing.T) {
 		t.Errorf("status history = %+v", history)
 	}
 
+	var submissions []db.DisclosureSubmission
+	s.DB.Where("finding_id = ? AND channel = ?", finding.ID, db.DisclosureChannelVINCE).Find(&submissions)
+	if len(submissions) != 1 || submissions[0].ExternalID != "VRF#26-07-ABCDE" || !strings.Contains(submissions[0].Request, `"ProductName":"widget"`) {
+		t.Errorf("VINCE submissions = %+v", submissions)
+	}
+
 	w = postForm(t, s, path, validVINCEWebForm())
-	if w.Code != http.StatusConflict {
-		t.Errorf("duplicate status = %d, want 409", w.Code)
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "already submitted to VINCE") {
+		t.Errorf("unconfirmed duplicate status = %d, want 422", w.Code)
 	}
 	if requests.Load() != 1 {
 		t.Errorf("VINCE requests = %d, want exactly 1", requests.Load())
+	}
+	form := validVINCEWebForm()
+	form.Set("resend", "yes")
+	if w = postForm(t, s, path, form); w.Code != http.StatusSeeOther {
+		t.Errorf("confirmed resend status = %d: %s", w.Code, w.Body)
+	}
+	if requests.Load() != 2 {
+		t.Errorf("VINCE requests after confirmed resend = %d, want 2", requests.Load())
 	}
 }
 
@@ -557,5 +575,79 @@ func TestVINCEAttachmentPreviewUsesTimestampAndListsSensitiveContents(t *testing
 	}
 	if !strings.Contains(string(report.Data), wantGeneratedAt) {
 		t.Errorf("report attachment does not use preview timestamp: %s", report.Data)
+	}
+}
+
+func TestFindingVINCESubmitsBundleWithInvalidPoC(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	ctx := seedVINCEFinding(t, s)
+	ctx.Finding.Validation = "```sh filename=run.sh\necho one\n```\n\n```sh filename=run.sh\necho two\n```\n"
+	ctx.Finding.SuggestedFix = "diff --git a/x b/x\n"
+	if err := s.DB.Save(&ctx.Finding).Error; err != nil {
+		t.Fatal(err)
+	}
+	seedBundleDependent(t, s, ctx.Repository.ID)
+	var attachment []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		file, _, err := r.FormFile("user_file")
+		if err != nil {
+			t.Errorf("attachment: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		defer func() { _ = file.Close() }()
+		attachment, err = io.ReadAll(file)
+		if err != nil {
+			t.Errorf("read attachment: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"vrf_id":"VRF#poc-warning"}`)
+	}))
+	defer server.Close()
+	s.VINCE = vince.Config{BaseURL: server.URL, APIKey: "secret"}
+	path := fmt.Sprintf("/findings/%d/vince", ctx.Finding.ID)
+	preview := httptest.NewRecorder()
+	s.Handler().ServeHTTP(preview, localReq(http.MethodGet, path))
+	if preview.Code != http.StatusOK {
+		t.Fatalf("preview status = %d: %s", preview.Code, preview.Body)
+	}
+	form := validVINCEWebForm()
+	form.Set("attachment", vinceAttachmentBundle)
+	for _, field := range []string{"attachment_generated_at", "attachment_sha256"} {
+		match := regexp.MustCompile(`name="` + field + `" value="([^"]+)"`).FindStringSubmatch(preview.Body.String())
+		if len(match) != 2 {
+			t.Fatalf("preview missing %s: %s", field, preview.Body)
+		}
+		form.Set(field, match[1])
+	}
+	w := postForm(t, s, path, form)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("submit status = %d: %s", w.Code, w.Body)
+	}
+	assertBundlePoCOmitted(t, readArchive(t, attachment), ctx.Finding.Validation)
+}
+
+func TestFindingVINCEAmbiguousResultIsRecorded(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	ctx := seedVINCEFinding(t, s)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer server.Close()
+	s.VINCE = vince.Config{BaseURL: server.URL, APIKey: "secret"}
+	w := postForm(t, s, fmt.Sprintf("/findings/%d/vince", ctx.Finding.ID), validVINCEWebForm())
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d: %s", w.Code, w.Body)
+	}
+	submissions, err := db.FindingDisclosureSubmissions(s.DB, ctx.Finding.ID, db.DisclosureChannelVINCE)
+	if err != nil || len(submissions) != 1 || submissions[0].Status != "uncertain" || submissions[0].Request == "" {
+		t.Fatalf("submissions = %+v, err = %v", submissions, err)
+	}
+	var finding db.Finding
+	s.DB.First(&finding, ctx.Finding.ID)
+	if finding.Status != db.FindingReady {
+		t.Errorf("status = %q, want ready", finding.Status)
 	}
 }

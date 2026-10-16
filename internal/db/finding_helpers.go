@@ -375,8 +375,11 @@ func conditionalFindingUpdate(gdb *gorm.DB, findingID uint, column string, oldVa
 }
 
 func findingWriteRetryDelay(err error, attempt int) (time.Duration, bool) {
-	if errors.Is(err, errFindingWriteConflict) || isPostgresSerializationFailure(err) {
+	if errors.Is(err, errFindingWriteConflict) {
 		return 0, true
+	}
+	if isPostgresSerializationFailure(err) {
+		return retry.BackoffDelay(attempt, time.Millisecond, findingWriteMaxDelay), true
 	}
 	var sqliteErr interface{ Code() int }
 	if !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff != sqliteBusyCode {
@@ -390,13 +393,12 @@ func findingWriteRetryDelay(err error, attempt int) (time.Duration, bool) {
 	return retry.BackoffDelay(attempt, time.Millisecond, findingWriteMaxDelay), true
 }
 
-// isPostgresSerializationFailure is the Postgres analogue of the SQLite busy
-// check in findingWriteRetryDelay: pgx
-// reports a serialization_failure (SQLSTATE 40001) or deadlock_detected (40P01)
-// when a concurrent transaction wins the compare-and-swap. Like the SQLite
-// case, the owned transaction must be restarted against a fresh snapshot. The
-// SQLState() method is matched structurally so the db package keeps no direct
-// pgconn dependency.
+// isPostgresSerializationFailure reports a deadlock (SQLSTATE 40P01), or a
+// serialization failure (40001) on servers running at repeatable read or
+// serializable; at read committed a losing compare-and-swap updates no rows
+// instead. Either way the owned transaction restarts against a fresh snapshot.
+// SQLState() is matched structurally so the db package keeps no direct pgconn
+// dependency.
 func isPostgresSerializationFailure(err error) bool {
 	var pgErr interface{ SQLState() string }
 	if !errors.As(err, &pgErr) {
@@ -659,8 +661,11 @@ func FindingDisclosureBlocked(f Finding) bool {
 	return f.ProductionViability == ProductionViabilityNonViable
 }
 
-// AddFindingCommunication records one external interaction.
-func AddFindingCommunication(gdb *gorm.DB, findingID uint, channel, direction, actor, body, offeredHelp string, at time.Time) (*FindingCommunication, error) {
+// AddFindingCommunication records one external interaction and appends a
+// disclosure.communication_recorded event in the same transaction. The event
+// keeps the channel and direction but never the body or actor text. When ctx
+// carries WithAuditScan the event is attributed to that scan.
+func AddFindingCommunication(gdb *gorm.DB, findingID uint, channel, direction, actor, body, offeredHelp string, at time.Time, source FindingSource) (*FindingCommunication, error) {
 	if at.IsZero() {
 		at = time.Now()
 	}
@@ -674,7 +679,28 @@ func AddFindingCommunication(gdb *gorm.DB, findingID uint, channel, direction, a
 		At:          at,
 		CreatedAt:   time.Now(),
 	}
-	if err := gdb.Create(c).Error; err != nil {
+	err := gdb.Transaction(func(tx *gorm.DB) error {
+		var f Finding
+		if err := tx.Select("id", "repository_id").First(&f, findingID).Error; err != nil {
+			return err
+		}
+		if err := tx.Create(c).Error; err != nil {
+			return err
+		}
+		payload := map[string]any{
+			AuditKeyRepositoryID: f.RepositoryID,
+			"communication_id":   c.ID,
+			"channel":            channel,
+			"direction":          direction,
+			"offered_help":       offeredHelp != "",
+		}
+		by := AuditScanAttribution(tx.Statement.Context, "", payload)
+		return LogEvent(tx, AuditEventInput{
+			Kind: AuditEventDisclosureCommunicationRecorded, SubjectType: AuditSubjectFinding, SubjectID: findingID,
+			Source: source, Actor: by, Payload: payload,
+		})
+	})
+	if err != nil {
 		return nil, err
 	}
 	return c, nil

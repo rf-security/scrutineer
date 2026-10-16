@@ -72,7 +72,13 @@ WORKDIR /opt/cpython
 # ac_cv_buggy_getaddrinfo=no: under ASan, configure's getaddrinfo runtime
 # probe can still misfire; this is the documented override for
 # sanitizer/cross builds.
-RUN ac_cv_buggy_getaddrinfo=no ./configure \
+# ac_cv_func_vfork=no: make subprocess fork+exec instead of vfork. gcc 14's
+# libasan vfork interceptor has no BTI landing pad after its call into the
+# real vfork, and glibc 2.41 returns to the child via `br x30`, so on a
+# BTI-capable CPU (Apple M4 under Docker Desktop, for one) every vfork child
+# dies with SIGILL before execve; `make install` then fails inside ensurepip
+# at `uname -rs`. Without HAVE_VFORK, _posixsubprocess uses plain fork.
+RUN ac_cv_buggy_getaddrinfo=no ac_cv_func_vfork=no ./configure \
         --prefix=/usr/local/python-asan \
         --with-pydebug \
         --with-address-sanitizer \

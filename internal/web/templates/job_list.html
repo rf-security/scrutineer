@@ -140,7 +140,7 @@
       <tr>
         {{template "th-sort" (dict "Sorter" .Sorter "Key" "id" "Def" "desc" "Label" "#" "Class" "")}}
         {{template "th-sort" (dict "Sorter" .Sorter "Key" "repository" "Def" "asc" "Label" "Repository" "Class" "")}}
-        {{if .AnySubPath}}<th>Sub-path</th>{{end}}
+        {{if .AnySubPath}}<th>Subpath</th>{{end}}
         {{template "th-sort" (dict "Sorter" .Sorter "Key" "skill" "Def" "asc" "Label" "Skill" "Class" "")}}
         {{template "th-sort" (dict "Sorter" .Sorter "Key" "status" "Def" "asc" "Label" "Status" "Class" "")}}
         <th>Completeness</th>
@@ -179,7 +179,7 @@
   {{if or .Skill .Status .Completeness .Group}}
   {{template "empty" (dict "Icon" "list-checks" "Title" "No matching scans" "Body" "")}}
   {{else}}
-  {{template "empty" (dict "Icon" "list-checks" "Title" "No jobs yet" "Body" "Jobs appear here once a repository has been queued.")}}
+  {{template "empty" (dict "Icon" "list-checks" "Title" "No scans yet" "Body" "Scans appear here once a repository has been queued.")}}
   {{end}}
 {{end}}
 

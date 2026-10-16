@@ -24,10 +24,14 @@
     },
     {
       "customType": "regex",
-      "description": "Update Codex CLI package assets using the release's codex-package_SHA256SUMS manifest",
-      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "description": "Update Codex CLI package assets, SHA-256 pins, and model catalog release",
+      "managerFilePatterns": [
+        "/^Dockerfile\\.runner$/",
+        "/^internal/worker/harness\\.go$/"
+      ],
       "matchStrings": [
-        "ARG CODEX_(?:AMD64|ARM64)_LOCK=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
+        "ARG CODEX_(?:AMD64|ARM64)_LOCK=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})",
+        "const CodexModelCatalogRelease = \"(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)\""
       ],
       "packageNameTemplate": "openai/codex",
       "depNameTemplate": "openai/codex",
@@ -274,10 +278,10 @@
       "minimumReleaseAge": "7 days"
     },
     {
-      "description": "Keep both Codex CLI package assets on one release; digests come from its checksum manifest",
+      "description": "Keep both Codex CLI package assets and the model catalog release synchronized",
       "matchPackageNames": ["openai/codex"],
       "groupName": "Codex CLI",
-      "minimumGroupSize": 2
+      "minimumGroupSize": 3
     },
     {
       "description": "Keep both OpenCode CLI release assets on one GitHub release",

@@ -126,31 +126,31 @@ func newQueue(sqldb *sql.DB, log *slog.Logger, concurrency int, dialect Dialect)
 }
 
 // goqiteSchemaLockKey is a fixed 64-bit key ("goqite" in ASCII hex) for the
-// Postgres session-level advisory lock that serialises first-run schema DDL.
+// Postgres advisory lock that serialises first-run schema DDL.
 const goqiteSchemaLockKey int64 = 0x676f71697465
 
 // installSchema applies the dialect's idempotent schema. On Postgres it holds a
-// session advisory lock across the DDL so that many processes starting against
-// a fresh database do not race `CREATE EXTENSION IF NOT EXISTS`, which collides
-// on the pg_extension_name_index unique constraint under concurrency. SQLite is
-// single-writer, so it just runs the statements.
+// transaction advisory lock across the DDL: `IF NOT EXISTS` and `OR REPLACE`
+// still collide on catalog unique constraints when processes start
+// concurrently against a fresh database. SQLite is single-writer, so it just
+// runs the statements.
 func installSchema(sqldb *sql.DB, dialect Dialect) error {
 	if dialect != Postgres {
 		_, err := sqldb.Exec(dialect.schema())
 		return err
 	}
-	ctx := context.Background()
-	conn, err := sqldb.Conn(ctx)
+	tx, err := sqldb.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }()
-	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", goqiteSchemaLockKey); err != nil {
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec("SELECT pg_advisory_xact_lock($1)", goqiteSchemaLockKey); err != nil {
 		return err
 	}
-	defer func() { _, _ = conn.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", goqiteSchemaLockKey) }()
-	_, err = conn.ExecContext(ctx, dialect.schema())
-	return err
+	if _, err := tx.Exec(dialect.schema()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Concurrency reports the parallelism limit the runner is currently using.
@@ -194,7 +194,10 @@ func (q *Queue) Start(ctx context.Context) {
 	q.mu.Unlock()
 
 	<-ctx.Done()
+	// Reconfigure must finish adding its replacement before shutdown waits.
+	q.mu.Lock()
 	q.wg.Wait()
+	q.mu.Unlock()
 }
 
 // startRunnerLocked builds a fresh goqite runner at the current concurrency,

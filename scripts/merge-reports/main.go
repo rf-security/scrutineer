@@ -4,7 +4,7 @@
 // Each input is the JSON export of one scrutineer instance's reporting
 // page:
 //
-//	curl -sSfOJ 'http://127.0.0.1:8080/reporting/report.json?interval=week'
+//	curl -sSfOJ -H "Authorization: Bearer $(cat data/operator-token)" 'http://127.0.0.1:8080/reporting/report.json?interval=week'
 //
 // Combining the exports of several instances that each scan their own set
 // of repositories yields one report in the same shape, as if a single

@@ -21,6 +21,7 @@ import (
 	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/feedbackpromotion"
 	"scrutineer/internal/worker"
 )
 
@@ -168,6 +169,7 @@ func (s *Server) apiHandler() http.Handler {
 	mux.HandleFunc("POST /findings/{id}/communications", s.apiAddFindingCommunication)
 	mux.HandleFunc("GET /findings/{id}/references", s.apiListFindingReferences)
 	mux.HandleFunc("POST /findings/{id}/references", s.apiAddFindingReference)
+	mux.HandleFunc("POST /findings/{id}/submissions", s.apiRecordFindingSubmission)
 	mux.HandleFunc("PUT /findings/{id}/labels", s.apiSetFindingLabels)
 	mux.HandleFunc("GET /findings/{id}/history", s.apiListFindingHistory)
 	mux.HandleFunc("GET /skills", s.apiListSkills)
@@ -295,6 +297,17 @@ func (s *Server) apiListScans(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// skillFacingReport strips host-promoted known_non_findings from a raw
+// threat-model report before a skill reads it. Promotions live only in the
+// repository contract, where they are retired with their decision; a copy in a
+// raw report would otherwise keep suppressing findings after retirement.
+func skillFacingReport(sc db.Scan) string {
+	if sc.SkillName != "threat-model" {
+		return sc.Report
+	}
+	return feedbackpromotion.StripPromoted(sc.Report)
+}
+
 func (s *Server) apiGetScan(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.Atoi(r.PathValue("id"))
 	var sc db.Scan
@@ -307,7 +320,7 @@ func (s *Server) apiGetScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	summary := scanSummary(sc)
-	summary["report"] = sc.Report
+	summary["report"] = skillFacingReport(sc)
 	summary["refusal_audit"] = sc.RefusalAudit
 	summary["log"] = sc.Log
 	writeJSON(w, http.StatusOK, summary)
@@ -347,7 +360,7 @@ func (s *Server) apiValidateReport(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusRequestEntityTooLarge, "could not read body (max 1 MB)")
 		return
 	}
-	if detail := worker.ValidateSkillReport(skill.Name, skill.SchemaJSON, string(body)); detail != "" {
+	if detail := worker.ValidateSkillReport(skill.Name, skill.SchemaJSON, skill.PoCField, string(body)); detail != "" {
 		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "errors": detail})
 		return
 	}
@@ -487,6 +500,8 @@ func (s *Server) apiRunFindingSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts.FindingID = new(uint(id))
+	opts.AuditDisclosure = externalReportingSkill(name)
+	opts.AuditSource = sourceFromRequest(r)
 	if caller := scanFromRequest(r); caller != nil && caller.SkillName == "triage" {
 		opts.TriageScanID = &caller.ID
 	}
@@ -546,7 +561,7 @@ func (s *Server) apiListCNAs(w http.ResponseWriter, r *http.Request) {
 	q := s.DB.Order("short_name")
 	if term := r.URL.Query().Get("q"); term != "" {
 		like := "%" + term + "%"
-		q = q.Where("short_name LIKE ? OR organization LIKE ? OR scope LIKE ?", like, like, like)
+		q = q.Where("LOWER(short_name) LIKE LOWER(?) OR LOWER(organization) LIKE LOWER(?) OR LOWER(scope) LIKE LOWER(?)", like, like, like)
 	}
 	var rows []db.CNA
 	q.Find(&rows)

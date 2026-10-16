@@ -1748,3 +1748,41 @@ body
 		t.Errorf("Requires default = %v, want nil", p.Requires)
 	}
 }
+
+func TestParseFile_pocField(t *testing.T) {
+	dir := t.TempDir()
+	path := writeSkill(t, dir, "poc", `---
+name: poc
+description: Skill whose findings carry reproductions.
+metadata:
+  scrutineer.output_kind: findings
+  scrutineer.poc_field: validation
+---
+
+body
+`)
+	p, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := p.ToModel("local")
+	if p.PoCField != "validation" || m.PoCField != "validation" {
+		t.Errorf("PoCField = %q, model %q, want validation", p.PoCField, m.PoCField)
+	}
+}
+
+func TestParseFile_pocFieldUnknown(t *testing.T) {
+	dir := t.TempDir()
+	path := writeSkill(t, dir, "bad", `---
+name: bad
+description: Skill with an unknown PoC field.
+metadata:
+  scrutineer.poc_field: trace
+---
+
+body
+`)
+	if _, err := ParseFile(path); err == nil {
+		t.Fatal("expected error on unknown poc_field")
+	}
+}

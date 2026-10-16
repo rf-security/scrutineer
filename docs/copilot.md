@@ -9,7 +9,7 @@ the per-scan container changes.
 ## Setup
 
 The runner image bundles the `copilot` binary (a glibc build, sha256-pinned
-in `docker/runner/Dockerfile.runner`), so there's nothing to install. Authenticate with a
+in `Dockerfile.runner`), so there's nothing to install. Authenticate with a
 GitHub token that has Copilot access and start scrutineer:
 
     export GH_TOKEN=$(gh auth token)
@@ -38,7 +38,7 @@ The block above is an example override, not the built-in list. The `models:`
 block is optional; without it the pick list is whatever
 `CopilotHarness.DefaultModels()` ships in the pinned `harness` module, which
 tracks the `/model --list --json` catalogue of the Copilot CLI version
-`docker/runner/Dockerfile.runner` pins and moves its tier tags with it. Pin the ids and tiers
+`Dockerfile.runner` pins and moves its tier tags with it. Pin the ids and tiers
 here when a scan's cost or model must not move under a harness bump. Model ids
 are Copilot CLI's own (dotted, e.g. `claude-sonnet-4.6`), which differ from
 claude-code's hyphenated ids (`claude-sonnet-4-6`) -- don't copy ids between
@@ -67,7 +67,7 @@ The copilot backend requires the containerised runner. `--no-container` with
 runner image, not on the host, and the local fallback (`LocalClaude`) is
 claude-only.
 
-## How the harness maps
+## How the backend maps
 
 | Aspect | claude | copilot |
 | --- | --- | --- |
@@ -121,7 +121,7 @@ executable and the CLI dies before doing any work:
     Error: Native addon "runtime" not found for linux-x64. Tried:
       .../prebuilds/linux-x64/runtime.node: failed to map segment from shared object
 
-`docker/runner/Dockerfile.runner` avoids this by unpacking the package at **build** time
+`Dockerfile.runner` avoids this by unpacking the package at **build** time
 into `/usr/local/lib/copilot` and setting `COPILOT_PKG_CACHE_HOME` to that
 path. It is the first entry in copilot's package search order (ahead of
 `COPILOT_CACHE_HOME`, `$XDG_CACHE_HOME/copilot`, `COPILOT_HOME`, and
@@ -181,7 +181,7 @@ parent stream.
 
 ## See also
 
-- `docs/codex.md`: the codex backend, including the "Adding another harness"
+- `docs/codex.md`: the codex backend, including the "Adding another backend"
   section that copilot follows.
 - `docs/opencode.md`: the opencode backend.
 - `internal/worker/harness.go`: the `Harness` interface aliases; the

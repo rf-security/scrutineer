@@ -933,7 +933,7 @@ func TestAddFindingCommunication(t *testing.T) {
 	f := seedFinding(t, gdb)
 
 	at := time.Date(2026, 6, 1, 9, 0, 0, 0, time.UTC)
-	c, err := AddFindingCommunication(gdb, f.ID, "email", "outbound", "alice", "sent disclosure", "patch", at)
+	c, err := AddFindingCommunication(gdb, f.ID, "email", "outbound", "alice", "sent disclosure", "patch", at, SourceAnalyst)
 	if err != nil {
 		t.Fatalf("AddFindingCommunication: %v", err)
 	}
@@ -942,7 +942,7 @@ func TestAddFindingCommunication(t *testing.T) {
 	}
 
 	// Zero At defaults to now.
-	c2, err := AddFindingCommunication(gdb, f.ID, "github", "inbound", "bot", "ack", "", time.Time{})
+	c2, err := AddFindingCommunication(gdb, f.ID, "github", "inbound", "bot", "ack", "", time.Time{}, SourceAnalyst)
 	if err != nil {
 		t.Fatalf("AddFindingCommunication (zero at): %v", err)
 	}

@@ -30,7 +30,7 @@ func locationURL(repoID uint, commit, location string) string {
 // trailing column group is optional so importer-supplied locations that carry
 // a column ("file.js:42:7", as emitted by the SARIF parser) resolve to the
 // same blob link as native "file.rb:12-34" locations.
-var locRE = regexp.MustCompile(`^(.*?):(\d+(?:-\d+)?)(?::\d+(?:-\d+)?)?$`)
+var locRE = regexp.MustCompile(`^(.*?):(\d+(?:-\d+)?)(?::(\d+)(?:-\d+)?)?$`)
 
 func splitLocation(loc string) (path, lines string) {
 	loc = strings.TrimPrefix(strings.TrimSpace(loc), "./")

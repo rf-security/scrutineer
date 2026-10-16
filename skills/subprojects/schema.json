@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "subprojects report",
-  "description": "Scannable sub-folders within a repository. Empty list means the repo is a single unit at the root.",
+  "description": "Scannable packages within a repository, including a root package alongside subprojects. Empty list means the repo is a single unit at the root.",
   "type": "object",
   "required": ["subprojects"],
   "additionalProperties": false,
@@ -17,7 +17,7 @@
           "path": {
             "type": "string",
             "pattern": "^[^/].*",
-            "description": "Sub-folder relative to repo root. No leading slash. This value is stored on Scan.sub_path when the analyst scopes a scan to this subproject."
+            "description": "Package path relative to repo root. No leading slash. Use . for a root package alongside subprojects; it becomes an empty Scan.sub_path for a repository-wide scan. Other paths are stored unchanged."
           },
           "name": {
             "type": "string",

@@ -34,8 +34,13 @@ func (s *Server) subprojectShow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var findings []db.Finding
-	s.DB.Where("repository_id = ? AND sub_path = ?", repo.ID, sub.Path).
-		Order("id desc").Find(&findings)
+	q := s.DB.Where("repository_id = ?", repo.ID)
+	if subPath := sub.ScanSubPath(); subPath == "" {
+		q = q.Where("sub_path = '' OR sub_path IS NULL")
+	} else {
+		q = q.Where("sub_path = ?", subPath)
+	}
+	q.Order("id desc").Find(&findings)
 	var packages []db.Package
 	s.DB.Where("subproject_id = ?", sub.ID).Order("downloads desc").Find(&packages)
 	var advisories []db.Advisory
@@ -69,8 +74,7 @@ func (s *Server) subprojectDisclosureChannel(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	value := strings.TrimSpace(r.FormValue("disclosure_channel"))
-	if err := s.DB.Model(&db.Subproject{}).Where("id = ?", sub.ID).
-		Update("disclosure_channel", value).Error; err != nil {
+	if err := db.SetSubprojectDisclosureChannel(s.DB, sub.ID, value, db.SourceAnalyst, ""); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

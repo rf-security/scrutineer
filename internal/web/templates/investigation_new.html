@@ -1,0 +1,19 @@
+{{template "head" .}}
+<div class="max-w-2xl">
+  <h2 class="text-2xl font-semibold mb-2">Investigate a report</h2>
+  <p class="text-sm text-muted-foreground mb-4">Check a suspected vulnerability against a repository. The scan investigates the supplied claims and records findings where the evidence supports a security issue.</p>
+  {{with .Error}}<div class="alert-destructive mb-4" role="alert">{{.}}</div>{{end}}
+  <form method="post" action="/investigations" class="form grid gap-3">
+    <label for="investigation-url">Repository URL</label>
+    <input id="investigation-url" class="input" type="text" name="url" value="{{.URL}}" required>
+    <label for="investigation-ref">Branch, tag or commit (optional)</label>
+    <input id="investigation-ref" class="input" type="text" name="ref" value="{{.Ref}}" placeholder="Default branch">
+    <label for="investigation-report">Report or research notes</label>
+    <textarea id="investigation-report" class="input font-mono text-sm" name="report" rows="16" required>{{.Report}}</textarea>
+    <p class="text-sm text-muted-foreground">Include any reproduction steps, suspected impact and unanswered questions. File locations are optional. Maximum 64 KB.</p>
+    <footer class="flex justify-end gap-2">
+      <button type="submit" class="btn">Investigate</button>
+    </footer>
+  </form>
+</div>
+{{template "foot" .}}

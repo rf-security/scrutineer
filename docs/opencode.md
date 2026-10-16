@@ -228,7 +228,7 @@ is deleted after that scan lineage completes. Logs, repository data, and
 session data remain under the ordinary per-scan harness-state mount in both
 cases.
 
-## Harness behaviour
+## Backend behaviour
 
 OpenCode receives `opencode run --format json --auto --model
 provider/model`. Skills are staged at `./.opencode/skill/{name}/SKILL.md`, and a

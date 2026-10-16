@@ -39,7 +39,7 @@ func multipartReq(t *testing.T, path, field, filename, content string) *http.Req
 	}
 	_ = mw.Close()
 	r := httptest.NewRequest("POST", path, &buf)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Content-Type", mw.FormDataContentType())
 	r.Header.Set("Sec-Fetch-Site", "same-origin")
 	return r

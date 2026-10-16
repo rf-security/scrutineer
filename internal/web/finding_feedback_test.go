@@ -123,7 +123,7 @@ func TestFindingRejectionDialog(t *testing.T) {
 	defer done()
 	f, _ := seedAuditFixture(t, s)
 	r := httptest.NewRequest(http.MethodGet, "/findings/"+strconv.FormatUint(uint64(f.ID), 10), nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {

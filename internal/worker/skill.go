@@ -89,7 +89,8 @@ type skillContextScrutineer struct {
 	// entirely for repositories without a saved configuration.
 	ScanConfig *repoconfig.Config `json:"scan_config,omitempty"`
 	// FocusArea narrows a fan-out security-deep-dive scan to one named
-	// input-processing subsystem from scan_config. Empty means normal scope.
+	// input-processing subsystem from scan_config. The full tree stays in
+	// ./src; the area is the audit's scope. Empty means normal scope.
 	FocusArea   *repoconfig.FocusArea    `json:"focus_area,omitempty"`
 	Exploration *skillContextExploration `json:"exploration,omitempty"`
 	// Recon is the latest completed focus-area map. It is staged only for the
@@ -169,13 +170,8 @@ func (w *Worker) doSkill(ctx context.Context, scan *db.Scan, emit func(Event)) (
 		w.Log.Warn("update scan skill metadata", "scan", scan.ID, "skill", skill.Name, "err", err)
 	}
 
-	// Per-scan workspace keeps concurrent skills on the same repo from
-	// clobbering each other's src/ and report.json. wrap() removes it once
-	// the scan reaches a terminal status. A paused scan keeps it and comes
-	// back through here on resume, after the agent has had the run of it, so
-	// staging always starts from an empty directory rather than writing into
-	// one the agent shaped (see resetWorkspace). The clone itself lives in the
-	// persistent repo-cache and is copied in by prepareRepoSrc.
+	// Resumes reuse the lineage path but replace agent-writable contents.
+	// Only validated PoC files are copied across the reset.
 	workRoot := w.scanWorkRoot(scan)
 	if err := validateSkillPaths(skill.Name, skill.OutputFile); err != nil {
 		return "", err
@@ -183,7 +179,7 @@ func (w *Worker) doSkill(ctx context.Context, scan *db.Scan, emit func(Event)) (
 	if scan.Repository.IsLocal() && skill.RequiresRemote {
 		return "", fmt.Errorf("skill %q requires a remote repository; cannot run on local directory", skill.Name)
 	}
-	if err := resetWorkspace(workRoot); err != nil {
+	if err := resetSkillWorkspace(workRoot, scan, &skill, emit); err != nil {
 		return "", fmt.Errorf("reset work: %w", err)
 	}
 	if scan.Repository.IsLocal() {
@@ -361,7 +357,7 @@ func (w *Worker) parsePartialSkillReport(ctx context.Context, skill *db.Skill, s
 
 func (w *Worker) repairAndParseSkillOutput(ctx context.Context, skill *db.Skill, scan *db.Scan, sj SkillJob, report string, emit func(Event)) (string, error) {
 	if skill.SchemaJSON != "" {
-		if detail := ValidateSkillReport(skill.Name, skill.SchemaJSON, report); detail != "" {
+		if detail := ValidateSkillReport(skill.Name, skill.SchemaJSON, skill.PoCField, report); detail != "" {
 			if repairedReport, ok := w.repairSchemaReport(ctx, skill, scan, sj, report, detail, emit); ok {
 				report = repairedReport
 			}
@@ -394,7 +390,7 @@ func (w *Worker) repairSchemaReport(ctx context.Context, skill *db.Skill, scan *
 		emit(Event{Kind: KindError, Text: fmt.Sprintf("validation: repair attempt did not produce %s; parsing original output", outputFile)})
 		return "", false
 	}
-	if detail = ValidateSkillReport(skill.Name, skill.SchemaJSON, res.Report); detail == "" {
+	if detail = ValidateSkillReport(skill.Name, skill.SchemaJSON, skill.PoCField, res.Report); detail == "" {
 		emit(Event{Kind: KindText, Text: fmt.Sprintf("validation: repaired %s validates", outputFile)})
 		return res.Report, true
 	}
@@ -535,6 +531,9 @@ func reportValidationForParsing(skill *db.Skill, report string) (string, bool) {
 	if detail := ValidateReportSchema(skill.SchemaJSON, report); detail != "" {
 		return detail, false
 	}
+	if detail := validateReportPoC(skill.PoCField, report); detail != "" {
+		return detail, false
+	}
 	detail := ValidateReportSemantics(skill.Name, report)
 	return detail, detail != "" && skill.Name == verifySkillName
 }
@@ -546,6 +545,10 @@ func reportValidationForParsing(skill *db.Skill, report string) (string, bool) {
 // creating a duplicate, so analyst triage state survives a rescan (#75).
 func (w *Worker) parseFindingsOutput(skill *db.Skill, scan *db.Scan, report string, emit func(Event)) error {
 	_, err := w.ingestFindings(skill, scan, report, emit)
+	var failOn *FailOnThresholdError
+	if err == nil || errors.As(err, &failOn) {
+		w.recordDeepDiveFeedbackConfirmations(skill, scan, report, emit)
+	}
 	return err
 }
 
@@ -595,7 +598,11 @@ func (w *Worker) ingestFindings(skill *db.Skill, scan *db.Scan, report string, e
 
 		wasCreated, perr := w.persistFinding(scan, f)
 		if perr != nil {
-			return nil, perr
+			if _, ok := errors.AsType[*PoCCaptureError](perr); !ok {
+				return nil, perr
+			}
+			emit(Event{Kind: KindError, Text: perr.Error()})
+			w.Log.Warn("capture PoC", "finding", f.ID, "scan", scan.ID, "err", perr)
 		}
 		if wasCreated {
 			created++
@@ -640,13 +647,20 @@ func (w *Worker) persistFinding(scan *db.Scan, f *db.Finding) (created bool, err
 			return false, uerr
 		}
 		f.ID = existing.ID
+		if err := w.captureFindingPoC(scan, f); err != nil {
+			return false, &PoCCaptureError{err}
+		}
 		return false, nil
 	}
 	if cerr := w.DB.Create(f).Error; cerr != nil {
 		return false, fmt.Errorf("save finding: %w", cerr)
 	}
+	captureErr := w.captureFindingPoC(scan, f)
 	if w.OnFindingCreated != nil {
 		w.OnFindingCreated(scan, f)
+	}
+	if captureErr != nil {
+		return true, &PoCCaptureError{captureErr}
 	}
 	return true, nil
 }
@@ -849,7 +863,7 @@ func (e *FailOnThresholdError) Error() string {
 // under more than one area, so scoping the query by focus area instead is
 // not available without joining back through a scan.
 func (w *Worker) markNotObserved(scan *db.Scan, seen map[string]bool) int {
-	if scan.FocusArea != "" {
+	if scan.FocusArea != "" || scan.SkillName == investigateSkillName {
 		return 0
 	}
 
@@ -984,6 +998,23 @@ func (rm reportedMaintainer) applyTo(m *db.Maintainer) {
 	}
 }
 
+// setSubprojectChannel is best-effort: it only touches an existing subproject
+// row and writes the skill-owned channel field only.
+func (w *Worker) setSubprojectChannel(scan *db.Scan, path, channel string) {
+	var ids []uint
+	if err := w.DB.Model(&db.Subproject{}).
+		Where("repository_id = ? AND path = ?", scan.RepositoryID, path).
+		Pluck("id", &ids).Error; err != nil {
+		w.Log.Warn("update subproject disclosure channel", "scan", scan.ID, "path", path, "err", err)
+		return
+	}
+	for _, id := range ids {
+		if err := db.SetSubprojectDisclosureChannel(w.DB, id, channel, db.SourceModel, scan.SkillName); err != nil {
+			w.Log.Warn("update subproject disclosure channel", "scan", scan.ID, "path", path, "err", err)
+		}
+	}
+}
+
 // parseMaintainersOutput upserts Maintainer rows and links them to the
 // scanned repo. Mirrors the legacy doMaintainerAnalysis logic so the
 // maintainers skill and the old Go handler stay interchangeable.
@@ -1019,7 +1050,7 @@ func (w *Worker) parseMaintainersOutput(scan *db.Scan, report string, emit func(
 	// of running it.
 	repoWide := scan.SubPath == ""
 	if repoWide && strings.TrimSpace(result.DisclosureChannel) != "" {
-		if err := db.SetDisclosureChannel(w.DB, repo.ID, result.DisclosureChannel); err != nil {
+		if err := db.SetDisclosureChannel(w.DB, repo.ID, result.DisclosureChannel, db.SourceModel, scan.SkillName); err != nil {
 			return fmt.Errorf("update disclosure channel: %w", err)
 		}
 	}
@@ -1030,13 +1061,7 @@ func (w *Worker) parseMaintainersOutput(scan *db.Scan, report string, emit func(
 			if path == "" || ch == "" {
 				continue
 			}
-			// Best-effort: only touches an existing subproject row, and only
-			// the reconcile/skill-owned channel field.
-			if err := w.DB.Model(&db.Subproject{}).
-				Where("repository_id = ? AND path = ?", scan.RepositoryID, path).
-				Update("disclosure_channel", ch).Error; err != nil {
-				w.Log.Warn("update subproject disclosure channel", "scan", scan.ID, "path", path, "err", err)
-			}
+			w.setSubprojectChannel(scan, path, ch)
 		}
 	}
 	var linked []db.Maintainer
@@ -1106,13 +1131,6 @@ func applyRepositoryPathFilters(workRoot string, skill *db.Skill, rawConfig stri
 		return fmt.Errorf("parse repository scan config: %w", err)
 	}
 	return applyPathFiltersWithSkips(workRoot, skill, cfg.Skip, emit)
-}
-
-// applyFocusAreaPathFilter narrows a fan-out audit to the paths belonging to
-// its persisted focus area. Repository skip rules have already been applied;
-// this only removes files outside the area and does not reintroduce anything.
-func applyFocusAreaPathFilter(workRoot string, area repoconfig.FocusArea, emit func(Event)) error {
-	return applyPathFiltersWithPatterns(workRoot, area.Paths, nil, emit)
 }
 
 func applyPathFiltersWithSkips(workRoot string, skill *db.Skill, repositorySkips []string, emit func(Event)) error {
@@ -1476,8 +1494,17 @@ func (w *Worker) stageWorkspace(ctx context.Context, workRoot, skillDir string, 
 	if err != nil {
 		return skillContext{}, err
 	}
+	if err := w.stageFindingPoC(workRoot, scan, skill); err != nil {
+		return skillContext{}, fmt.Errorf("stage PoC: %w", err)
+	}
+	model, err := w.activeThreatModel(scan.RepositoryID, scan.Repository.ThreatModel, skill.Name)
+	if err != nil {
+		return skillContext{}, fmt.Errorf("filter promoted feedback: %w", err)
+	}
+	staged := *scan
+	staged.Repository.ThreatModel = model
 	return stageWorkspaceWithInputs(
-		workRoot, skillDir, w.apiBaseFor(skill.Name), w.ForkOrg, w.metadataDir(), scan, skill, recon, novelty, controls, feedback,
+		workRoot, skillDir, w.apiBaseFor(skill.Name), w.ForkOrg, w.metadataDir(), &staged, skill, recon, novelty, controls, feedback,
 	)
 }
 
@@ -1573,7 +1600,7 @@ func (w *Worker) parseReconContext(reconScan db.Scan) (*skillContextRecon, error
 		}
 		return nil, fmt.Errorf("load recon schema: %w", err)
 	}
-	report, err := parseReconReport(reconSkill.Name, reconSkill.SchemaJSON, reconScan.Report)
+	report, err := parseReconReport(reconSkill.Name, reconSkill.SchemaJSON, reconSkill.PoCField, reconScan.Report)
 	if err != nil {
 		w.Log.Warn("ignore invalid recon report", "scan", reconScan.ID, "err", err)
 		return nil, nil
@@ -1581,8 +1608,8 @@ func (w *Worker) parseReconContext(reconScan db.Scan) (*skillContextRecon, error
 	return report, nil
 }
 
-func parseReconReport(skillName, schema, raw string) (*skillContextRecon, error) {
-	if detail := ValidateSkillReport(skillName, schema, raw); detail != "" {
+func parseReconReport(skillName, schema, pocField, raw string) (*skillContextRecon, error) {
+	if detail := ValidateSkillReport(skillName, schema, pocField, raw); detail != "" {
 		return nil, errors.New(detail)
 	}
 	var report skillContextRecon

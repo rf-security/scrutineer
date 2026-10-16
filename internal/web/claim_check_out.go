@@ -29,9 +29,10 @@ const peerClaimMaxBody = 4096
 // boolean and a contact, so it never legitimately redirects, and following
 // one would let a peer aim this instance's own POST anywhere: a 307 to
 // http://127.0.0.1:8080/repositories/1/delete replays the request against
-// the admin UI, whose only authorization is the loopback Host check and a
-// Sec-Fetch-Site check that a redirected Go request satisfies (the Host
-// comes from the redirect target and no Sec-Fetch-Site is sent).
+// the admin UI, past the loopback Host check and a Sec-Fetch-Site check that
+// a redirected Go request satisfies (the Host comes from the redirect target
+// and no Sec-Fetch-Site is sent), leaving the operator token as the only
+// thing in its way.
 var peerClaimClient = &http.Client{
 	Timeout:       peerClaimTimeout,
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },

@@ -17,9 +17,11 @@ import (
 
 // Internal selector category names that BriefMatch.Category can reference.
 // package_manager and language map to brief's top-level package_managers and
-// languages arrays; everything else is a key under brief's tools object.
+// languages arrays; manifest selects a root manifest's ecosystem.
+// Other categories are keys under brief's tools object.
 const (
 	briefPackageManager  = "package_manager"
+	briefManifest        = "manifest"
 	briefLanguage        = "language"
 	briefBuild           = "build"
 	briefNativeExtension = "native_extension"
@@ -126,7 +128,10 @@ var builtinProfiles = []Profile{
 		Detect:          []BriefMatch{{briefBuild, []string{"Rails"}}},
 	},
 	{Name: "ruby", Detect: pm("Bundler", "RubyGems")},
-	{Name: "node", Detect: pm("npm", "pnpm", "Yarn", "Bun")},
+	{Name: "node", Detect: []BriefMatch{
+		{briefPackageManager, []string{"npm", "pnpm", "Yarn", "Bun"}},
+		{briefManifest, []string{"npm"}},
+	}},
 	{
 		// Before python: brief's setuptools-Extension detector keys on
 		// setup.py declaring Extension()/ext_modules or a .pyx file, so
@@ -266,6 +271,11 @@ func briefDetections(out []byte) map[string]map[string]bool {
 		PackageManagers []detection            `json:"package_managers"`
 		Languages       []detection            `json:"languages"`
 		Tools           map[string][]detection `json:"tools"`
+		Manifests       []struct {
+			Ecosystem string `json:"ecosystem"`
+			Path      string `json:"path"`
+			Kind      string `json:"kind"`
+		} `json:"manifests"`
 	}
 	_ = json.Unmarshal(out, &r)
 	det := map[string]map[string]bool{}
@@ -280,6 +290,12 @@ func briefDetections(out []byte) map[string]map[string]bool {
 	}
 	for _, d := range r.PackageManagers {
 		add(briefPackageManager, d.Name)
+	}
+	for _, m := range r.Manifests {
+		// Nested frontend packages must not select a runner for their parent.
+		if m.Kind == "manifest" && m.Path == "package.json" {
+			add(briefManifest, m.Ecosystem)
+		}
 	}
 	for _, d := range r.Languages {
 		// Skip data/markup/prose entries the same way parseRepoOverviewOutput

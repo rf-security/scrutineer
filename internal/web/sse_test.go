@@ -29,6 +29,7 @@ func TestEventsStream_filteredWireFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.AddCookie(&http.Cookie{Name: testOperatorCookie, Value: testOperatorToken})
 	// Response headers are flushed after Subscribe, so having them means this
 	// client is registered and the publishes below cannot race it.
 	resp, err := http.DefaultClient.Do(req)
@@ -104,6 +105,7 @@ func TestEventsStream_eventListToleratesSpaces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.AddCookie(&http.Cookie{Name: testOperatorCookie, Value: testOperatorToken})
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)

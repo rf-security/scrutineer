@@ -96,6 +96,7 @@ func (s *Server) findingCommunications(w http.ResponseWriter, r *http.Request) {
 		r.FormValue("body"),
 		r.FormValue("offered_help"),
 		at,
+		db.SourceAnalyst,
 	); err != nil {
 		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 		return

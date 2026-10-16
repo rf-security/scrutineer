@@ -140,7 +140,7 @@ func testRepoDeleteLinkedData(t *testing.T, foreignKeys bool) {
 	keepWS, _ := mkScanDirs(t, dataDir, keepScan.ID)
 
 	r := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/delete", repo.ID), nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -410,7 +410,7 @@ func TestRepoDelete_unknownIs404(t *testing.T) {
 	defer done()
 
 	r := httptest.NewRequest("POST", "/repositories/999999/delete", nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)

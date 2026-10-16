@@ -1,361 +1,422 @@
-// Command migrate-sqlite-to-postgres copies a scrutineer SQLite database into
-// a PostgreSQL server so an operator can switch the `database` backend in
-// scrutineer.yaml without losing history.
-//
-// Usage:
-//
-//	go run ./scripts/migrate-sqlite-to-postgres \
-//	    -sqlite ./data/scrutineer.db \
-//	    -postgres 'postgres://scrutineer:secret@localhost:5432/scrutineer?sslmode=disable'
-//
-// It reuses the application's GORM models and db.OpenBackend, so the target
-// schema is created exactly as the server would create it (including the
-// two-pass migration that resolves the scans<->findings foreign-key cycle),
-// and SQLite's text-encoded timestamps/booleans/blobs are converted through
-// their Go types rather than copied as raw strings.
-//
-// The whole copy runs in one transaction with session_replication_role set to
-// 'replica', which suspends foreign-key and trigger enforcement for the load.
-// That sidesteps insert-ordering entirely (again, the scans<->findings cycle)
-// and is the standard bulk-import approach; it requires a superuser or
-// equivalent (rds_superuser on managed Postgres). After the copy, per-table id
-// sequences are advanced past the imported rows.
-//
-// The target must be empty (no repositories) unless -force is given. The
-// SQLite source is opened the same way the server opens it, which brings it up
-// to the current schema before copying — run against a copy if you would
-// rather not touch the live file.
+// Command migrate-sqlite-to-postgres copies a stopped instance's SQLite database
+// into an empty PostgreSQL database.
 package main
 
 import (
+	"cmp"
+	"context"
 	"database/sql"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
-	"unicode/utf8"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
+	"gorm.io/gorm/schema"
 
+	"scrutineer/internal/config"
 	"scrutineer/internal/db"
 )
 
 const batchSize = 200
+const serverDialTimeout = 500 * time.Millisecond
+const schemaVersionKey = "database_schema_version"
+
+type repositoryMaintainer struct {
+	RepositoryID uint `gorm:"primaryKey"`
+	MaintainerID uint `gorm:"primaryKey"`
+}
+
+func (repositoryMaintainer) TableName() string { return "repository_maintainers" }
+
+type findingLabel struct {
+	FindingID      uint `gorm:"primaryKey"`
+	FindingLabelID uint `gorm:"primaryKey"`
+}
+
+func (findingLabel) TableName() string { return "finding_labels_join" }
+
+func migrationModels() []any {
+	return append(db.Models(), &repositoryMaintainer{}, &findingLabel{})
+}
 
 func main() {
-	var sqlitePath, pgDSN string
-	var force bool
-	flag.StringVar(&sqlitePath, "sqlite", "./data/scrutineer.db", "path to the source SQLite database")
-	flag.StringVar(&pgDSN, "postgres", "", "destination PostgreSQL DSN (required)")
-	flag.BoolVar(&force, "force", false, "copy even if the destination already has data (rows are added, not replaced)")
+	var configPath, sqlitePath string
+	flag.StringVar(&configPath, "config", "", "scrutineer.yaml whose database.dsn names the destination (required)")
+	flag.StringVar(&sqlitePath, "sqlite", "", "source SQLite database (default: scrutineer.db in the config's data directory)")
 	flag.Parse()
-
-	if err := run(sqlitePath, pgDSN, force); err != nil {
+	if err := run(configPath, sqlitePath); err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
 }
 
-func run(sqlitePath, pgDSN string, force bool) error {
-	if pgDSN == "" {
-		return fmt.Errorf("-postgres DSN is required")
+func run(configPath, sqlitePath string) error {
+	if configPath == "" {
+		return fmt.Errorf("-config is required")
 	}
-	if _, err := os.Stat(sqlitePath); err != nil {
-		return fmt.Errorf("source database %s: %w", sqlitePath, err)
-	}
-
-	src, err := db.Open(sqlitePath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
-		return fmt.Errorf("open sqlite source: %w", err)
+		return err
+	}
+	pgDSN := cfg.Database.DSN
+	if pgDSN == "" {
+		return fmt.Errorf("set database.dsn in %s to the destination PostgreSQL database", configPath)
+	}
+	if sqlitePath == "" {
+		sqlitePath = filepath.Join(cmp.Or(cfg.Data, "./data"), "scrutineer.db")
+	}
+	if addr := cmp.Or(cfg.Addr, "127.0.0.1:8080"); serverRunning(addr) {
+		return fmt.Errorf("scrutineer is still running on %s; stop it before migrating", addr)
+	}
+	info, err := os.Stat(sqlitePath)
+	if err != nil {
+		return fmt.Errorf("source database: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("source database must be a regular file")
+	}
+	// Refuse a populated destination before spending a full source snapshot.
+	if err := checkDestinationEmpty(pgDSN); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "scrutineer-migrate-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	snapshot := filepath.Join(dir, "source.db")
+	log.Print("snapshotting SQLite source; keep both instances stopped until migration finishes")
+	if err := db.Snapshot(sqlitePath, snapshot); err != nil {
+		return fmt.Errorf("snapshot source: %w", err)
+	}
+	src, err := db.Connect(snapshot)
+	if err != nil {
+		return fmt.Errorf("open source snapshot: %w", err)
+	}
+	defer closeDB(src)
+	tables, err := migrationTables(src)
+	if err != nil {
+		return err
+	}
+	if err := checkSource(src, tables); err != nil {
+		return err
 	}
 	dst, err := db.OpenBackend(db.Options{Dialect: db.DialectPostgres, DSN: pgDSN})
 	if err != nil {
-		return fmt.Errorf("open postgres destination: %w", err)
+		return fmt.Errorf("open destination: %w", err)
 	}
-
-	if !force {
-		var repos int64
-		if err := dst.Model(&db.Repository{}).Count(&repos).Error; err != nil {
-			return fmt.Errorf("check destination: %w", err)
-		}
-		if repos > 0 {
-			return fmt.Errorf("destination already has %d repositories; refusing without -force", repos)
-		}
-
-		// The goqite job queue is transient and intentionally not migrated (see
-		// warnUnhandledTables). A queued or running scan lives as both a scans
-		// row and a queue message; copying only the row would strand it in
-		// Postgres — status=queued with nothing to dispatch it. Refuse so the
-		// operator drains or cancels pending work first; -force migrates anyway.
-		var pending int64
-		if err := src.Model(&db.Scan{}).
-			Where("status IN ?", []db.ScanStatus{db.ScanQueued, db.ScanRunning}).
-			Count(&pending).Error; err != nil {
-			return fmt.Errorf("check pending scans: %w", err)
-		}
-		if pending > 0 {
-			return fmt.Errorf("source has %d queued/running scan(s); the job queue is not migrated so they would be stranded. Let them finish or cancel them first, or pass -force to migrate anyway", pending)
-		}
-	}
-
-	// copiers copy the typed models in an order that reads parents before
-	// children (irrelevant for FK enforcement while it is suspended, but it
-	// keeps the log readable). Each entry resolves its own table name.
-	copiers := []func(src, tx *gorm.DB) (string, int64, error){
-		copyModel[db.Repository], copyModel[db.Scan], copyModel[db.Finding],
-		copyModel[db.ExpectedFinding],
-		copyModel[db.FindingLabel], copyModel[db.FindingNote], copyModel[db.FindingCommunication],
-		copyModel[db.FindingReference], copyModel[db.FindingHistory], copyModel[db.FindingReview],
-		copyModel[db.Dependency], copyModel[db.Package], copyModel[db.Dependent],
-		copyModel[db.FindingDependent], copyModel[db.Advisory], copyModel[db.Maintainer],
-		copyModel[db.Skill], copyModel[db.Subproject], copyModel[db.SBOMUpload],
-		copyModel[db.SBOMPackage], copyModel[db.CNA], copyModel[db.Setting],
-	}
-	// joinTables have no model struct (pure many-to-many link rows). They hold
-	// only integer foreign keys, so a generic row copy is safe.
-	joinTables := []string{"repository_maintainers", "finding_labels_join"}
-
-	if err := warnUnhandledTables(src, dst, joinTables); err != nil {
+	defer closeDB(dst)
+	if err := dst.Transaction(func(tx *gorm.DB) error {
+		return migrate(src, tx, tables)
+	}); err != nil {
 		return err
 	}
+	log.Print("migration complete; set database.driver to postgres before restarting Scrutineer")
+	return nil
+}
 
-	handled := make([]string, 0, len(copiers))
-	err = dst.Transaction(func(tx *gorm.DB) error {
-		// Suspend FK/trigger enforcement for this transaction so insert order
-		// and the scans<->findings cycle do not matter.
-		if err := tx.Exec("SET LOCAL session_replication_role = replica").Error; err != nil {
-			return fmt.Errorf("disable fk enforcement: %w", err)
+func closeDB(gdb *gorm.DB) {
+	if conn, err := gdb.DB(); err == nil {
+		_ = conn.Close()
+	}
+}
+
+// Runs before AutoMigrate can alter an existing instance's schema or data.
+func checkDestinationEmpty(dsn string) error {
+	connection, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		return fmt.Errorf("open destination: %w", err)
+	}
+	defer closeDB(connection)
+	return checkDestination(connection)
+}
+
+// Best effort: a server bound to another address is not detected.
+func serverRunning(addr string) bool {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), serverDialTimeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+func checkDestination(tx *gorm.DB) error {
+	var tables []string
+	if err := tx.Raw("SELECT tablename FROM pg_tables WHERE schemaname = current_schema()").Scan(&tables).Error; err != nil {
+		return err
+	}
+	for _, table := range tables {
+		query := tx.Table(pgx.Identifier{table}.Sanitize())
+		if table == "settings" {
+			query = query.Where("key <> ?", schemaVersionKey)
 		}
-		for _, c := range copiers {
-			table, n, err := c(src, tx)
-			if err != nil {
-				return fmt.Errorf("copy %s: %w", table, err)
+		var exists bool
+		if err := tx.Raw("SELECT EXISTS (?)", query.Select("1")).Scan(&exists).Error; err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("destination table %s is not empty; use an empty database", table)
+		}
+	}
+	return nil
+}
+
+func migrationTables(src *gorm.DB) ([]*schema.Schema, error) {
+	var tables []*schema.Schema
+	for _, model := range migrationModels() {
+		stmt := &gorm.Statement{DB: src}
+		if err := stmt.Parse(model); err != nil {
+			return nil, err
+		}
+		tables = append(tables, stmt.Schema)
+	}
+	return tables, nil
+}
+
+func checkSource(src *gorm.DB, tables []*schema.Schema) error {
+	known := map[string]bool{"sqlite_sequence": true, "goqite": true}
+	for _, table := range tables {
+		known[table.Table] = true
+		if !src.Migrator().HasTable(table.Table) {
+			return fmt.Errorf("source is missing table %s; upgrade the SQLite instance to this Scrutineer revision before migrating", table.Table)
+		}
+		columns, err := src.Migrator().ColumnTypes(table.Table)
+		if err != nil {
+			return err
+		}
+		present := make(map[string]bool, len(columns))
+		for _, column := range columns {
+			present[column.Name()] = true
+			if table.FieldsByDBName[column.Name()] == nil {
+				return fmt.Errorf("source column %s.%s is not handled by this migrator", table.Table, column.Name())
 			}
-			handled = append(handled, table)
-			log.Printf("copied %-24s %6d rows", table, n)
 		}
-		for _, jt := range joinTables {
-			n, err := copyRaw(src, tx, jt)
-			if err != nil {
-				return fmt.Errorf("copy %s: %w", jt, err)
+		for _, column := range table.DBNames {
+			if !present[column] {
+				return fmt.Errorf("source is missing column %s.%s; upgrade the SQLite instance to this Scrutineer revision before migrating", table.Table, column)
 			}
-			log.Printf("copied %-24s %6d rows", jt, n)
 		}
-		return nil
-	})
+	}
+	var names []string
+	if err := src.Raw("SELECT name FROM sqlite_master WHERE type = 'table'").Scan(&names).Error; err != nil {
+		return err
+	}
+	for _, name := range names {
+		if !known[name] && !strings.HasPrefix(name, "sqlite_") {
+			return fmt.Errorf("source table %s is not handled by this migrator", name)
+		}
+	}
+	var pending int64
+	if err := src.Model(&db.Scan{}).Where("LOWER(status) IN ?", []string{"queued", "running"}).Count(&pending).Error; err != nil {
+		return err
+	}
+	if pending != 0 {
+		return fmt.Errorf("source has %d queued/running scans; finish or cancel them before migrating", pending)
+	}
+	if src.Migrator().HasTable("goqite") {
+		if err := src.Table("goqite").Count(&pending).Error; err != nil {
+			return err
+		}
+		if pending != 0 {
+			return fmt.Errorf("source job queue contains %d messages; drain it before migrating", pending)
+		}
+	}
+	return nil
+}
+
+func migrate(src, tx *gorm.DB, tables []*schema.Schema) error {
+	var namespace string
+	if err := tx.Raw("SELECT current_schema()").Scan(&namespace).Error; err != nil {
+		return err
+	}
+	names := make([]string, 0, len(tables))
+	for _, table := range tables {
+		names = append(names, pgx.Identifier{namespace, table.Table}.Sanitize())
+	}
+	if err := tx.Exec("LOCK TABLE " + strings.Join(names, ", ") + " IN ACCESS EXCLUSIVE MODE").Error; err != nil {
+		return err
+	}
+	if err := checkDestination(tx); err != nil {
+		return err
+	}
+	constraints, err := deferConstraints(tx, namespace, tables)
 	if err != nil {
 		return err
 	}
-
-	// Sequences were not touched while rows were inserted with explicit ids, so
-	// advance each id sequence past the imported maximum.
-	for _, table := range handled {
-		if err := resetSequence(dst, table); err != nil {
-			return fmt.Errorf("reset sequence for %s: %w", table, err)
+	for _, table := range tables {
+		count, err := copyTable(src, tx, table)
+		if err != nil {
+			return fmt.Errorf("copy %s: %w", table.Table, err)
+		}
+		log.Printf("copied %-26s %d rows", table.Table, count)
+	}
+	if err := tx.Exec("SET CONSTRAINTS ALL IMMEDIATE").Error; err != nil {
+		return fmt.Errorf("validate migrated relationships: %w", err)
+	}
+	for _, constraint := range constraints {
+		if err := tx.Exec(constraint.restoreSQL(namespace)).Error; err != nil {
+			return err
 		}
 	}
-
-	log.Printf("done. Set `database: {driver: postgres, dsn: ...}` in scrutineer.yaml to use the migrated data.")
+	for _, table := range tables {
+		if table.FieldsByDBName["id"] != nil {
+			if err := resetSequence(tx, namespace, table.Table); err != nil {
+				return fmt.Errorf("reset sequence for %s: %w", table.Table, err)
+			}
+		}
+	}
 	return nil
 }
 
-// copyModel streams every row of model T from src into tx in batches, reading
-// through the Go types so SQLite's text/int encodings become the destination's
-// native column types. Associations are omitted so each table is copied exactly
-// once (children are copied by their own entry, not cascaded from the parent).
-func copyModel[T any](src, tx *gorm.DB) (string, int64, error) {
-	table := tableName(tx, new(T))
-	var total, cleaned int64
-	var batch []T
-	res := src.Model(new(T)).FindInBatches(&batch, batchSize, func(_ *gorm.DB, _ int) error {
-		if len(batch) == 0 {
-			return nil
-		}
-		// SQLite stores arbitrary bytes in TEXT columns; PostgreSQL rejects any
-		// row whose text is not valid UTF-8 (or contains a NUL), aborting the
-		// whole load. Scrub each row's string fields first so one corrupt log
-		// or report can't sink the migration.
-		for i := range batch {
-			if sanitizeStrings(&batch[i]) {
-				cleaned++
-			}
-		}
-		if err := tx.Session(&gorm.Session{SkipHooks: true}).
-			Omit(clause.Associations).
-			CreateInBatches(batch, batchSize).Error; err != nil {
-			return err
-		}
-		total += int64(len(batch))
-		return nil
-	})
-	if cleaned > 0 {
-		log.Printf("  note: scrubbed invalid UTF-8/NUL bytes in %d %s row(s)", cleaned, table)
-	}
-	return table, total, res.Error
+type foreignKey struct {
+	TableName  string
+	Name       string
+	Deferrable bool
+	Deferred   bool
 }
 
-// sanitizeStrings rewrites every string field of the struct pointed at by ptr
-// so it is safe for a PostgreSQL text column: NUL bytes are dropped and any
-// invalid UTF-8 sequence is replaced with U+FFFD. It reports whether anything
-// changed. Only top-level string and *string fields are touched — associations
-// are omitted from the copy, and []byte fields map to bytea, which takes
-// arbitrary bytes untouched. Returns false for non-struct inputs.
-func sanitizeStrings(ptr any) bool {
-	rv := reflect.ValueOf(ptr)
-	if rv.Kind() != reflect.Pointer || rv.IsNil() {
-		return false
+func (key foreignKey) alterSQL(namespace string) string {
+	return "ALTER TABLE " + pgx.Identifier{namespace, key.TableName}.Sanitize() +
+		" ALTER CONSTRAINT " + pgx.Identifier{key.Name}.Sanitize()
+}
+
+func (key foreignKey) restoreSQL(namespace string) string {
+	mode := " NOT DEFERRABLE INITIALLY IMMEDIATE"
+	if key.Deferrable {
+		mode = " DEFERRABLE INITIALLY IMMEDIATE"
+		if key.Deferred {
+			mode = " DEFERRABLE INITIALLY DEFERRED"
+		}
 	}
-	rv = rv.Elem()
-	if rv.Kind() != reflect.Struct {
-		return false
+	return key.alterSQL(namespace) + mode
+}
+
+func deferConstraints(tx *gorm.DB, namespace string, tables []*schema.Schema) ([]foreignKey, error) {
+	names := make([]string, 0, len(tables))
+	for _, table := range tables {
+		names = append(names, table.Table)
 	}
+	var keys []foreignKey
+	if err := tx.Raw(`SELECT r.relname AS table_name, c.conname AS name,
+		c.condeferrable AS deferrable, c.condeferred AS deferred
+		FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
+		JOIN pg_namespace n ON n.oid = r.relnamespace
+		WHERE c.contype = 'f' AND n.nspname = ? AND r.relname IN ?`, namespace, names).Scan(&keys).Error; err != nil {
+		return nil, err
+	}
+	for _, key := range keys {
+		if err := tx.Exec(key.alterSQL(namespace) + " DEFERRABLE INITIALLY IMMEDIATE").Error; err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Exec("SET CONSTRAINTS ALL DEFERRED").Error; err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+func copyTable(src, tx *gorm.DB, table *schema.Schema) (int64, error) {
+	query := src.Table(table.Table)
+	if table.Table == "settings" {
+		query = query.Where("key <> ?", schemaVersionKey)
+	}
+	rows, err := query.Rows()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rows.Close() }()
+	columns, err := rows.Columns()
+	if err != nil {
+		return 0, err
+	}
+	batch := make([]map[string]any, 0, batchSize)
+	var total, cleaned int64
+	for rows.Next() {
+		record, changed, err := readRow(src, rows, columns, table)
+		if err != nil {
+			return total, err
+		}
+		if changed {
+			cleaned++
+		}
+		batch = append(batch, record)
+		total++
+		if len(batch) == batchSize {
+			if err := tx.Table(table.Table).Create(&batch).Error; err != nil {
+				return total, err
+			}
+			batch = make([]map[string]any, 0, batchSize)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return total, err
+	}
+	if len(batch) != 0 {
+		if err := tx.Table(table.Table).Create(&batch).Error; err != nil {
+			return total, err
+		}
+	}
+	if cleaned != 0 {
+		log.Printf("removed NUL bytes or replaced invalid UTF-8 in %d %s rows", cleaned, table.Table)
+	}
+	return total, nil
+}
+
+func readRow(src *gorm.DB, rows *sql.Rows, columns []string, table *schema.Schema) (map[string]any, bool, error) {
+	record := reflect.New(table.ModelType)
+	if err := src.ScanRows(rows, record.Interface()); err != nil {
+		return nil, false, err
+	}
+	// Preserve SQL NULLs and zero values instead of applying GORM create defaults.
+	raw := make([]any, len(columns))
+	pointers := make([]any, len(columns))
+	for i := range raw {
+		pointers[i] = &raw[i]
+	}
+	if err := rows.Scan(pointers...); err != nil {
+		return nil, false, err
+	}
+	values := make(map[string]any, len(columns))
 	changed := false
-	for i := 0; i < rv.NumField(); i++ {
-		f := rv.Field(i)
-		if !f.CanSet() {
+	for i, column := range columns {
+		if raw[i] == nil {
+			values[column] = nil
 			continue
 		}
-		switch {
-		case f.Kind() == reflect.String:
-			if clean := cleanText(f.String()); clean != f.String() {
-				f.SetString(clean)
-				changed = true
-			}
-		case f.Kind() == reflect.Pointer && !f.IsNil() && f.Elem().Kind() == reflect.String:
-			if clean := cleanText(f.Elem().String()); clean != f.Elem().String() {
-				f.Elem().SetString(clean)
-				changed = true
-			}
+		value, _ := table.FieldsByDBName[column].ValueOf(context.Background(), record)
+		rv := reflect.ValueOf(value)
+		if rv.Kind() == reflect.Pointer {
+			rv = rv.Elem()
 		}
-	}
-	return changed
-}
-
-// cleanText makes s safe for a PostgreSQL text column: strip NUL bytes (valid
-// UTF-8 but forbidden in text), then replace any remaining invalid byte
-// sequence with the Unicode replacement character.
-func cleanText(s string) string {
-	if s == "" {
-		return s
-	}
-	if strings.IndexByte(s, 0) >= 0 {
-		s = strings.ReplaceAll(s, "\x00", "")
-	}
-	if !utf8.ValidString(s) {
-		s = strings.ToValidUTF8(s, "�")
-	}
-	return s
-}
-
-// copyRaw copies a table generically as untyped rows. Used for the many-to-many
-// join tables, which have no model and carry only integer foreign keys.
-func copyRaw(src, tx *gorm.DB, table string) (int64, error) {
-	var total int64
-	var batch []map[string]any
-	// FindInBatches keeps only batchSize rows in memory at a time instead of
-	// loading the whole table, matching copyModel's bounded footprint.
-	res := src.Table(table).FindInBatches(&batch, batchSize, func(_ *gorm.DB, _ int) error {
-		if len(batch) == 0 {
-			return nil
+		if rv.Kind() == reflect.String {
+			text := rv.String()
+			clean := db.SanitizePGText(text)
+			changed = changed || clean != text
+			value = clean
 		}
-		if err := tx.Table(table).CreateInBatches(batch, batchSize).Error; err != nil {
-			return err
-		}
-		total += int64(len(batch))
-		return nil
-	})
-	return total, res.Error
+		values[column] = value
+	}
+	return values, changed, nil
 }
 
-// resetSequence advances table's id sequence past the largest imported id so
-// future inserts do not collide. Tables without an id serial (e.g. settings,
-// keyed by a string) have no such sequence and are skipped — pg_get_serial_sequence
-// errors rather than returns null for a missing column, so the id column is
-// checked first.
-func resetSequence(dst *gorm.DB, table string) error {
-	var hasID bool
-	if err := dst.Raw(
-		`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = 'id')`,
-		table).Scan(&hasID).Error; err != nil {
-		return err
-	}
-	if !hasID {
-		return nil
-	}
-	var seq sql.NullString
-	if err := dst.Raw("SELECT pg_get_serial_sequence(?, 'id')", table).Scan(&seq).Error; err != nil {
-		return err
-	}
-	if !seq.Valid || seq.String == "" {
-		return nil
-	}
-	// is_called is true only when rows exist, so an empty table leaves the
-	// sequence delivering 1 on the first insert.
-	q := fmt.Sprintf(
-		`SELECT setval(?, COALESCE((SELECT MAX(id) FROM %q), 1), (SELECT MAX(id) FROM %q) IS NOT NULL)`,
-		table, table)
-	return dst.Exec(q, seq.String).Error
-}
-
-// warnUnhandledTables fails loudly if the source holds a table this migrator
-// neither copies nor knowingly skips, so a future schema addition cannot be
-// dropped silently. goqite (transient job queue) and SQLite internals are
-// expected skips.
-func warnUnhandledTables(src, dst *gorm.DB, joinTables []string) error {
-	known := map[string]bool{"goqite": true}
-	for _, jt := range joinTables {
-		known[jt] = true
-	}
-	// Resolve each model's table name via the destination naming strategy.
-	for _, name := range modelTableNames(dst) {
-		known[name] = true
-	}
-
-	var names []string
-	if err := src.Raw(
-		"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-	).Scan(&names).Error; err != nil {
-		return fmt.Errorf("list source tables: %w", err)
-	}
-	var unknown []string
-	for _, n := range names {
-		if !known[n] {
-			unknown = append(unknown, n)
-		}
-	}
-	if len(unknown) > 0 {
-		return fmt.Errorf("source has tables this migrator does not handle: %v; update the script before migrating", unknown)
-	}
-	return nil
-}
-
-// modelTableNames returns the destination table name for every copied model,
-// kept in sync with the copiers list above.
-func modelTableNames(g *gorm.DB) []string {
-	models := []any{
-		&db.Repository{}, &db.Scan{}, &db.Finding{},
-		&db.ExpectedFinding{},
-		&db.FindingLabel{}, &db.FindingNote{}, &db.FindingCommunication{},
-		&db.FindingReference{}, &db.FindingHistory{}, &db.FindingReview{},
-		&db.Dependency{}, &db.Package{}, &db.Dependent{},
-		&db.FindingDependent{}, &db.Advisory{}, &db.Maintainer{},
-		&db.Skill{}, &db.Subproject{}, &db.SBOMUpload{},
-		&db.SBOMPackage{}, &db.CNA{}, &db.Setting{},
-	}
-	names := make([]string, 0, len(models))
-	for _, m := range models {
-		names = append(names, tableName(g, m))
-	}
-	return names
-}
-
-// tableName resolves the table a model maps to under g's naming strategy.
-func tableName(g *gorm.DB, model any) string {
-	stmt := &gorm.Statement{DB: g}
-	if err := stmt.Parse(model); err != nil {
-		return fmt.Sprintf("%T", model)
-	}
-	return stmt.Schema.Table
+func resetSequence(tx *gorm.DB, namespace, table string) error {
+	name := pgx.Identifier{namespace, table}.Sanitize()
+	// Explicit IDs do not advance PostgreSQL sequences.
+	return tx.Exec("SELECT setval(pg_get_serial_sequence(?, 'id'), "+
+		"COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM "+name, name).Error
 }

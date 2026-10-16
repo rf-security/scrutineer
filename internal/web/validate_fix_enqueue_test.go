@@ -53,7 +53,7 @@ func validateFixPost(s *Server, repoID uint, ref string, findingIDs ...uint) *ht
 	}
 	r := httptest.NewRequest("POST", fmt.Sprintf("/repositories/%d/validate-fix", repoID), strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.Host = testHost
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	return w

@@ -96,7 +96,7 @@ func TestFindingBrowserWrites_lockWaitStops(t *testing.T) {
 				testFindingEditLockWaitStops(t, mode, func(ctx context.Context, findingID uint, _ string) *http.Request {
 					r := httptest.NewRequestWithContext(ctx, http.MethodPost,
 						fmt.Sprintf("/findings/%d/%s", findingID, tc.route), strings.NewReader(tc.form.Encode()))
-					r.Host = testHost
+					asOperator(r)
 					r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 					r.Header.Set("Sec-Fetch-Site", "same-origin")
 					return r
@@ -242,7 +242,7 @@ func findingEditRequest(ctx context.Context, api bool, findingID uint, token str
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		r.Header.Set("Sec-Fetch-Site", "same-origin")
 	}
-	r.Host = testHost
+	asOperator(r)
 	return r
 }
 

@@ -21,7 +21,7 @@
     </summary>
     <section class="pb-4">
       <table class="table w-full">
-        <thead><tr><th>Name</th><th>In scope</th><th>Touches</th><th>Entry points</th><th>Source</th></tr></thead>
+        <thead><tr><th>Name</th><th>In scope</th><th>Touches</th><th>Entry points</th><th>Evidence</th></tr></thead>
         <tbody>
         {{range index $tm "components"}}
           <tr>
@@ -48,7 +48,7 @@
     </summary>
     <section class="pb-4">
       <table class="table w-full">
-        <thead><tr><th>Entry point</th><th>Parameter</th><th>Attacker-controllable</th><th>Caller must enforce</th><th>Source</th></tr></thead>
+        <thead><tr><th>Entry point</th><th>Parameter</th><th>Attacker-controllable</th><th>Caller must enforce</th><th>Evidence</th></tr></thead>
         <tbody>
         {{range index $tm "entry_points"}}
           <tr>
@@ -75,7 +75,7 @@
     </summary>
     <section class="pb-4">
       <table class="table w-full mb-4">
-        <thead><tr><th>Component</th><th>Boundary</th><th>Reachability precondition</th><th>Source</th></tr></thead>
+        <thead><tr><th>Component</th><th>Boundary</th><th>Reachability precondition</th><th>Evidence</th></tr></thead>
         <tbody>
         {{range index $tm "trust_boundaries"}}
           <tr>
@@ -111,7 +111,7 @@
     <section class="pb-4">
       <h4 class="text-xs font-medium text-muted-foreground uppercase mb-2">Provided</h4>
       <table class="table w-full mb-4">
-        <thead><tr><th>Property</th><th>Conditions</th><th>Violation</th><th>Tier</th><th>Source</th></tr></thead>
+        <thead><tr><th>Property</th><th>Conditions</th><th>Violation</th><th>Tier</th><th>Evidence</th></tr></thead>
         <tbody>
         {{range index $tm "properties_provided"}}
           <tr>
@@ -127,7 +127,7 @@
       {{if index $tm "properties_not_provided"}}
       <h4 class="text-xs font-medium text-muted-foreground uppercase mb-2">Not provided</h4>
       <table class="table w-full mb-4">
-        <thead><tr><th>Property</th><th>Reason</th><th></th><th>Source</th></tr></thead>
+        <thead><tr><th>Property</th><th>Reason</th><th></th><th>Evidence</th></tr></thead>
         <tbody>
         {{range index $tm "properties_not_provided"}}
           <tr>
@@ -210,7 +210,7 @@
     </summary>
     <section class="pb-4">
       <table class="table w-full mb-4">
-        <thead><tr><th>Actor</th><th>Trusted</th><th>Controls</th><th>Source</th></tr></thead>
+        <thead><tr><th>Actor</th><th>Trusted</th><th>Controls</th><th>Evidence</th></tr></thead>
         <tbody>
         {{range index $tm "boundaries"}}
           <tr>

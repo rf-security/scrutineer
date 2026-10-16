@@ -42,6 +42,7 @@ const (
 	metaRequiresCommands  = "scrutineer.requires_commands"
 	metaRequiresFeatures  = "scrutineer.requires_features"
 	metaDegradedMode      = "scrutineer.degraded_mode"
+	metaPoCField          = "scrutineer.poc_field"
 
 	// SchemaVersion is the only scrutineer.version this build accepts.
 	// Skills omitting the key are treated as version 1. Bump when the
@@ -72,7 +73,17 @@ var scrutineerKeys = map[string]bool{
 	metaRequiresCommands:  true,
 	metaRequiresFeatures:  true,
 	metaDegradedMode:      true,
+	metaPoCField:          true,
 }
+
+// scrutineer.poc_field names the report field holding reproduction Markdown,
+// which is then validated for named, closed fences.
+const (
+	PoCFieldValidation = "validation"
+	PoCFieldReproducer = "reproducer"
+)
+
+var pocFields = map[string]bool{PoCFieldValidation: true, PoCFieldReproducer: true}
 
 var confidenceLevels = map[string]bool{"low": true, "medium": true, "high": true}
 var severityLevels = map[string]bool{"Low": true, "Medium": true, "High": true, "Critical": true}
@@ -145,6 +156,7 @@ type Parsed struct {
 	RequiresCommands  []string
 	RequiresFeatures  []string
 	DegradedMode      bool
+	PoCField          string
 }
 
 // ParseFile reads a single SKILL.md (with its sibling schema.json if any)
@@ -214,17 +226,8 @@ func (p *Parsed) validateMetadata() error {
 			return fmt.Errorf("%s %d not supported (this build accepts %d)", metaVersion, got, SchemaVersion)
 		}
 	}
-	if v, ok := p.Metadata[metaOutputKind]; ok {
-		s, ok := v.(string)
-		if !ok {
-			return fmt.Errorf("%s must be a string, got %T", metaOutputKind, v)
-		}
-		if !OutputKinds[strings.TrimSpace(s)] {
-			return fmt.Errorf("%s %q is not a recognised parser", metaOutputKind, s)
-		}
-		if strings.TrimSpace(s) == "reflection" && p.Name != "reflect" {
-			return fmt.Errorf("%s: reflection output is reserved for the reflect skill", metaOutputKind)
-		}
+	if err := p.validateOutputMetadata(); err != nil {
+		return err
 	}
 	if v, ok := p.Metadata[metaMaxTurns]; ok {
 		if _, ok := v.(int); !ok {
@@ -340,6 +343,27 @@ func checkRequiresProfile(m map[string]any) error {
 	return nil
 }
 
+func (p *Parsed) validateOutputMetadata() error {
+	if v, ok := p.Metadata[metaOutputKind]; ok {
+		s, ok := v.(string)
+		if !ok {
+			return fmt.Errorf("%s must be a string, got %T", metaOutputKind, v)
+		}
+		if !OutputKinds[strings.TrimSpace(s)] {
+			return fmt.Errorf("%s %q is not a recognised parser", metaOutputKind, s)
+		}
+		if strings.TrimSpace(s) == "reflection" && p.Name != "reflect" {
+			return fmt.Errorf("%s: reflection output is reserved for the reflect skill", metaOutputKind)
+		}
+	}
+	if v, ok := p.Metadata[metaPoCField]; ok {
+		if s, ok := v.(string); !ok || !pocFields[strings.TrimSpace(s)] {
+			return fmt.Errorf("%s must be %q or %q, got %v", metaPoCField, PoCFieldValidation, PoCFieldReproducer, v)
+		}
+	}
+	return nil
+}
+
 func checkEnum(m map[string]any, key string, allowed map[string]bool) error {
 	v, ok := m[key]
 	if !ok {
@@ -399,6 +423,9 @@ func (p *Parsed) extractMetadataKeys() {
 	p.RequiresCommands = extractStringList(p.Metadata, metaRequiresCommands)
 	p.RequiresFeatures = extractStringList(p.Metadata, metaRequiresFeatures)
 	p.DegradedMode, _ = p.Metadata[metaDegradedMode].(bool)
+	if v, ok := p.Metadata[metaPoCField].(string); ok {
+		p.PoCField = strings.TrimSpace(v)
+	}
 }
 
 func extractStringList(m map[string]any, key string) []string {
@@ -456,6 +483,7 @@ func (p *Parsed) ToModel(source string) (*db.Skill, error) {
 		RequiresCommands:  JoinPatterns(p.RequiresCommands),
 		RequiresFeatures:  JoinPatterns(p.RequiresFeatures),
 		DegradedMode:      p.DegradedMode,
+		PoCField:          p.PoCField,
 		Active:            true,
 		Source:            source,
 		SourcePath:        p.SourcePath,

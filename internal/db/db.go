@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -421,7 +422,9 @@ type Scan struct {
 	StartedAt  *time.Time
 	FinishedAt *time.Time
 	CostUSD    float64
-	Turns      int
+	// SessionCostUSD is the highest reported cumulative cost of the harness session.
+	SessionCostUSD float64 `gorm:"not null;default:0"`
+	Turns          int
 	// Token usage from the claude-code result event. CacheWriteTokens is
 	// cache_creation_input_tokens; CacheReadTokens is
 	// cache_read_input_tokens. AutoMigrate adds these as zero-default
@@ -1044,8 +1047,10 @@ type Finding struct {
 	Notes                  []FindingNote           `gorm:"constraint:OnDelete:CASCADE"`
 	Communications         []FindingCommunication  `gorm:"constraint:OnDelete:CASCADE"`
 	References             []FindingReference      `gorm:"constraint:OnDelete:CASCADE"`
+	DisclosureSubmissions  []DisclosureSubmission  `gorm:"constraint:OnDelete:CASCADE" json:"-"`
 	History                []FindingHistory        `gorm:"constraint:OnDelete:CASCADE"`
 	Verifications          []FindingVerification   `gorm:"constraint:OnDelete:CASCADE"`
+	PoC                    *FindingPoC             `gorm:"constraint:OnDelete:CASCADE"`
 	AttackPaths            []FindingAttackPath     `gorm:"constraint:OnDelete:CASCADE"`
 	RemediationAttempts    []RemediationAttempt    `gorm:"constraint:OnDelete:CASCADE"`
 	RemediationValidations []RemediationValidation `gorm:"constraint:OnDelete:CASCADE"`
@@ -1491,6 +1496,8 @@ type Skill struct {
 	RequiresCommands string `gorm:"type:text"`
 	RequiresFeatures string `gorm:"type:text"`
 	DegradedMode     bool
+	// PoCField is set via `scrutineer.poc_field`.
+	PoCField string `gorm:"column:poc_field"`
 
 	Source     string // "bundled" | "local" | "remote" | "ui"
 	SourcePath string // directory on disk (bundled/local/remote) or empty (ui)
@@ -1627,16 +1634,13 @@ func withPragmas(dsn string) string {
 	return dsn + sep + connectionPragmas
 }
 
-// Connect opens a SQLite dsn with the standard pragmas and logger but
-// performs no migration. Open is Connect plus the full migration path.
+// Connect opens dsn with the standard pragmas and logger but performs no
+// migration. Open is Connect plus the full migration path.
 func Connect(dsn string) (*gorm.DB, error) {
-	return ConnectBackend(Options{Dialect: DialectSQLite, DSN: dsn})
+	return connectBackend(Options{Dialect: DialectSQLite, DSN: dsn})
 }
 
-// ConnectBackend connects to the backend named by opts without migrating.
-// SQLite gets the per-connection pragmas appended to its DSN (foreign_keys,
-// busy_timeout, WAL); PostgreSQL takes the DSN verbatim.
-func ConnectBackend(opts Options) (*gorm.DB, error) {
+func connectBackend(opts Options) (*gorm.DB, error) {
 	cfg := &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
 	}
@@ -1657,10 +1661,6 @@ func ConnectBackend(opts Options) (*gorm.DB, error) {
 		return nil, fmt.Errorf("%s: %w", openErr, err)
 	}
 	if opts.Dialect == DialectPostgres {
-		// PostgreSQL rejects NUL bytes / invalid UTF-8 in text columns, which
-		// SQLite accepts. Scrub captured text on every write so a stray byte in
-		// scan/finding/chat output cannot fail the write (and strand a scan in
-		// 'running'). See registerTextSanitizer.
 		if err := registerTextSanitizer(gdb); err != nil {
 			return nil, fmt.Errorf("register text sanitizer: %w", err)
 		}
@@ -1668,25 +1668,28 @@ func ConnectBackend(opts Options) (*gorm.DB, error) {
 	return gdb, nil
 }
 
-// Open connects to a SQLite database at dsn (a file path or in-memory DSN)
-// and runs migrations. It is the historical single-argument entrypoint,
-// retained for tests and any SQLite-only caller; OpenBackend is the
-// config-driven path that also handles PostgreSQL.
 func Open(dsn string) (*gorm.DB, error) {
 	return OpenBackend(Options{Dialect: DialectSQLite, DSN: dsn})
 }
 
-// OpenBackend connects to the backend named by opts, then runs the
-// pre-migration fixups, AutoMigrate, and creates the extra composite indexes.
-// AutoMigrate is dialect-portable, so the same model set builds the schema on
-// either backend. The PRAGMA-based schema version stamp is SQLite-only and is
-// skipped on PostgreSQL.
+// OpenBackend connects to the selected backend and applies its schema migrations.
 func OpenBackend(opts Options) (*gorm.DB, error) {
-	gdb, err := ConnectBackend(opts)
+	gdb, err := connectBackend(opts)
 	if err != nil {
 		return nil, err
 	}
-	if err := migrateSchema(gdb); err != nil {
+	if opts.Dialect == DialectPostgres {
+		err = gdb.Transaction(func(tx *gorm.DB) error {
+			// Hold the lock through every schema check and DDL statement.
+			if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", postgresMigrationLock).Error; err != nil {
+				return err
+			}
+			return migrate(tx)
+		})
+	} else {
+		err = migrate(gdb)
+	}
+	if err != nil {
 		if sqldb, dbErr := gdb.DB(); dbErr == nil {
 			_ = sqldb.Close()
 		}
@@ -1695,25 +1698,46 @@ func OpenBackend(opts Options) (*gorm.DB, error) {
 	return gdb, nil
 }
 
-// migrateSchema brings gdb up to databaseSchemaVersion. The PRAGMA-based
-// schema version stamp is SQLite-only and is skipped on PostgreSQL.
-func migrateSchema(gdb *gorm.DB) error {
-	isSQLite := gdb.Name() != string(DialectPostgres)
-	foundSchemaVersion := databaseSchemaVersion
-	if isSQLite {
-		var err error
-		foundSchemaVersion, err = checkDatabaseSchemaVersion(gdb)
-		if err != nil {
-			return err
-		}
+const postgresMigrationLock int64 = 0x736372757469
+const postgresSchemaVersionKey = "database_schema_version"
+
+// Models lists every GORM model the schema migrates.
+func Models() []any {
+	return []any{
+		&Repository{}, &Scan{},
+		&Finding{}, &FindingLabel{}, &FindingNote{}, &DisclosureSubmission{},
+		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{}, &FeedbackConfirmation{}, &FindingVerification{}, &FindingAttackPath{}, &ScanPreflightReceipt{},
+		&RemediationAttempt{}, &RemediationValidation{}, &AuditEvent{}, &FindingPoC{},
+		&Dependency{}, &ExpectedFinding{}, &Package{}, &PackageAlternative{}, &Dependent{}, &FindingDependent{}, &Advisory{}, &AdvisoryAudit{},
+		&Maintainer{}, &Skill{}, &Subproject{}, &ComplianceControl{},
+		&SBOMUpload{}, &SBOMPackage{}, &CNA{}, &Setting{},
+		&Conversation{}, &ChatMessage{}, &InterchangeRecord{},
+	}
+}
+
+func migrate(gdb *gorm.DB) error {
+	foundSchemaVersion, err := checkDatabaseSchemaVersion(gdb)
+	if err != nil {
+		return err
 	}
 	if err := preMigrate(gdb); err != nil {
 		return fmt.Errorf("premigrate: %w", err)
 	}
-	if err := migrate(gdb); err != nil {
+	if gdb.Name() == string(DialectPostgres) && !gdb.Migrator().HasTable(&Scan{}) {
+		// Create both sides of the scans/findings cycle before adding foreign keys.
+		gdb.DisableForeignKeyConstraintWhenMigrating = true
+		err := gdb.AutoMigrate(Models()...)
+		gdb.DisableForeignKeyConstraintWhenMigrating = false
+		if err != nil {
+			return fmt.Errorf("automigrate tables: %w", err)
+		}
+	}
+	if err := gdb.AutoMigrate(Models()...); err != nil {
 		return fmt.Errorf("automigrate: %w", err)
 	}
-	gdb.Exec(`CREATE INDEX IF NOT EXISTS idx_scans_priority_id ON scans (status_priority, id DESC)`)
+	if err := gdb.Exec(`CREATE INDEX IF NOT EXISTS idx_scans_priority_id ON scans (status_priority, id DESC)`).Error; err != nil {
+		return err
+	}
 	// Subproject identity is (repository_id, path): the upsert in
 	// parseSubprojectsOutput keys on it so ids stay stable across skill
 	// re-runs (Package/Advisory.SubprojectID reference them). Collapse any
@@ -1724,10 +1748,17 @@ func migrateSchema(gdb *gorm.DB) error {
 	// and re-running the full-table dedup scan on every boot would be wasted
 	// work.
 	if !gdb.Migrator().HasIndex(&Subproject{}, "idx_subprojects_repo_path") {
-		gdb.Exec(`DELETE FROM subprojects WHERE id NOT IN (SELECT MIN(id) FROM subprojects GROUP BY repository_id, path)`)
-		gdb.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_subprojects_repo_path ON subprojects (repository_id, path)`)
+		if err := gdb.Exec(`DELETE FROM subprojects WHERE id NOT IN (SELECT MIN(id) FROM subprojects GROUP BY repository_id, path)`).Error; err != nil {
+			return err
+		}
+		if err := gdb.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_subprojects_repo_path ON subprojects (repository_id, path)`).Error; err != nil {
+			return err
+		}
 	}
-	if isSQLite && foundSchemaVersion < databaseSchemaVersion {
+	if foundSchemaVersion < databaseSchemaVersion {
+		if gdb.Name() == string(DialectPostgres) {
+			return SetSetting(gdb, postgresSchemaVersionKey, strconv.Itoa(databaseSchemaVersion))
+		}
 		if err := gdb.Exec(fmt.Sprintf("PRAGMA user_version = %d", databaseSchemaVersion)).Error; err != nil {
 			return fmt.Errorf("record database schema version: %w", err)
 		}
@@ -1735,44 +1766,22 @@ func migrateSchema(gdb *gorm.DB) error {
 	return nil
 }
 
-// models is the full set AutoMigrate manages, parents ahead of children.
-// scans.finding_id and findings.scan_id reference each other, so the set
-// contains a foreign-key cycle no ordering can linearise.
-func models() []any {
-	return []any{
-		&Repository{}, &Scan{},
-		&Finding{}, &FindingLabel{}, &FindingNote{},
-		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{}, &FindingVerification{}, &FindingAttackPath{}, &ScanPreflightReceipt{},
-		&RemediationAttempt{}, &RemediationValidation{}, &AuditEvent{},
-		&Dependency{}, &ExpectedFinding{}, &Package{}, &PackageAlternative{}, &Dependent{}, &FindingDependent{}, &Advisory{}, &AdvisoryAudit{},
-		&Maintainer{}, &Skill{}, &Subproject{}, &ComplianceControl{},
-		&SBOMUpload{}, &SBOMPackage{}, &CNA{}, &Setting{},
-		&Conversation{}, &ChatMessage{}, &InterchangeRecord{},
-	}
-}
-
-// migrate runs AutoMigrate over every model. SQLite migrates in one pass:
-// it accepts an inline REFERENCES to a table created later, so the
-// scans<->findings foreign-key cycle is fine. PostgreSQL rejects a forward
-// reference at CREATE TABLE, so it takes two passes — first create every
-// table with foreign-key constraints suppressed, then a second pass that
-// adds the constraints now that all tables exist. The end state (all tables,
-// all FKs, cascade deletes) is identical on both backends.
-func migrate(gdb *gorm.DB) error {
-	if gdb.Name() == string(DialectPostgres) {
-		gdb.DisableForeignKeyConstraintWhenMigrating = true
-		err := gdb.AutoMigrate(models()...)
-		gdb.DisableForeignKeyConstraintWhenMigrating = false
-		if err != nil {
-			return err
-		}
-	}
-	return gdb.AutoMigrate(models()...)
-}
-
 func checkDatabaseSchemaVersion(gdb *gorm.DB) (int, error) {
 	var found int
-	if err := gdb.Raw("PRAGMA user_version").Scan(&found).Error; err != nil {
+	var err error
+	if gdb.Name() == string(DialectPostgres) {
+		if !gdb.Migrator().HasTable(&Setting{}) {
+			return 0, nil
+		}
+		var setting Setting
+		err = gdb.Where("key = ?", postgresSchemaVersionKey).Limit(1).Find(&setting).Error
+		if err == nil && setting.Value != "" {
+			found, err = strconv.Atoi(setting.Value)
+		}
+	} else {
+		err = gdb.Raw("PRAGMA user_version").Scan(&found).Error
+	}
+	if err != nil {
 		return 0, fmt.Errorf("read database schema version: %w", err)
 	}
 	if found > databaseSchemaVersion {
@@ -2185,9 +2194,8 @@ type Subproject struct {
 	ID           uint `gorm:"primarykey"`
 	RepositoryID uint `gorm:"index;not null"`
 
-	// Path is the sub-folder within the clone, relative to root. Empty
-	// is not allowed — the root case is represented by absence of any
-	// Subproject row, not by a Subproject with Path "".
+	// Path is relative to the clone root. "." identifies a root package;
+	// its scans use the empty SubPath shared by repository-wide scans.
 	Path string `gorm:"not null"`
 	// Name is a short human label ("airflow-core", "cli", ...). Falls
 	// back to the last segment of Path when the skill cannot infer one.
@@ -2208,6 +2216,13 @@ type Subproject struct {
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+func (s Subproject) ScanSubPath() string {
+	if s.Path == "." {
+		return ""
+	}
+	return s.Path
 }
 
 // EnsureSubproject records a monorepo sub-package an operator submitted
@@ -2239,11 +2254,12 @@ func EnsureSubproject(gdb *gorm.DB, repoID uint, subPath string) error {
 // single-package repo (no sub-path, or no per-subproject channel) behaves
 // exactly as before. Empty when neither is set.
 func EffectiveDisclosureChannel(gdb *gorm.DB, repoID uint, subPath string) string {
-	if subPath != "" {
-		var sub Subproject
-		if err := gdb.Where("repository_id = ? AND path = ?", repoID, subPath).First(&sub).Error; err == nil && sub.DisclosureChannel != "" {
-			return sub.DisclosureChannel
-		}
+	if subPath == "" {
+		subPath = "."
+	}
+	var sub Subproject
+	if err := gdb.Where("repository_id = ? AND path = ?", repoID, subPath).First(&sub).Error; err == nil && sub.DisclosureChannel != "" {
+		return sub.DisclosureChannel
 	}
 	var repo Repository
 	if err := gdb.Select("disclosure_channel").First(&repo, repoID).Error; err != nil {

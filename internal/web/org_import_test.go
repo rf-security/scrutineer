@@ -26,7 +26,7 @@ var orgRepoFixture = []OrgRepo{
 func postOrgImport(t *testing.T, s *Server, form url.Values) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest("POST", "/repositories/org", strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -102,7 +102,7 @@ func TestOrgImport_previewHXSwapsConfirmStep(t *testing.T) {
 	s.fetchOrgRepos = func(context.Context, string) ([]OrgRepo, error) { return orgRepoFixture, nil }
 
 	req := httptest.NewRequest("POST", "/repositories/org", strings.NewReader(url.Values{"org": {"acme"}}.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("HX-Request", "true")
 	w := httptest.NewRecorder()
@@ -282,7 +282,7 @@ func TestOrgImport_dialogReachable(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/", nil)
-	req.Host = testHost
+	asOperator(req)
 	s.Handler().ServeHTTP(w, req)
 	body := w.Body.String()
 	for _, want := range []string{
@@ -303,7 +303,7 @@ func TestRepoNew_rendersOrgForm(t *testing.T) {
 	defer done()
 
 	req := httptest.NewRequest("GET", "/repositories/new?org=1", nil)
-	req.Host = testHost
+	asOperator(req)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusOK {

@@ -54,7 +54,7 @@ func TestAuditPage_listsQueueAndAgreementRate(t *testing.T) {
 	s.DB.Create(&other)
 
 	r := httptest.NewRequest(http.MethodGet, "/audit", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -86,7 +86,7 @@ func TestApiAddFindingReview_notReachableWithScanToken(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost,
 		"/api/findings/"+strconv.Itoa(int(f.ID))+"/reviews",
 		strings.NewReader(`{"verdict":"true_positive","reason":"actually exploitable","reviewer":"andrew"}`))
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer T1")
 	w := httptest.NewRecorder()
@@ -120,7 +120,7 @@ func TestApiAuditMetrics_returnsAggregate(t *testing.T) {
 	_, _ = db.AddFindingReview(s.DB, b.ID, "true_positive", "", "false_positive", "andrew")
 
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/audit/metrics", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -199,11 +199,24 @@ func TestApiAudit_notReachableFromScanContainer(t *testing.T) {
 		}
 	}
 
+	// A scan that forges a loopback Host still holds only its own bearer,
+	// which the operator gate refuses.
+	for _, path := range []string{"/api/v1/audit/queue", "/api/v1/findings", "/api/v1/repositories"} {
+		r := httptest.NewRequest("GET", path, nil)
+		r.Host = testHost
+		r.Header.Set("Authorization", "Bearer "+tok)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s with a scan token and loopback Host: status = %d, want 401", path, w.Code)
+		}
+	}
+
 	// The per-scan bearer API no longer routes these at all, so a valid
 	// scan token gets a 404 rather than instance-wide findings.
 	for _, path := range []string{"/api/audit/queue", "/api/audit/metrics"} {
 		r := httptest.NewRequest("GET", path, nil)
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Authorization", "Bearer "+tok)
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)
@@ -216,7 +229,7 @@ func TestApiAudit_notReachableFromScanContainer(t *testing.T) {
 func TestApiAuditQueue(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
-	f, tok := seedAuditFixture(t, s)
+	f, _ := seedAuditFixture(t, s)
 
 	// A High-severity finding with no other audit signal does not qualify.
 	high := db.Finding{ScanID: f.ScanID, RepositoryID: f.RepositoryID, Title: "high", Severity: "High"}
@@ -232,7 +245,7 @@ func TestApiAuditQueue(t *testing.T) {
 		t.Fatalf("seed review: %v", err)
 	}
 
-	w := apiReq(t, s, "GET", "/api/v1/audit/queue", tok, "")
+	w := apiReq(t, s, "GET", "/api/v1/audit/queue", testOperatorToken, "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d; body=%s", w.Code, w.Body)
 	}
@@ -253,7 +266,7 @@ func TestApiAuditQueue(t *testing.T) {
 	}
 
 	// limit applies.
-	w = apiReq(t, s, "GET", "/api/v1/audit/queue?limit=1", tok, "")
+	w = apiReq(t, s, "GET", "/api/v1/audit/queue?limit=1", testOperatorToken, "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("limit=1 status = %d; body=%s", w.Code, w.Body)
 	}
@@ -268,7 +281,7 @@ func TestApiAuditQueue(t *testing.T) {
 	// sub-day cutoffs across timezones are unreliable; use date-level
 	// boundaries here so the comparison holds regardless of encoding.
 	countAt := func(since string) int {
-		w := apiReq(t, s, "GET", "/api/v1/audit/queue?since="+url.QueryEscape(since), tok, "")
+		w := apiReq(t, s, "GET", "/api/v1/audit/queue?since="+url.QueryEscape(since), testOperatorToken, "")
 		if w.Code != http.StatusOK {
 			t.Fatalf("since=%s status = %d; body=%s", since, w.Code, w.Body)
 		}

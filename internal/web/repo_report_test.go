@@ -69,7 +69,7 @@ func seedRepoWithReport(t *testing.T, s *Server) db.Repository {
 		t.Fatal(err)
 	}
 	if _, err := db.AddFindingCommunication(s.DB, finding.ID, "email", "outbound",
-		"security@acme.example", "Initial report email body", "pr", now); err != nil {
+		"security@acme.example", "Initial report email body", "pr", now, db.SourceAnalyst); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.AddFindingReference(s.DB, finding.ID,

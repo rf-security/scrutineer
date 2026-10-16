@@ -269,7 +269,7 @@
         </form>
         {{end}}
       </div>
-      <p class="text-sm text-muted-foreground mb-2">Detected scannable units inside this repository. Each can be scanned independently with its own findings stream.</p>
+      <p class="text-sm text-muted-foreground mb-2">Detected packages in this repository, including any root package with code outside its subprojects. Root scans retain the whole repository and its build configuration.</p>
       <table class="table w-full mb-6">
         <thead><tr>
           <th class="w-48">Path</th>
@@ -283,14 +283,14 @@
         {{$counts := .SubScanCount}}
         {{range .Subprojects}}
           <tr>
-            <td><a class="hover:underline" href="/repositories/{{$repoID}}/subprojects/{{.ID}}"><code class="text-xs">{{.Path}}</code></a>{{if and .Name (ne .Name .Path)}}<div class="text-xs text-muted-foreground">{{.Name}}</div>{{end}}</td>
+            <td><a class="hover:underline" href="/repositories/{{$repoID}}/subprojects/{{.ID}}"><code class="text-xs">{{if eq .Path "."}}root{{else}}{{.Path}}{{end}}</code></a>{{if and .Name (ne .Name .Path)}}<div class="text-xs text-muted-foreground">{{.Name}}</div>{{end}}</td>
             <td>{{if .Kind}}<span class="badge-outline text-xs">{{.Kind}}</span>{{end}}</td>
             <td class="whitespace-normal text-sm text-muted-foreground">{{.Description}}</td>
-            <td class="text-right text-sm text-muted-foreground">{{index $counts .Path}}</td>
+            <td class="text-right text-sm text-muted-foreground">{{index $counts .ScanSubPath}}</td>
             <td>
               {{if not $.Sharing}}
               <form method="post" action="/repositories/{{$repoID}}/scan" hx-post="/repositories/{{$repoID}}/scan" hx-swap="none">
-                <input type="hidden" name="sub_path" value="{{.Path}}">
+                <input type="hidden" name="sub_path" value="{{.ScanSubPath}}">
                 <button type="submit" class="btn-sm-outline"><i data-lucide="play"></i> Scan</button>
               </form>
               {{end}}
@@ -350,7 +350,7 @@
               action="/repositories/{{.Repo.ID}}/verify-all{{if .Category}}?category={{.Category}}{{end}}"
               hx-post="/repositories/{{.Repo.ID}}/verify-all{{if .Category}}?category={{.Category}}{{end}}"
               hx-swap="none"
-              hx-confirm="Enqueue a verification job for {{.NewFindingCount}} finding(s) awaiting verification?">
+              hx-confirm="Enqueue a verification scan for {{.NewFindingCount}} finding(s) awaiting verification?">
           <button type="submit" class="btn-outline">
             <i data-lucide="shield-check"></i> Verify all new ({{.NewFindingCount}})
           </button>
@@ -784,7 +784,9 @@
 {{define "scan-row"}}{{with .S}}
   <tr id="scan-{{.ID}}"{{if $.OOB}} hx-swap-oob="true"{{end}}>
     <td><a href="/scans/{{.ID}}">{{.ID}}</a></td>
-    <td>{{if .SkillName}}{{.SkillName}}{{else}}{{.Kind}}{{end}} {{template "branch-tag" .Ref}}{{if eq .RescanMode "diff"}} <span class="badge-outline text-xs">diff</span>{{end}} {{template "focus-tag" (focus .)}}</td>
+    <td>{{if .SkillName}}{{.SkillName}}{{else}}{{.Kind}}{{end}} {{template "branch-tag" .Ref}}{{if eq .RescanMode "diff"}} <span class="badge-outline text-xs">diff</span>{{end}} {{template "focus-tag" (focus .)}}
+      {{if .SubPath}}<div class="text-xs text-muted-foreground">Subpath: <code>{{.SubPath}}</code></div>{{end}}
+    </td>
     <td>{{template "status-badge" (status .Status)}} {{if .MaxTurnsHit}}<span class="badge-outline"><i data-lucide="timer-off"></i> max turns</span>{{end}}{{if .RefusalAuditWarning}} <span class="badge-outline" data-tooltip="The deep-dive reported refused or skipped analysis"><i data-lucide="triangle-alert"></i> analysis incomplete</span>{{end}}</td>
     <td>{{if gt .FindingsCount 0}}{{template "findings-badge" .FindingsCount}}{{end}}</td>
     <td class="text-muted-foreground">{{if .Model}}{{.Model}}{{else}}-{{end}}</td>

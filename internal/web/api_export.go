@@ -26,9 +26,11 @@ const exportPrefix = "/api/v1"
 func (s *Server) exportHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("DELETE /repositories/{id}", s.apiDeleteRepository)
+	mux.HandleFunc("GET /repositories/{id}", s.apiExportRepository)
 	mux.HandleFunc("GET /repositories/{id}/findings", s.apiExportRepoFindings)
 	mux.HandleFunc("GET /repositories", s.apiExportRepositories)
 	mux.HandleFunc("DELETE /findings/{id}", s.apiDeleteFinding)
+	mux.HandleFunc("GET /findings/{id}", s.apiExportFinding)
 	mux.HandleFunc("GET /findings", s.apiExportFindings)
 	mux.HandleFunc("GET /scans", s.apiExportScans)
 	mux.HandleFunc("POST /import", s.handleImport)
@@ -155,7 +157,49 @@ func (s *Server) apiExportRepositories(w http.ResponseWriter, r *http.Request) {
 	if !validateExportFormat(w, r) {
 		return
 	}
-	q := s.DB.Table("repositories").
+	q := s.repositoryExportQuery().Order("repositories.updated_at desc")
+	streamJSONL(w, q, s.Log, repositoryExport)
+}
+
+// apiExportRepository returns one repository with the same shape as a line of
+// the repositories JSONL export.
+func (s *Server) apiExportRepository(w http.ResponseWriter, r *http.Request) {
+	if !validateExportFormat(w, r) {
+		return
+	}
+	id, ok := exportPathID(w, r, "repository")
+	if !ok {
+		return
+	}
+	var rows []repositoryExportRow
+	if err := s.repositoryExportQuery().Where("repositories.id = ?", id).Limit(1).Scan(&rows).Error; err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(rows) == 0 {
+		writeAPIError(w, http.StatusNotFound, "repository not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, repositoryExport(rows[0]))
+}
+
+// apiExportFinding returns one finding with the same shape as a line of the
+// findings JSONL export.
+func (s *Server) apiExportFinding(w http.ResponseWriter, r *http.Request) {
+	if !validateExportFormat(w, r) {
+		return
+	}
+	finding, ok := s.loadExportFindingByID(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, findingExport(finding))
+}
+
+// repositoryExportQuery selects the repositoryExportRow projection shared by
+// the repositories export and the single-repository read.
+func (s *Server) repositoryExportQuery() *gorm.DB {
+	return s.DB.Table("repositories").
 		Select(`repositories.id,
 			repositories.url,
 			repositories.name,
@@ -178,15 +222,13 @@ func (s *Server) apiExportRepositories(w http.ResponseWriter, r *http.Request) {
 			WHERE repository_id = repositories.id
 			ORDER BY id DESC
 			LIMIT 1
-		)`).
-		Order("repositories.updated_at desc")
-	streamJSONL(w, q, s.Log, repositoryExport)
+		)`)
 }
 
 func (s *Server) apiExportRepoFindings(w http.ResponseWriter, r *http.Request) {
 	format := r.URL.Query().Get("format")
-	if format != "" && format != "jsonl" && format != "bundle" {
-		writeAPIError(w, http.StatusBadRequest, "unsupported format: jsonl or bundle")
+	if format != "" && format != "jsonl" && format != "bundle" && format != "sarif" {
+		writeAPIError(w, http.StatusBadRequest, "unsupported format: jsonl, bundle or sarif")
 		return
 	}
 	// encrypt only applies to the bundle format. Rejecting it here is a
@@ -197,7 +239,7 @@ func (s *Server) apiExportRepoFindings(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "encrypt requires format=bundle")
 		return
 	}
-	// scope=findings curates either format to the Findings bucket (deep-dive,
+	// scope=findings curates every format to the Findings bucket (deep-dive,
 	// vuln-scan, imports), dropping per-repo scanner noise. Unknown values are
 	// rejected rather than silently returning the full set a caller asked to
 	// narrow.
@@ -228,6 +270,10 @@ func (s *Server) apiExportRepoFindings(w http.ResponseWriter, r *http.Request) {
 
 	if format == "bundle" {
 		s.apiExportRepoBundle(w, r, &repo)
+		return
+	}
+	if format == "sarif" {
+		s.apiExportRepoSARIF(w, r, &repo)
 		return
 	}
 	q := s.DB.Model(&db.Finding{}).
@@ -650,6 +696,9 @@ func (s *Server) apiExportScans(w http.ResponseWriter, r *http.Request) {
 }
 
 func scanExportSince(q *gorm.DB, since time.Time) *gorm.DB {
+	if q.Name() == string(db.DialectPostgres) {
+		return q.Where("created_at >= ?", since)
+	}
 	// SQLite timestamps retain local offsets. Compare seconds and the fraction
 	// separately: text ordering ignores offsets, while julianday loses nanoseconds.
 	return q.Where(`(unixepoch(created_at),
@@ -724,9 +773,13 @@ func applyFindingFilters(q *gorm.DB, r *http.Request) *gorm.DB {
 	}
 	// sub_path narrows an export to a single monorepo sub-package, so a repo
 	// like rails/rails can be exported (or bundled/encrypted) one gem at a
-	// time. Empty means the whole repository, as before.
+	// time. "." selects root-scoped findings; empty includes all scopes.
 	if v := strings.TrimSpace(params.Get("sub_path")); v != "" {
-		q = q.Where("sub_path = ?", v)
+		if v == "." {
+			q = q.Where("sub_path = '' OR sub_path IS NULL")
+		} else {
+			q = q.Where("sub_path = ?", v)
+		}
 	}
 	// scope=findings curates to the bucket the Findings tab shows; the callers
 	// validate the value.
@@ -812,38 +865,63 @@ func findingExport(f db.Finding) map[string]any {
 		"severity":                        f.Severity,
 		"severity_caps":                   f.SeverityCapList(),
 		"severity_calibration_incomplete": f.SeverityCalibrationIncomplete,
+		"confidence":                      f.Confidence,
 		statusKey:                         string(f.Status),
 		"cwe":                             f.CWE,
 		"location":                        f.Location,
+		"locations":                       f.Locations,
+		"snippet":                         f.Snippet,
 		"vid":                             f.VID,
 		"affected":                        f.Affected,
 		"reachability":                    f.Reachability,
 		"quality_tier":                    f.QualityTier,
+		"imported_from":                   f.ImportedFrom,
 		"cve_id":                          f.CVEID,
 		"ghsa_id":                         f.GHSAID,
 		"cvss_vector":                     f.CVSSVector,
 		"cvss_score":                      f.CVSSScore,
+		"cvss_v4_vector":                  f.CVSSv4Vector,
+		"cvss_v4_score":                   f.CVSSv4Score,
 		"fix_version":                     f.FixVersion,
 		"fix_commit":                      f.FixCommit,
+		"released_at":                     f.ReleasedAt,
+		"release_tag":                     f.ReleaseTag,
+		"release_url":                     f.ReleaseURL,
 		"resolution":                      string(f.Resolution),
 		"disclosure_draft":                f.DisclosureDraft,
 		"disclosure_title":                f.DisclosureTitle,
 		"suggested_recipients":            f.SuggestedRecipients,
+		"federation_claim_contacts":       f.FederationClaimContacts,
+		"federation_claim_at":             f.FederationClaimAt,
 		"assignee":                        f.Assignee,
+		"last_revalidate_verdict":         f.LastRevalidateVerdict,
+		"production_viability":            f.ProductionViability,
+		"novelty":                         string(f.Novelty),
+		"novelty_checked_commit":          f.NoveltyCheckedCommit,
+		"novelty_checked_at":              f.NoveltyCheckedAt,
+		"suggested_fix":                   f.SuggestedFix,
+		"suggested_fix_commit":            f.SuggestedFixCommit,
+		"breaking_change":                 f.BreakingChange,
+		"breaking_change_rationale":       f.BreakingChangeRationale,
+		"exploited_in_wild":               f.ExploitedInWild,
+		"exploited_in_wild_evidence":      f.ExploitedInWildEvidence,
+		"mitigation":                      f.Mitigation,
+		"mitigation_semgrep":              f.MitigationSemgrep,
 		"trace":                           f.Trace,
 		"boundary":                        f.Boundary,
 		"validation":                      f.Validation,
 		"prior_art":                       f.PriorArt,
 		"reach":                           f.Reach,
 		"rating":                          f.Rating,
+		"dup_check":                       f.DupCheck,
 		"created_at":                      f.CreatedAt,
 		"updated_at":                      f.UpdatedAt,
 	}
 }
 
 // scanExport mirrors db.Scan's columns minus APIToken: the bearer is the
-// running scan's auth credential and must never leak through an
-// unauthenticated channel.
+// running scan's auth credential, scoped to that scan, and must never leave
+// the instance, even to an operator-authenticated caller.
 func scanExport(sc db.Scan) map[string]any {
 	out := map[string]any{
 		"id":                 sc.ID,

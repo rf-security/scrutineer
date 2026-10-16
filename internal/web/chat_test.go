@@ -60,7 +60,7 @@ func seedRepo(t *testing.T, s *Server) db.Repository {
 func getPage(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	r := httptest.NewRequest("GET", path, nil)
-	r.Host = testHost
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	return w
@@ -172,7 +172,7 @@ func TestStartConversationWithoutRepoRedirects(t *testing.T) {
 	// page back with an error, not a bare database message on a dead-end page.
 	r := httptest.NewRequest("POST", "/findings/1/conversations", strings.NewReader("message=hi"))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.Host = testHost
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.startConversation(w, r, 0, nil, "/findings/1")
 
@@ -421,7 +421,7 @@ func TestEventsAnnouncesFinishedTurnOnConnect(t *testing.T) {
 func getEvents(t *testing.T, s *Server, convID uint) *httptest.ResponseRecorder {
 	t.Helper()
 	r := httptest.NewRequest("GET", fmt.Sprintf("/events?conv=%d", convID), nil)
-	r.Host = testHost
+	asOperator(r)
 	ctx, cancel := context.WithCancel(r.Context())
 	cancel()
 	w := httptest.NewRecorder()

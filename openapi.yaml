@@ -12,9 +12,10 @@ info:
     is only valid while its originating scan is running, and only grants
     access to the repository the scan was issued against.
 
-    The `/v1/*` paths are an unauthenticated, localhost-only export surface
-    intended for external scripts (jq, cron, CI dumps). They emit JSONL and
-    rely on the same host-header check as the browser UI; see threatmodel.md.
+    The `/v1/*` paths are the operator's localhost-only export, import and
+    delete surface, intended for external scripts (jq, cron, CI dumps). They
+    require the operator token from `<data>/operator-token` and the same
+    host-header check as the browser UI; see docs/api.md and threatmodel.md.
 
 servers:
   - url: http://127.0.0.1:8080/api
@@ -33,7 +34,8 @@ paths:
 
         Two ways in. From localhost it is unauthenticated, because a caller
         discovering the API has no running scan to take a bearer token from;
-        the host check is the boundary, as on the browser UI. A skill inside
+        the host check is the boundary, without the operator token the
+        browser UI requires. A skill inside
         the runner container cannot pass that check -- it reaches the server
         through the egress proxy on the host endpoint `api_base` advertises,
         which forwards the original `Host` -- so it authenticates with the
@@ -362,10 +364,13 @@ paths:
         Records a single finding emitted mid-scan so sibling scans in the same
         `scan_group` can read it before this scan completes. The body is one
         finding in the same shape it has in the skill's `report.json`; the
-        scan's identity (scan id, repository, commit, sub-path) is stamped from
+        scan's identity (scan id, repository, commit, subpath) is stamped from
         the bearer token, never trusted from the body. The finding still
         belongs in the final `report.json`, which reconciles against the
         streamed row by fingerprint rather than duplicating it.
+        If PoC capture fails, the finding is still saved and the 201 response
+        includes `poc_capture_error`. Correct the files and publish again to
+        retry capture.
       operationId: streamRepositoryFinding
       parameters:
         - $ref: '#/components/parameters/RepositoryID'
@@ -628,10 +633,11 @@ paths:
         FindingReview row. Spot-check the queue to keep automated triage
         calibrated.
 
-        Instance-wide and unauthenticated; relies on the host-only
-        boundary like the other `/v1/*` exports. Not reachable with a
+        Instance-wide; requires the operator token like the other
+        `/v1/*` exports. Not reachable with a
         per-scan bearer token.
       operationId: getAuditQueue
+      security: [{ operatorToken: [] }]
       parameters:
         - name: limit
           in: query
@@ -657,9 +663,10 @@ paths:
         agreements between human verdict and automation, and the
         agreement rate (0..1). The audit page renders the same numbers.
 
-        Instance-wide and unauthenticated; relies on the host-only
-        boundary like the other `/v1/*` exports.
+        Instance-wide; requires the operator token like the other
+        `/v1/*` exports.
       operationId: getAuditMetrics
+      security: [{ operatorToken: [] }]
       responses:
         '200':
           description: OK
@@ -739,6 +746,47 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/FindingReference' }
+
+  /findings/{id}/submissions:
+    post:
+      summary: Record a report a skill filed with an outside recipient
+      description: |
+        Records a GitHub private vulnerability report filed by the report-upstream skill. In one write it stores
+        the submission with the report as sent, adds a ghsa-upstream reference and an outbound communication,
+        moves a finding not yet reported to reported, and logs disclosure.pvr_submitted. Requires a scan token
+        scoped to the finding.
+      operationId: recordFindingSubmission
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, external_id, url, body, request]
+              properties:
+                channel: { type: string, enum: [pvr] }
+                endpoint: { type: string, description: Where the report was sent. }
+                external_id: { type: string, description: The GHSA ID. }
+                url: { type: string, description: The advisory page. }
+                summary: { type: string, description: Summary for the reference. }
+                actor: { type: string }
+                body: { type: string, description: The outbound communication text. }
+                request: { type: object, description: The report body exactly as sent. }
+                response: { type: object, description: The recipient response. }
+      responses:
+        '201':
+          description: Created
+        '403':
+          description: The scan token is not scoped to this finding.
+        '412':
+          description: The finding is not viable for disclosure.
+        '422':
+          description: Missing fields or a channel other than pvr.
 
   /findings/{id}/labels:
     put:
@@ -975,9 +1023,9 @@ paths:
         repository columns, the latest scan summary, and the same curated
         findings count shown in the UI. Large metadata and ecosystems cache
         blobs are intentionally omitted to keep the payload suitable for
-        automation. No bearer token; localhost-only.
+        automation. Operator token; localhost-only.
       operationId: exportRepositories
-      security: []
+      security: [{ operatorToken: [] }]
       parameters:
         - name: format
           in: query
@@ -994,6 +1042,26 @@ paths:
           description: Host header is not localhost
 
   /v1/repositories/{id}:
+    get:
+      summary: Get one repository
+      description: |
+        Returns one repository with the same shape as a line of the
+        repositories JSONL export: selected scalar columns, the latest scan
+        summary and the curated findings count. Operator token;
+        localhost-only. Not reachable with a per-scan bearer token.
+      operationId: getRepositoryExport
+      security: [{ operatorToken: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RepositoryID'
+      responses:
+        '200':
+          description: The repository.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepositoryExport' }
+        '400': { description: 'Invalid repository id, or an unsupported `format` or an `encrypt`, `scope` or `include` query value' }
+        '403': { description: Host header is not localhost }
+        '404': { description: Repository not found }
     delete:
       summary: Delete a repository and its linked data
       description: |
@@ -1003,7 +1071,7 @@ paths:
         cleanup path as the browser delete action. Not reachable with a
         per-scan bearer token.
       operationId: deleteRepository
-      security: []
+      security: [{ operatorToken: [] }]
       parameters:
         - $ref: '#/components/parameters/RepositoryID'
       responses:
@@ -1016,7 +1084,7 @@ paths:
 
   /v1/repositories/{id}/findings:
     get:
-      summary: Export findings for a repository (JSONL, or a shareable bundle)
+      summary: Export findings for a repository (JSONL, a shareable bundle, or SARIF)
       description: |
         With `format=jsonl` (the default) returns one JSON object per line
         (`application/x-ndjson`), each a `FindingExport` carrying the full set
@@ -1040,20 +1108,28 @@ paths:
         snippet embeds verbatim source, which a cross-party share must not leak.
 
         Adding `encrypt=1` (bundle only) wraps the bundle in armored age,
-        encrypted to every configured recipient. Adding `scope=findings` (either
+        encrypted to every configured recipient. Adding `scope=findings` (any
         format) curates the export to the Findings bucket (deep-dive and
         vuln-scan audits plus operator imports), dropping per-repo scanner
-        noise. No bearer token; localhost-only.
+        noise.
+
+        With `format=sarif` returns one SARIF 2.1.0 log with a run per
+        observed revision. Disclosure drafts, recipients, notes and
+        communications are never included, and each result records its latest
+        `verify` outcome (or `unverified`) apart from the audit's own evidence.
+        See docs/sarif-export.md for the field mapping. Operator token;
+        localhost-only.
       operationId: exportRepositoryFindings
-      security: []
+      security: [{ operatorToken: [] }]
       parameters:
         - $ref: '#/components/parameters/RepositoryID'
         - name: format
           in: query
           description: |
             `jsonl` (default) streams NDJSON; `bundle` returns one JSON sharing
-            document. Other values get a 400.
-          schema: { type: string, enum: [jsonl, bundle] }
+            document; `sarif` returns one SARIF 2.1.0 log. Other values get a
+            400.
+          schema: { type: string, enum: [jsonl, bundle, sarif] }
         - name: encrypt
           in: query
           description: |
@@ -1064,7 +1140,7 @@ paths:
         - name: scope
           in: query
           description: |
-            `findings` curates a `jsonl` or `bundle` export to the Findings
+            `findings` curates a `jsonl`, `bundle` or `sarif` export to the Findings
             bucket (deep-dive and vuln-scan audits plus operator imports),
             excluding per-repo scanner noise. It combines with `severity` and
             `status`. Any other value, or use on the cross-repo
@@ -1094,13 +1170,18 @@ paths:
         '200':
           description: |
             JSONL stream (`format=jsonl`), a JSON sharing bundle
-            (`format=bundle`), or armored age ciphertext
-            (`format=bundle&encrypt=1`).
+            (`format=bundle`), a SARIF 2.1.0 log (`format=sarif`), or armored
+            age ciphertext (`format=bundle&encrypt=1`).
           content:
             application/x-ndjson:
               schema: { $ref: '#/components/schemas/FindingExport' }
             application/json:
-              schema: { $ref: '#/components/schemas/ImportMinimal' }
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ImportMinimal'
+                  - type: object
+                    description: SARIF 2.1.0 log (`format=sarif`), valid against the OASIS sarif-schema-2.1.0.json.
+                    required: [version, runs]
             text/plain:
               schema:
                 type: string
@@ -1116,11 +1197,11 @@ paths:
     get:
       summary: Export findings across all repositories as JSONL
       description: |
-        Returns one JSON object per line (`application/x-ndjson`). No bearer
+        Returns one JSON object per line (`application/x-ndjson`). Operator
         token; localhost-only. Each line is a `FindingExport` carrying the
         full set of `db.Finding` columns.
       operationId: exportFindings
-      security: []
+      security: [{ operatorToken: [] }]
       parameters:
         - name: format
           in: query
@@ -1145,6 +1226,28 @@ paths:
           description: Host header is not localhost
 
   /v1/findings/{id}:
+    get:
+      summary: Get one finding
+      description: |
+        Returns one finding with the same shape as a line of the findings
+        JSONL export, carrying the full set of `db.Finding` columns. Operator
+        token; localhost-only. Not reachable with a per-scan bearer token.
+      operationId: getFindingExport
+      security: [{ operatorToken: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: The finding.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FindingExport' }
+        '400': { description: 'Invalid finding id, or an unsupported `format` or an `encrypt`, `scope` or `include` query value' }
+        '403': { description: Host header is not localhost }
+        '404': { description: Finding not found }
     delete:
       summary: Delete one finding and its linked data
       description: |
@@ -1154,7 +1257,7 @@ paths:
         pointed at the finding are preserved with `finding_id` cleared. Not
         reachable with a per-scan bearer token.
       operationId: deleteFinding
-      security: []
+      security: [{ operatorToken: [] }]
       parameters:
         - name: id
           in: path
@@ -1172,12 +1275,12 @@ paths:
     get:
       summary: Export scans across all repositories as JSONL
       description: |
-        Returns one JSON object per line (`application/x-ndjson`). No bearer
+        Returns one JSON object per line (`application/x-ndjson`). Operator
         token; localhost-only. Each line is a `ScanExport` carrying the full
         set of `db.Scan` columns minus `api_token` (the per-scan bearer must
-        not leak through an unauthenticated channel).
+        not leak through an instance-wide export).
       operationId: exportScans
-      security: []
+      security: [{ operatorToken: [] }]
       parameters:
         - name: format
           in: query
@@ -1243,10 +1346,10 @@ paths:
         or binary) are transparently decrypted first when an identity file or
         plugin is configured (`-identity-file` or `-identity-plugin`); plaintext
         bodies pass through untouched.
-        No bearer token; localhost-only. See docs/import.md for the per-format
+        Operator token; localhost-only. See docs/import.md for the per-format
         field mapping.
       operationId: importFindings
-      security: []
+      security: [{ operatorToken: [] }]
       parameters:
         - name: repo
           in: query
@@ -1320,6 +1423,12 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
+    operatorToken:
+      type: http
+      scheme: bearer
+      description: |
+        The operator token from `<data>/operator-token`. The browser UI
+        sends it as the `operator` cookie that `/login` sets instead.
 
   parameters:
     RepositoryID:
@@ -1380,7 +1489,7 @@ components:
 
     RepositoryExport:
       description: |
-        Compact repository row used by the unauthenticated JSONL export. This
+        Compact repository row used by the operator JSONL export. This
         intentionally omits large metadata and ecosystems cache blobs.
       type: object
       required: [id, url, name, findings_count, last_scan]
@@ -1619,6 +1728,7 @@ components:
         scan_id:       { type: integer, format: int64 }
         repository_id: { type: integer, format: int64 }
         finding_id:    { type: string, description: Short id within the scan report (F1, F2, ...). }
+        poc_capture_error: { type: string, description: "Present on streamed publication when the finding was saved but PoC capture failed." }
         sinks:         { type: string, description: Comma-joined sink ids. }
         title:         { type: string }
         severity:      { type: string, enum: [Critical, High, Medium, Low] }
@@ -1844,9 +1954,9 @@ components:
 
     FindingExport:
       description: |
-        Full db.Finding row used by the unauthenticated JSONL export. Adds
-        the dedup, denormalised, and timestamp columns that the bearer-only
-        FindingDetail leaves out.
+        Full db.Finding row used by the operator JSONL export. Adds
+        the dedup, denormalised, release, triage, fix, federation and
+        timestamp columns that the bearer-only FindingDetail leaves out.
       allOf:
         - $ref: '#/components/schemas/FindingDetail'
         - type: object
@@ -1865,6 +1975,22 @@ components:
             last_seen_scan_id: { type: integer, format: int64 }
             last_seen_commit:  { type: string }
             seen_count:        { type: integer }
+            missed_count:      { type: integer, description: "Consecutive same-skill full-repository rescans that did not report the finding again." }
+            last_missed_scan_id: { type: integer, format: int64, description: "Latest rescan that did not report the finding; 0 when none has." }
+            confidence:        { type: string, description: "How certain the producing audit is: high, medium or low. Empty when not reported." }
+            locations:         { type: string, description: "Newline-joined file:line positions when one rule fired at many places. The first entry is also in location." }
+            snippet:           { type: string, description: "Source excerpt around location, captured at ingest. Empty when it could not be read." }
+            imported_from:     { type: string, description: "External producer for findings that arrived through /import, such as CodeQL. Empty for findings Scrutineer produced." }
+            released_at:       { type: string, format: date-time, nullable: true, description: "When the upstream release that first contained the fix was published." }
+            release_tag:       { type: string, description: "Tag of the upstream release that first contained the fix." }
+            release_url:       { type: string, description: "URL of the upstream release that first contained the fix." }
+            federation_claim_contacts: { type: string, description: "Comma-joined peer contacts returned by the last federation claim-check that found the same finding elsewhere." }
+            federation_claim_at: { type: string, format: date-time, nullable: true, description: "When that federation claim was recorded." }
+            last_revalidate_verdict: { type: string, enum: [true_positive, false_positive, already_fixed, uncertain, ""], description: "Latest revalidate verdict. Empty when revalidate has not run." }
+            suggested_fix:     { type: string, description: "Unified diff from the patch skill that passed the applicability gate. Empty when none." }
+            suggested_fix_commit: { type: string, description: "Commit the suggested fix applies to." }
+            breaking_change:   { type: string, enum: [breaking, non_breaking, unknown, ""], description: "Breaking-change verdict for the suggested fix. Empty when the skill has not run." }
+            breaking_change_rationale: { type: string, description: "Prose explaining the breaking-change verdict." }
             created_at:        { type: string, format: date-time }
             updated_at:        { type: string, format: date-time }
 
@@ -1944,7 +2070,7 @@ components:
                 items:
                   type: object
                   properties:
-                    channel:      { type: string, enum: [email, ghsa, issue, pr, direct, registry] }
+                    channel:      { type: string, enum: [email, ghsa, issue, pr, direct, registry, vince, akrites] }
                     direction:    { type: string, enum: [outbound, inbound] }
                     actor:        { type: string }
                     body:         { type: string }
@@ -2001,7 +2127,7 @@ components:
 
     ScanExport:
       description: |
-        Full db.Scan row used by the unauthenticated JSONL export, minus
+        Full db.Scan row used by the operator JSONL export, minus
         api_token.
       allOf:
         - $ref: '#/components/schemas/ScanDetail'
@@ -2054,7 +2180,7 @@ components:
       properties:
         id:           { type: integer, format: int64 }
         finding_id:   { type: integer, format: int64 }
-        channel:      { type: string, enum: [email, ghsa, issue, pr, direct, registry] }
+        channel:      { type: string, enum: [email, ghsa, issue, pr, direct, registry, vince, akrites] }
         direction:    { type: string, enum: [outbound, inbound] }
         actor:        { type: string }
         body:         { type: string }

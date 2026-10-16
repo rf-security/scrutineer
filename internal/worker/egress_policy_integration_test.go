@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -195,14 +194,7 @@ func policyIntegrationSetup(t *testing.T) (ContainerRuntime, string) {
 
 func runPolicyProbe(t *testing.T, runner ContainerRunner, skill string) policyProbeResult {
 	t.Helper()
-	work := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(work, "src"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// The scan runs as a different uid on some runtimes; let it write results.
-	if err := os.Chmod(work, 0o777); err != nil { //nolint:gosec // test workspace only
-		t.Fatal(err)
-	}
+	work := newScanWorkspace(t)
 	var mu sync.Mutex
 	var events []Event
 	_, err := runner.RunSkill(t.Context(), SkillJob{
@@ -211,17 +203,7 @@ func runPolicyProbe(t *testing.T, runner ContainerRunner, skill string) policyPr
 		SrcReady:     true,
 		Name:         skill,
 	}, func(e Event) { mu.Lock(); events = append(events, e); mu.Unlock() })
-	files := map[string]string{}
-	entries, _ := os.ReadDir(work)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		if b, readErr := os.ReadFile(filepath.Join(work, e.Name())); readErr == nil {
-			files[e.Name()] = strings.TrimSpace(string(b))
-		}
-	}
-	return policyProbeResult{files: files, events: events, err: err}
+	return policyProbeResult{files: readWorkspaceFiles(work), events: events, err: err}
 }
 
 func hasEventPrefix(events []Event, prefix string) bool {

@@ -356,7 +356,7 @@ func TestExploratoryAPILineageAndIsolation(t *testing.T) {
 	request := func(method, path, body string) *httptest.ResponseRecorder {
 		t.Helper()
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Authorization", "Bearer "+caller.APIToken)
 		out := httptest.NewRecorder()
 		s.Handler().ServeHTTP(out, r)

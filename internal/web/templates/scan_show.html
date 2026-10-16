@@ -50,7 +50,32 @@
 </section>
 {{end}}
 
+{{if eq .SkillName "investigate"}}
+{{with .ImportPayload}}
+<details class="border-b py-4 mb-4">
+  <summary class="cursor-pointer text-sm font-medium">Submitted report</summary>
+  <pre class="text-sm whitespace-pre-wrap break-words font-sans mt-2">{{printf "%s" .}}</pre>
+</details>
+{{end}}
+{{end}}
+
 <dl class="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-6 text-sm">
+  <div>
+    <dt class="text-muted-foreground">Subpath</dt>
+    <dd><code>{{if .SubPath}}{{.SubPath}}{{else}}root{{end}}</code></dd>
+  </div>
+  <div>
+    <dt class="text-muted-foreground">Runner profile</dt>
+    <dd>{{if .Profile}}{{.Profile}}{{else if eq (status .Status) "queued"}}Automatic{{else}}Not recorded{{end}}</dd>
+  </div>
+  {{with focus .}}{{if .Name}}
+  <div class="sm:col-span-3">
+    <dt class="text-muted-foreground">Focus area</dt>
+    <dd>{{template "focus-tag" .}}</dd>
+    {{if .Paths}}<dd><code class="break-words">{{.Paths}}</code></dd>{{end}}
+    {{if .Surface}}<dd>{{.Surface}}</dd>{{end}}
+  </div>
+  {{end}}{{end}}
   <div>
     <dt class="text-muted-foreground">Model</dt>
     <dd>{{if .Model}}{{.Model}}{{else}}-{{end}}</dd>
@@ -200,6 +225,16 @@
   </nav>
 
   <div role="tabpanel" id="p1" aria-labelledby="t1" {{if ne $default 1}}hidden{{end}}>
+    {{with $.Investigation}}
+      <p class="whitespace-pre-wrap mb-4">{{.Notes}}</p>
+      {{range .Assessments}}
+      <section class="border-b py-4 mb-4">
+        <h3 class="font-medium">{{.Claim}}</h3>
+        <p class="text-sm my-2">Outcome: {{.Outcome}}</p>
+        <p class="whitespace-pre-wrap text-sm">{{.Evidence}}</p>
+      </section>
+      {{end}}
+    {{end}}
     {{if .Findings}}
       <table class="table table-fixed w-full mb-4">
         <thead><tr>

@@ -77,7 +77,7 @@
 {{else if .Q}}
   {{template "empty" (dict "Icon" "search-x" "Title" "No matches" "Body" "No maintainers matched the search.")}}
 {{else}}
-  {{template "empty" (dict "Icon" "users" "Title" "No maintainers" "Body" "Maintainers are populated from the commits job when repositories are scanned.")}}
+  {{template "empty" (dict "Icon" "users" "Title" "No maintainers" "Body" "Maintainers appear here once the maintainers skill runs on a repository.")}}
 {{end}}
 
 {{template "foot" .}}

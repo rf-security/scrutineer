@@ -56,4 +56,3 @@ they never enable writes. The configuration is read once at startup, so adding
 or removing a grant requires restarting the sharing process. Removing a grant
 then takes effect on the next request after restart; users do not need to sign
 out.
-

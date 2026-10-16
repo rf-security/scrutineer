@@ -212,7 +212,7 @@ func TestFindingStatus_peerClaimBlocksReported(t *testing.T) {
 	// The finding page names the contact to coordinate through.
 	page := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/findings/"+strconv.FormatUint(uint64(f.ID), 10), nil)
-	req.Host = testHost
+	asOperator(req)
 	s.Handler().ServeHTTP(page, req)
 	if !strings.Contains(page.Body.String(), "peer@example.com") {
 		t.Error("the finding page must surface the peer contact")
@@ -633,5 +633,37 @@ func TestClaimPeerHold_reopenedAfterRejectAsksPeersAgain(t *testing.T) {
 	}
 	if asked.Load() != 2 {
 		t.Errorf("peer asked %d times, want one round per report attempt", asked.Load())
+	}
+}
+
+// The peer-claim banner links to the claim-check docs, and only when a peer
+// has actually claimed the finding.
+func TestFindingShow_peerClaimBannerLinksTheClaimCheckDocs(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	repo := db.Repository{URL: "https://github.com/foo/claimed", Name: "claimed"}
+	s.DB.Create(&repo)
+	scan := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName}
+	s.DB.Create(&scan)
+
+	const link = "docs/interchange.md#asking-peers-before-reporting"
+	for _, tc := range []struct {
+		name     string
+		contacts string
+		want     bool
+	}{
+		{"claimed", "security@peer.example", true},
+		{"unclaimed", "", false},
+	} {
+		f := db.Finding{ScanID: scan.ID, RepositoryID: repo.ID, Title: tc.name, Severity: "High", Status: db.FindingReady, FederationClaimContacts: tc.contacts}
+		s.DB.Create(&f)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, localReq(http.MethodGet, fmt.Sprintf("/findings/%d", f.ID)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status %d: %s", tc.name, w.Code, w.Body)
+		}
+		if got := strings.Contains(w.Body.String(), link); got != tc.want {
+			t.Errorf("%s: claim-check docs link present = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

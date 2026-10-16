@@ -85,14 +85,14 @@ func TestValidateReportSemanticsDeepDiveSinkDispositions(t *testing.T) {
 
 func TestValidateSkillReportAppliesSkillSpecificSemantics(t *testing.T) {
 	incomplete := `{"inventory":[{"id":"S1"}],"findings":[],"ruled_out":[]}`
-	if got := ValidateSkillReport("posture", semanticValidationTestSchema, incomplete); got != "" {
+	if got := ValidateSkillReport("posture", semanticValidationTestSchema, "", incomplete); got != "" {
 		t.Fatalf("other skill validation = %q, want schema-valid report", got)
 	}
-	if got := ValidateSkillReport(deepDiveSkillName, semanticValidationTestSchema, incomplete); !strings.Contains(got, "inventory sink S1 has no disposition") {
+	if got := ValidateSkillReport(deepDiveSkillName, semanticValidationTestSchema, "", incomplete); !strings.Contains(got, "inventory sink S1 has no disposition") {
 		t.Fatalf("deep-dive validation = %q, want unresolved sink", got)
 	}
 	invalidVerify := strings.Replace(confirmedVerificationReport(t), `"number":2`, `"number":1`, 1)
-	if got := ValidateSkillReport(verifySkillName, `{"type":"object"}`, invalidVerify); !strings.Contains(got, "not unique") {
+	if got := ValidateSkillReport(verifySkillName, `{"type":"object"}`, "", invalidVerify); !strings.Contains(got, "not unique") {
 		t.Fatalf("verify validation = %q, want duplicate attempt number", got)
 	}
 }

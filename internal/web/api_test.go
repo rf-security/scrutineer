@@ -36,7 +36,7 @@ func runSkillAPIJSON(t *testing.T, s *Server, repo db.Repository, scan db.Scan, 
 	t.Helper()
 	path := "/api/repositories/" + strconv.FormatUint(uint64(repo.ID), 10) + "/skills/" + skillName + "/run"
 	r := httptest.NewRequest("POST", path, strings.NewReader(body))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -55,7 +55,7 @@ func TestAPIListCNAs(t *testing.T) {
 
 	get := func(q string) []map[string]any {
 		r := httptest.NewRequest("GET", "/api/cnas"+q, nil)
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)
@@ -85,7 +85,7 @@ func TestAPIRejectsMissingBearer(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	r := httptest.NewRequest("GET", "/api/repositories/1", nil)
-	r.Host = testHost
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != 401 {
@@ -103,7 +103,7 @@ func TestAPIRejectsCrossRepoAccess(t *testing.T) {
 	s.DB.Create(&other)
 
 	r := httptest.NewRequest("GET", "/api/repositories/"+strconv.FormatUint(uint64(other.ID), 10), nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -125,7 +125,7 @@ func TestAPIGetRepository_includesPostureFields(t *testing.T) {
 	})
 
 	r := httptest.NewRequest("GET", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10), nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -177,7 +177,7 @@ func TestAPIListsTypedReads(t *testing.T) {
 	}
 	for path, want := range cases {
 		r := httptest.NewRequest("GET", replaceID(path, repo.ID), nil)
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)
@@ -206,7 +206,7 @@ func TestAPIListPackages_subPathAttribution(t *testing.T) {
 	s.DB.Create(&db.Package{RepositoryID: repo.ID, Name: "railties", Ecosystem: "rubygems"}) // repo-level, unlinked
 
 	r := httptest.NewRequest("GET", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/packages", nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -236,7 +236,7 @@ func TestAPIPatchRepositoryFork(t *testing.T) {
 
 	r := httptest.NewRequest("PATCH", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10),
 		strings.NewReader(`{"fork":"fork-central/x"}`))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -250,7 +250,7 @@ func TestAPIPatchRepositoryFork(t *testing.T) {
 	}
 
 	r = httptest.NewRequest("GET", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10), nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -270,7 +270,7 @@ func TestAPIPatchRepositoryRejectsOtherRepo(t *testing.T) {
 
 	r := httptest.NewRequest("PATCH", "/api/repositories/"+strconv.FormatUint(uint64(other.ID), 10),
 		strings.NewReader(`{"fork":"fork-central/y"}`))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -286,7 +286,7 @@ func TestAPIPatchRepositoryRejectsEmptyBody(t *testing.T) {
 
 	r := httptest.NewRequest("PATCH", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10),
 		strings.NewReader(`{}`))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -302,7 +302,7 @@ func TestAPIPatchRepositoryRejectsInvalidJSON(t *testing.T) {
 
 	r := httptest.NewRequest("PATCH", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10),
 		strings.NewReader(`not json`))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -324,7 +324,7 @@ func TestAPIFindingReadsAndFilters(t *testing.T) {
 	repo, scan := seedRunningScan(t, s)
 	get := func(q string) []map[string]any {
 		r := httptest.NewRequest("GET", fmt.Sprintf("/api/repositories/%d/findings%s", repo.ID, q), nil)
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)
@@ -418,7 +418,7 @@ func TestAPIFindingReadsAndFilters(t *testing.T) {
 		Report:              criticReportFixture,
 	})
 	r := httptest.NewRequest("GET", "/api/findings/"+toString(fid), nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -476,7 +476,7 @@ func TestAPIListDependencyFindings(t *testing.T) {
 	s.DB.Create(&db.Finding{ScanID: scan.ID, RepositoryID: app.ID, Title: "self", Severity: sevHigh, Status: db.FindingNew})
 
 	r := httptest.NewRequest("GET", "/api/repositories/"+strconv.FormatUint(uint64(app.ID), 10)+"/dependency-findings", nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -502,7 +502,7 @@ func TestAPIListDependencyFindings(t *testing.T) {
 
 	// Severity filter
 	r = httptest.NewRequest("GET", "/api/repositories/"+strconv.FormatUint(uint64(app.ID), 10)+"/dependency-findings?severity=High", nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -553,7 +553,7 @@ func TestDependencyFindings_excludesUnpublishedCrossRepo(t *testing.T) {
 			path := "/api/repositories/" + strconv.FormatUint(uint64(app.ID), 10) +
 				"/dependency-findings"
 			r := httptest.NewRequest(http.MethodGet, path, nil)
-			r.Host = testHost
+			asOperator(r)
 			r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 			w := httptest.NewRecorder()
 			s.Handler().ServeHTTP(w, r)
@@ -593,7 +593,7 @@ func TestAPIRunSkill_profileOverridePersists(t *testing.T) {
 
 	path := "/api/repositories/" + strconv.FormatUint(uint64(repo.ID), 10) + "/skills/metadata/run"
 	r := httptest.NewRequest("POST", path, strings.NewReader(`{"profile":"php"}`))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -621,7 +621,7 @@ func TestAPIRunSkill_diffRescanOptionsPersist(t *testing.T) {
 	body := fmt.Sprintf(`{"rescan_mode":"diff","baseline_scan_id":%d}`, baseline.ID)
 	path := "/api/repositories/" + strconv.FormatUint(uint64(repo.ID), 10) + "/skills/metadata/run"
 	r := httptest.NewRequest("POST", path, strings.NewReader(body))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -687,7 +687,7 @@ func TestAPIRunSkill_emptyBodyStillEnqueues(t *testing.T) {
 
 	path := "/api/repositories/" + strconv.FormatUint(uint64(repo.ID), 10) + "/skills/metadata/run"
 	r := httptest.NewRequest("POST", path, nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -766,7 +766,7 @@ func TestAPIRunSkill_unknownProfileRejected(t *testing.T) {
 
 	path := "/api/repositories/" + strconv.FormatUint(uint64(repo.ID), 10) + "/skills/metadata/run"
 	r := httptest.NewRequest("POST", path, strings.NewReader(`{"profile":"bogus"}`))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -792,7 +792,7 @@ func TestAPIRunSkill_profileMismatchRejected(t *testing.T) {
 
 	path := "/api/repositories/" + strconv.FormatUint(uint64(repo.ID), 10) + "/skills/php-only/run"
 	r := httptest.NewRequest("POST", path, strings.NewReader(`{"profile":"default"}`))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -817,7 +817,7 @@ func TestAPIRunSkill_badRefRejectedAt400(t *testing.T) {
 
 	path := "/api/repositories/" + strconv.FormatUint(uint64(repo.ID), 10) + "/skills/metadata/run"
 	r := httptest.NewRequest("POST", path, strings.NewReader(`{"ref":"--upload-pack=/bin/sh"}`))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -849,7 +849,7 @@ func TestAPIRunFindingSkill_scopesFindingID(t *testing.T) {
 
 	path := "/api/findings/" + strconv.FormatUint(uint64(finding.ID), 10) + "/skills/verify/run"
 	r := httptest.NewRequest("POST", path, strings.NewReader("{}"))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -868,7 +868,7 @@ func TestAPIRunFindingSkill_scopesFindingID(t *testing.T) {
 	}
 
 	r = httptest.NewRequest("POST", path, strings.NewReader("{}"))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	r.Header.Set("Content-Type", "application/json")
 	w = httptest.NewRecorder()
@@ -897,7 +897,7 @@ func TestAPIRunFindingSkill_rejectsMalformedJSON(t *testing.T) {
 
 	path := "/api/findings/" + strconv.FormatUint(uint64(finding.ID), 10) + "/skills/verify/run"
 	r := httptest.NewRequest("POST", path, strings.NewReader(`{"model":`))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -926,7 +926,7 @@ func TestAPIRunFindingSkill_emptyBodyStillEnqueues(t *testing.T) {
 
 	path := "/api/findings/" + strconv.FormatUint(uint64(finding.ID), 10) + "/skills/verify/run"
 	r := httptest.NewRequest("POST", path, nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -952,7 +952,7 @@ func TestAPIScansFilterBySkill(t *testing.T) {
 
 	r := httptest.NewRequest("GET",
 		"/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/scans?skill=metadata", nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -989,7 +989,7 @@ func TestAPIAuth_capsRequestBody(t *testing.T) {
 
 	body := `{"fork":"` + strings.Repeat("x", apiMaxBody) + `"}`
 	r := httptest.NewRequest("PATCH", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10), strings.NewReader(body))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
@@ -1035,7 +1035,7 @@ func postValidate(t *testing.T, s *Server, scanID uint, token, body string) (int
 	t.Helper()
 	path := "/api/scans/" + strconv.FormatUint(uint64(scanID), 10) + "/validate-report"
 	r := httptest.NewRequest("POST", path, strings.NewReader(body))
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+token)
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

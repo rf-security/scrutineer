@@ -33,7 +33,7 @@ func TestSubprojectShow(t *testing.T) {
 	s.DB.Create(&db.Package{RepositoryID: repo.ID, SubprojectID: &sub.ID, Name: "activesupport", Ecosystem: "rubygems"})
 
 	r := httptest.NewRequest("GET", subURL(repo.ID, sub.ID, ""), nil)
-	r.Host = testHost
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -95,7 +95,7 @@ func TestSubprojectShow_wrongRepo404(t *testing.T) {
 
 	// Ask for repoB's page with repoA's subproject id: must 404, not leak.
 	r := httptest.NewRequest("GET", subURL(repoB.ID, sub.ID, ""), nil)
-	r.Host = testHost
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusNotFound {
@@ -115,7 +115,7 @@ func TestSubprojectDisclosureChannel_setAndClearFallsBack(t *testing.T) {
 		form := url.Values{"disclosure_channel": {v}}
 		r := httptest.NewRequest("POST", subURL(repo.ID, sub.ID, "/disclosure-channel"), strings.NewReader(form.Encode()))
 		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		r.Host = testHost
+		asOperator(r)
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)
 		if w.Code >= 400 {

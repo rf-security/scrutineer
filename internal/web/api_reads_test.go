@@ -292,7 +292,7 @@ func TestAPIListFindings_filtersBySkill(t *testing.T) {
 
 	get := func(q string) []map[string]any {
 		r := httptest.NewRequest("GET", fmt.Sprintf("/api/repositories/%d/findings%s", repo.ID, q), nil)
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Authorization", "Bearer "+auth.APIToken)
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)
@@ -348,7 +348,7 @@ func TestAPIListFindings_filtersByScanGroup(t *testing.T) {
 
 	get := func(q string) []map[string]any {
 		r := httptest.NewRequest("GET", fmt.Sprintf("/api/repositories/%d/findings%s", repo.ID, q), nil)
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Authorization", "Bearer "+auth.APIToken)
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)

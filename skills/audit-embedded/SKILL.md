@@ -1,6 +1,6 @@
 ---
 name: audit-embedded
-description: Focused static audit of device firmware and IoT software for update, boot, provisioning, credential, debug-interface and device-communication boundary failures, using an ISVS-informed threat model.
+description: Focused static audit of device firmware and IoT software for update, boot, provisioning, credential, debug-interface and device-communication boundary failures, using a threat model informed by the OWASP IoT Security Verification Standard (ISVS).
 license: MIT
 compatibility: Static source review in ./src using bundled references. No repository execution or external network access; the worker-provided Scrutineer API at api_base is allowed.
 allowed-tools: Read,Write,Bash,Grep,Glob
@@ -8,6 +8,7 @@ metadata:
   scrutineer.version: 1
   scrutineer.output_file: report.json
   scrutineer.output_kind: findings
+  scrutineer.poc_field: validation
   scrutineer.max_turns: 48
   scrutineer.model: high
   scrutineer.min_confidence: high

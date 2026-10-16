@@ -378,7 +378,7 @@ func TestAPIRunSkill_optedOutRepositoryAnswers409(t *testing.T) {
 	s.DB.Create(&db.Skill{Name: "metadata", Description: "m", Body: "b", OutputFile: "report.json", Version: 1, Active: true, Source: "ui"})
 
 	r := httptest.NewRequest("POST", "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/skills/metadata/run", nil)
-	r.Host = testHost
+	asOperator(r)
 	r.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)

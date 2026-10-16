@@ -22,7 +22,7 @@ func TestExpectedFindingsAPI(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/expected",
 		strings.NewReader(`{"file":"./src/app.go","cwe":"cwe-79","cve":"CVE-2026-0001","note":"known sink"}`))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -31,7 +31,7 @@ func TestExpectedFindingsAPI(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/repositories/"+strconv.FormatUint(uint64(repo.ID), 10)+"/expected", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -48,7 +48,7 @@ func TestExpectedFindingsAPI(t *testing.T) {
 
 	req = httptest.NewRequest(http.MethodDelete,
 		fmt.Sprintf("/api/repositories/%d/expected/%d", repo.ID, row.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Authorization", "Bearer "+scan.APIToken)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -75,7 +75,7 @@ func TestExpectedFindingForms(t *testing.T) {
 		"note": {"known sink"},
 	}
 	req := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/repositories/%d/expected", repo.ID), strings.NewReader(form.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -91,7 +91,7 @@ func TestExpectedFindingForms(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodPost, fmt.Sprintf("/repositories/%d/expected/%d/delete", repo.ID, row.ID), nil)
-	req.Host = testHost
+	asOperator(req)
 	w = httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusSeeOther {
@@ -289,10 +289,13 @@ func TestBenchmarkPageRollupUsesLatestCompletedScan(t *testing.T) {
 		t.Fatalf("status %d: %s", w.Code, w.Body)
 	}
 	body := w.Body.String()
-	for _, want := range []string{"bench-rollup", "50%", "1 / 2", "claude-test", "v1", "abc123456789"} {
+	for _, want := range []string{"bench-rollup", "50%", "1 / 2", "claude-test", "v1", "abc123456789", "<th>Skills SHA</th>"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body missing %q:\n%s", want, body)
 		}
+	}
+	if strings.Contains(body, "<th>Harness</th>") {
+		t.Fatalf("skills-repo column still labelled as the backend:\n%s", body)
 	}
 
 	w = httptest.NewRecorder()

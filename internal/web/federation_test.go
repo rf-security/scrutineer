@@ -599,6 +599,7 @@ func TestImportFeed_routeOnlyFillsAnEmptyChannel(t *testing.T) {
 	if !strings.Contains(filled.DisclosureChannel, "(via "+remote+")") {
 		t.Errorf("an imported channel must name the feed it came from, got %q", filled.DisclosureChannel)
 	}
+	assertFeedChannelEvent(t, s, empty.ID, owned.ID, remote, filled.DisclosureChannel)
 	// An imported hint is not a route this instance validated, and the peer
 	// feed remote it is annotated with may name an internal host or a path on
 	// this operator's disk. Leaving disclosure_channel_at unset is what keeps
@@ -1015,7 +1016,7 @@ func TestSetDisclosureChannel_stampsOnlyOnChange(t *testing.T) {
 	defer done()
 	repo := seedFeedRepo(t, s, "https://github.com/acme/lib", "")
 
-	if err := db.SetDisclosureChannel(s.DB, repo.ID, "security@acme.example"); err != nil {
+	if err := db.SetDisclosureChannel(s.DB, repo.ID, "security@acme.example", db.SourceAnalyst, ""); err != nil {
 		t.Fatal(err)
 	}
 	var got db.Repository
@@ -1025,7 +1026,7 @@ func TestSetDisclosureChannel_stampsOnlyOnChange(t *testing.T) {
 	}
 	stamped := *got.DisclosureChannelAt
 
-	if err := db.SetDisclosureChannel(s.DB, repo.ID, "security@acme.example"); err != nil {
+	if err := db.SetDisclosureChannel(s.DB, repo.ID, "security@acme.example", db.SourceAnalyst, ""); err != nil {
 		t.Fatal(err)
 	}
 	s.DB.First(&got, repo.ID)
@@ -1037,7 +1038,7 @@ func TestSetDisclosureChannel_stampsOnlyOnChange(t *testing.T) {
 	// loaded earlier: a scan that started an hour ago holds a stale snapshot,
 	// and a stamp skipped there would publish the new channel under the old
 	// verified_at.
-	if err := db.SetDisclosureChannel(s.DB, repo.ID, "moved@acme.example"); err != nil {
+	if err := db.SetDisclosureChannel(s.DB, repo.ID, "moved@acme.example", db.SourceAnalyst, ""); err != nil {
 		t.Fatal(err)
 	}
 	s.DB.First(&got, repo.ID)

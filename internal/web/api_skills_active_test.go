@@ -27,7 +27,7 @@ func TestAPIListSkills_activeFilter(t *testing.T) {
 
 	get := func(q string) (int, []map[string]any) {
 		r := httptest.NewRequest("GET", "/api/skills"+q, nil)
-		r.Host = testHost
+		asOperator(r)
 		r.Header.Set("Authorization", "Bearer "+auth.APIToken)
 		w := httptest.NewRecorder()
 		s.Handler().ServeHTTP(w, r)

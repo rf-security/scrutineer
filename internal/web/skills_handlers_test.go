@@ -347,7 +347,7 @@ func TestSkillRetry_preservesSkillID(t *testing.T) {
 	runForm := url.Values{"skill_id": {strconv.Itoa(int(skill.ID))}}
 	req := httptest.NewRequest("POST", "/repositories/"+strconv.Itoa(int(repo.ID))+"/skill-scan",
 		strings.NewReader(runForm.Encode()))
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
@@ -366,7 +366,7 @@ func TestSkillRetry_preservesSkillID(t *testing.T) {
 
 	// Retry it.
 	req = httptest.NewRequest("POST", "/scans/"+strconv.Itoa(int(initial.ID))+"/retry", nil)
-	req.Host = testHost
+	asOperator(req)
 	req.Header.Set("Sec-Fetch-Site", "same-origin")
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, req)

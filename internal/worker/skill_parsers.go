@@ -22,9 +22,10 @@ import (
 const insertBatchSize = 50
 
 const (
-	findingDedupSkill = "finding-dedup"
-	verifySkillName   = "verify"
-	criticSkillName   = "critic"
+	findingDedupSkill    = "finding-dedup"
+	verifySkillName      = "verify"
+	criticSkillName      = "critic"
+	investigateSkillName = "investigate"
 )
 
 type verifyOutput struct {
@@ -386,7 +387,7 @@ func (w *Worker) parseDependenciesOutput(scan *db.Scan, report string, emit func
 	// Per-sub-package snapshots are deferred until SBOMUpload/Dependency are
 	// keyed on sub-path.
 	if scan.SubPath != "" {
-		emit(Event{Kind: KindText, Text: "sub-path scan: repo-level dependency rows and SBOM snapshot unchanged"})
+		emit(Event{Kind: KindText, Text: "subpath scan: repo-level dependency rows and SBOM snapshot unchanged"})
 		return nil
 	}
 
@@ -947,7 +948,7 @@ func (w *Worker) parseComplianceOutput(scan *db.Scan, report string, emit func(E
 		return fmt.Errorf("compliance report carries %d controls but total says %d", len(result.Controls), result.Total)
 	}
 	if scan.SubPath != "" {
-		emit(Event{Kind: KindText, Text: "sub-path scan: repo-level compliance rows unchanged"})
+		emit(Event{Kind: KindText, Text: "subpath scan: repo-level compliance rows unchanged"})
 		return nil
 	}
 	if len(result.Controls) == 0 {
@@ -1633,6 +1634,7 @@ func (w *Worker) parseRevalidateOutput(scan *db.Scan, report string, emit func(E
 		PrivilegeRequired      string `json:"privilege_required"`
 		AdjustedSeverity       string `json:"adjusted_severity"`
 		AdjustedSeverityReason string `json:"adjusted_severity_reason"`
+		AnalystFeedbackIDs     []uint `json:"analyst_feedback_ids"`
 	}
 	if err := json.Unmarshal([]byte(report), &result); err != nil {
 		return fmt.Errorf("parse revalidate report: %w", err)
@@ -1726,6 +1728,9 @@ func (w *Worker) parseRevalidateOutput(scan *db.Scan, report string, emit func(E
 	}
 
 	emit(Event{Kind: KindText, Text: "finding " + fmt.Sprint(f.ID) + " -> " + result.Verdict})
+	if result.Verdict == "false_positive" {
+		w.recordFeedbackConfirmations(scan, &f, result.AnalystFeedbackIDs, emit)
+	}
 
 	// Hand the verdict to the web layer for downstream chaining. The
 	// post-adjustment severity is what the chain reads: when revalidate

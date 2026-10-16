@@ -14,7 +14,7 @@ import (
 func postImport(t *testing.T, s *Server, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	return w

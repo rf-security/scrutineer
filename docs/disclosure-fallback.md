@@ -2,7 +2,7 @@
 
 `report-upstream` is the happy path: scrutineer files the finding as a private GitHub Security Advisory on the upstream repo, pushes the proposed patch into the temporary private fork GitHub allocates, and waits for the maintainer to acknowledge. The skill refuses to run if `gh api repos/{owner}/{repo}/private-vulnerability-reporting` does not report `{"enabled": true}`, because there is no equivalent private channel inside the GitHub UI.
 
-This page is the runbook for the rest: how to disclose when PVR is off, when the upstream is not on github.com at all, or when the project sits inside a CNA's scope and the CNA prefers to handle intake. None of it needs new skills; the existing posture, maintainers, and cna-match runs already produce the data, and the choice tree below names which skill answers which question.
+This page is the runbook for the rest: how to disclose when private vulnerability reporting (PVR) is off, when the upstream is not on github.com at all, or when the project sits inside the scope of a CVE Numbering Authority (CNA) and the CNA prefers to handle intake. None of it needs new skills; the existing posture, maintainers, and cna-match runs already produce the data, and the choice tree below names which skill answers which question.
 
 ## Decide the route in this order
 
@@ -27,7 +27,7 @@ If the CNA wants the report submitted through a GitHub PVR on a different repo (
 
 ### Submit to CERT/CC VINCE
 
-Scrutineer can submit a reviewed finding to CERT/CC through VINCE's authenticated vulnerability-report endpoint. Add the API key and reporter defaults to `scrutineer.yaml`:
+Scrutineer can submit a reviewed finding to the CERT Coordination Center (CERT/CC) through the authenticated vulnerability-report endpoint of VINCE, its Vulnerability Information and Coordination Environment. Add the API key and reporter defaults to `scrutineer.yaml`:
 
 ```yaml
 vince:
@@ -49,7 +49,7 @@ The key is a long-lived credential. Keep `scrutineer.yaml` out of source control
 chmod 600 scrutineer.yaml
 ```
 
-The finding page enables **Submit to VINCE** only when `vince.api_key` is set. A finding must have a non-empty disclosure draft and must not be rejected, duplicated, subsumed, already reported, or linked to an earlier VINCE submission.
+The finding page enables **Submit to VINCE** only when `vince.api_key` is set. A finding must have a non-empty disclosure draft and must not be rejected, duplicated, subsumed, fixed or published. A finding already reported elsewhere can still go to VINCE. When it already has a VINCE submission or reference, the page lists the earlier submissions and asks you to confirm sending another.
 
 The submission page maps the package or repository name, affected range, tested commit, disclosure text, validation, impact, producing skill, previous communications, exploitation evidence, and selected public references. Every VINCE field remains editable. Unknown yes/no answers stay blank until the analyst resolves them. The analyst must confirm the recipient, reporter details, policy choices, attachment, and manual review before the request is sent.
 
@@ -57,7 +57,17 @@ The attachment can be the disclosure bundle, `report.md`, or nothing. The page l
 
 Scrutineer sends one request and does not retry it. VINCE has no idempotency key or pending-report lookup, so a timeout or server error leaves an uncertain result. Check [My Vulnerability Reports](https://kb.cert.org/vince/comm/reports/) before submitting again.
 
-When VINCE returns HTTP 201 with a VRF ID, Scrutineer adds a `vince,coordinator` reference, records an outbound communication with the attachment name, and moves the finding to `reported`. If VINCE accepts the report but local bookkeeping fails, the error page shows the VRF ID for manual reconciliation.
+When VINCE returns HTTP 201 with a VRF ID, Scrutineer saves a submission record with the form fields and attachment as sent, adds a `vince,coordinator` reference, records an outbound communication with the attachment name, and moves the finding to `reported` if it was not already. A response that leaves acceptance unclear is saved as an `uncertain` submission to reconcile. If VINCE accepts the report but local bookkeeping fails, the error page shows the VRF ID for manual reconciliation.
+
+### Submit to Akrites
+
+Set `akrites.submission_token` in the owner-only `scrutineer.yaml` file to enable **Akrites submission** on findings. Removing the token stops new submissions; saved receipts stay visible and polling continues. `akrites.base_url` defaults to `https://intake.tap.akrites.dev`; staging uses `https://intake.taptest.akrites.dev`. Both require HTTPS with certificate verification and TLS 1.2 or later. `akrites.email` prefills the notification address, which is required unless notifications are off. Authentication sends the token as `Authorization: Bearer`. Intake answers an expired or revoked token with HTTP 401; ask Akrites for a new one.
+
+Open the submission page after reviewing the disclosure draft. Check the package URL, or both the software name and the ecosystem; Akrites derives the ecosystem from a package URL. The affected file and line are prefilled from the finding's location, and the function can be added. Then enter affected versions and review the disclosure text, exploitation details, discovery method and notification choices. The report uses the [TAP Intake API fields](https://github.com/Akrites-Foundation/SIRT/blob/main/docs/TAP-API-Spec.md): the disclosure text is sent as a `text/markdown` attachment and the exploitation details as a `text/plain` attachment of type `exploit-proof-of-concept`, each limited to 1 MiB, within a 3 MiB request. No bundle or patch attachment is sent. The same non-viable and subsumed-finding guards apply, and configured federation peers are checked before submission.
+
+An accepted report stores its receipt in a submission record with the report as sent, records an outbound communication and moves the finding to `reported`. Receipts grant access to intake status, so they appear only on the submission page and are excluded from finding exports. Background polling resumes after restart, backs off to hourly checks, honors `Retry-After` and stops when intake returns `done`, or when it answers 404 because it has no submission with that receipt. Completion describes intake processing and does not change the finding to `fixed` or `published`.
+
+Submissions are never retried automatically. When intake rejects fields, the page names each field and its error code. Rejected requests return to the form with your edits, to be corrected and submitted again after any requested delay. A timeout, malformed acceptance or interrupted submission leaves an uncertain result; contact Akrites to reconcile it. Every submission, accepted or uncertain, is listed on the page with the report as sent kept in the database, and sending another needs a separate confirmation. If saving a returned receipt fails, the page displays it so you can record it before leaving.
 
 ## GitHub upstream without PVR
 

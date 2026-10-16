@@ -2,11 +2,11 @@ module scrutineer
 
 go 1.27.0
 
-toolchain go1.27.1
+toolchain go1.27.2
 
 require (
 	filippo.io/age v1.3.1
-	github.com/alpha-omega-security/harness v0.1.15
+	github.com/alpha-omega-security/harness v0.1.16
 	github.com/ecosyste-ms/ecosystems-go v0.4.0
 	github.com/git-pkgs/clone v0.7.4
 	github.com/git-pkgs/clone/gogit v0.1.1

@@ -42,14 +42,14 @@ The equivalent CLI option is repeatable:
 
 Export a repo's findings as an encrypted bundle:
 
-    curl -o findings.bundle.age \
+    curl -H "Authorization: Bearer $(cat data/operator-token)" -o findings.bundle.age \
       'http://127.0.0.1:8080/api/v1/repositories/1/findings?format=bundle&encrypt=1'
 
 Send `findings.bundle.age` over Slack, email, shared drive — it's encrypted to every key in `recipients.txt`.
 
 Import on the receiving end (decryption is automatic):
 
-    curl --data-binary @findings.bundle.age http://127.0.0.1:8080/api/v1/import
+    curl -H "Authorization: Bearer $(cat data/operator-token)" --data-binary @findings.bundle.age http://127.0.0.1:8080/api/v1/import
 
 Plaintext bundles work too — drop `&encrypt=1` on export and import accepts them as-is regardless of whether an identity is configured.
 
@@ -83,13 +83,13 @@ A local checkout without a usable origin keeps its `file://` URL and emits a ser
 
 What travels is the substance of each finding plus the reasoning that justifies it. Alongside title, severity, confidence, CWE, location and the suggested `patch`, the bundle carries the six-step audit narrative (`description` is the trace; `boundary`, `validation`, `prior_art`, `reach` and `rating` are the other five steps), the `reachability` and `quality_tier` verdicts, the comma-joined `sinks`, the cross-party `vid` correlation hash, the patch's base `fix_commit`, and enough provenance — per-finding `commit`, `sub_path`, the full `locations` set, and the `model` that produced the finding — to resolve the location unambiguously on the receiving side and keep the finding attributed to the model that found it rather than to the receiving import run. Every field beyond the original seven is emitted only when set, and the importer tolerates bundles produced before they existed, so the shape is backward-compatible in both directions.
 
-Several things stay out of the default share bundle. Instance-local lifecycle the recipient owns (status, CVE/GHSA id, affected packages, fix version, references, assignee) does not travel — the recipient imports the finding, not your team's triage, and triages it independently on their side (in their case management tool of choice). Your internal workspace — notes and communications — stays out too, as does the enrichment and disclosure work product (CVSS, mitigation, disclosure draft, exploited-in-wild). And source `snippet`s are omitted: the recipient usually owns the code, and a snippet would embed verbatim (possibly private) source into a shared artifact. When you are archiving your *own* findings rather than sharing them, `include=all` carries all of that back — see below.
+Several things stay out of the default share bundle. Instance-local lifecycle the recipient owns (status, [CVE/GHSA](glossary.md#review-fixes-and-disclosure) id, affected packages, fix version, references, assignee) does not travel — the recipient imports the finding, not your team's triage, and triages it independently on their side (in their case management tool of choice). Your internal workspace — notes and communications — stays out too, as does the enrichment and disclosure work product ([CVSS](glossary.md#security-analysis-and-evidence) score, mitigation, disclosure draft, exploited-in-wild). And source `snippet`s are omitted: the recipient usually owns the code, and a snippet would embed verbatim (possibly private) source into a shared artifact. When you are archiving your *own* findings rather than sharing them, `include=all` carries all of that back — see below.
 
 ## Archival exports (`include=all`)
 
 A bundle has a second audience: yourself. The same `format=bundle` export, with `&include=all`, produces an archival superset that round-trips a repository's findings losslessly back into your own instance — the natural unit for an encrypted, per-repo backup.
 
-    curl -o findings.archive.age \
+    curl -H "Authorization: Bearer $(cat data/operator-token)" -o findings.archive.age \
       'http://127.0.0.1:8080/api/v1/repositories/1/findings?format=bundle&include=all&encrypt=1'
 
 On top of the default share-safe set it carries the enrichment and disclosure work product — `snippet`, `affected`, `fix_version`, `cve_id`, `ghsa_id`, the `cvss_vector`/`cvss_v4_vector` (scores are recomputed from the vectors on import, never trusted), `mitigation`/`mitigation_semgrep`, the `breaking_change` verdict, `dup_check`, `disclosure_draft`, `exploited_in_wild` — the real `upstream_fix_commit` (kept on its own key because the legacy `fix_commit` already carries the patch's base), and the finding's `notes`, `communications`, and `references` child records with their timestamps.
@@ -241,6 +241,6 @@ No new routes. The existing endpoints gain four optional parameters:
 |----------|-----------|--------|
 | `GET /api/v1/repositories/{id}/findings` | `format=bundle` | JSON bundle instead of NDJSON |
 | `GET /api/v1/repositories/{id}/findings` | `encrypt=1` | Wrap bundle in armored age (requires `format=bundle`) |
-| `GET /api/v1/repositories/{id}/findings` | `scope=findings` | Curate the export (JSONL or bundle) to the Findings bucket, excluding scanner noise |
+| `GET /api/v1/repositories/{id}/findings` | `scope=findings` | Curate the export (JSONL, bundle or SARIF) to the Findings bucket, excluding scanner noise |
 | `GET /api/v1/repositories/{id}/findings` | `include=all` | Promote the bundle to the archival superset — enrichment, disclosure fields, and notes/communications/references — for lossless round-trip into your own instance (requires `format=bundle`) |
 | `POST /api/v1/import` | *(none)* | Auto-detects age header and decrypts before parsing |

@@ -88,7 +88,7 @@ func TestFindingBundle_containsManifestAndExports(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodGet,
 		"/findings/"+strconv.Itoa(int(f.ID))+"/bundle.tar.gz", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -134,7 +134,7 @@ func TestFindingBundle_containsManifestAndExports(t *testing.T) {
 	// they hit the same builder, so the bytes should match exactly.
 	osvReq := httptest.NewRequest(http.MethodGet,
 		"/findings/"+strconv.Itoa(int(f.ID))+"/osv.json", nil)
-	osvReq.Host = "127.0.0.1:8080"
+	asOperator(osvReq)
 	osvRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(osvRec, osvReq)
 	if !bytes.Equal(files["osv.json"], osvRec.Body.Bytes()) {
@@ -149,7 +149,7 @@ func TestFindingBundle_omitsCSAFWhenNoDependents(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodGet,
 		"/findings/"+strconv.Itoa(int(f.ID))+"/bundle.tar.gz", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -176,7 +176,7 @@ func TestFindingBundle_skipsPatchWhenAbsent(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodGet,
 		"/findings/"+strconv.Itoa(int(f.ID))+"/bundle.tar.gz", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusOK {
@@ -202,7 +202,7 @@ func TestFindingBundle_rejectsDuplicate(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodGet,
 		"/findings/"+strconv.Itoa(int(f.ID))+"/bundle.tar.gz", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusGone {
@@ -214,7 +214,7 @@ func TestFindingBundle_notFoundReturns404(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	r := httptest.NewRequest(http.MethodGet, "/findings/99999/bundle.tar.gz", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusNotFound {
@@ -248,7 +248,7 @@ func TestFindingBundle_failsOnDependentLookupError(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodGet,
 		"/findings/"+strconv.Itoa(int(f.ID))+"/bundle.tar.gz", nil)
-	r.Host = "127.0.0.1:8080"
+	asOperator(r)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)
 	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "load dependents:") {

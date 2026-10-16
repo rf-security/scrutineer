@@ -1,143 +1,350 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"unicode/utf8"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
+	"scrutineer/internal/poc"
+	"scrutineer/internal/testutil"
 )
 
-// TestMigrate is a live end-to-end check: it seeds a temp SQLite database
-// (including the scans<->findings foreign-key cycle and both many-to-many
-// join tables), migrates it into a real PostgreSQL server, and verifies the
-// row counts and key relationships survive. It is skipped unless
-// SCRUTINEER_TEST_PG_DSN points at an empty-or-forceable Postgres.
-func TestMigrate(t *testing.T) {
-	dsn := os.Getenv("SCRUTINEER_TEST_PG_DSN")
-	if dsn == "" {
-		t.Skip("set SCRUTINEER_TEST_PG_DSN to run the migrator integration test")
+func TestMigratorProcess(_ *testing.T) {
+	if os.Getenv("SCRUTINEER_MIGRATOR_PROCESS") != "1" {
+		return
 	}
+	flag.CommandLine = flag.NewFlagSet("migrate-sqlite-to-postgres", flag.ExitOnError)
+	os.Args = append([]string{os.Args[0]}, strings.Split(os.Getenv("SCRUTINEER_MIGRATOR_ARGS"), "\n")...)
+	main()
+	os.Exit(0)
+}
 
-	// Seed a SQLite source.
-	srcPath := filepath.Join(t.TempDir(), "scrutineer.db")
-	src, err := db.Open(srcPath)
-	if err != nil {
-		t.Fatalf("open source: %v", err)
-	}
-	repo := db.Repository{
-		URL:  "https://example.com/repo",
-		Name: "repo",
-		Maintainers: []db.Maintainer{ // many2many -> repository_maintainers
-			{Login: "alice"}, {Login: "bob"},
-		},
-	}
-	must(t, src.Create(&repo).Error)
-	scan := db.Scan{RepositoryID: repo.ID, Commit: "abc123", Status: db.ScanDone}
-	must(t, src.Create(&scan).Error)
-	finding := db.Finding{
-		ScanID: scan.ID,
-		Title:  "example",
-		Labels: []db.FindingLabel{{Name: "triage"}}, // many2many -> finding_labels_join
-	}
-	must(t, src.Create(&finding).Error)
-	// Close the scans<->findings cycle: a finding-scoped scan pointing back.
-	fScan := db.Scan{RepositoryID: repo.ID, Status: db.ScanDone, FindingID: &finding.ID}
-	must(t, src.Create(&fScan).Error)
-	must(t, src.Create(&db.ExpectedFinding{RepositoryID: repo.ID, File: "app.rb", CWE: "CWE-89"}).Error)
-	must(t, src.Create(&db.Setting{Key: "concurrency", Value: "4"}).Error)
+func migrateCLI(t *testing.T, path, dsn string) (string, error) {
+	t.Helper()
+	return migrateCLIConfig(t, path, fmt.Sprintf("addr: %q\ndatabase:\n  dsn: %q\n", unusedAddr(t), dsn))
+}
 
-	// Migrate into the empty Postgres.
-	if err := run(srcPath, dsn, false); err != nil {
-		t.Fatalf("run migrate: %v", err)
-	}
+func migrateCLIConfig(t *testing.T, path, yaml string) (string, error) {
+	t.Helper()
+	configPath := filepath.Join(t.TempDir(), "scrutineer.yaml")
+	must(t, os.WriteFile(configPath, []byte(yaml), 0o600))
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMigratorProcess$")
+	cmd.Env = append(os.Environ(), "SCRUTINEER_MIGRATOR_PROCESS=1",
+		"SCRUTINEER_MIGRATOR_ARGS=-config\n"+configPath+"\n-sqlite\n"+path)
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
 
-	dst, err := db.OpenBackend(db.Options{Dialect: db.DialectPostgres, DSN: dsn})
-	if err != nil {
-		t.Fatalf("open dest: %v", err)
-	}
+func sqliteSource(t *testing.T) (*gorm.DB, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "source.db")
+	source, err := db.Open(path)
+	must(t, err)
+	t.Cleanup(func() { closeDB(source) })
+	return source, path
+}
 
-	// Row counts survived.
-	for _, tc := range []struct {
-		model any
-		want  int64
-	}{
-		{&db.Repository{}, 1}, {&db.Scan{}, 2}, {&db.Finding{}, 1},
-		{&db.Maintainer{}, 2}, {&db.FindingLabel{}, 1}, {&db.Setting{}, 1},
-		{&db.ExpectedFinding{}, 1},
-	} {
-		var n int64
-		must(t, dst.Model(tc.model).Count(&n).Error)
-		if n != tc.want {
-			t.Errorf("%T count = %d, want %d", tc.model, n, tc.want)
-		}
-	}
+func postgresDestination(t *testing.T, dsn string) *gorm.DB {
+	t.Helper()
+	destination, err := db.OpenBackend(db.Options{Dialect: db.DialectPostgres, DSN: dsn})
+	must(t, err)
+	t.Cleanup(func() { closeDB(destination) })
+	return destination
+}
 
-	// Join tables survived.
-	for _, jt := range []struct {
-		table string
-		want  int64
-	}{{"repository_maintainers", 2}, {"finding_labels_join", 1}} {
-		var n int64
-		must(t, dst.Table(jt.table).Count(&n).Error)
-		if n != jt.want {
-			t.Errorf("%s count = %d, want %d", jt.table, n, jt.want)
-		}
-	}
-
-	// The FK-cycle edge survived: the finding-scoped scan still points at the
-	// finding, and the reserved-word commit column round-tripped.
-	var gotScan db.Scan
-	must(t, dst.First(&gotScan, fScan.ID).Error)
-	if gotScan.FindingID == nil || *gotScan.FindingID != finding.ID {
-		t.Errorf("finding-scoped scan lost its FindingID: got %v, want %d", gotScan.FindingID, finding.ID)
-	}
-	var origScan db.Scan
-	must(t, dst.First(&origScan, scan.ID).Error)
-	if origScan.Commit != "abc123" {
-		t.Errorf("commit round-trip = %q, want abc123", origScan.Commit)
-	}
-
-	// Sequence was reset: a fresh insert must not collide with imported ids.
-	newRepo := db.Repository{URL: "https://example.com/after", Name: "after"}
-	must(t, dst.Create(&newRepo).Error)
-	if newRepo.ID <= repo.ID {
-		t.Errorf("new repo id %d did not advance past imported max %d (sequence not reset)", newRepo.ID, repo.ID)
+func TestMigrationTableCoverage(t *testing.T) {
+	src, _ := sqliteSource(t)
+	tables, err := migrationTables(src)
+	must(t, err)
+	must(t, checkSource(src, tables))
+	var actual []string
+	must(t, src.Raw("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").Scan(&actual).Error)
+	if len(actual) != len(tables) {
+		t.Fatalf("database has %d application tables; migrator has %d", len(actual), len(tables))
 	}
 }
 
-// TestSanitizeStrings covers the UTF-8/NUL scrubbing that lets SQLite text
-// survive a PostgreSQL text column, without needing a live Postgres.
-func TestSanitizeStrings(t *testing.T) {
-	// The reported failure: a mangled em-dash (doubled 0xe2) in a scan's log,
-	// plus a NUL that Postgres text also forbids.
-	scan := db.Scan{
-		Log:    "before \xe2\xe2\x80 after",
-		Report: "has\x00nul",
-		Commit: "clean",
+func TestPostgresMigration(t *testing.T) {
+	dsn := ownerDSN(t)
+	src, path := sqliteSource(t)
+	seedHistory(t, src)
+	must(t, src.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error)
+	before, err := os.ReadFile(path)
+	must(t, err)
+	output, err := migrateCLI(t, path, dsn)
+	if err != nil {
+		t.Fatalf("CLI: %v\n%s", err, output)
 	}
-	if !sanitizeStrings(&scan) {
-		t.Fatal("sanitizeStrings reported no change on invalid input")
+	after, err := os.ReadFile(path)
+	must(t, err)
+	if sha256.Sum256(before) != sha256.Sum256(after) {
+		t.Fatal("migration changed the source database")
 	}
-	if !utf8.ValidString(scan.Log) {
-		t.Errorf("Log still invalid UTF-8: %q", scan.Log)
+	dst := postgresDestination(t, dsn)
+	var tables []string
+	must(t, src.Raw("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").Scan(&tables).Error)
+	for _, table := range tables {
+		var want, got int64
+		must(t, src.Table(table).Count(&want).Error)
+		must(t, dst.Table(table).Count(&got).Error)
+		if table == "settings" {
+			got-- // PostgreSQL owns its schema-version setting.
+		}
+		if want == 0 || got != want {
+			t.Errorf("%s: got %d rows, want %d nonzero rows", table, got, want)
+		}
 	}
-	if strings.ContainsRune(scan.Report, 0) {
-		t.Errorf("Report still contains NUL: %q", scan.Report)
+	var scan db.Scan
+	must(t, dst.First(&scan, 1).Error)
+	if scan.Commit != "abc123" || scan.FindingID == nil || *scan.FindingID != 1 ||
+		scan.Report != "hasnul" || scan.Log != db.SanitizePGText("bad\xfftext") {
+		t.Fatalf("scan data changed: commit=%q finding=%v report=%q log=%q", scan.Commit, scan.FindingID, scan.Report, scan.Log)
 	}
-	if scan.Report != "hasnul" {
-		t.Errorf("Report = %q, want NUL stripped to %q", scan.Report, "hasnul")
+	var nulls bool
+	must(t, dst.Raw("SELECT created_at IS NULL AND fetched_at IS NULL FROM repositories WHERE id = 1").Scan(&nulls).Error)
+	if !nulls {
+		t.Error("NULL timestamps were replaced")
 	}
-	if scan.Commit != "clean" {
-		t.Errorf("Commit was altered: %q", scan.Commit)
+	var skill db.Skill
+	must(t, dst.First(&skill, 1).Error)
+	if skill.Active || skill.Version != 0 {
+		t.Errorf("stored zero values replaced by defaults: active=%t version=%d", skill.Active, skill.Version)
 	}
+	var upload db.SBOMUpload
+	must(t, dst.First(&upload, 1).Error)
+	if !bytes.Equal(upload.Raw, []byte{0, 0xff, 1}) || upload.Origin != "" {
+		t.Errorf("SBOM bytes or empty origin changed: raw=%v origin=%q", upload.Raw, upload.Origin)
+	}
+	var capture db.FindingPoC
+	must(t, dst.First(&capture, 1).Error)
+	if capture.FindingID != 1 || capture.ScanID != 1 || capture.Commit != "abc123" || !bytes.Equal(capture.Files, migrationPoCFiles(t)) {
+		t.Errorf("PoC capture changed: %+v", capture)
+	}
+	var message db.ChatMessage
+	must(t, dst.First(&message, 1).Error)
+	wantTime := time.Date(2020, 2, 3, 4, 5, 6, 123456000, time.UTC)
+	if message.Content != "retain this conversation" || !message.CreatedAt.Equal(wantTime) {
+		t.Errorf("chat content/timestamp changed: %+v", message)
+	}
+	assertMigratedDisclosureSubmission(t, dst, wantTime)
+	var badConstraints int64
+	must(t, dst.Raw("SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND connamespace = current_schema()::regnamespace AND (condeferrable OR NOT convalidated)").Scan(&badConstraints).Error)
+	if badConstraints != 0 {
+		t.Errorf("%d constraints were not restored and validated", badConstraints)
+	}
+	for _, model := range []any{
+		&db.Repository{URL: "https://example.com/after"},
+		&db.Scan{RepositoryID: 1, Status: db.ScanDone},
+		&db.Finding{ScanID: 1, Title: "after migration"},
+	} {
+		must(t, dst.Create(model).Error)
+	}
+	if output, err := migrateCLI(t, path, dsn); err == nil || !strings.Contains(output, "not empty") {
+		t.Fatalf("rerun should refuse a populated destination: %v\n%s", err, output)
+	}
+}
 
-	// A clean row is left untouched (and reported as unchanged).
-	clean := db.Scan{Log: "plain — text", Commit: "abc"}
-	if sanitizeStrings(&clean) {
-		t.Error("sanitizeStrings reported a change on clean input")
+func assertMigratedDisclosureSubmission(t *testing.T, dst *gorm.DB, wantTime time.Time) {
+	t.Helper()
+	var submission db.DisclosureSubmission
+	must(t, dst.First(&submission, 1).Error)
+	if submission.FindingID != 1 || submission.Channel != db.DisclosureChannelAkrites ||
+		submission.ExternalID != "SUB-migrated" || submission.Status != "queued" ||
+		submission.Request != `{"software":"widget","ecosystem":"npm"}` ||
+		submission.NextPollAt == nil || !submission.NextPollAt.Equal(wantTime) {
+		t.Errorf("disclosure submission changed: %+v", submission)
+	}
+}
+
+func ownerDSN(t *testing.T) string {
+	t.Helper()
+	dsn := testutil.PostgresDSN(t)
+	admin, err := sql.Open("pgx", dsn)
+	must(t, err)
+	t.Cleanup(func() { _ = admin.Close() })
+	role := "migrator_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	identifier := pgx.Identifier{role}.Sanitize()
+	_, err = admin.Exec("CREATE ROLE " + identifier + " NOSUPERUSER NOCREATEDB NOCREATEROLE")
+	must(t, err)
+	t.Cleanup(func() {
+		_, err := admin.Exec("DROP OWNED BY " + identifier + " CASCADE")
+		must(t, err)
+		_, err = admin.Exec("DROP ROLE " + identifier)
+		must(t, err)
+	})
+	_, err = admin.Exec("GRANT CREATE ON SCHEMA public TO " + identifier)
+	must(t, err)
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		parsed, err := url.Parse(dsn)
+		must(t, err)
+		query := parsed.Query()
+		query.Set("options", "-c role="+role)
+		parsed.RawQuery = query.Encode()
+		return parsed.String()
+	}
+	return dsn + " options='-c role=" + role + "'"
+}
+
+func seedHistory(t *testing.T, src *gorm.DB) {
+	t.Helper()
+	const count = batchSize*2 + 1
+	var repositories []db.Repository
+	var scans []db.Scan
+	var findings []db.Finding
+	var labels []db.FindingLabel
+	var maintainers []db.Maintainer
+	var repoLinks []repositoryMaintainer
+	var findingLinks []findingLabel
+	for i := uint(1); i <= count; i++ {
+		repositories = append(repositories, db.Repository{ID: i, URL: fmt.Sprintf("https://example.com/repo-%d", i)})
+		scans = append(scans, db.Scan{ID: i, RepositoryID: i, Status: db.ScanDone, Commit: "abc123"})
+		findings = append(findings, db.Finding{ID: i, ScanID: i, Title: fmt.Sprintf("finding-%d", i)})
+		labels = append(labels, db.FindingLabel{ID: i, Name: fmt.Sprintf("label-%d", i)})
+		maintainers = append(maintainers, db.Maintainer{ID: i, Login: fmt.Sprintf("maintainer-%d", i)})
+		repoLinks = append(repoLinks, repositoryMaintainer{RepositoryID: i, MaintainerID: i})
+		findingLinks = append(findingLinks, findingLabel{FindingID: i, FindingLabelID: i})
+	}
+	for _, rows := range []any{&repositories, &scans, &findings, &labels, &maintainers, &repoLinks, &findingLinks} {
+		must(t, src.CreateInBatches(rows, batchSize).Error)
+	}
+	must(t, src.Model(&db.Scan{}).Where("id = 1").Updates(map[string]any{
+		"finding_id": 1, "report": "has\x00nul", "log": "bad\xfftext",
+	}).Error)
+	for _, row := range []any{
+		&db.ExpectedFinding{RepositoryID: 1, File: "app.rb", CWE: "CWE-89"},
+		&db.FindingNote{FindingID: 1, Body: "analyst note"},
+		&db.FindingCommunication{FindingID: 1, Body: "disclosure"},
+		&db.DisclosureSubmission{FindingID: 1, Channel: db.DisclosureChannelAkrites,
+			ExternalID: "SUB-migrated", Status: "queued", Request: `{"software":"widget","ecosystem":"npm"}`,
+			NextPollAt: new(time.Date(2020, 2, 3, 4, 5, 6, 123456000, time.UTC))},
+		&db.FindingReference{FindingID: 1, URL: "https://example.com/reference"},
+		&db.FindingHistory{FindingID: 1, Field: "status", NewValue: "confirmed"},
+		&db.FindingReview{FindingID: 1, Verdict: "true_positive"},
+		&db.FindingPoC{FindingID: 1, ScanID: 1, Commit: "abc123", Files: migrationPoCFiles(t)},
+		&db.FeedbackConfirmation{ReviewID: 1, ScanID: 1, FindingID: 1, Commit: "abc123"},
+		&db.ScanPreflightReceipt{ScanID: 1, ProbeID: "probe", Report: "{}"},
+		&db.FindingVerification{FindingID: 1, ScanID: 1, Status: "verified", Report: "{}"},
+		&db.FindingAttackPath{FindingID: 1, ScanID: 1, ProductionViability: "VIABLE", Report: "{}"},
+		&db.RemediationAttempt{FindingID: 1, PatchScanID: 1, Attempt: 1, Patch: "diff", BaseCommit: "abc123"},
+		&db.RemediationValidation{FindingID: 1, RemediationAttemptID: 1, ScanID: 1, RootCauseStatus: "failed_to_bypass", Report: "{}"},
+		&db.AuditEvent{Kind: "finding.status", SubjectType: "finding", SubjectID: 1, Payload: "{}"},
+		&db.Dependency{RepositoryID: 1, Name: "dependency"},
+		&db.Package{RepositoryID: 1, Name: "package"},
+		&db.PackageAlternative{RepositoryID: 1, PURL: "pkg:gem/successor", Kind: "successor"},
+		&db.Dependent{RepositoryID: 1, Name: "dependent"},
+		&db.FindingDependent{FindingID: 1, DependentID: 1, Status: "known_affected"},
+		&db.Advisory{RepositoryID: 1, UUID: "advisory"},
+		&db.AdvisoryAudit{RepositoryID: 1, ScanID: 1, AdvisoryUUID: "advisory", Status: "fixed"},
+		&db.Skill{Name: "audit", Body: "recipe"},
+		&db.Subproject{RepositoryID: 1, Path: "lib"},
+		&db.ComplianceControl{RepositoryID: 1, ScanID: 1, ControlID: "control", Status: "PASS"},
+		&db.SBOMUpload{Name: "snapshot", Raw: []byte{0, 0xff, 1}},
+		&db.SBOMPackage{SBOMUploadID: 1, Name: "package"},
+		&db.CNA{ShortName: "authority"},
+		&db.Setting{Key: "concurrency", Value: "4"},
+		&db.Conversation{RepositoryID: 1, Title: "triage"},
+		&db.ChatMessage{ConversationID: 1, Role: "user", Content: "retain this conversation",
+			CreatedAt: time.Date(2020, 2, 3, 4, 5, 6, 123456000, time.UTC)},
+		&db.InterchangeRecord{Feed: "peer", PredicateType: "claim", SubjectDigest: "digest", Record: "{}"},
+	} {
+		must(t, src.Create(row).Error)
+	}
+	must(t, src.Exec("UPDATE repositories SET created_at = NULL, fetched_at = NULL WHERE id = 1").Error)
+	must(t, src.Exec("UPDATE skills SET active = false, version = 0 WHERE id = 1").Error)
+	must(t, src.Exec("UPDATE sbom_uploads SET origin = '' WHERE id = 1").Error)
+}
+
+func migrationPoCFiles(t *testing.T) []byte {
+	t.Helper()
+	data := []byte{0, 0xff, 1}
+	files, err := json.Marshal([]poc.File{{Path: "repro.bin", Data: data, SHA256: fmt.Sprintf("%x", sha256.Sum256(data))}})
+	must(t, err)
+	return files
+}
+
+func TestPostgresMigrationRejectsUnsafeSources(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"queued", "INSERT INTO scans (repository_id, kind, status) VALUES (1, 'skill', 'queued')", "queued/running"},
+		{"running", "INSERT INTO scans (repository_id, kind, status) VALUES (1, 'skill', 'Running')", "queued/running"},
+		{"queue", "CREATE TABLE goqite (id TEXT); INSERT INTO goqite VALUES ('pending')", "job queue"},
+		{"unknown table", "CREATE TABLE extra_history (id INTEGER)", "source table extra_history"},
+		{"unknown column", "ALTER TABLE repositories ADD COLUMN extra_history TEXT", "source column repositories.extra_history"},
+		{"older schema", "ALTER TABLE findings DROP COLUMN title", "source is missing column findings.title"},
+		{"missing table", "DROP TABLE audit_events", "source is missing table audit_events"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn := testutil.PostgresDSN(t)
+			src, path := sqliteSource(t)
+			must(t, src.Create(&db.Repository{URL: "https://example.com/repo"}).Error)
+			must(t, src.Exec(tc.sql).Error)
+			output, err := migrateCLI(t, path, dsn)
+			if err == nil || !strings.Contains(output, tc.want) {
+				t.Fatalf("expected %q: %v\n%s", tc.want, err, output)
+			}
+		})
+	}
+}
+
+func TestPostgresMigrationRejectsDestinationData(t *testing.T) {
+	for _, model := range []any{&db.Setting{Key: "concurrency", Value: "8"}, &db.FindingLabel{Name: "existing"}} {
+		t.Run(fmt.Sprintf("%T", model), func(t *testing.T) {
+			dsn := testutil.PostgresDSN(t)
+			dst := postgresDestination(t, dsn)
+			must(t, dst.Create(model).Error)
+			src, path := sqliteSource(t)
+			must(t, src.Create(&db.Repository{URL: "https://example.com/repo"}).Error)
+			output, err := migrateCLI(t, path, dsn)
+			if err == nil || !strings.Contains(output, "not empty") {
+				t.Fatalf("expected refusal: %v\n%s", err, output)
+			}
+			var count int64
+			must(t, dst.Model(&db.Repository{}).Count(&count).Error)
+			if count != 0 {
+				t.Fatalf("copied %d repositories into populated destination", count)
+			}
+		})
+	}
+}
+
+func TestPostgresMigrationRollsBackInvalidRelationships(t *testing.T) {
+	dsn := testutil.PostgresDSN(t)
+	src, path := sqliteSource(t)
+	must(t, src.Create(&db.Repository{URL: "https://example.com/repo"}).Error)
+	must(t, src.Exec("PRAGMA foreign_keys = OFF").Error)
+	must(t, src.Exec("INSERT INTO scans (repository_id, kind, status) VALUES (999, 'skill', 'done')").Error)
+	output, err := migrateCLI(t, path, dsn)
+	if err == nil || !strings.Contains(output, "validate migrated relationships") {
+		t.Fatalf("expected FK validation error: %v\n%s", err, output)
+	}
+	dst := postgresDestination(t, dsn)
+	var count int64
+	must(t, dst.Model(&db.Repository{}).Count(&count).Error)
+	if count != 0 {
+		t.Fatalf("failed migration left %d repositories", count)
+	}
+	must(t, src.Exec("UPDATE scans SET repository_id = 1").Error)
+	if output, err := migrateCLI(t, path, dsn); err != nil {
+		t.Fatalf("retry after fixing source: %v\n%s", err, output)
 	}
 }
 
@@ -145,5 +352,45 @@ func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func unusedAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	must(t, err)
+	addr := ln.Addr().String()
+	must(t, ln.Close())
+	return addr
+}
+
+func TestMigrationRefusesUnsafeConfig(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	must(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	_, path := sqliteSource(t)
+	for _, tc := range []struct{ name, yaml, want string }{
+		{"no dsn", fmt.Sprintf("addr: %q\n", unusedAddr(t)), "set database.dsn"},
+		{"server running", fmt.Sprintf("addr: %q\ndatabase:\n  dsn: postgres://unused/db\n", ln.Addr()), "still running"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := migrateCLIConfig(t, path, tc.yaml)
+			if err == nil || !strings.Contains(output, tc.want) {
+				t.Fatalf("expected %q: %v\n%s", tc.want, err, output)
+			}
+		})
+	}
+}
+
+// A non-SQLite source would fail the snapshot, so reaching "not empty" shows
+// the destination is checked first.
+func TestPostgresMigrationChecksDestinationBeforeSnapshot(t *testing.T) {
+	dsn := testutil.PostgresDSN(t)
+	must(t, postgresDestination(t, dsn).Create(&db.FindingLabel{Name: "existing"}).Error)
+	path := filepath.Join(t.TempDir(), "source.db")
+	must(t, os.WriteFile(path, []byte("not a database"), 0o600))
+	output, err := migrateCLI(t, path, dsn)
+	if err == nil || !strings.Contains(output, "not empty") {
+		t.Fatalf("expected destination refusal before snapshot: %v\n%s", err, output)
 	}
 }

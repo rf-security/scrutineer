@@ -106,6 +106,7 @@
         <button type="button" data-dialog="reject-{{$id}}" class="btn-ghost">
           Reject
         </button>
+        {{if not .Sharing}}
         {{if .CriticInFlight}}
           <button type="button" class="btn-outline" disabled title="A critic scan is already queued or running for this finding">
             <i data-lucide="loader-circle" class="animate-spin"></i> Viability in progress
@@ -116,8 +117,10 @@
             <i data-lucide="route"></i> Assess viability
           </button>
         {{end}}
+        {{end}}
 
       {{else if eq $s "triaged"}}
+        {{if not .Sharing}}
         {{if .DisclosureBlocked}}
           <button type="button" class="btn" disabled title="The latest critic assessment is NON_VIABLE">
             <i data-lucide="ban"></i> Disclosure blocked
@@ -165,6 +168,7 @@
                 hx-post="/findings/{{$id}}/mitigate">
           <i data-lucide="shield"></i> Draft mitigation
         </button>
+        {{end}}
         {{if and .HasDisclosureDraft (not .DisclosureBlocked)}}
           <button type="submit" name="status" value="ready" class="btn-outline"
                   hx-post="/findings/{{$id}}/status">
@@ -185,13 +189,14 @@
             <i data-lucide="file-check-2"></i> Review disclosure
           </a>
         {{end}}
-        {{if and (not .DisclosureBlocked) (not (or (eq .Severity "High") (eq .Severity "Critical")))}}
+        {{if and (not .Sharing) (not .DisclosureBlocked) (not (or (eq .Severity "High") (eq .Severity "Critical")))}}
           <button type="submit" class="btn-outline" formaction="/findings/{{$id}}/public-issue"
                   hx-post="/findings/{{$id}}/public-issue">
             <i data-lucide="message-square-plus"></i> File public issue
           </button>
         {{end}}
         {{if .DisclosureBlocked}}
+          {{if not .Sharing}}
           {{if .CriticInFlight}}
             <button type="button" class="btn-outline" disabled title="A critic scan is already queued or running for this finding">
               <i data-lucide="loader-circle" class="animate-spin"></i> Viability in progress
@@ -201,6 +206,7 @@
                     hx-post="/findings/{{$id}}/critic">
               <i data-lucide="route"></i> Reassess viability
             </button>
+          {{end}}
           {{end}}
           <button type="button" class="btn" disabled title="The latest critic assessment is NON_VIABLE">
             <i data-lucide="ban"></i> Reporting blocked
@@ -246,9 +252,11 @@
       <i data-lucide="bug" class="size-3.5"></i>
       <span>Exploitation status</span>
       {{if eq .ExploitedInWild "yes"}}<span class="badge-destructive">yes</span>{{else if eq .ExploitedInWild "no"}}<span class="badge-outline">no</span>{{else}}<span>unknown</span>{{end}}
+      {{if not .Sharing}}
       <button type="button" data-dialog="exploitation-{{$id}}" class="btn-sm-outline ml-auto">
         <i data-lucide="pencil"></i> Edit
       </button>
+      {{end}}
     </div>
     {{if .ExploitedInWildEvidence}}<p class="pl-6">{{.ExploitedInWildEvidence}}</p>{{end}}
   </section>
@@ -284,6 +292,7 @@
   </article>
 </dialog>
 
+{{if not .Sharing}}
 <dialog id="exploitation-{{$id}}" class="dialog">
   <article>
     <header>
@@ -311,4 +320,5 @@
     </form>
   </article>
 </dialog>
+{{end}}
 {{end}}

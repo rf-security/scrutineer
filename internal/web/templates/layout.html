@@ -33,12 +33,14 @@
           </span>
           <span class="grid flex-1 text-left leading-tight">
             <span class="truncate font-medium">scrutineer</span>
-            <span class="truncate text-xs text-muted-foreground">local</span>
+            <span class="truncate text-xs text-muted-foreground">{{if .Sharing}}sharing{{else}}local{{end}}</span>
           </span>
         </a>
+        {{if not .Sharing}}
         <a href="/settings" class="btn-ghost p-2 size-10 flex items-center justify-center rounded-lg text-muted-foreground hover:text-foreground" aria-label="Settings" data-tooltip="Settings" data-side="bottom">
           <i data-lucide="settings" class="size-4"></i>
         </a>
+        {{end}}
       </div>
     </header>
     <section>
@@ -46,8 +48,9 @@
         <ul id="nav">
           {{$nav := .Nav}}
           <li><a href="/"{{if eq $nav "repos"}} aria-current="page"{{end}}><i data-lucide="folder-git-2"></i><span>Repositories</span></a></li>
-          <li><a href="/orgs"{{if eq $nav "orgs"}} aria-current="page"{{end}}><i data-lucide="building"></i><span>Organizations</span></a></li>
+          {{if not .Sharing}}<li><a href="/orgs"{{if eq $nav "orgs"}} aria-current="page"{{end}}><i data-lucide="building"></i><span>Organizations</span></a></li>{{end}}
           <li><a href="/findings"{{if eq $nav "findings"}} aria-current="page"{{end}}><i data-lucide="bug"></i><span>Findings</span></a></li>
+          {{if not .Sharing}}
           <li><a href="/benchmark"{{if eq $nav "benchmark"}} aria-current="page"{{end}}><i data-lucide="gauge"></i><span>Benchmark</span></a></li>
           <li><a href="/packages"{{if eq $nav "packages"}} aria-current="page"{{end}}><i data-lucide="package"></i><span>Packages</span></a></li>
           <li><a href="/sboms"{{if eq $nav "sboms"}} aria-current="page"{{end}}><i data-lucide="file-box"></i><span>SBOMs</span></a></li>
@@ -58,6 +61,7 @@
           <li><a href="/skills"{{if eq $nav "skills"}} aria-current="page"{{end}}><i data-lucide="sparkles"></i><span>Skills</span></a></li>
           <li><a href="/usage"{{if eq $nav "usage"}} aria-current="page"{{end}}><i data-lucide="coins"></i><span>Usage</span></a></li>
           <li><a href="/reporting"{{if eq $nav "reporting"}} aria-current="page"{{end}}><i data-lucide="file-chart-column"></i><span>Reporting</span></a></li>
+          {{end}}
         </ul>
       </div>
     </section>
@@ -73,10 +77,18 @@
           <i data-lucide="circle-alert"></i> Report issue
         </a>
       </div>
+      {{if .Sharing}}
+      <form method="post" action="/auth/logout" hx-post="/auth/logout" hx-swap="none">
+        <button type="submit" class="btn-outline w-full">
+          <i data-lucide="log-out"></i> Sign out
+        </button>
+      </form>
+      {{else}}
       <a href="/repositories/new" data-dialog="add-repo" class="btn w-full">
         <i data-lucide="plus"></i> Add repository
       </a>
       <a href="/investigations/new" class="btn-outline w-full">Investigate a report</a>
+      {{end}}
     </footer>
   </nav>
 </aside>
@@ -89,6 +101,7 @@
   </div>
 </main>
 
+{{if not .Sharing}}
 <dialog id="add-repo" class="dialog w-full sm:max-w-md">
   <div>
     <header><h2>Add repository</h2></header>
@@ -187,6 +200,7 @@
     <form method="dialog"><button aria-label="Close"><i data-lucide="x"></i></button></form>
   </div>
 </dialog>
+{{end}}
 
 <div id="toaster" class="toaster">
   {{with .Flash}}{{template "toast" .}}{{end}}

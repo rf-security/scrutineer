@@ -19,7 +19,7 @@
     {{end}}
   </div>
   <div class="flex items-center gap-2">
-    {{if .Skills}}
+    {{if and (not .Sharing) .Skills}}
     <form method="post" action="/repositories/{{.Repo.ID}}/skill-scan">
       <div class="dropdown-menu">
         <button class="btn-outline" type="button" aria-haspopup="menu" aria-expanded="false"
@@ -47,6 +47,7 @@
        data-tooltip="Trimmed report for an upstream maintainer: summary, threat model, findings and fixes only — no internal notes, communications, labels, or repo-wide inventory.">
       <i data-lucide="share-2"></i> Export for upstream
     </a>
+    {{if not .Sharing}}
     <form method="post" action="/repositories/{{.Repo.ID}}/delete"
           hx-post="/repositories/{{.Repo.ID}}/delete" hx-swap="none"
           hx-confirm="{{if .ActiveScans}}{{.ActiveScans}} scan(s) on {{.Repo.Name}} are still running or queued and will keep writing to disk until they finish; cancel them first. {{end}}{{if .PausedScans}}{{.PausedScans}} paused scan(s) will also be permanently removed. {{end}}Permanently delete {{.Repo.Name}}? This removes the repository, all its scans and findings, and its cached clone on disk. This cannot be undone.">
@@ -64,6 +65,7 @@
         <i data-lucide="git-compare-arrows"></i> Diff rescan
       </button>
     </form>
+    {{end}}
   </div>
 </div>
 
@@ -105,6 +107,7 @@
       Compliance {{if .Repo.BaselineLevel}}<span class="badge-outline ml-1">L{{.Repo.BaselineLevel}}</span>{{end}}
     </button>
     {{end}}
+    {{if not .Sharing}}
     <button type="button" role="tab" id="rt12" aria-controls="rp12" aria-selected="false">
       Workbench
       {{if .Workbench.HasOverride}}<span class="badge-outline ml-1">override</span>{{end}}
@@ -115,6 +118,7 @@
     <button type="button" role="tab" id="rt13" aria-controls="rp13" aria-selected="false">
       Benchmark{{if .ExpectedFindings}} <span class="badge-outline ml-1">{{.ExpectedMatched}}/{{len .ExpectedFindings}}</span>{{end}}
     </button>
+    {{end}}
     {{if .Advisories}}
     <button type="button" role="tab" id="rt8" aria-controls="rp8" aria-selected="false">
       Advisories
@@ -172,6 +176,7 @@
       {{else}}
         <p class="text-sm mt-2 italic text-muted-foreground">not set</p>
       {{end}}
+      {{if not .Sharing}}
       <details class="mt-2">
         <summary class="text-xs text-muted-foreground cursor-pointer hover:underline">Edit</summary>
         <form method="post" action="/repositories/{{.Repo.ID}}/disclosure-channel" class="form grid grid-cols-[1fr_auto] gap-2 mt-2">
@@ -182,6 +187,7 @@
         </form>
         <p class="text-xs text-muted-foreground mt-1">Auto-filled by the maintainers skill from <code>SECURITY.md</code>, registry owner data, or CODEOWNERS. Edit freely.</p>
       </details>
+      {{end}}
     </div>
 
     <div class="mb-4 max-w-3xl">
@@ -255,11 +261,13 @@
     {{if .Subprojects}}
       <div class="flex items-center justify-between gap-2 mb-2">
         <h3 class="font-medium">Subprojects <span class="text-muted-foreground text-xs">({{len .Subprojects}})</span></h3>
+        {{if not .Sharing}}
         <form method="post" action="/repositories/{{.Repo.ID}}/scan-all"
               hx-post="/repositories/{{.Repo.ID}}/scan-all" hx-swap="none"
               hx-confirm="Enqueue a deep-dive scan for all {{len .Subprojects}} subproject(s)?">
           <button type="submit" class="btn-sm-outline"><i data-lucide="play"></i> Scan all</button>
         </form>
+        {{end}}
       </div>
       <p class="text-sm text-muted-foreground mb-2">Detected packages in this repository, including any root package with code outside its subprojects. Root scans retain the whole repository and its build configuration.</p>
       <table class="table w-full mb-6">
@@ -280,10 +288,12 @@
             <td class="whitespace-normal text-sm text-muted-foreground">{{.Description}}</td>
             <td class="text-right text-sm text-muted-foreground">{{index $counts .ScanSubPath}}</td>
             <td>
+              {{if not $.Sharing}}
               <form method="post" action="/repositories/{{$repoID}}/scan" hx-post="/repositories/{{$repoID}}/scan" hx-swap="none">
                 <input type="hidden" name="sub_path" value="{{.ScanSubPath}}">
                 <button type="submit" class="btn-sm-outline"><i data-lucide="play"></i> Scan</button>
               </form>
+              {{end}}
             </td>
           </tr>
         {{end}}
@@ -335,7 +345,7 @@
         Scanners tab for zizmor/semgrep output.{{end}}
       </p>
       <div class="flex items-center gap-2 shrink-0">
-      {{if gt .NewFindingCount 0}}
+      {{if and (not .Sharing) (gt .NewFindingCount 0)}}
         <form method="post"
               action="/repositories/{{.Repo.ID}}/verify-all{{if .Category}}?category={{.Category}}{{end}}"
               hx-post="/repositories/{{.Repo.ID}}/verify-all{{if .Category}}?category={{.Category}}{{end}}"
@@ -549,7 +559,7 @@
             <td class="text-muted-foreground whitespace-normal break-all">{{if .Requirement}}{{.Requirement}}{{else}}-{{end}}{{if .RequirementUnresolved}} <span class="badge-outline" data-tooltip="{{if .RequirementResolution}}{{.RequirementResolution}}{{else}}Requirement contains an unresolved manifest expression{{end}}">unresolved</span>{{end}}</td>
             <td class="text-muted-foreground">{{.DependencyType}}</td>
             <td class="whitespace-normal text-muted-foreground text-xs">{{range $i, $m := .Manifests}}{{if $i}}, {{end}}{{$u := locurl $.Repo.ID $.DepsCommit $m}}{{if $u}}<a href="{{$u}}" class="hover:underline break-all">{{$m}}</a>{{else}}{{$m}}{{end}}{{end}}</td>
-            <td>{{if .PURL}}{{$rid := lookup $.KnownPURLs .PURL}}{{if $rid}}<a href="/repositories/{{$rid}}" class="btn-sm-ghost" aria-label="View repository" data-tooltip="View repository"><i data-lucide="external-link"></i></a>{{else}}<form method="post" action="/dependencies/{{.ID}}/scan" hx-post="/dependencies/{{.ID}}/scan" hx-swap="none"><button type="submit" class="btn-sm-ghost" aria-label="Import repository" data-tooltip="Import repository"><i data-lucide="import"></i></button></form>{{end}}{{end}}</td>
+            <td>{{if .PURL}}{{$rid := lookup $.KnownPURLs .PURL}}{{if $rid}}<a href="/repositories/{{$rid}}" class="btn-sm-ghost" aria-label="View repository" data-tooltip="View repository"><i data-lucide="external-link"></i></a>{{else if not $.Sharing}}<form method="post" action="/dependencies/{{.ID}}/scan" hx-post="/dependencies/{{.ID}}/scan" hx-swap="none"><button type="submit" class="btn-sm-ghost" aria-label="Import repository" data-tooltip="Import repository"><i data-lucide="import"></i></button></form>{{end}}{{end}}</td>
           </tr>
         {{end}}
         </tbody>
@@ -594,6 +604,7 @@
   </div>
   {{end}}
 
+  {{if not .Sharing}}
   <div role="tabpanel" id="rp12" aria-labelledby="rt12" hidden>
     {{template "threat_workbench" .}}
   </div>
@@ -653,6 +664,7 @@
       {{end}}
     </div>
   </div>
+  {{end}}
 
   {{if .Advisories}}
   <div role="tabpanel" id="rp8" aria-labelledby="rt8" hidden>
@@ -701,7 +713,7 @@
           <td class="text-muted-foreground">{{.LatestVersion}}</td>
           <td class="text-muted-foreground">{{bignum .Downloads}}</td>
           <td class="text-muted-foreground">{{bignum .DependentRepos}} repos</td>
-          <td>{{if .RepositoryURL}}{{$rid := lookup $.KnownURLs .RepositoryURL}}{{if $rid}}<a href="/repositories/{{$rid}}" class="btn-sm-ghost" aria-label="View repository" data-tooltip="View repository"><i data-lucide="external-link"></i></a>{{else}}<form method="post" action="/dependents/{{.ID}}/scan" hx-post="/dependents/{{.ID}}/scan" hx-swap="none"><button type="submit" class="btn-sm-ghost" aria-label="Import repository" data-tooltip="Import repository"><i data-lucide="import"></i></button></form>{{end}}{{end}}</td>
+          <td>{{if .RepositoryURL}}{{$rid := lookup $.KnownURLs .RepositoryURL}}{{if $rid}}<a href="/repositories/{{$rid}}" class="btn-sm-ghost" aria-label="View repository" data-tooltip="View repository"><i data-lucide="external-link"></i></a>{{else if not $.Sharing}}<form method="post" action="/dependents/{{.ID}}/scan" hx-post="/dependents/{{.ID}}/scan" hx-swap="none"><button type="submit" class="btn-sm-ghost" aria-label="Import repository" data-tooltip="Import repository"><i data-lucide="import"></i></button></form>{{end}}{{end}}</td>
         </tr>
       {{end}}
       </tbody>
@@ -765,7 +777,7 @@
 
 {{define "scan_rows"}}
 <tbody id="scan-rows">
-{{range .Scans}}{{template "scan-row" (dict "S" .)}}{{end}}
+{{range .Scans}}{{template "scan-row" (dict "S" . "Sharing" $.Sharing)}}{{end}}
 </tbody>
 {{end}}
 
@@ -782,7 +794,7 @@
     <td><code>{{short .Commit}}</code></td>
     <td>{{if .StartedAt}}{{since .StartedAt}}{{end}}</td>
     <td>{{if .FinishedAt}}{{dur .Duration}}{{end}}</td>
-    <td>{{template "scan-actions" .}}</td>
+    <td>{{if not $.Sharing}}{{template "scan-actions" .}}{{end}}</td>
   </tr>
 {{end}}{{end}}
 

@@ -162,6 +162,12 @@ type Server struct {
 	FederationMembersFeed string
 	FederationImportFeeds []string
 	FederationPeers       []string
+	// AllowRemote, when true, permits remote access by disabling
+	// securityHeaders' localhost-only host-header check, so the UI and
+	// unauthenticated /api/v1 export endpoints can be served for any Host (e.g.
+	// behind a reverse proxy or over a LAN). Defaults to false, which keeps the
+	// DNS-rebinding protection. Set from config.AllowRemote.
+	AllowRemote bool
 
 	// resolvePURL maps a Package URL to its source repository URL via
 	// packages.ecosyste.ms. Field rather than direct call so tests can
@@ -644,15 +650,15 @@ func (s *Server) Handler() http.Handler {
 	// share the browser's boundary: loopback Host plus the operator token;
 	// see threatmodel.md.
 	root := http.NewServeMux()
-	root.Handle("/api/v1/", securityHeaders(s.requireOperator(http.StripPrefix(exportPrefix, s.exportHandler()))))
+	root.Handle("/api/v1/", securityHeaders(s.AllowRemote, s.requireOperator(http.StripPrefix(exportPrefix, s.exportHandler()))))
 	// Reachable without the operator token: the login page has to be, and
 	// claim-check is called by federation peers through a reverse proxy.
-	root.Handle("GET /static/", securityHeaders(http.FileServerFS(staticFS)))
-	root.Handle("GET /login", securityHeaders(http.HandlerFunc(s.login)))
+	root.Handle("GET /static/", securityHeaders(s.AllowRemote, http.FileServerFS(staticFS)))
+	root.Handle("GET /login", securityHeaders(s.AllowRemote, http.HandlerFunc(s.login)))
 	// No method in the pattern: the handler 404s non-POST itself so a
 	// federation-capable build cannot be fingerprinted by the 405 the
 	// mux would otherwise answer.
-	root.Handle("/claim-check", securityHeaders(http.HandlerFunc(s.claimCheck)))
+	root.Handle("/claim-check", securityHeaders(s.AllowRemote, http.HandlerFunc(s.claimCheck)))
 	// More specific than "/api/", so it wins the mux match and gets its own
 	// access rule rather than the scan-token auth apiHandler applies; see
 	// openAPISpecHandler.
@@ -661,7 +667,7 @@ func (s *Server) Handler() http.Handler {
 	if s.ModelProxy != nil {
 		root.Handle(worker.ModelProxyPathPrefix+"/", s.ModelProxy)
 	}
-	root.Handle("/", securityHeaders(s.requireOperator(mux)))
+	root.Handle("/", securityHeaders(s.AllowRemote, s.requireOperator(mux)))
 	return logRequests(s.Log, root)
 }
 
@@ -3822,10 +3828,15 @@ func localHost(host string) bool {
 // securityHeaders enforces T3 mitigations: host header check to prevent DNS
 // rebinding, Sec-Fetch-Site check on POST to prevent cross-origin CSRF, and
 // a CSP that prevents stored XSS in any rendered content from executing JS.
-func securityHeaders(h http.Handler) http.Handler {
+//
+// allowRemote=false (the default) keeps the localhost-only host check;
+// allowRemote=true skips it so the server can be reached for any Host, for
+// deployments that front scrutineer with a trusted reverse proxy or serve it on
+// a LAN. See config.AllowRemote.
+func securityHeaders(allowRemote bool, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", cspPolicy)
-		if !localHost(r.Host) {
+		if !allowRemote && !localHost(r.Host) {
 			http.Error(w, "forbidden: invalid host", http.StatusForbidden)
 			return
 		}

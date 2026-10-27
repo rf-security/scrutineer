@@ -134,6 +134,7 @@ type flags struct {
 	federationPeers       []string
 	subprojectScope       string
 	monorepoAttribution   bool
+	allowRemote           bool
 	skillLocal            skillDirs
 	// Keep connection credentials out of command-line arguments.
 	dbDriver string
@@ -419,6 +420,9 @@ func (f *flags) merge(cfg *config.Config) {
 	f.dbDriver = cfg.Database.Driver
 	f.dbDSN = cfg.Database.DSN
 
+	// AllowRemote is config-only (no CLI flag); the zero value keeps the
+	// localhost-only host-header check on (remote access denied).
+	f.allowRemote = cfg.AllowRemote
 	f.mergeFederation(cfg)
 
 	// Seed the model pick list from the active harness's own defaults,
@@ -741,6 +745,7 @@ func newApp(f *flags, cfg *config.Config, log *slog.Logger, setup runnerSetup) (
 	applyServerDefaults(srv, f, log)
 	srv.FederationSalt = f.federationSalt
 	srv.FederationContact = f.federationContact
+	srv.AllowRemote = f.allowRemote
 	srv.MonorepoAttribution = f.monorepoAttribution
 	srv.VINCE = cfg.VINCE
 	srv.Akrites = cfg.Akrites

@@ -15,7 +15,7 @@ Rust) from source — ~15–20 min.
 
 ```bash
 # from repo root
-docker build -t scrutineer-runner:local -f Dockerfile.runner .
+docker build -t scrutineer-runner:local -f docker/runner/Dockerfile.runner .
 docker build -t scrutineer-profile-ruby-ext \
   -f docker/profiles/ruby-ext/Dockerfile \
   --build-arg RUNNER_IMAGE=scrutineer-runner:local \

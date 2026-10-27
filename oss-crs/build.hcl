@@ -11,6 +11,6 @@ group "default" {
 # adds libCRS and the entrypoint on top of it.
 target "scrutineer-oss-crs-base" {
   context    = "."
-  dockerfile = "Dockerfile.runner"
+  dockerfile = "docker/runner/Dockerfile.runner"
   tags       = ["scrutineer-oss-crs-base:${VERSION}"]
 }

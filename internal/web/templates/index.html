@@ -11,12 +11,12 @@
   </h3>
   {{if eq .AuthorizedRepoCount 0}}
     <p class="text-sm text-muted-foreground mt-2">
-      GitHub did not report any public repositories where this account has write,
-      maintain, or admin access. Findings require one of those permission levels.
+      This account is not authorized for any scanned repositories. Findings require
+      GitHub write, maintain, or admin access, or an explicit operator grant.
     </p>
   {{else}}
     <p class="text-sm text-muted-foreground mt-2">
-      GitHub authorizes this account for {{.AuthorizedRepoCount}} public
+      This account is authorized for {{.AuthorizedRepoCount}} public
       {{if eq .AuthorizedRepoCount 1}}repository{{else}}repositories{{end}}.
       Scrutineer has scanned {{.ScannedRepoCount}}; {{len .UnscannedRepositories}}
       {{if eq (len .UnscannedRepositories) 1}}has{{else}}have{{end}} not been scanned.
@@ -48,7 +48,8 @@
         GitHub also reports {{len .InsufficientRepositories}} public
         {{if eq (len .InsufficientRepositories) 1}}repository{{else}}repositories{{end}}
         where this account's permission is below the required level. Their findings
-        remain hidden until GitHub grants write, maintain, or admin access.
+        remain hidden until GitHub grants write, maintain, or admin access, or the
+        Scrutineer operator explicitly grants access.
       </p>
       <details class="mt-3"{{if eq .AuthorizedRepoCount 0}} open{{end}}>
         <summary class="cursor-pointer text-sm font-medium">

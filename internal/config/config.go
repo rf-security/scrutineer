@@ -257,6 +257,11 @@ type Config struct {
 	// LAN. Only enable it when a trusted front end already restricts who can
 	// connect, since it removes the DNS-rebinding protection.
 	AllowRemote bool `yaml:"allow_remote"`
+	// RequireOperatorToken gates the browser UI and /api/v1 on the operator
+	// token (see docs/api.md). Unset or true keeps the gate on. Set false only
+	// when a trusted front end (IAP, an OAuth proxy) already authenticates
+	// every request, since it leaves the UI open to anyone who can reach it.
+	RequireOperatorToken *bool `yaml:"require_operator_token"`
 	// Sharing holds settings specific to the external maintainer portal
 	// (cmd/sharing): an optional separate database connection and explicit
 	// read-only access grants on top of the repositories GitHub reports with

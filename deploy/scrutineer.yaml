@@ -24,6 +24,9 @@ database:
   dsn: postgres://scrutineer:__DB_PASSWORD__@localhost:5432/scrutineer?sslmode=disable
 
 allow_remote: true
+# The load balancer health check (GET /) and browser access go straight to
+# the app, so the upstream operator-token gate is turned off here.
+require_operator_token: false
 
 sharing:
  database:

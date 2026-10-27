@@ -754,3 +754,20 @@ func TestLoad_rejectsInvalidSharingDatabase(t *testing.T) {
 		t.Fatal("expected error for sharing postgres without a dsn")
 	}
 }
+
+func TestLoad_requireOperatorToken(t *testing.T) {
+	c, err := Load(write(t, "addr: 127.0.0.1:8080\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequireOperatorToken != nil {
+		t.Errorf("unset require_operator_token = %v, want nil", *c.RequireOperatorToken)
+	}
+	c, err = Load(write(t, "require_operator_token: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequireOperatorToken == nil || *c.RequireOperatorToken {
+		t.Errorf("require_operator_token: false parsed as %v", c.RequireOperatorToken)
+	}
+}

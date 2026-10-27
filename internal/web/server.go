@@ -199,6 +199,11 @@ type Server struct {
 	// behind a reverse proxy or over a LAN). Defaults to false, which keeps the
 	// DNS-rebinding protection. Set from config.AllowRemote.
 	AllowRemote bool
+	// DisableOperatorToken, when true, makes requireOperator pass every
+	// request through without checking the operator token. Defaults to false
+	// (token required). Set from config.RequireOperatorToken: false, for
+	// deployments where a trusted front end already authenticates users.
+	DisableOperatorToken bool
 
 	// resolvePURL maps a Package URL to its source repository URL via
 	// packages.ecosyste.ms. Field rather than direct call so tests can

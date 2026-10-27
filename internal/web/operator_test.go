@@ -224,3 +224,21 @@ func TestRequireOperatorSharingScope(t *testing.T) {
 		})
 	}
 }
+
+func TestRequireOperatorDisabledServesWithoutToken(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	s.DisableOperatorToken = true
+
+	r := httptest.NewRequest("GET", "/repositories", nil)
+	r.Host = testHost
+	if w := serve(s, r); w.Code != http.StatusOK {
+		t.Errorf("status %d, want 200", w.Code)
+	}
+	// The host check still applies when the token gate is off.
+	r = httptest.NewRequest("GET", "/repositories", nil)
+	r.Host = "evil.example:8080"
+	if w := serve(s, r); w.Code != http.StatusForbidden {
+		t.Errorf("foreign host: status %d, want 403", w.Code)
+	}
+}

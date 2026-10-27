@@ -135,6 +135,7 @@ type flags struct {
 	subprojectScope       string
 	monorepoAttribution   bool
 	allowRemote           bool
+	noOperatorToken       bool
 	skillLocal            skillDirs
 	// Keep connection credentials out of command-line arguments.
 	dbDriver string
@@ -423,6 +424,8 @@ func (f *flags) merge(cfg *config.Config) {
 	// AllowRemote is config-only (no CLI flag); the zero value keeps the
 	// localhost-only host-header check on (remote access denied).
 	f.allowRemote = cfg.AllowRemote
+	// Config-only as well; nil (unset) keeps the operator token required.
+	f.noOperatorToken = cfg.RequireOperatorToken != nil && !*cfg.RequireOperatorToken
 	f.mergeFederation(cfg)
 
 	// Seed the model pick list from the active harness's own defaults,

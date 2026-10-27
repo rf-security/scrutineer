@@ -19,6 +19,13 @@
 # LAN. Only enable it when a trusted front end already restricts who can connect.
 # allow_remote: false
 
+# Require the operator token (written to <data>/operator-token and printed as
+# a /login?token=... link at startup) for the web UI and /api/v1. Default true.
+# Set false only when a trusted front end (IAP, an OAuth proxy) already
+# authenticates every request; otherwise anyone who can reach the server can
+# use the UI.
+# require_operator_token: true
+
 # Where scan workspaces and (for the default sqlite backend) the database
 # file live.
 # data: ./data

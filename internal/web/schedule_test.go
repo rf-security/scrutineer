@@ -677,7 +677,7 @@ func TestScheduleTick_baselineLookupErrorAbortsRun(t *testing.T) {
 	// column) to simulate a transient database error mid-run.
 	const name = "test:fail_baseline_lookup"
 	if err := s.DB.Callback().Query().Before("gorm:query").Register(name, func(d *gorm.DB) {
-		if strings.Contains(strings.Join(d.Statement.Selects, ","), "`commit`") {
+		if strings.Contains(strings.Join(d.Statement.Selects, ","), `"commit"`) {
 			_ = d.AddError(errors.New("injected lookup failure"))
 		}
 	}); err != nil {

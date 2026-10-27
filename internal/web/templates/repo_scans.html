@@ -1,5 +1,5 @@
 <div id="repo-scans">
-{{if or (gt .ActiveScans 0) (gt .PausedScans 0) (gt .FailedScans 0)}}
+{{if and (not .Sharing) (or (gt .ActiveScans 0) (gt .PausedScans 0) (gt .FailedScans 0))}}
   <div class="flex justify-end gap-2 mb-2">
     {{if gt .ActiveScans 0}}
     <form method="post" action="/scans/cancel-all?repository={{.Repo.ID}}"

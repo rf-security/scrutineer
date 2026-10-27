@@ -1,0 +1,729 @@
+{{template "head" .}}
+
+<div class="flex items-start justify-between gap-4 mb-6">
+  <div>
+    {{template "crumbs" (crumbs "Repositories" "/" .Repo.Name "")}}
+    <h2 class="text-2xl font-semibold mt-1 flex items-center gap-2">
+      <i data-lucide="folder-git-2"></i> {{.Repo.Name}}
+      <span class="text-muted-foreground font-normal text-lg">#{{.Repo.ID}}</span>
+    </h2>
+    {{if .Repo.IsLocal}}
+    <span class="text-sm text-muted-foreground inline-flex items-center gap-1">
+      <i data-lucide="hard-drive" class="size-3"></i> {{.Repo.LocalPath}}
+    </span>
+    {{else}}
+    <a href="{{.Repo.URL}}" target="_blank" rel="noopener"
+       class="text-sm text-muted-foreground hover:underline inline-flex items-center gap-1">
+      {{.Repo.URL}}<i data-lucide="external-link" class="size-3"></i>
+    </a>
+    {{end}}
+  </div>
+  <div class="flex items-center gap-2">
+    {{if and (not .Sharing) .Skills}}
+    <form method="post" action="/repositories/{{.Repo.ID}}/skill-scan">
+      <div class="dropdown-menu">
+        <button class="btn-outline" type="button" aria-haspopup="menu" aria-expanded="false"
+                aria-controls="skill-menu">
+          <i data-lucide="sparkles"></i> Run skill <i data-lucide="chevron-down"></i>
+        </button>
+        <div data-popover aria-hidden="true" data-align="end">
+          <div role="menu" id="skill-menu">
+            {{range .Skills}}
+              <button type="submit" role="menuitem" name="skill_id" value="{{.ID}}"
+                      data-tooltip="{{.Description}}">
+                {{.Name}}
+                {{if .OutputKind}}<span class="text-muted-foreground ml-auto text-xs">{{.OutputKind}}</span>{{end}}
+              </button>
+            {{end}}
+          </div>
+        </div>
+      </div>
+    </form>
+    {{end}}
+    <a href="/repositories/{{.Repo.ID}}/report.md" class="btn-outline" download>
+      <i data-lucide="download"></i> Export report
+    </a>
+    <a href="/repositories/{{.Repo.ID}}/report.md?audience=upstream" class="btn-outline" download
+       data-tooltip="Trimmed report for an upstream maintainer: summary, threat model, findings and fixes only — no internal notes, communications, labels, or repo-wide inventory.">
+      <i data-lucide="share-2"></i> Export for upstream
+    </a>
+    {{if not .Sharing}}
+    <form method="post" action="/repositories/{{.Repo.ID}}/delete"
+          hx-post="/repositories/{{.Repo.ID}}/delete" hx-swap="none"
+          hx-confirm="{{if .ActiveScans}}{{.ActiveScans}} scan(s) on {{.Repo.Name}} are still running or queued and will keep writing to disk until they finish; cancel them first. {{end}}Permanently delete {{.Repo.Name}}? This removes the repository, all its scans and findings, and its cached clone on disk. This cannot be undone.">
+      <button class="btn-destructive" type="submit"><i data-lucide="trash-2"></i> Delete</button>
+    </form>
+    <form method="post" action="/repositories/{{.Repo.ID}}/scan"
+          hx-post="/repositories/{{.Repo.ID}}/scan" hx-swap="none">
+      <button class="btn" type="submit"><i data-lucide="play"></i> New scan</button>
+    </form>
+    <form method="post" action="/repositories/{{.Repo.ID}}/scan"
+          hx-post="/repositories/{{.Repo.ID}}/scan" hx-swap="none">
+      <input type="hidden" name="rescan_mode" value="diff">
+      <button class="btn-outline" type="submit"
+              data-tooltip="Scan changes since the latest compatible deep-dive baseline; falls back to a full scan when no usable baseline exists.">
+        <i data-lucide="git-compare-arrows"></i> Diff rescan
+      </button>
+    </form>
+    {{end}}
+  </div>
+</div>
+
+<div class="tabs w-full" id="repo-tabs">
+  <nav role="tablist" aria-orientation="horizontal">
+    <button type="button" role="tab" id="rt1" aria-controls="rp1" aria-selected="true">Summary</button>
+    {{if or .Findings .Category}}
+      <button type="button" role="tab" id="rt4" aria-controls="rp4" aria-selected="false">
+        Findings <span class="badge-destructive ml-1">{{len .Findings}}</span>
+      </button>
+    {{end}}
+    {{if .ScannerFindings}}
+      <button type="button" role="tab" id="rt11" aria-controls="rp11" aria-selected="false">
+        Scanners <span class="badge-outline ml-1">{{len .ScannerFindings}}</span>
+      </button>
+    {{end}}
+    {{if .Pkgs}}
+    <button type="button" role="tab" id="rt6" aria-controls="rp6" aria-selected="false">
+      Packages
+    </button>
+    {{end}}
+    {{if .ShowAlternatives}}
+    <button type="button" role="tab" id="rt15" aria-controls="rp15" aria-selected="false">
+      Alternatives{{if .Alternatives}} <span class="badge-outline ml-1">{{len .Alternatives}}</span>{{end}}
+    </button>
+    {{end}}
+    {{if or .Deps .HiddenDeps}}
+      <button type="button" role="tab" id="rt5" aria-controls="rp5" aria-selected="false">
+        Dependencies
+      </button>
+    {{end}}
+    {{if .ThreatModel}}
+    <button type="button" role="tab" id="rt10" aria-controls="rp10" aria-selected="false">
+      Threat Model
+    </button>
+    {{end}}
+    {{if .Advisories}}
+    <button type="button" role="tab" id="rt8" aria-controls="rp8" aria-selected="false">
+      Advisories
+    </button>
+    {{end}}
+    {{if .Dependents}}
+    <button type="button" role="tab" id="rt7" aria-controls="rp7" aria-selected="false">
+      Dependents
+    </button>
+    {{end}}
+    <button type="button" role="tab" id="rt9" aria-controls="rp9" aria-selected="false">
+      Maintainers
+    </button>
+    <button type="button" role="tab" id="rt2" aria-controls="rp2" aria-selected="false">Data</button>
+    <button type="button" role="tab" id="rt3" aria-controls="rp3" aria-selected="false">Scans</button>
+    <button type="button" role="tab" id="rt15" aria-controls="rp15" aria-selected="false">
+      Chat{{if .Conversations}} <span class="badge-outline ml-1">{{len .Conversations}}</span>{{end}}
+    </button>
+  </nav>
+
+  <div role="tabpanel" id="rp1" aria-labelledby="rt1">
+    {{if .Repo.FetchedAt}}
+      {{if .Repo.Description}}<p class="mb-4 max-w-3xl">{{.Repo.Description}}</p>{{end}}
+    {{else}}
+      <p class="text-muted-foreground text-sm mb-6">Metadata not fetched yet.</p>
+    {{end}}
+
+    {{/* One badge row. Metadata badges depend on the fetch; the disk-usage
+         badge depends only on a clone existing, so it shares the row but is
+         shown independently — same visibility rule as the repo list. */}}
+    {{if or .Repo.FetchedAt .DiskBytes}}
+      <div class="flex flex-wrap gap-2 mb-6">
+        {{if .Repo.FetchedAt}}
+          {{if .Repo.Languages}}<span class="badge-outline"><i data-lucide="code"></i><span class="sr-only">Languages: </span>{{.Repo.Languages}}</span>{{end}}
+          {{if .Repo.DefaultBranch}}<span class="badge-outline"><i data-lucide="git-branch"></i><span class="sr-only">Default branch: </span>{{.Repo.DefaultBranch}}</span>{{end}}
+          {{if .Repo.Stars}}<span class="badge-outline"><i data-lucide="star"></i><span class="sr-only">Stars: </span>{{bignum .Repo.Stars}}</span>{{end}}
+          {{if .Repo.License}}<span class="badge-outline"><i data-lucide="scale"></i><span class="sr-only">License: </span>{{.Repo.License}}</span>{{end}}
+          {{if .Repo.PushedAt}}<span class="badge-outline"><i data-lucide="clock"></i>pushed {{since .Repo.PushedAt}}</span>{{end}}
+          {{if .Repo.Health}}<span class="badge-outline" data-tooltip="{{.HealthSummary}}"><i data-lucide="heart-pulse"></i>{{.Repo.Health}} health<span class="sr-only">: {{.HealthSummary}}</span></span>{{end}}
+          {{if gt .TotalCost 0.0}}<span class="badge-outline" data-tooltip="Total scan spend on this repository"><i data-lucide="coins"></i><span class="sr-only">Total scan spend: </span>{{usd .TotalCost}}</span>{{end}}
+          {{if .Repo.Archived}}<span class="badge-destructive"><i data-lucide="archive"></i>archived</span>{{end}}
+          {{if .Repo.CloneError}}<span class="badge-destructive" data-tooltip="{{.Repo.CloneError}}"><i data-lucide="wifi-off"></i>unreachable<span class="sr-only">: {{.Repo.CloneError}}</span></span>{{end}}
+        {{end}}
+        {{if .DiskBytes}}<span class="badge-outline" data-tooltip="On-disk size of the cached clone"><i data-lucide="hard-drive"></i>{{bytes .DiskBytes}}</span>{{end}}
+      </div>
+    {{end}}
+
+    <div class="mb-4 max-w-3xl">
+      <h3 class="text-sm font-medium flex items-center gap-2">
+        <i data-lucide="send"></i>
+        Disclosure channel
+      </h3>
+      {{if .Repo.DisclosureChannel}}
+        <p class="text-sm mt-2 whitespace-pre-wrap">{{.Repo.DisclosureChannel}}</p>
+      {{else}}
+        <p class="text-sm mt-2 italic text-muted-foreground">not set</p>
+      {{end}}
+      {{if not .Sharing}}
+      <details class="mt-2">
+        <summary class="text-xs text-muted-foreground cursor-pointer hover:underline">Edit</summary>
+        <form method="post" action="/repositories/{{.Repo.ID}}/disclosure-channel" class="form grid grid-cols-[1fr_auto] gap-2 mt-2">
+          <input class="input text-xs" type="text" name="disclosure_channel"
+                 value="{{.Repo.DisclosureChannel}}"
+                 placeholder="security@example.org, https://…/security/advisories, …">
+          <button class="btn-sm" type="submit">Save</button>
+        </form>
+        <p class="text-xs text-muted-foreground mt-1">Auto-filled by the maintainers skill from <code>SECURITY.md</code>, registry owner data, or CODEOWNERS. Edit freely.</p>
+      </details>
+      {{end}}
+    </div>
+
+    <div class="mb-4 max-w-3xl">
+      <h3 class="text-sm font-medium flex items-center gap-2">
+        <i data-lucide="hand"></i>
+        Federation opt-out
+      </h3>
+      {{if .Repo.FederationOptOutAt}}
+        <p class="text-sm mt-2">Requested {{since .Repo.FederationOptOutAt}}. Scans in flight were stopped and new ones are refused, including scheduled runs.</p>
+        {{if .Repo.FederationOptOutReason}}
+          <p class="text-sm mt-1 whitespace-pre-wrap">{{.Repo.FederationOptOutReason}}</p>
+        {{end}}
+      {{else}}
+        <p class="text-sm mt-2 italic text-muted-foreground">not requested</p>
+      {{end}}
+      <details class="mt-2">
+        <summary class="text-xs text-muted-foreground cursor-pointer hover:underline">Edit</summary>
+        <form method="post" action="/repositories/{{.Repo.ID}}/federation-opt-out" class="form mt-2">
+          <label class="text-xs flex items-center gap-2">
+            <input type="checkbox" name="opt_out" value="1" {{if .Repo.FederationOptOutAt}}checked{{end}}>
+            The maintainer asked not to be scanned or contacted
+          </label>
+          <div class="grid grid-cols-[1fr_auto] gap-2 mt-2">
+            <input class="input text-xs" type="text" name="reason"
+                   value="{{.Repo.FederationOptOutReason}}"
+                   placeholder="reason (optional)">
+            <button class="btn-sm" type="submit">Save</button>
+          </div>
+        </form>
+        <p class="text-xs text-muted-foreground mt-1">Cancels the scans queued, running and paused on this repository, then refuses every new one: a manual run, a scheduled one, and any automatic follow-up.</p>
+      </details>
+    </div>
+
+    <div class="mb-4 max-w-3xl">
+      <h3 class="text-sm font-medium flex items-center gap-2">
+        <i data-lucide="calendar-clock"></i>
+        Scheduled scans
+      </h3>
+      {{$sched := .Repo.ScanSchedule}}
+      {{$effective := $sched}}{{if not $effective}}{{$effective = .GlobalScanSchedule}}{{end}}
+      {{if and $effective (ne $effective "off")}}
+        <p class="text-sm mt-2">
+          <code>{{$effective}}</code>{{if not $sched}} <span class="text-muted-foreground">(global default)</span>{{end}}
+          {{if .Repo.NextScheduledScanAt}}<span class="text-muted-foreground"> · next run {{until .Repo.NextScheduledScanAt}}</span>{{end}}
+        </p>
+      {{else}}
+        <p class="text-sm mt-2 italic text-muted-foreground">not scheduled</p>
+      {{end}}
+      <details class="mt-2">
+        <summary class="text-xs text-muted-foreground cursor-pointer hover:underline">Edit</summary>
+        {{$isCron := and $sched (ne $sched "off") (ne $sched "daily") (ne $sched "weekly")}}
+        <form method="post" action="/repositories/{{.Repo.ID}}/schedule" class="form grid grid-cols-[auto_1fr_auto] gap-2 mt-2 items-center">
+          <select class="select text-xs" name="scan_schedule">
+            <option value="" {{if not $sched}}selected{{end}}>Global default{{if .GlobalScanSchedule}} ({{.GlobalScanSchedule}}){{else}} (off){{end}}</option>
+            <option value="off" {{if eq $sched "off"}}selected{{end}}>Off</option>
+            <option value="daily" {{if eq $sched "daily"}}selected{{end}}>Daily</option>
+            <option value="weekly" {{if eq $sched "weekly"}}selected{{end}}>Weekly</option>
+            <option value="custom" {{if $isCron}}selected{{end}}>Custom cron</option>
+          </select>
+          <input class="input text-xs" type="text" name="scan_schedule_cron"
+                 value="{{if $isCron}}{{$sched}}{{end}}" placeholder="cron, e.g. 0 3 * * 1 (used when Custom cron is selected)">
+          <button class="btn-sm" type="submit">Save</button>
+          <label class="text-xs text-muted-foreground" for="upstream_url">Upstream</label>
+          <input class="input text-xs col-span-2" id="upstream_url" type="text" name="upstream_url"
+                 value="{{.Repo.UpstreamURL}}" placeholder="https://... (staging copies only: synced before each scheduled check)">
+        </form>
+        <p class="text-xs text-muted-foreground mt-1">Scheduled runs compare the remote HEAD against the last completed scan and enqueue a diff rescan when new commits landed; otherwise they log a skipped entry. Set Upstream when this repository is a pushed staging copy so it is force-synced from upstream first (a mirror push; local-only commits are overwritten).</p>
+      </details>
+    </div>
+
+    {{if .Subprojects}}
+      <div class="flex items-center justify-between gap-2 mb-2">
+        <h3 class="font-medium">Subprojects <span class="text-muted-foreground text-xs">({{len .Subprojects}})</span></h3>
+        {{if not .Sharing}}
+        <form method="post" action="/repositories/{{.Repo.ID}}/scan-all"
+              hx-post="/repositories/{{.Repo.ID}}/scan-all" hx-swap="none"
+              hx-confirm="Enqueue a deep-dive scan for all {{len .Subprojects}} subproject(s)?">
+          <button type="submit" class="btn-sm-outline"><i data-lucide="play"></i> Scan all</button>
+        </form>
+        {{end}}
+      </div>
+      <p class="text-sm text-muted-foreground mb-2">Detected scannable units inside this repository. Each can be scanned independently with its own findings stream.</p>
+      <table class="table w-full mb-6">
+        <thead><tr>
+          <th class="w-48">Path</th>
+          <th class="w-40">Kind</th>
+          <th>Description</th>
+          <th class="w-16 text-right">Scans</th>
+          <th class="w-32"></th>
+        </tr></thead>
+        <tbody>
+        {{$repoID := .Repo.ID}}
+        {{$counts := .SubScanCount}}
+        {{range .Subprojects}}
+          <tr>
+            <td><code class="text-xs">{{.Path}}</code>{{if and .Name (ne .Name .Path)}}<div class="text-xs text-muted-foreground">{{.Name}}</div>{{end}}</td>
+            <td>{{if .Kind}}<span class="badge-outline text-xs">{{.Kind}}</span>{{end}}</td>
+            <td class="whitespace-normal text-sm text-muted-foreground">{{.Description}}</td>
+            <td class="text-right text-sm text-muted-foreground">{{index $counts .Path}}</td>
+            <td>
+              {{if not $.Sharing}}
+              <form method="post" action="/repositories/{{$repoID}}/scan" hx-post="/repositories/{{$repoID}}/scan" hx-swap="none">
+                <input type="hidden" name="sub_path" value="{{.Path}}">
+                <button type="submit" class="btn-sm-outline"><i data-lucide="play"></i> Scan</button>
+              </form>
+              {{end}}
+            </td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+    {{end}}
+
+    {{if .Latest}}
+      <h3 class="font-medium mb-2">Latest scan</h3>
+      <a href="/scans/{{.Latest.ID}}" class="text-sm text-muted-foreground mb-2 inline-flex items-center gap-1 hover:underline">
+        #{{.Latest.ID}} &middot; {{.Latest.Model}} &middot; {{since .Latest.StartedAt}}
+        &middot; {{template "status-badge" (status .Latest.Status)}}
+      </a>
+      {{if .Latest.Findings}}
+        <table class="table table-fixed w-full">
+          <thead><tr>
+            <th class="w-24">Severity</th><th>Title</th><th class="w-24">Status</th><th class="w-64">Location</th>
+          </tr></thead>
+          <tbody>
+          {{range .Latest.Findings}}
+            <tr id="finding-{{.ID}}">
+              <td>{{template "severity-badge" .Severity}}</td>
+              <td class="min-w-0 whitespace-normal"><a href="/findings/{{.ID}}">{{.Title}}</a></td>
+              <td>
+                {{template "finding-status" (fstatus .Status)}}
+                {{if $.ExpectedFindings}}
+                  {{if index $.ExpectedFindingStatus .ID}}<span class="badge-outline text-xs mt-1">expected</span>{{else}}<span class="badge-outline text-xs mt-1">unexpected</span>{{end}}
+                {{end}}
+              </td>
+              <td class="whitespace-normal">
+                {{template "loc-link" (dict "HTMLURL" $.Repo.HTMLURL "Commit" $.Latest.Commit "Location" .Location "Extra" .ExtraLocationCount)}}
+              </td>
+            </tr>
+          {{end}}
+          </tbody>
+        </table>
+      {{else if eq (status .Latest.Status) "done"}}
+        <p class="text-sm">No findings.</p>
+      {{end}}
+    {{end}}
+  </div>
+
+  {{if or .Findings .Category}}
+  <div role="tabpanel" id="rp4" aria-labelledby="rt4" hidden>
+    <div class="flex items-center justify-between mb-4 gap-2">
+      <p class="text-sm text-muted-foreground">
+        Open findings from the security-deep-dive audit.
+        Fixed, published, rejected, and duplicate findings are hidden.{{if .ScannerFindings}} See the
+        Scanners tab for zizmor/semgrep output.{{end}}
+      </p>
+      <div class="flex items-center gap-2 shrink-0">
+      {{if and (not .Sharing) (gt .NewFindingCount 0)}}
+        <form method="post"
+              action="/repositories/{{.Repo.ID}}/verify-all{{if .Category}}?category={{.Category}}{{end}}"
+              hx-post="/repositories/{{.Repo.ID}}/verify-all{{if .Category}}?category={{.Category}}{{end}}"
+              hx-swap="none"
+              hx-confirm="Enqueue a verification job for {{.NewFindingCount}} finding(s) awaiting verification?">
+          <button type="submit" class="btn-outline">
+            <i data-lucide="shield-check"></i> Verify all new ({{.NewFindingCount}})
+          </button>
+        </form>
+      {{end}}
+      <div class="dropdown-menu">
+        <button type="button" class="btn-outline" aria-haspopup="menu" aria-expanded="false">
+          <i data-lucide="tags"></i>
+          {{if .Category}}{{catlabel .Category}}{{else}}Category{{end}}
+          <i data-lucide="chevron-down"></i>
+        </button>
+        <div data-popover aria-hidden="true" data-align="end">
+          <div role="menu">
+            <a role="menuitem" href="/repositories/{{.Repo.ID}}#rt4">All categories</a>
+            {{range .Categories}}
+              <a role="menuitem" href="/repositories/{{$.Repo.ID}}?category={{.}}#rt4"
+                 {{if eq . $.Category}}aria-current="true"{{end}}>{{catlabel .}}</a>
+            {{end}}
+            <a role="menuitem" href="/repositories/{{.Repo.ID}}?category={{.Uncategorized}}#rt4"
+               {{if eq .Uncategorized .Category}}aria-current="true"{{end}}>{{.Uncategorized}}</a>
+          </div>
+        </div>
+      </div>
+      </div>
+    </div>
+    {{if not .Findings}}
+      <p class="text-sm text-muted-foreground">No findings in this category.</p>
+    {{end}}
+    <div class="grid gap-4">
+      {{$commits := .ScanCommit}}
+      {{range .Findings}}
+        <div id="finding-card-{{.ID}}" class="card">
+          <header>
+            <div class="flex items-center gap-2">
+              {{template "severity-badge" .Severity}}
+              {{template "finding-status" (fstatus .Status)}}
+              {{if $.ExpectedFindings}}
+                {{if index $.ExpectedFindingStatus .ID}}<span class="badge-outline text-xs">expected</span>{{else}}<span class="badge-outline text-xs">unexpected</span>{{end}}
+              {{end}}
+              <h3><a href="/findings/{{.ID}}">{{.Title}}</a></h3>
+              {{if .CWE}}<span class="badge-outline ml-auto" data-tooltip="{{cwename .CWE}}">{{with cwecatid .CWE}}<span class="text-muted-foreground">{{.}} ›</span> {{end}}{{.CWE}}</span>{{end}}
+            </div>
+            <p>
+              {{template "loc-link" (dict "HTMLURL" $.Repo.HTMLURL "Commit" (index $commits .ScanID) "Location" .Location "Extra" .ExtraLocationCount)}}
+              <span class="text-xs text-muted-foreground">&middot; scan <a class="hover:underline" href="/scans/{{.ScanID}}">#{{.ScanID}}</a></span>
+            </p>
+          </header>
+          <section class="text-sm">
+            <p class="line-clamp-3">{{.Summary}}</p>
+          </section>
+        </div>
+      {{end}}
+    </div>
+    {{- template "row-cap" (dict "Shown" .Findings "Total" .FindingsTotal "Href" (printf "/findings?owner=%s&category=%s" .Repo.Owner .Category))}}
+  </div>
+  {{end}}
+
+  {{if .ScannerFindings}}
+  <div role="tabpanel" id="rp11" aria-labelledby="rt11" hidden>
+    <p class="text-sm text-muted-foreground mb-4">
+      Findings from tool-style scanners (zizmor, semgrep). These run as their
+      own skills and are kept separate from the curated deep-dive output.
+    </p>
+    <div class="grid gap-4">
+      {{$skills := .ScanSkill}}
+      {{$commits := .ScanCommit}}
+      {{range .ScannerFindings}}
+        <div id="finding-card-{{.ID}}" class="card">
+          <header>
+            <div class="flex items-center gap-2">
+              {{template "severity-badge" .Severity}}
+              {{template "finding-status" (fstatus .Status)}}
+              {{if $.ExpectedFindings}}
+                {{if index $.ExpectedFindingStatus .ID}}<span class="badge-outline text-xs">expected</span>{{else}}<span class="badge-outline text-xs">unexpected</span>{{end}}
+              {{end}}
+              <h3><a href="/findings/{{.ID}}">{{.Title}}</a></h3>
+              <span class="badge-outline ml-auto">{{index $skills .ScanID}}</span>
+              {{if .CWE}}<span class="badge-outline" data-tooltip="{{cwename .CWE}}">{{with cwecatid .CWE}}<span class="text-muted-foreground">{{.}} ›</span> {{end}}{{.CWE}}</span>{{end}}
+            </div>
+            <p>
+              {{template "loc-link" (dict "HTMLURL" $.Repo.HTMLURL "Commit" (index $commits .ScanID) "Location" .Location "Extra" .ExtraLocationCount)}}
+              <span class="text-xs text-muted-foreground">&middot; scan <a class="hover:underline" href="/scans/{{.ScanID}}">#{{.ScanID}}</a></span>
+            </p>
+          </header>
+          <section class="text-sm">
+            <p class="line-clamp-3">{{.Summary}}</p>
+          </section>
+        </div>
+      {{end}}
+    </div>
+    {{- template "row-cap" (dict "Shown" .ScannerFindings "Total" .ScannerFindingsTotal "Href" (printf "/findings?owner=%s&scanners=1" .Repo.Owner))}}
+  </div>
+  {{end}}
+
+  {{if .Pkgs}}
+  <div role="tabpanel" id="rp6" aria-labelledby="rt6" hidden>
+    <table class="table w-full">
+      <thead><tr>
+        <th>Name</th><th>Ecosystem</th><th>Registry</th>
+        <th>Latest</th><th>Downloads</th>
+        <th>Dependents</th>
+      </tr></thead>
+      <tbody>
+      {{range .Pkgs}}
+        <tr id="package-{{.ID}}">
+          <td class="whitespace-normal"><a href="/packages/{{.ID}}" class="font-medium">{{.Name}}</a></td>
+          <td><span class="badge-outline">{{.Ecosystem}}</span></td>
+          <td class="text-muted-foreground">{{if .RegistryURL}}{{domain .RegistryURL}}{{end}}</td>
+          <td class="text-muted-foreground">{{.LatestVersion}}</td>
+          <td class="text-muted-foreground">{{bignum .Downloads}}</td>
+          <td class="text-muted-foreground">{{bignum .DependentPackages}} pkgs / {{bignum .DependentRepos}} repos</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{end}}
+
+  {{if .ShowAlternatives}}
+  <div role="tabpanel" id="rp15" aria-labelledby="rt15" hidden>
+    <div class="grid gap-4">
+      <section>
+        <h3 class="text-sm font-medium mb-2">Migration alternatives</h3>
+        <p class="text-sm text-muted-foreground mb-4">
+          Operator-curated forks, successors, or equivalent packages for consumers moving away from this repository.
+        </p>
+        {{if .Alternatives}}
+        <table class="table w-full">
+          <thead><tr><th>PURL</th><th>Kind</th><th>Note</th><th class="w-16"></th></tr></thead>
+          <tbody>
+          {{range .Alternatives}}
+            <tr>
+              <td class="whitespace-normal"><code class="text-sm break-all">{{.PURL}}</code></td>
+              <td><span class="badge-outline">{{.Kind}}</span></td>
+              <td class="text-muted-foreground whitespace-normal">{{.Note}}</td>
+              <td>
+                <form method="post" action="/repositories/{{$.Repo.ID}}/alternatives/{{.ID}}/delete"
+                      hx-post="/repositories/{{$.Repo.ID}}/alternatives/{{.ID}}/delete" hx-swap="none"
+                      hx-confirm="Delete this package alternative?">
+                  <button class="btn-sm-ghost" type="submit" aria-label="Delete alternative" data-tooltip="Delete alternative">
+                    <i data-lucide="trash-2"></i>
+                  </button>
+                </form>
+              </td>
+            </tr>
+          {{end}}
+          </tbody>
+        </table>
+        {{else}}
+          <p class="text-muted-foreground text-sm">No alternatives recorded yet.</p>
+        {{end}}
+      </section>
+
+      <section class="card">
+        <h3 class="text-sm font-medium mb-3">Add alternative</h3>
+        <form method="post" action="/repositories/{{.Repo.ID}}/alternatives" class="form grid md:grid-cols-[1fr_12rem] gap-3">
+          <label>
+            <span>PURL</span>
+            <input class="input" type="text" name="purl" placeholder="pkg:npm/example" required>
+          </label>
+          <label>
+            <span>Kind</span>
+            <select class="select" name="kind" required>
+              <option value="fork">Fork</option>
+              <option value="successor">Successor</option>
+              <option value="equivalent">Equivalent</option>
+            </select>
+          </label>
+          <label class="md:col-span-2">
+            <span>Note</span>
+            <input class="input" type="text" name="note" placeholder="Why this is a credible migration target">
+          </label>
+          <div class="md:col-span-2">
+            <button class="btn-sm" type="submit">Save alternative</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  </div>
+  {{end}}
+
+  {{if or .Deps .HiddenDeps}}
+  <div role="tabpanel" id="rp5" aria-labelledby="rt5" hidden>
+    <div class="flex items-center justify-between gap-3 mb-3">
+      <p class="text-sm text-muted-foreground">
+        {{if .ShowAllDeps}}Showing all dependency phases.{{else}}Showing runtime dependencies.{{end}}
+        {{if .HiddenDeps}}{{.HiddenDeps}} test/build/dev row(s) hidden.{{end}}
+      </p>
+      {{if .ShowAllDeps}}
+        <a class="btn-sm-outline" href="/repositories/{{.Repo.ID}}#rt5">Runtime only</a>
+      {{else if .HiddenDeps}}
+        <a class="btn-sm-outline" href="/repositories/{{.Repo.ID}}?deps=all#rt5">Include test/build/dev</a>
+      {{end}}
+    </div>
+    {{if .Deps}}
+      <table class="table w-full">
+        <thead><tr>
+          <th>Name</th><th>Ecosystem</th>
+          <th>Version</th><th>Type</th><th>Manifests</th><th class="w-16"></th>
+        </tr></thead>
+        <tbody>
+        {{range .Deps}}
+          <tr>
+            <td class="whitespace-normal font-medium"><code class="text-sm break-all">{{.Name}}</code></td>
+            <td><span class="badge-outline">{{.Ecosystem}}</span></td>
+            <td class="text-muted-foreground whitespace-normal break-all">{{if .Requirement}}{{.Requirement}}{{else}}-{{end}}{{if .RequirementUnresolved}} <span class="badge-outline" data-tooltip="{{if .RequirementResolution}}{{.RequirementResolution}}{{else}}Requirement contains an unresolved manifest expression{{end}}">unresolved</span>{{end}}</td>
+            <td class="text-muted-foreground">{{.DependencyType}}</td>
+            <td class="whitespace-normal text-muted-foreground text-xs">{{range $i, $m := .Manifests}}{{if $i}}, {{end}}{{$u := locurl $.Repo.ID $.DepsCommit $m}}{{if $u}}<a href="{{$u}}" class="hover:underline break-all">{{$m}}</a>{{else}}{{$m}}{{end}}{{end}}</td>
+            <td>{{if .PURL}}{{$rid := lookup $.KnownPURLs .PURL}}{{if $rid}}<a href="/repositories/{{$rid}}" class="btn-sm-ghost" aria-label="View repository" data-tooltip="View repository"><i data-lucide="external-link"></i></a>{{else if not $.Sharing}}<form method="post" action="/dependencies/{{.ID}}/scan" hx-post="/dependencies/{{.ID}}/scan" hx-swap="none"><button type="submit" class="btn-sm-ghost" aria-label="Import repository" data-tooltip="Import repository"><i data-lucide="import"></i></button></form>{{end}}{{end}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{if gt .DepsTotal .TabRowCap}}
+      <p class="text-sm text-muted-foreground mt-3">
+        Dependency list capped at the first {{.TabRowCap}} of {{.DepsTotal}} rows.
+      </p>
+      {{end}}
+    {{else if .HiddenDeps}}
+      <p class="text-muted-foreground text-sm p-4">No runtime dependencies in the default view.</p>
+    {{end}}
+  </div>
+  {{end}}
+
+  {{if .ThreatModel}}
+  <div role="tabpanel" id="rp10" aria-labelledby="rt10" hidden>
+    {{template "threat_model" (dict "TM" .ThreatModel "RepoID" .Repo.ID "Commit" $.TMCommit)}}
+  </div>
+  {{end}}
+
+  {{if .Advisories}}
+  <div role="tabpanel" id="rp8" aria-labelledby="rt8" hidden>
+    <table class="table w-full">
+      <thead><tr>
+        <th>Severity</th><th>CVSS</th><th>Title</th><th>Packages</th><th>Published</th><th class="w-16"></th>
+      </tr></thead>
+      <tbody>
+      {{range .Advisories}}
+        <tr>
+          <td>{{template "severity-badge" .Severity}}</td>
+          <td class="text-muted-foreground">{{if .CVSSScore}}{{printf "%.1f" .CVSSScore}}{{end}}</td>
+          <td class="whitespace-normal">
+            <div class="font-medium">{{.Title}}</div>
+            {{if .WithdrawnAt}}<span class="badge-outline text-xs">withdrawn</span>{{end}}
+            {{$a := .}}{{with index $.AdvisoryAudits .ID}}
+              {{if eq . "fixed"}}<a href="/advisories/{{$a.ID}}/certificate.json" class="badge-outline text-xs hover:underline"
+                  data-tooltip="Download fix-audit certificate">fix audit: fixed</a>
+              {{else}}<span class="badge-outline text-xs">fix audit: {{.}}</span>{{end}}
+            {{end}}
+          </td>
+          <td class="whitespace-normal text-muted-foreground text-xs">{{.Packages}}</td>
+          <td class="text-muted-foreground">{{if .PublishedAt}}{{since .PublishedAt}}{{end}}</td>
+          <td>{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noopener" class="btn-sm-ghost"
+              aria-label="View advisory" data-tooltip="View advisory"><i data-lucide="external-link"></i></a>{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{- template "row-cap" (dict "Shown" .Advisories "Total" .AdvisoriesTotal)}}
+  </div>
+  {{end}}
+
+  {{if .Dependents}}
+  <div role="tabpanel" id="rp7" aria-labelledby="rt7" hidden>
+    <table class="table w-full">
+      <thead><tr>
+        <th>Name</th><th>Ecosystem</th><th>Latest</th>
+        <th>Downloads</th><th>Dependents</th><th class="w-16"></th>
+      </tr></thead>
+      <tbody>
+      {{range .Dependents}}
+        <tr>
+          <td class="whitespace-normal font-medium">{{.Name}}</td>
+          <td><span class="badge-outline">{{.Ecosystem}}</span></td>
+          <td class="text-muted-foreground">{{.LatestVersion}}</td>
+          <td class="text-muted-foreground">{{bignum .Downloads}}</td>
+          <td class="text-muted-foreground">{{bignum .DependentRepos}} repos</td>
+          <td>{{if .RepositoryURL}}{{$rid := lookup $.KnownURLs .RepositoryURL}}{{if $rid}}<a href="/repositories/{{$rid}}" class="btn-sm-ghost" aria-label="View repository" data-tooltip="View repository"><i data-lucide="external-link"></i></a>{{else if not $.Sharing}}<form method="post" action="/dependents/{{.ID}}/scan" hx-post="/dependents/{{.ID}}/scan" hx-swap="none"><button type="submit" class="btn-sm-ghost" aria-label="Import repository" data-tooltip="Import repository"><i data-lucide="import"></i></button></form>{{end}}{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{- template "row-cap" (dict "Shown" .Dependents "Total" .DependentsTotal)}}
+  </div>
+  {{end}}
+
+  <div role="tabpanel" id="rp9" aria-labelledby="rt9" hidden>
+    {{if .Maintainers}}
+    <table class="table w-full">
+      <thead><tr><th>Login</th><th>Name</th><th>Email</th><th>Status</th></tr></thead>
+      <tbody>
+      {{range .Maintainers}}
+        <tr id="maintainer-{{.ID}}">
+          <td><a href="/maintainers/{{.ID}}" class="font-medium">{{.Login}}</a></td>
+          <td>{{.Name}}</td>
+          <td class="text-muted-foreground">{{.Email}}</td>
+          <td>{{template "status-badge" (printf "%s" .Status)}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{else}}
+      <p class="text-muted-foreground text-sm">No maintainers identified yet. Click the button above to run the analysis.</p>
+    {{end}}
+  </div>
+
+  <div role="tabpanel" id="rp2" aria-labelledby="rt2" hidden>
+    {{if .Repo.Metadata}}
+      {{jsontree .Repo.Metadata}}
+      <details class="mt-4">
+        <summary class="cursor-pointer text-sm text-muted-foreground">raw json</summary>
+        <pre class="log mt-2">{{prettyjson .Repo.Metadata}}</pre>
+      </details>
+    {{else}}
+      <p class="text-muted-foreground text-sm p-4">No metadata stored.</p>
+    {{end}}
+  </div>
+
+  <div role="tabpanel" id="rp3" aria-labelledby="rt3" hidden>
+    {{if and (not .Sharing) (or (gt .ActiveScans 0) (gt .PausedScans 0) (gt .FailedScans 0))}}
+      <div class="flex justify-end gap-2 mb-2">
+        {{if gt .ActiveScans 0}}
+        <form method="post" action="/scans/cancel-all?repository={{.Repo.ID}}"
+              hx-post="/scans/cancel-all?repository={{.Repo.ID}}" hx-swap="none"
+              hx-confirm="Cancel all {{.ActiveScans}} running or queued scan(s) on {{.Repo.Name}}? Any work in progress is discarded.">
+          <button type="submit" class="btn-outline">
+            <i data-lucide="x"></i> Cancel all ({{.ActiveScans}})
+          </button>
+        </form>
+        {{end}}
+        {{if gt .PausedScans 0}}
+        <form method="post" action="/scans/resume-paused?repository={{.Repo.ID}}"
+              hx-post="/scans/resume-paused?repository={{.Repo.ID}}" hx-swap="none"
+              hx-confirm="Resume all {{.PausedScans}} paused scan(s) on {{.Repo.Name}}?">
+          <button type="submit" class="btn-outline">
+            <i data-lucide="play"></i> Resume all ({{.PausedScans}})
+          </button>
+        </form>
+        {{end}}
+        {{if gt .FailedScans 0}}
+        <form method="post" action="/scans/retry-failed?repository={{.Repo.ID}}"
+              hx-post="/scans/retry-failed?repository={{.Repo.ID}}" hx-swap="none"
+              hx-confirm="Re-enqueue every failed scan on this repository?">
+          <button type="submit" class="btn-outline">
+            <i data-lucide="refresh-cw"></i> Retry failed ({{.FailedScans}})
+          </button>
+        </form>
+        {{end}}
+      </div>
+    {{end}}
+    <table class="table">
+      <thead>
+        <tr><th>#</th><th>Skill</th><th>Status</th><th>Findings</th><th>Model</th><th>Cost</th><th>Commit</th><th>Started</th><th>Duration</th><th class="w-12"></th></tr>
+      </thead>
+      {{template "scan_rows" .}}
+    </table>
+  </div>
+
+  <div role="tabpanel" id="rp15" aria-labelledby="rt15" hidden>
+    {{template "chat-panel" (dict "Action" (printf "/repositories/%d/conversations" .Repo.ID) "Conversations" .Conversations "Placeholder" "Ask about this repository's code or findings...")}}
+  </div>
+
+  <div hx-ext="sse" sse-connect="/events?repo={{.Repo.ID}}"
+       sse-swap="scan-status" hx-swap="none" hx-disinherit="*" hidden></div>
+</div>
+
+{{template "foot" .}}
+
+{{define "scan_rows"}}
+<tbody id="scan-rows">
+{{range .Scans}}{{template "scan-row" (dict "S" . "Sharing" $.Sharing)}}{{end}}
+</tbody>
+{{end}}
+
+{{define "scan-row"}}{{with .S}}
+  <tr id="scan-{{.ID}}"{{if $.OOB}} hx-swap-oob="true"{{end}}>
+    <td><a href="/scans/{{.ID}}">{{.ID}}</a></td>
+    <td>{{if .SkillName}}{{.SkillName}}{{else}}{{.Kind}}{{end}} {{template "branch-tag" .Ref}}{{if eq .RescanMode "diff"}} <span class="badge-outline text-xs">diff</span>{{end}}</td>
+    <td>{{template "status-badge" (status .Status)}} {{if .MaxTurnsHit}}<span class="badge-outline"><i data-lucide="timer-off"></i> max turns</span>{{end}}{{if .RefusalAuditWarning}} <span class="badge-outline" data-tooltip="The deep-dive reported refused or skipped analysis"><i data-lucide="triangle-alert"></i> analysis incomplete</span>{{end}}</td>
+    <td>{{if gt .FindingsCount 0}}{{template "findings-badge" .FindingsCount}}{{end}}</td>
+    <td class="text-muted-foreground">{{if .Model}}{{.Model}}{{else}}-{{end}}</td>
+    <td class="text-muted-foreground">{{if gt .CostUSD 0.0}}{{usd .CostUSD}}{{else}}-{{end}}</td>
+    <td><code>{{short .Commit}}</code></td>
+    <td>{{if .StartedAt}}{{since .StartedAt}}{{end}}</td>
+    <td>{{if .FinishedAt}}{{dur .Duration}}{{end}}</td>
+    <td>{{if not $.Sharing}}{{template "scan-actions" .}}{{end}}</td>
+  </tr>
+{{end}}{{end}}
+
+{{define "scan-status-sse"}}
+{{template "scan-row" (dict "S" .Scan "OOB" true)}}
+<div hx-swap-oob="afterbegin:#toaster">{{template "toast" .Flash}}</div>
+{{end}}

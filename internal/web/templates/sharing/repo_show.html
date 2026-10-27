@@ -307,7 +307,7 @@
                 {{end}}
               </td>
               <td class="whitespace-normal">
-                {{template "loc-link" (dict "HTMLURL" $.Repo.HTMLURL "Commit" $.Latest.Commit "Location" .Location "Extra" .ExtraLocationCount)}}
+                {{template "loc-link" (dict "RepoID" $.Repo.ID "Commit" $.Latest.Commit "Location" .Location "Extra" .ExtraLocationCount)}}
               </td>
             </tr>
           {{end}}
@@ -377,7 +377,7 @@
               {{if .CWE}}<span class="badge-outline ml-auto" data-tooltip="{{cwename .CWE}}">{{with cwecatid .CWE}}<span class="text-muted-foreground">{{.}} ›</span> {{end}}{{.CWE}}</span>{{end}}
             </div>
             <p>
-              {{template "loc-link" (dict "HTMLURL" $.Repo.HTMLURL "Commit" (index $commits .ScanID) "Location" .Location "Extra" .ExtraLocationCount)}}
+              {{template "loc-link" (dict "RepoID" $.Repo.ID "Commit" (index $commits .ScanID) "Location" .Location "Extra" .ExtraLocationCount)}}
               <span class="text-xs text-muted-foreground">&middot; scan <a class="hover:underline" href="/scans/{{.ScanID}}">#{{.ScanID}}</a></span>
             </p>
           </header>
@@ -414,7 +414,7 @@
               {{if .CWE}}<span class="badge-outline" data-tooltip="{{cwename .CWE}}">{{with cwecatid .CWE}}<span class="text-muted-foreground">{{.}} ›</span> {{end}}{{.CWE}}</span>{{end}}
             </div>
             <p>
-              {{template "loc-link" (dict "HTMLURL" $.Repo.HTMLURL "Commit" (index $commits .ScanID) "Location" .Location "Extra" .ExtraLocationCount)}}
+              {{template "loc-link" (dict "RepoID" $.Repo.ID "Commit" (index $commits .ScanID) "Location" .Location "Extra" .ExtraLocationCount)}}
               <span class="text-xs text-muted-foreground">&middot; scan <a class="hover:underline" href="/scans/{{.ScanID}}">#{{.ScanID}}</a></span>
             </p>
           </header>

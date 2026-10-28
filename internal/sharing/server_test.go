@@ -2,11 +2,13 @@ package sharing
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -310,5 +312,114 @@ func TestRequireAuthAppliesGrantForExactNumericUser(t *testing.T) {
 	}
 	if code := call(583232); code != http.StatusNotFound || inner.hit {
 		t.Fatalf("different numeric user inherited grant: status %d, forwarded %v", code, inner.hit)
+	}
+}
+
+func TestFirstPageNavigationShowsProgressUntilLookupFinishes(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		_, _ = io.WriteString(w, `{"data":{"viewer":{"repositories":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`)
+	}))
+	defer srv.Close()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	old := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = old }()
+
+	s, inner := newServer(t)
+	sealed, err := s.cfg.seal(session{GitHubUserID: 1, Login: "octocat", Token: "tok", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(path string, header map[string]string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.Host = "share.example.org"
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sealed})
+		for k, v := range header {
+			r.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		return w
+	}
+	status := func() accessStatus {
+		var st accessStatus
+		if err := json.NewDecoder(request("/auth/status", nil).Body).Decode(&st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+
+	w := request("/", map[string]string{"Sec-Fetch-Dest": "document"})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "Loading your repositories") {
+		t.Fatalf("first navigation: status %d, want the progress page", w.Code)
+	}
+	if inner.hit {
+		t.Fatal("progress page should not reach the inner handler")
+	}
+	if got := status().State; got != accessLoading {
+		t.Fatalf("status during lookup = %q, want loading", got)
+	}
+	if w := request("/auth/loading.js", nil); w.Code != http.StatusOK {
+		t.Fatalf("loading.js: status %d", w.Code)
+	}
+
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for status().State != accessReady {
+		if time.Now().After(deadline) {
+			t.Fatal("lookup never became ready")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	w = request("/", map[string]string{"Sec-Fetch-Dest": "document"})
+	if !inner.hit {
+		t.Fatalf("navigation after lookup: status %d, want it forwarded", w.Code)
+	}
+}
+
+func TestNonDocumentRequestWaitsForFirstLookup(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		_, _ = io.WriteString(w, `{"data":{"viewer":{"repositories":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`)
+	}))
+	defer srv.Close()
+	old := githubAPI
+	githubAPI = srv.URL
+	defer func() { githubAPI = old }()
+
+	s, inner := newServer(t)
+	sealed, err := s.cfg.seal(session{GitHubUserID: 1, Login: "octocat", Token: "tok", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("HX-Request", "true")
+	r.Header.Set("Sec-Fetch-Dest", "empty")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sealed})
+	s.requireAuth(inner).ServeHTTP(httptest.NewRecorder(), r)
+	if !inner.hit {
+		t.Fatal("htmx request should wait for the lookup and be forwarded, not get the progress page")
+	}
+}
+
+func TestAccessStatusWithoutSessionIsUnauthorized(t *testing.T) {
+	s, _ := newServer(t)
+	r := httptest.NewRequest(http.MethodGet, "/auth/status", nil)
+	w := httptest.NewRecorder()
+	s.accessStatus(w, r)
+	var st accessStatus
+	if err := json.NewDecoder(w.Body).Decode(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st.State != accessUnauthorized {
+		t.Fatalf("state = %q, want unauthorized", st.State)
 	}
 }

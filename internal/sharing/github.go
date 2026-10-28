@@ -124,6 +124,13 @@ type githubGraphQLResponse struct {
 // still has to enforce viewerPermission: READ and TRIAGE repositories are
 // returned so the portal can explain why their findings remain hidden.
 func fetchRepositoryAccess(ctx context.Context, token string) ([]githubRepo, error) {
+	return fetchRepositoryAccessProgress(ctx, token, nil)
+}
+
+// fetchRepositoryAccessProgress is fetchRepositoryAccess that also reports the
+// running repository count after each page, so a waiting visitor can be shown
+// that the lookup is advancing. progress may be nil.
+func fetchRepositoryAccessProgress(ctx context.Context, token string, progress func(found int)) ([]githubRepo, error) {
 	ctx, cancel := context.WithTimeout(ctx, githubTimeout)
 	defer cancel()
 
@@ -160,6 +167,9 @@ func fetchRepositoryAccess(ctx context.Context, token string) ([]githubRepo, err
 				CloneURL:         strings.TrimSuffix(r.URL, "/") + ".git",
 				ViewerPermission: r.ViewerPermission,
 			})
+		}
+		if progress != nil {
+			progress(len(repos))
 		}
 		if !connection.PageInfo.HasNextPage {
 			return repos, nil

@@ -12,8 +12,8 @@ import (
 )
 
 // session is the authenticated state sealed into the visitor's cookie. The
-// GitHub OAuth token is stored here (encrypted) so the portal can re-check the
-// visitor's maintained repositories on every request for real-time tracking.
+// GitHub OAuth token is stored here (encrypted) so the portal can periodically
+// re-check the visitor's maintained repositories (see accessCache).
 // The short TTL bounds how long a stolen token could be replayed.
 type session struct {
 	GitHubUserID int64  `json:"u"`

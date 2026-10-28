@@ -58,7 +58,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 
 // callback completes the handshake: it validates the state cookie, exchanges
 // the code for a token, fetches the visitor's GitHub identity, and seals a
-// session cookie containing the token for real-time repo checks on each request.
+// session cookie containing the token used for the periodic repo checks.
 func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 	st, err := r.Cookie(stateCookie)
 	if err != nil || st.Value == "" || st.Value != r.URL.Query().Get("state") {
@@ -106,6 +106,9 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
 	s.log.Info("sharing login", "login", identity.Login, "github_user_id", identity.ID)
+	// Start the repository lookup now so it is usually done, or at least in
+	// flight, by the time the redirected request needs it.
+	s.access.prefetch(identity.ID, tok.AccessToken)
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -117,6 +120,7 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		if sess, err := s.cfg.open(c.Value); err == nil && sess.Token != "" {
+			s.access.invalidate(sess.GitHubUserID, sess.Token)
 			if err := revokeGrant(r.Context(), s.cfg.clientID, s.cfg.clientSecret, sess.Token); err != nil {
 				s.log.Warn("sharing logout: github grant revocation failed", "login", sess.Login, "err", err)
 			} else {

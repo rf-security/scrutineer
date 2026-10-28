@@ -27,6 +27,7 @@ type Server struct {
 	log    *slog.Logger
 	inner  http.Handler // the reused web.Server handler
 	grants GrantSource
+	access *accessCache
 }
 
 // New builds a portal Server. inner is the handler returned by
@@ -35,7 +36,7 @@ func New(cfg *Config, gdb *gorm.DB, log *slog.Logger, inner http.Handler, grants
 	if grants == nil {
 		grants = EmptyGrantSource()
 	}
-	return &Server{cfg: cfg, db: gdb, log: log, inner: inner, grants: grants}
+	return &Server{cfg: cfg, db: gdb, log: log, inner: inner, grants: grants, access: newAccessCache(log)}
 }
 
 // resourceKind classifies a whitelisted route so the authorization middleware
@@ -86,6 +87,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /auth/login", s.login)
 	mux.HandleFunc("GET /auth/callback", s.callback)
 	mux.HandleFunc("POST /auth/logout", s.logout)
+	mux.HandleFunc("GET /auth/status", s.accessStatus)
+	mux.HandleFunc("GET /auth/loading.js", s.loadingScript)
 
 	// Static assets are embedded, read-only, and needed before login; forward
 	// them straight through without a session.
@@ -120,10 +123,13 @@ func (s *Server) secure(next http.Handler) http.Handler {
 	})
 }
 
-// requireAuth admits only requests with a valid session. On every request it
-// re-fetches the visitor's maintained repositories from GitHub so that changes
-// in repo access are reflected immediately without waiting for the session to
-// expire. An invalid GitHub token clears the session and redirects to login;
+// requireAuth admits only requests with a valid session. The visitor's
+// repositories come from GitHub via s.access, which re-checks them in the
+// background once they are older than accessFreshTTL, so access changes take
+// effect within minutes without a GitHub round trip on every request. When
+// nothing is cached yet (first visit after login), a page navigation gets the
+// progress page while the lookup runs; other requests wait for it. An
+// invalid GitHub token clears the session and redirects to login;
 // transient upstream failures leave the session intact and return 503 so a
 // temporary GitHub outage cannot turn into a login loop.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
@@ -139,7 +145,14 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			s.redirectToLogin(w, r)
 			return
 		}
-		repos, err := fetchRepositoryAccess(r.Context(), sess.Token)
+		repos, flight := s.access.lookup(sess.GitHubUserID, sess.Token)
+		if flight != nil {
+			if wantsDocument(r) {
+				s.renderLoading(w)
+				return
+			}
+			repos, err = flight.wait(r.Context())
+		}
 		if err != nil {
 			s.log.Warn("fetch repository access failed", "login", sess.Login, "err", err)
 			if isGitHubUnauthorized(err) {

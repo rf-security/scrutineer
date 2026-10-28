@@ -24,7 +24,12 @@ const (
 	githubPerPage  = 100
 	githubMaxPages = 100
 	githubTimeout  = 30 * time.Second
-	maxGitHubBody  = 25 * 1024 * 1024
+	// githubAccessTimeout bounds a whole repository-access lookup (every page).
+	// It is longer than githubTimeout because members of large organizations
+	// page through thousands of repositories at roughly a second per 100, and
+	// the lookup runs in the background behind the cache and progress page.
+	githubAccessTimeout = 120 * time.Second
+	maxGitHubBody       = 25 * 1024 * 1024
 )
 
 // githubUser is the slice of GET /user the portal needs.
@@ -131,7 +136,7 @@ func fetchRepositoryAccess(ctx context.Context, token string) ([]githubRepo, err
 // running repository count after each page, so a waiting visitor can be shown
 // that the lookup is advancing. progress may be nil.
 func fetchRepositoryAccessProgress(ctx context.Context, token string, progress func(found int)) ([]githubRepo, error) {
-	ctx, cancel := context.WithTimeout(ctx, githubTimeout)
+	ctx, cancel := context.WithTimeout(ctx, githubAccessTimeout)
 	defer cancel()
 
 	var (

@@ -15,6 +15,10 @@ var (
 	loadingHTML []byte
 	//go:embed assets/loading.js
 	loadingJS []byte
+	// accessWatchJS rides along on pages served from a partial repository list
+	// and reloads them once the lookup completes.
+	//go:embed assets/access-watch.js
+	accessWatchJS []byte
 )
 
 // loadingCSP mirrors internal/web's policy: same-origin scripts only, with
@@ -51,10 +55,18 @@ func (s *Server) renderLoading(w http.ResponseWriter) {
 }
 
 func (s *Server) loadingScript(w http.ResponseWriter, _ *http.Request) {
+	writeScript(w, loadingJS)
+}
+
+func (s *Server) accessWatchScript(w http.ResponseWriter, _ *http.Request) {
+	writeScript(w, accessWatchJS)
+}
+
+func writeScript(w http.ResponseWriter, js []byte) {
 	h := w.Header()
 	h.Set("Content-Type", "text/javascript; charset=utf-8")
 	h.Set("Cache-Control", "no-cache")
-	_, _ = w.Write(loadingJS)
+	_, _ = w.Write(js)
 }
 
 // accessStatus reports the visitor's repository lookup to the progress page.

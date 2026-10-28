@@ -423,3 +423,55 @@ func TestAccessStatusWithoutSessionIsUnauthorized(t *testing.T) {
 		t.Fatalf("state = %q, want unauthorized", st.State)
 	}
 }
+
+func TestNavigationPastLoadingWindowServesPartialScope(t *testing.T) {
+	gdb := openTestDB(t)
+	first := db.Repository{URL: "https://github.com/acme/first", Name: "first"}
+	second := db.Repository{URL: "https://github.com/acme/second", Name: "second"}
+	for _, repo := range []*db.Repository{&first, &second} {
+		if err := gdb.Create(repo).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var seen *user
+	inner := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { seen, _ = userFrom(r.Context()) })
+	s := New(testConfig(), gdb, slog.New(slog.NewTextHandler(io.Discard, nil)), inner, EmptyGrantSource())
+	s.access.loadingMax = 50 * time.Millisecond
+	release := make(chan struct{})
+	defer close(release)
+	s.access.fetch = func(_ context.Context, _ string, progress func([]githubRepo)) ([]githubRepo, error) {
+		page := []githubRepo{{FullName: "acme/first", HTMLURL: "https://github.com/acme/first", ViewerPermission: "WRITE"}}
+		progress(page)
+		<-release
+		return append(page, githubRepo{FullName: "acme/second", HTMLURL: "https://github.com/acme/second", ViewerPermission: "WRITE"}), nil
+	}
+
+	sealed, err := s.cfg.seal(session{GitHubUserID: 1, Login: "octocat", Token: "tok", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	navigate := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Header.Set("Sec-Fetch-Dest", "document")
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sealed})
+		w := httptest.NewRecorder()
+		s.requireAuth(inner).ServeHTTP(w, r)
+		return w
+	}
+
+	if w := navigate(); !strings.Contains(w.Body.String(), "Loading your repositories") || seen != nil {
+		t.Fatal("first navigation should get the progress page")
+	}
+	time.Sleep(60 * time.Millisecond)
+	navigate()
+	if seen == nil {
+		t.Fatal("navigation past the loading window should be forwarded")
+	}
+	if _, ok := seen.RepoIDs[first.ID]; !ok {
+		t.Fatal("partial scope is missing the repository from the first page")
+	}
+	if _, ok := seen.RepoIDs[second.ID]; ok {
+		t.Fatal("partial scope includes a repository GitHub has not reported yet")
+	}
+}

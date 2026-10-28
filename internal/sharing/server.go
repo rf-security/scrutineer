@@ -89,6 +89,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /auth/logout", s.logout)
 	mux.HandleFunc("GET /auth/status", s.accessStatus)
 	mux.HandleFunc("GET /auth/loading.js", s.loadingScript)
+	mux.HandleFunc("GET /auth/access-watch.js", s.accessWatchScript)
 
 	// Static assets are embedded, read-only, and needed before login; forward
 	// them straight through without a session.
@@ -128,7 +129,9 @@ func (s *Server) secure(next http.Handler) http.Handler {
 // background once they are older than accessFreshTTL, so access changes take
 // effect within minutes without a GitHub round trip on every request. When
 // nothing is cached yet (first visit after login), a page navigation gets the
-// progress page while the lookup runs; other requests wait for it. An
+// progress page and other requests wait — both for at most accessLoadingMax.
+// After that the request is served on the repositories found so far, marked
+// Incomplete so the page says so and reloads once the lookup finishes. An
 // invalid GitHub token clears the session and redirects to login;
 // transient upstream failures leave the session intact and return 503 so a
 // temporary GitHub outage cannot turn into a login loop.
@@ -146,12 +149,13 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			return
 		}
 		repos, flight := s.access.lookup(sess.GitHubUserID, sess.Token)
+		complete := true
 		if flight != nil {
-			if wantsDocument(r) {
+			if wantsDocument(r) && !s.access.pastLoadingWindow(flight) {
 				s.renderLoading(w)
 				return
 			}
-			repos, err = flight.wait(r.Context())
+			repos, complete, err = s.access.waitBounded(r.Context(), flight)
 		}
 		if err != nil {
 			s.log.Warn("fetch repository access failed", "login", sess.Login, "err", err)
@@ -180,6 +184,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			Login:        sess.Login,
 			RepoIDs:      scope.RepoIDs,
 		})
+		scope.Incomplete = !complete
 		ctx = web.WithViewScope(ctx, scope)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

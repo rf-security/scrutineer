@@ -132,10 +132,12 @@ func fetchRepositoryAccess(ctx context.Context, token string) ([]githubRepo, err
 	return fetchRepositoryAccessProgress(ctx, token, nil)
 }
 
-// fetchRepositoryAccessProgress is fetchRepositoryAccess that also reports the
-// running repository count after each page, so a waiting visitor can be shown
-// that the lookup is advancing. progress may be nil.
-func fetchRepositoryAccessProgress(ctx context.Context, token string, progress func(found int)) ([]githubRepo, error) {
+// fetchRepositoryAccessProgress is fetchRepositoryAccess that also hands the
+// repositories gathered so far to progress after each page, so a visitor can be
+// let in on a partial list while a long lookup continues. Each call receives a
+// prefix of the final result; later pages only ever add to it. The slice must
+// be treated as read-only. progress may be nil.
+func fetchRepositoryAccessProgress(ctx context.Context, token string, progress func(sofar []githubRepo)) ([]githubRepo, error) {
 	ctx, cancel := context.WithTimeout(ctx, githubAccessTimeout)
 	defer cancel()
 
@@ -174,7 +176,9 @@ func fetchRepositoryAccessProgress(ctx context.Context, token string, progress f
 			})
 		}
 		if progress != nil {
-			progress(len(repos))
+			// Cap the capacity so a later append reallocates rather than writing
+			// into memory a reader of this prefix could see.
+			progress(repos[:len(repos):len(repos)])
 		}
 		if !connection.PageInfo.HasNextPage {
 			return repos, nil

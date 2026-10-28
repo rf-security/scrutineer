@@ -94,6 +94,16 @@
 
 <main id="content" class="min-h-screen">
   <div class="p-4 md:p-6 xl:p-12">
+  {{if .ScopeIncomplete}}
+    <div class="alert mb-6" id="access-incomplete">
+      <i data-lucide="loader-circle" class="animate-spin"></i>
+      <section>
+        <strong>Still loading your repositories from GitHub.</strong>
+        You are seeing the ones found so far; this page will refresh when the rest have loaded.
+      </section>
+    </div>
+    <script src="/auth/access-watch.js" defer></script>
+  {{end}}
 {{end}}
 
 {{define "foot"}}

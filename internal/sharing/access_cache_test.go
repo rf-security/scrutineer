@@ -26,12 +26,12 @@ type fakeAccess struct {
 func newFakeCache(f *fakeAccess) *accessCache {
 	c := newAccessCache(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	c.now = func() time.Time { f.mu.Lock(); defer f.mu.Unlock(); return f.now }
-	c.fetch = func(_ context.Context, _ string, progress func(int)) ([]githubRepo, error) {
+	c.fetch = func(_ context.Context, _ string, progress func([]githubRepo)) ([]githubRepo, error) {
 		f.calls.Add(1)
 		f.mu.Lock()
 		release := f.release
 		f.mu.Unlock()
-		progress(7)
+		progress(make([]githubRepo, 7))
 		if release != nil {
 			<-release
 		}
@@ -240,5 +240,48 @@ func TestAccessCacheFailedFirstFetchReportsErrorThenRetries(t *testing.T) {
 	}
 	if got := f.calls.Load(); got != 2 {
 		t.Fatalf("fetches = %d, want a new fetch after the failure", got)
+	}
+}
+
+func TestAccessCacheWaitBoundedReturnsPartialAfterLoadingWindow(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	c := newAccessCache(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.loadingMax = 50 * time.Millisecond
+	c.fetch = func(_ context.Context, _ string, progress func([]githubRepo)) ([]githubRepo, error) {
+		progress(repoNamed("a/first-page"))
+		<-release
+		return append(repoNamed("a/first-page"), repoNamed("a/second-page")...), nil
+	}
+
+	_, flight := c.lookup(1, "tok")
+	repos, complete, err := c.waitBounded(context.Background(), flight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("waitBounded reported complete while the fetch was still running")
+	}
+	if len(repos) != 1 || repos[0].FullName != "a/first-page" {
+		t.Fatalf("partial repos = %v, want the first page", repos)
+	}
+	if !c.pastLoadingWindow(flight) {
+		t.Fatal("flight should be past the loading window")
+	}
+	if st := c.status(1, "tok"); st != (accessStatus{State: accessLoading, Found: 1, Partial: true}) {
+		t.Fatalf("status = %+v, want loading/partial with 1 found", st)
+	}
+}
+
+func TestAccessCacheWaitBoundedReturnsCompleteWhenFetchFinishesInTime(t *testing.T) {
+	c := newAccessCache(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.fetch = func(_ context.Context, _ string, progress func([]githubRepo)) ([]githubRepo, error) {
+		progress(repoNamed("a/one"))
+		return repoNamed("a/one"), nil
+	}
+	_, flight := c.lookup(1, "tok")
+	repos, complete, err := c.waitBounded(context.Background(), flight)
+	if err != nil || !complete || len(repos) != 1 {
+		t.Fatalf("waitBounded = (%v, %v, %v), want the complete list", repos, complete, err)
 	}
 }

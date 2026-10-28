@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -18,6 +17,10 @@ const (
 	// background refreshes fail. Past it, the visitor waits on a fresh fetch so
 	// a prolonged GitHub outage cannot keep stale access alive indefinitely.
 	accessMaxStale = 15 * time.Minute
+	// accessLoadingMax is how long a visitor with nothing cached is held on the
+	// progress page (or a request is held waiting) before being let in on the
+	// repositories found so far while the lookup continues in the background.
+	accessLoadingMax = 20 * time.Second
 )
 
 // accessKey identifies one visitor's GitHub answer. The token hash means a new
@@ -31,13 +34,14 @@ func newAccessKey(userID int64, token string) accessKey {
 	return accessKey{userID: userID, tokenHash: sha256.Sum256([]byte(token))}
 }
 
-// accessFlight is one in-progress GitHub fetch. found advances as pages
-// arrive; repos and err are set before done is closed.
+// accessFlight is one in-progress GitHub fetch. partial grows as pages arrive
+// (guarded by accessCache.mu); repos and err are set before done is closed.
 type accessFlight struct {
-	done  chan struct{}
-	found atomic.Int64
-	repos []githubRepo
-	err   error
+	done    chan struct{}
+	started time.Time
+	partial []githubRepo
+	repos   []githubRepo
+	err     error
 }
 
 type accessEntry struct {
@@ -61,18 +65,24 @@ const (
 
 type accessStatus struct {
 	State accessState `json:"state"`
-	Found int64       `json:"found"`
+	Found int         `json:"found"`
+	// Partial is set while loading once accessLoadingMax has passed: pages are
+	// now served on the repositories found so far.
+	Partial bool `json:"partial,omitempty"`
 }
 
 // accessCache memoizes fetchRepositoryAccess per visitor so that a page view
 // does not pay for a full, sequentially paginated GitHub listing. Fresh entries
 // are served directly; stale ones are served while a single background fetch
-// replaces them. Only a visitor with no usable entry has to wait on GitHub,
-// and the portal shows them a progress page rather than a hung request.
+// replaces them. A visitor with no usable entry waits at most loadingMax (on
+// the progress page) and is then served the repositories found so far, which
+// grow page by page until the lookup completes. A partial list is always a
+// subset of what GitHub reports, so it can only under-authorize.
 type accessCache struct {
-	fetch func(ctx context.Context, token string, progress func(int)) ([]githubRepo, error)
-	now   func() time.Time
-	log   *slog.Logger
+	fetch      func(ctx context.Context, token string, progress func([]githubRepo)) ([]githubRepo, error)
+	now        func() time.Time
+	log        *slog.Logger
+	loadingMax time.Duration
 
 	mu      sync.Mutex
 	entries map[accessKey]*accessEntry
@@ -80,10 +90,11 @@ type accessCache struct {
 
 func newAccessCache(log *slog.Logger) *accessCache {
 	return &accessCache{
-		fetch:   fetchRepositoryAccessProgress,
-		now:     time.Now,
-		log:     log,
-		entries: map[accessKey]*accessEntry{},
+		fetch:      fetchRepositoryAccessProgress,
+		now:        time.Now,
+		log:        log,
+		loadingMax: accessLoadingMax,
+		entries:    map[accessKey]*accessEntry{},
 	}
 }
 
@@ -105,6 +116,36 @@ func (f *accessFlight) wait(ctx context.Context) ([]githubRepo, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// waitBounded waits for f until it finishes or has run for loadingMax,
+// whichever is first. complete reports whether repos is the final list; when
+// false, repos is the prefix found so far and the lookup carries on.
+func (c *accessCache) waitBounded(ctx context.Context, f *accessFlight) (repos []githubRepo, complete bool, err error) {
+	timer := time.NewTimer(max(f.started.Add(c.loadingMax).Sub(c.now()), 0))
+	defer timer.Stop()
+	select {
+	case <-f.done:
+		return f.repos, true, f.err
+	case <-timer.C:
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		// The fetch may have finished as the timer fired; prefer its result.
+		select {
+		case <-f.done:
+			return f.repos, true, f.err
+		default:
+			return f.partial, false, nil
+		}
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+}
+
+// pastLoadingWindow reports whether f has run long enough that visitors should
+// be served its partial results rather than held on the progress page.
+func (c *accessCache) pastLoadingWindow(f *accessFlight) bool {
+	return c.now().Sub(f.started) >= c.loadingMax
 }
 
 // lookup never blocks. It returns the cached list, refreshing it in the
@@ -148,9 +189,9 @@ func (c *accessCache) status(userID int64, token string) accessStatus {
 	case e == nil:
 		return accessStatus{State: accessIdle}
 	case !e.fetchedAt.IsZero() && c.now().Sub(e.fetchedAt) < accessMaxStale:
-		return accessStatus{State: accessReady, Found: int64(len(e.repos))}
+		return accessStatus{State: accessReady, Found: len(e.repos)}
 	case e.flight != nil:
-		return accessStatus{State: accessLoading, Found: e.flight.found.Load()}
+		return accessStatus{State: accessLoading, Found: len(e.flight.partial), Partial: c.pastLoadingWindow(e.flight)}
 	case e.lastErr != nil && isGitHubUnauthorized(e.lastErr):
 		return accessStatus{State: accessUnauthorized}
 	case e.lastErr != nil:
@@ -165,7 +206,7 @@ func (c *accessCache) startLocked(key accessKey, e *accessEntry, token string) *
 	if e.flight != nil {
 		return e.flight
 	}
-	f := &accessFlight{done: make(chan struct{})}
+	f := &accessFlight{done: make(chan struct{}), started: c.now()}
 	e.flight = f
 	go c.run(key, f, token)
 	return f
@@ -175,8 +216,14 @@ func (c *accessCache) startLocked(key accessKey, e *accessEntry, token string) *
 // does not fail the visitor's other waiting requests, and stores the result. A
 // rejected token drops the cached list so the visitor re-authenticates instead
 // of being served stale access; other failures keep it until accessMaxStale.
+// A failed first lookup discards its partial pages: the next request starts
+// over rather than caching an incomplete list as if it were whole.
 func (c *accessCache) run(key accessKey, f *accessFlight, token string) {
-	repos, err := c.fetch(context.Background(), token, func(n int) { f.found.Store(int64(n)) })
+	repos, err := c.fetch(context.Background(), token, func(sofar []githubRepo) {
+		c.mu.Lock()
+		f.partial = sofar
+		c.mu.Unlock()
+	})
 	if err != nil {
 		c.log.Warn("repository access fetch failed", "github_user_id", key.userID, "err", err)
 	}

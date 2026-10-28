@@ -455,3 +455,27 @@ func TestViewScope_distinctLanguagesRespectScope(t *testing.T) {
 		t.Errorf("scoped languages = %v, want %v (repo b's Rust/Kotlin leaked)", got, want)
 	}
 }
+
+// TestViewScope_incompleteShowsLoadingNotice confirms that, through the
+// portal's template set, a scope the caller is still assembling renders the "still loading" notice and its refresh hook,
+// and that a complete scope renders neither.
+func TestViewScope_incompleteShowsLoadingNotice(t *testing.T) {
+	s, done := newTestServerWith(t, WithTemplateGlob("templates/sharing/*.html"))
+	defer done()
+	for _, incomplete := range []bool{true, false} {
+		r := localReq("GET", "/")
+		r = r.WithContext(WithViewScope(r.Context(), ViewScope{
+			RepoIDs:    map[uint]struct{}{},
+			ReadOnly:   true,
+			Incomplete: incomplete,
+		}))
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, r)
+		body := w.Body.String()
+		notice := strings.Contains(body, "Still loading your repositories from GitHub")
+		watch := strings.Contains(body, `src="/auth/access-watch.js"`)
+		if notice != incomplete || watch != incomplete {
+			t.Errorf("incomplete=%v: notice=%v watch-script=%v, want both %v", incomplete, notice, watch, incomplete)
+		}
+	}
+}

@@ -740,6 +740,9 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 	// when the request runs under a read-only view scope (the sharing portal).
 	// Unset for the local operator, so every page renders as before.
 	data["Sharing"] = isReadOnly(r)
+	if scope, ok := viewScopeFrom(r); ok {
+		data["ScopeIncomplete"] = scope.Incomplete
+	}
 	// Seed the sorter with the handler's EFFECTIVE sort (data["Sort"]) rather
 	// than the raw ?sort param. That token is already the sanitized, defaulted
 	// sort the ORDER BY actually used, so folding it in makes a default or

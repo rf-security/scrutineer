@@ -36,6 +36,12 @@
             fail('GitHub did not respond. Your repositories could not be loaded.');
             return;
         }
+        if (st.partial) {
+          // The lookup has run long enough; the page is now served on the
+          // repositories found so far and refreshes itself when done.
+          location.reload();
+          return;
+        }
         if (st.found > 0) {
           detail.textContent = 'Found ' + st.found + ' ' +
             (st.found === 1 ? 'repository' : 'repositories') + ' so far…';

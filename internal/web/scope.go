@@ -31,6 +31,10 @@ type ViewScope struct {
 	// on the external forge but cannot see findings for because their permission
 	// is below the sharing portal's authorization threshold.
 	InsufficientRepositories []ExternalRepository
+	// Incomplete marks an allow-list the caller is still assembling: it may
+	// grow, so pages show a notice that more repositories may appear. It never
+	// widens RepoIDs.
+	Incomplete bool
 	// ReadOnly hides mutating controls in rendered pages via the template
 	// "Sharing" flag (see render and isReadOnly).
 	ReadOnly bool

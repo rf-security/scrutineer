@@ -27,6 +27,7 @@ type uiScanListParams struct {
 	group        string
 	repositoryID uint
 	findingID    uint
+	dates        uiDateRange
 	sort         string
 }
 
@@ -48,6 +49,9 @@ func parseUIScanListParams(r *http.Request) (uiScanListParams, error) {
 		return p, err
 	}
 	if p.findingID, err = uiQueryID(r, "finding_id"); err != nil {
+		return p, err
+	}
+	if p.dates, err = parseUIDateRange(q); err != nil {
 		return p, err
 	}
 	p.skill = parseScanSkillFilter(q.Get("skill"))
@@ -76,7 +80,7 @@ func (p uiScanListParams) where(q *gorm.DB) *gorm.DB {
 	if p.findingID != 0 {
 		q = q.Where("scans.finding_id = ?", p.findingID)
 	}
-	return q
+	return p.dates.apply(q, "scans.created_at")
 }
 
 // uiScanListOrder applies the HTML scans page's sort (scansOrder) so URL sort

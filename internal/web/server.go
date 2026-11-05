@@ -1336,6 +1336,11 @@ func applyFindingsOrder(q *gorm.DB, token string) (*gorm.DB, string, string) {
 		q = q.Order(orderByExpr("findings.model", dir, false)).Order("findings.id desc")
 	case "scan":
 		q = q.Order(orderByExpr("findings.scan_id", dir, true)).Order("findings.id desc")
+	case uiSortDate:
+		// SPA-only token (its Date column); the HTML findings page never sends
+		// it. id breaks created_at ties in the same direction.
+		desc := wantDesc(dir, true)
+		q = q.Order(orderBySuffix("findings.created_at", desc)).Order(orderBySuffix("findings.id", desc))
 	default:
 		sortCol, dir = defaultSort, ""
 		q = q.Order("id desc")

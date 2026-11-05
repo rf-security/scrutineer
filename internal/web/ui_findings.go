@@ -71,8 +71,8 @@ var uiFindingListOmit = []string{
 
 // uiFindingListParams are the parsed, validated filters of GET /ui/findings.
 // Filtering itself is delegated to findingsIndexQuery (the HTML list's
-// query) so both lists agree; this struct only validates and adds the two
-// UI-only filters (repository_id, sub_path).
+// query) so both lists agree; this struct only validates and adds the
+// UI-only filters (repository_id, sub_path, date_from/date_to).
 type uiFindingListParams struct {
 	page         listPage
 	scanners     bool
@@ -80,6 +80,7 @@ type uiFindingListParams struct {
 	subPath      string
 	hasSubPath   bool
 	facets       []string
+	dates        uiDateRange
 	sort         string
 }
 
@@ -125,6 +126,9 @@ func parseUIFindingListParams(r *http.Request) (uiFindingListParams, error) {
 	if p.facets, err = parseUIFindingFacets(q.Get("facets")); err != nil {
 		return p, err
 	}
+	if p.dates, err = parseUIDateRange(q); err != nil {
+		return p, err
+	}
 	p.sort = q.Get("sort")
 	return p, nil
 }
@@ -149,7 +153,9 @@ func parseUIFindingFacets(raw string) ([]string, error) {
 	return out, nil
 }
 
-// uiFindingScope applies the UI-only filters the HTML list does not have.
+// scope applies the UI-only filters the HTML list does not have (repository_id,
+// sub_path, date_from/date_to). The list, total, toggle counts and facets all
+// run through it, so every count respects the date window.
 func (p uiFindingListParams) scope(q *gorm.DB) *gorm.DB {
 	if p.repositoryID != 0 {
 		q = q.Where("findings.repository_id = ?", p.repositoryID)
@@ -157,7 +163,7 @@ func (p uiFindingListParams) scope(q *gorm.DB) *gorm.DB {
 	if p.hasSubPath {
 		q = q.Where("findings.sub_path = ?", p.subPath)
 	}
-	return q
+	return p.dates.apply(q, "findings.created_at")
 }
 
 // uiRequestWithQuery returns a shallow copy of r whose query has the given

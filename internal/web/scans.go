@@ -110,6 +110,12 @@ func (s *Server) scansOrder(q *gorm.DB, token string) (*gorm.DB, string, string)
 	case "findings":
 		// findings_count is a denormalised column on the scan row.
 		q = q.Order(orderByExpr("findings_count", dir, true)).Order("scans.id desc")
+	case uiSortDate:
+		// Only the SPA sends this (its Date column); the HTML jobs page has no
+		// date header, so its behaviour is unchanged. id breaks created_at ties
+		// in the same direction.
+		desc := wantDesc(dir, true)
+		q = q.Order(orderBySuffix("scans.created_at", desc)).Order(orderBySuffix("scans.id", desc))
 	default:
 		sortCol, dir = defaultSort, ""
 		q = q.Order("status_priority, scans.id desc")

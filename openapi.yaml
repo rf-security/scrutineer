@@ -1793,7 +1793,10 @@ paths:
         in: query
         schema:
           type: string
-        description: newest (default) | id | skill | status | repository | findings, optional .asc/.desc
+        description: newest (default) | id | skill | status | repository | findings | date (created_at, id tiebreak;
+          desc first), optional .asc/.desc
+      - $ref: '#/components/parameters/UIDateFrom'
+      - $ref: '#/components/parameters/UIDateTo'
       - name: skill
         in: query
         schema:
@@ -1883,6 +1886,8 @@ paths:
     get:
       summary: Paged findings list with toggle counts and optional facets
       operationId: listUIFindings
+      description: 'Sort tokens: newest (default, id desc) | severity | repository | title | status | repo_id | cwe | model
+        | scan | date (created_at with an id tiebreak, desc first), each with optional .asc/.desc.'
       tags:
       - ui-findings
       security:
@@ -1939,7 +1944,10 @@ paths:
         in: query
         schema:
           type: string
-        description: Comma list of status,severity,category
+        description: Comma list of status,severity,category. Facet and toggle counts respect every other filter,
+          including date_from/date_to.
+      - $ref: '#/components/parameters/UIDateFrom'
+      - $ref: '#/components/parameters/UIDateTo'
       responses:
         '200':
           description: OK
@@ -3291,6 +3299,8 @@ paths:
     get:
       summary: Repository findings
       operationId: listUIRepositoryFindings
+      description: 'Sort tokens: severity (default) | newest (id) | title | status | cwe | date (created_at with an id
+        tiebreak, desc first), each with optional .asc/.desc.'
       tags:
       - ui-repositories
       security:
@@ -3320,6 +3330,8 @@ paths:
         in: query
         schema:
           type: string
+      - $ref: '#/components/parameters/UIDateFrom'
+      - $ref: '#/components/parameters/UIDateTo'
       responses:
         '200':
           description: OK
@@ -3339,6 +3351,10 @@ paths:
     get:
       summary: Repository scans (latest set or full history)
       operationId: listUIRepositoryScans
+      description: 'latest=1 (default) is the latest attempt per (skill, sub_path, focus_area), one capped set; a `sort`
+        token (the /ui/scans tokens, e.g. date.desc) only reorders that set, and the filters (status, skill, completeness,
+        group, finding_id, date_from, date_to) are ignored so the set never changes which attempt is latest. latest=0
+        is the paged full history with every /ui/scans filter and sort.'
       tags:
       - ui-repositories
       security:
@@ -3377,6 +3393,8 @@ paths:
         schema:
           type: integer
           format: int64
+      - $ref: '#/components/parameters/UIDateFrom'
+      - $ref: '#/components/parameters/UIDateTo'
       responses:
         '200':
           description: OK
@@ -6277,6 +6295,22 @@ components:
       schema:
         type: string
       description: Sort token `key` or `key.asc|.desc` (same tokens as the HTML UI); unknown keys fall back to the default
+    UIDateFrom:
+      name: date_from
+      in: query
+      schema:
+        type: string
+      description: 'Lower bound on the row''s `created_at` (inclusive). RFC3339 (any offset) or `YYYY-MM-DD`
+        (a UTC day, from 00:00). Invalid values, or a window whose start is after its end, return 400 `bad_param`.'
+      example: '2026-10-01'
+    UIDateTo:
+      name: date_to
+      in: query
+      schema:
+        type: string
+      description: 'Upper bound on the row''s `created_at`. RFC3339 is inclusive of that instant; `YYYY-MM-DD`
+        includes the whole (UTC) day. Invalid values return 400 `bad_param`.'
+      example: '2026-11-05'
     UIQ:
       name: q
       in: query

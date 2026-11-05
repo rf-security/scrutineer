@@ -47,6 +47,7 @@ type uiRepoFindingParams struct {
 	status   string
 	severity string
 	category string
+	dates    uiDateRange
 	sort     string
 }
 
@@ -70,6 +71,9 @@ func parseUIRepoFindingParams(r *http.Request) (uiRepoFindingParams, error) {
 	if p.category != "" && p.category != UncategorizedCWE && !slices.Contains(CWECategories(), p.category) {
 		return p, fmt.Errorf("invalid category filter %q", p.category)
 	}
+	if p.dates, err = parseUIDateRange(q); err != nil {
+		return p, err
+	}
 	p.sort = q.Get("sort")
 	return p, nil
 }
@@ -88,7 +92,7 @@ func (p uiRepoFindingParams) where(q *gorm.DB, r *http.Request, repoID uint) *go
 		like := "%" + search + "%"
 		q = q.Where("LOWER(title) LIKE LOWER(?) OR LOWER(location) LIKE LOWER(?) OR LOWER(cwe) LIKE LOWER(?)", like, like, like)
 	}
-	return q
+	return p.dates.apply(q, "findings.created_at")
 }
 
 // uiRepoFindingOrder is the repo tab's order: severity first (the HTML tab's
@@ -104,6 +108,9 @@ func uiRepoFindingOrder(q *gorm.DB, token string) *gorm.DB {
 		return q.Order(orderByExpr("status", dir, false)).Order("id desc")
 	case uiKeyCWE:
 		return q.Order(orderByExpr(uiKeyCWE, dir, false)).Order("id desc")
+	case uiSortDate:
+		desc := wantDesc(dir, true)
+		return q.Order(orderBySuffix("findings.created_at", desc)).Order(orderBySuffix("findings.id", desc))
 	default:
 		return q.Order(severityOrder).Order("id desc")
 	}
@@ -174,7 +181,7 @@ func (s *Server) uiRepoScans(w http.ResponseWriter, r *http.Request) {
 	counts := map[string]int64{"active": active, "paused": paused, "failed": int64(countFailedScans(latest))}
 	switch v := r.URL.Query().Get(uiLatestParam); v {
 	case "", uiParamOn:
-		s.uiRepoLatestScans(w, latest, counts)
+		s.uiRepoLatestScans(w, latest, counts, r.URL.Query().Get("sort"))
 	case "0":
 		s.uiRepoScanHistory(w, r, repo.ID, counts)
 	default:
@@ -185,7 +192,13 @@ func (s *Server) uiRepoScans(w http.ResponseWriter, r *http.Request) {
 // uiRepoLatestScans writes the latest attempt per (skill, sub_path,
 // focus_area), capped; total reports the whole set so the SPA can fall back
 // to latest=0 paging.
-func (s *Server) uiRepoLatestScans(w http.ResponseWriter, latest []db.Scan, counts map[string]int64) {
+//
+// A sort token orders only the rows of that capped set (newest attempts are
+// picked first, then re-ordered), so `sort=date` never changes which attempt
+// represents a skill. Filters (status, skill, date_from/date_to) are latest=0
+// only: filtering before picking would surface an older attempt as "latest",
+// and filtering after would make total disagree with the set's counts.
+func (s *Server) uiRepoLatestScans(w http.ResponseWriter, latest []db.Scan, counts map[string]int64, sort string) {
 	ids := make([]uint, 0, min(len(latest), uiRepoLatestScanCap))
 	for i := 0; i < len(latest) && i < uiRepoLatestScanCap; i++ {
 		ids = append(ids, latest[i].ID)
@@ -193,7 +206,13 @@ func (s *Server) uiRepoLatestScans(w http.ResponseWriter, latest []db.Scan, coun
 	rows := []map[string]any{}
 	if len(ids) > 0 {
 		var err error
-		rows, err = s.uiScanRows(s.DB.Model(&db.Scan{}).Where("scans.id IN ?", ids).Order("scans.id desc"))
+		q := s.DB.Model(&db.Scan{}).Where("scans.id IN ?", ids)
+		if sort == "" {
+			q = q.Order("scans.id desc")
+		} else {
+			q = s.uiScanListOrder(q, sort)
+		}
+		rows, err = s.uiScanRows(q)
 		if err != nil {
 			uiInternal(w, err)
 			return

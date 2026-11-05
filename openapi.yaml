@@ -1125,7 +1125,12 @@ paths:
         '400': { description: Invalid repository id }
         '403': { description: Host header is not localhost }
         '404': { description: Repository not found }
-        '409': { description: Repository has queued or running scans, or a linked paused scan on another repository }
+        '409':
+          description: Repository has queued or running scans, or a linked paused scan on another repository
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoDeleteInFlight'
         '500': { description: Delete failed }
 
   /v1/repositories/{id}/findings:
@@ -3156,7 +3161,6 @@ paths:
       operationId: listUIRepositories
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3187,8 +3191,7 @@ paths:
       operationId: createUIRepository
       tags:
       - ui-repositories
-      description: '**Enqueues model work when triage is true and the repo is new, or a ref/sub-path is given.**'
-      x-status: planned
+      description: '**Enqueues model work when triage is true and the repo is new, or a ref/sub-path is given.** `created:false` with no ref/sub-path enqueues nothing (`scan_ids: []`, `scan_id: null`). Publishes `repository {change: created}` for a new row.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3219,7 +3222,6 @@ paths:
       operationId: getUIRepository
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3235,6 +3237,8 @@ paths:
           headers:
             ETag:
               $ref: '#/components/headers/UIETag'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3243,10 +3247,10 @@ paths:
           $ref: '#/components/responses/UIInternal'
     patch:
       summary: Autosave repository settings
+      description: 'Partial update; absent fields are untouched. `If-Match` (whole-row `updated_at`) is optional; a mismatch is 409 with `current` (RepoRow). Every PATCH bumps `updated_at`. Publishes `repository {change: updated}`.'
       operationId: patchUIRepository
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3285,7 +3289,6 @@ paths:
       operationId: listUIRepositoryFindings
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3334,7 +3337,6 @@ paths:
       operationId: listUIRepositoryScans
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3355,6 +3357,14 @@ paths:
         schema:
           type: string
       - name: skill
+        in: query
+        schema:
+          type: string
+      - name: completeness
+        in: query
+        schema:
+          type: string
+      - name: group
         in: query
         schema:
           type: string
@@ -3384,7 +3394,6 @@ paths:
       operationId: listUIRepositoryDependencies
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3424,7 +3433,6 @@ paths:
       operationId: listUIRepositoryPackages
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3438,7 +3446,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RepoTabList'
+                $ref: '#/components/schemas/RepoPackageList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3451,7 +3461,6 @@ paths:
       operationId: listUIRepositoryDependents
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3465,7 +3474,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RepoTabList'
+                $ref: '#/components/schemas/RepoDependentList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3478,7 +3489,6 @@ paths:
       operationId: listUIRepositoryAdvisories
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3492,7 +3502,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RepoTabList'
+                $ref: '#/components/schemas/RepoAdvisoryList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3505,7 +3517,6 @@ paths:
       operationId: listUIRepositoryMaintainers
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3519,7 +3530,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RepoTabList'
+                $ref: '#/components/schemas/RepoMaintainerList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3532,7 +3545,6 @@ paths:
       operationId: listUIRepositoryAlternatives
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3546,7 +3558,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RepoTabList'
+                $ref: '#/components/schemas/RepoAlternativeList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3558,7 +3572,6 @@ paths:
       operationId: createUIRepositoryAlternative
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3576,8 +3589,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RepoAlternative'
         '400':
           $ref: '#/components/responses/UIBadParam'
         '404':
@@ -3594,7 +3606,6 @@ paths:
       operationId: listUIRepositoryExpected
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3608,7 +3619,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RepoTabList'
+                $ref: '#/components/schemas/RepoExpectedList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3620,7 +3633,6 @@ paths:
       operationId: createUIRepositoryExpected
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3638,8 +3650,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/RepoExpected'
         '400':
           $ref: '#/components/responses/UIBadParam'
         '404':
@@ -3656,7 +3667,6 @@ paths:
       operationId: listUIRepositorySubprojects
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3670,7 +3680,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RepoTabList'
+                $ref: '#/components/schemas/RepoSubprojectList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3683,7 +3695,6 @@ paths:
       operationId: listUIRepositoryCompliance
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3697,7 +3708,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/RepoTabList'
+                $ref: '#/components/schemas/RepoComplianceList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3710,7 +3723,6 @@ paths:
       operationId: getUIRepositoryThreatModel
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3723,6 +3735,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ThreatModelView'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3735,7 +3749,6 @@ paths:
       operationId: getUIRepositoryWorkbench
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3748,6 +3761,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/WorkbenchView'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3760,7 +3775,6 @@ paths:
       operationId: getUIRepositoryScanConfig
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3773,6 +3787,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ScanConfigView'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3785,7 +3801,6 @@ paths:
       operationId: getUIRepositoryMetadata
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3799,6 +3814,8 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3811,7 +3828,6 @@ paths:
       operationId: addUIRepositoryIgnoredPath
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3843,7 +3859,6 @@ paths:
       operationId: deleteUIRepositoryIgnoredPath
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3875,7 +3890,6 @@ paths:
       operationId: deleteUIRepositoryAlternative
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3890,6 +3904,8 @@ paths:
       responses:
         '204':
           description: Deleted
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3902,7 +3918,6 @@ paths:
       operationId: deleteUIRepositoryExpected
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3917,6 +3932,8 @@ paths:
       responses:
         '204':
           description: Deleted
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3929,7 +3946,6 @@ paths:
       operationId: getUISubproject
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3941,6 +3957,7 @@ paths:
           type: string
         required: true
       - $ref: '#/components/parameters/UIPage'
+      - $ref: '#/components/parameters/UIPageSize'
       responses:
         '200':
           description: OK
@@ -3948,6 +3965,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SubprojectView'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3959,7 +3978,6 @@ paths:
       operationId: patchUISubproject
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3982,8 +4000,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: true
+                $ref: '#/components/schemas/SubprojectPatchResult'
         '400':
           $ref: '#/components/responses/UIBadParam'
         '404':
@@ -4001,7 +4018,6 @@ paths:
       tags:
       - ui-repositories
       description: '**Enqueues model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4043,7 +4059,6 @@ paths:
       tags:
       - ui-repositories
       description: '**Enqueues model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4068,6 +4083,8 @@ paths:
           $ref: '#/components/responses/UINotFound'
         '409':
           $ref: '#/components/responses/UIConflict'
+        '412':
+          $ref: '#/components/responses/UIPreconditionFailed'
         '422':
           $ref: '#/components/responses/UIValidationFailed'
         '401':
@@ -4081,7 +4098,6 @@ paths:
       tags:
       - ui-repositories
       description: '**Enqueues model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4108,6 +4124,8 @@ paths:
           $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
+        '412':
+          $ref: '#/components/responses/UIPreconditionFailed'
         '422':
           $ref: '#/components/responses/UIValidationFailed'
         '401':
@@ -4121,7 +4139,6 @@ paths:
       tags:
       - ui-repositories
       description: '**Enqueues model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4161,7 +4178,6 @@ paths:
       tags:
       - ui-repositories
       description: '**Enqueues model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4199,7 +4215,6 @@ paths:
       tags:
       - ui-repositories
       description: '**Enqueues model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4236,7 +4251,6 @@ paths:
       operationId: listUIRemoteBranches
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4268,7 +4282,6 @@ paths:
       tags:
       - ui-repositories
       description: '**May enqueue model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4299,7 +4312,6 @@ paths:
       operationId: previewUIOrgImport
       tags:
       - ui-repositories
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4333,7 +4345,6 @@ paths:
       tags:
       - ui-repositories
       description: '**May enqueue model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4367,7 +4378,6 @@ paths:
       tags:
       - ui-repositories
       description: '**Enqueues model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4401,7 +4411,6 @@ paths:
       tags:
       - ui-repositories
       description: '**May enqueue model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4439,7 +4448,6 @@ paths:
       tags:
       - ui-repositories
       description: '**May enqueue model work.**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4476,8 +4484,7 @@ paths:
       operationId: getUIRepositoryBlob
       tags:
       - ui-repositories
-      description: Go pattern `{path...}`. Full-SHA commits are immutable-cached.
-      x-status: planned
+      description: 'Go pattern `{path...}`. Full-SHA commits are served with `ETag: "<commit>:<path>"` and `Cache-Control: private, max-age=31536000, immutable`; abbreviated SHAs and the missing/error states are `no-store`. Missing clone, git error and non-UTF-8 content are 200 with `missing`, `error` or `unsupported` set.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4498,6 +4505,10 @@ paths:
         schema:
           type: string
         description: A or A-B
+      - name: If-None-Match
+        in: header
+        schema:
+          type: string
       responses:
         '200':
           description: OK
@@ -4505,6 +4516,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BlobView'
+        '304':
+          description: Not modified (full-SHA ETag matched)
         '400':
           $ref: '#/components/responses/UIBadParam'
         '404':
@@ -4519,8 +4532,7 @@ paths:
       operationId: getUIRepositoryTree
       tags:
       - ui-repositories
-      description: Go pattern `{path...}`.
-      x-status: planned
+      description: Go pattern `{path...}`; the repository root is the empty path (`/tree/<commit>/`). Same cache rule as the blob route. A path that is not a directory at the commit is 404.
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4543,6 +4555,10 @@ paths:
           enum:
           - 1
           - 2
+      - name: If-None-Match
+        in: header
+        schema:
+          type: string
       responses:
         '200':
           description: OK
@@ -4550,6 +4566,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TreeView'
+        '304':
+          description: Not modified (full-SHA ETag matched)
         '400':
           $ref: '#/components/responses/UIBadParam'
         '404':
@@ -9672,9 +9690,15 @@ components:
       - type: object
         properties:
           scan_commit:
-            type: string
+            type: object
+            description: Producing scan id → commit, for location links.
+            additionalProperties:
+              type: string
           scan_skill:
-            type: string
+            type: object
+            description: Producing scan id → skill name.
+            additionalProperties:
+              type: string
     RepoScanList:
       allOf:
       - $ref: '#/components/schemas/ListPage'
@@ -9721,21 +9745,28 @@ components:
           type: string
         unresolved:
           type: boolean
+        resolution:
+          type: string
         type:
           type: string
         manifests:
           type: array
+          description: One row per manifest (the SPA groups by name+ecosystem and builds blob links from the list's `commit`).
           items:
             type: object
             properties:
               path:
                 type: string
-              url:
+              kind:
                 type: string
         purl:
           type: string
-        known_repo_url:
-          type: string
+        known_repository_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Repository publishing this PURL, when it is in the inventory (View repository).
     DependencyList:
       allOf:
       - $ref: '#/components/schemas/ListPage'
@@ -9782,6 +9813,9 @@ components:
         scan_id:
           type: integer
           format: int64
+        skill_name:
+          type: string
+          description: threat-model, or security-deep-dive when falling back to its report.
     WorkbenchView:
       type: object
       required:
@@ -9798,8 +9832,54 @@ components:
           items:
             $ref: '#/components/schemas/ScanRow'
         diff:
-          type: object
-          additionalProperties: true
+          description: Latest two completed root deep-dive runs compared; null with fewer than two runs.
+          oneOf:
+          - $ref: '#/components/schemas/WorkbenchDiff'
+          - type: 'null'
+    WorkbenchDiff:
+      type: object
+      required:
+      - now_reported
+      - now_suppressed
+      - reason_changed
+      - unchanged
+      - only_in_curr
+      - only_in_prev
+      properties:
+        now_reported:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkbenchDiffRow'
+        now_suppressed:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkbenchDiffRow'
+        reason_changed:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkbenchDiffRow'
+        unchanged:
+          type: integer
+        only_in_curr:
+          type: integer
+        only_in_prev:
+          type: integer
+    WorkbenchDiffRow:
+      type: object
+      required:
+      - location
+      - class
+      - before
+      - after
+      properties:
+        location:
+          type: string
+        class:
+          type: string
+        before:
+          type: string
+        after:
+          type: string
     ScanConfigView:
       type: object
       required:
@@ -9886,10 +9966,17 @@ components:
       type: object
       required:
       - subproject
+      - repository
+      - findings
+      - packages
+      - advisories
+      - disclosure_channel
+      - attribution
       properties:
         subproject:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/SubprojectRow'
+        repository:
+          $ref: '#/components/schemas/RepoRef'
         findings:
           allOf:
           - $ref: '#/components/schemas/ListPage'
@@ -9920,7 +10007,10 @@ components:
               type: string
         attribution:
           type: object
-          additionalProperties: true
+          description: Registry attribution (packages/advisories) is shown only when enabled.
+          properties:
+            enabled:
+              type: boolean
     SubprojectPatch:
       type: object
       required:
@@ -10045,6 +10135,8 @@ components:
             properties:
               line:
                 type: integer
+              url:
+                type: string
               error:
                 type: string
         repositories:
@@ -10089,6 +10181,8 @@ components:
                 type: string
               name:
                 type: string
+              full_name:
+                type: string
               fork:
                 type: boolean
               archived:
@@ -10098,10 +10192,27 @@ components:
     OrgImportResult:
       type: object
       required:
+      - org
       - created
       - skipped
       - errored
+      - filtered
+      - repositories
       properties:
+        org:
+          type: string
+        filtered:
+          type: integer
+          description: Forks/archived/mirrors held back by the filters.
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              full_name:
+                type: string
+              error:
+                type: string
         created:
           type: integer
         skipped:
@@ -10175,6 +10286,9 @@ components:
           type: boolean
         highlight:
           type: array
+          description: Inclusive [start, end] from `line`; [0, 0] when absent.
+          minItems: 2
+          maxItems: 2
           items:
             type: integer
         forge_url:
@@ -10202,22 +10316,421 @@ components:
         entries:
           type: array
           items:
-            type: object
-            required:
-            - name
-            - type
-            properties:
-              name:
-                type: string
-              type:
-                type: string
-                enum:
-                - file
-                - dir
-                - symlink
-              size:
-                type: integer
-                format: int64
+            $ref: '#/components/schemas/TreeEntry'
+        local:
+          type: boolean
+        missing:
+          type: boolean
+        error:
+          type: string
+    TreeEntry:
+      type: object
+      required:
+      - name
+      - type
+      - size
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum:
+          - file
+          - dir
+          - symlink
+          - submodule
+        size:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        entries:
+          type: array
+          description: Children of a directory when depth=2.
+          items:
+            $ref: '#/components/schemas/TreeEntry'
+    RepoPackage:
+      type: object
+      required:
+      - id
+      - name
+      - ecosystem
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        ecosystem:
+          type: string
+        purl:
+          type: string
+        latest_version:
+          type: string
+        downloads:
+          type: integer
+          format: int64
+        dependent_packages:
+          type: integer
+        dependent_repos:
+          type: integer
+        registry_url:
+          type: string
+        latest_release_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        sub_path:
+          type: string
+        risk_flags:
+          type: array
+          items:
+            type: string
+    RepoPackageList:
+      allOf:
+      - $ref: '#/components/schemas/ListPage'
+      - type: object
+        required:
+        - items
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/RepoPackage'
+    RepoDependent:
+      type: object
+      required:
+      - id
+      - name
+      - ecosystem
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        ecosystem:
+          type: string
+        purl:
+          type: string
+        repository_url:
+          type: string
+        downloads:
+          type: integer
+          format: int64
+        dependent_repos:
+          type: integer
+        registry_url:
+          type: string
+        latest_version:
+          type: string
+        known_repository_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+    RepoDependentList:
+      allOf:
+      - $ref: '#/components/schemas/ListPage'
+      - type: object
+        required:
+        - items
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/RepoDependent'
+    RepoAdvisory:
+      type: object
+      required:
+      - id
+      - title
+      properties:
+        id:
+          type: integer
+          format: int64
+        uuid:
+          type: string
+        url:
+          type: string
+        title:
+          type: string
+        severity:
+          type: string
+        cvss_score:
+          type: number
+        classification:
+          type: string
+        packages:
+          type: string
+        published_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        withdrawn_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        audit_status:
+          type: string
+          description: Latest advisory-audit outcome; "" when never audited.
+        certificate_url:
+          type: string
+          description: Root-absolute certificate download when audit_status is fixed.
+    RepoAdvisoryList:
+      allOf:
+      - $ref: '#/components/schemas/ListPage'
+      - type: object
+        required:
+        - items
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/RepoAdvisory'
+    RepoMaintainer:
+      type: object
+      required:
+      - id
+      - login
+      properties:
+        id:
+          type: integer
+          format: int64
+        login:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+        status:
+          type: string
+        notes:
+          type: string
+        do_not_contact:
+          type: boolean
+    RepoMaintainerList:
+      allOf:
+      - $ref: '#/components/schemas/ListPage'
+      - type: object
+        required:
+        - items
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/RepoMaintainer'
+    RepoAlternative:
+      type: object
+      required:
+      - id
+      - repository_id
+      - purl
+      - kind
+      properties:
+        id:
+          type: integer
+          format: int64
+        repository_id:
+          type: integer
+          format: int64
+        purl:
+          type: string
+        kind:
+          type: string
+          enum:
+          - fork
+          - successor
+          - equivalent
+        note:
+          type: string
+    RepoAlternativeList:
+      allOf:
+      - $ref: '#/components/schemas/ListPage'
+      - type: object
+        required:
+        - items
+        - show
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/RepoAlternative'
+          show:
+            type: boolean
+            description: Whether the tab is shown (repo abandoned/zombie or has rows).
+    RepoExpected:
+      type: object
+      required:
+      - id
+      - file
+      - cwe
+      - status
+      - matched_finding_id
+      properties:
+        id:
+          type: integer
+          format: int64
+        repository_id:
+          type: integer
+          format: int64
+        file:
+          type: string
+        cwe:
+          type: string
+        cve:
+          type: string
+        note:
+          type: string
+        status:
+          type: string
+          enum:
+          - matched
+          - missed
+        matched_finding_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+    RepoExpectedList:
+      allOf:
+      - $ref: '#/components/schemas/ListPage'
+      - type: object
+        required:
+        - items
+        - matched
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/RepoExpected'
+          matched:
+            type: integer
+          finding_total:
+            type: integer
+          true_positive_findings:
+            type: integer
+    SubprojectRow:
+      type: object
+      required:
+      - id
+      - path
+      - name
+      - scan_count
+      properties:
+        id:
+          type: integer
+          format: int64
+        repository_id:
+          type: integer
+          format: int64
+        path:
+          type: string
+        name:
+          type: string
+        kind:
+          type: string
+        description:
+          type: string
+        disclosure_channel:
+          type: string
+        sub_path:
+          type: string
+          description: The scan sub_path ("" for a root package).
+        scan_count:
+          type: integer
+    RepoSubprojectList:
+      allOf:
+      - $ref: '#/components/schemas/ListPage'
+      - type: object
+        required:
+        - items
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/SubprojectRow'
+    SubprojectPatchResult:
+      type: object
+      required:
+      - subproject
+      - disclosure_channel
+      properties:
+        subproject:
+          $ref: '#/components/schemas/SubprojectRow'
+        disclosure_channel:
+          type: object
+          properties:
+            own:
+              type: string
+            effective:
+              type: string
+    ComplianceControlRow:
+      type: object
+      required:
+      - id
+      - control_id
+      - level
+      - status
+      properties:
+        id:
+          type: integer
+          format: int64
+        control_id:
+          type: string
+        level:
+          type: integer
+        status:
+          type: string
+        details:
+          type: string
+        source:
+          type: string
+        scan_id:
+          type: integer
+          format: int64
+    RepoComplianceList:
+      allOf:
+      - $ref: '#/components/schemas/ListPage'
+      - type: object
+        required:
+        - items
+        - level
+        properties:
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/ComplianceControlRow'
+          level:
+            type: string
+            description: OpenSSF Baseline level badge, e.g. L1.
+    RepoDeleteInFlight:
+      type: object
+      description: 409 body of DELETE /api/v1/repositories/{id} (additive; `error` is the legacy string).
+      required:
+      - error
+      - code
+      - active
+      - paused
+      - request_id
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          enum:
+          - in_flight
+        active:
+          type: integer
+          format: int64
+        paused:
+          type: integer
+          format: int64
+        request_id:
+          type: string
     # --- ui:repositories schemas end ---
     # --- ui:scans schemas begin --- (WP-API-4)
     UIScanDetail:

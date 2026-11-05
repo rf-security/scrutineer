@@ -25,9 +25,20 @@ func (s *Server) repoFederationOptOut(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if err := s.setFederationOptOut(repo, r.FormValue("opt_out") != "", r.FormValue("reason")); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.redirect(w, r, fmt.Sprintf("/repositories/%d", repo.ID))
+}
+
+// setFederationOptOut records (optOut) or clears the opt-out under the
+// repository's federation lock, then stops the scans already under way. An
+// edit that only changes the reason keeps the original request date. Shared by
+// the HTML form and PATCH /api/v1/ui/repositories/{id}.
+func (s *Server) setFederationOptOut(repo db.Repository, optOut bool, reason string) error {
 	unlock := s.lockRepoFederation(repo.ID)
 	defer unlock()
-	optOut := r.FormValue("opt_out") != ""
 	updates := map[string]any{"federation_opt_out_at": nil, "federation_opt_out_reason": ""}
 	if optOut {
 		at := time.Now().UTC()
@@ -35,22 +46,18 @@ func (s *Server) repoFederationOptOut(w http.ResponseWriter, r *http.Request) {
 			at = *repo.FederationOptOutAt
 		}
 		updates["federation_opt_out_at"] = &at
-		updates["federation_opt_out_reason"] = strings.TrimSpace(r.FormValue("reason"))
+		updates["federation_opt_out_reason"] = strings.TrimSpace(reason)
 	}
 	if err := s.DB.Model(&db.Repository{}).Where("id = ?", repo.ID).Updates(updates).Error; err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
 	// Sweep only after the flag is committed: from here on every enqueue path
 	// refuses this repository, so nothing slips in behind the sweep, and a scan
 	// the worker claims from the queue meanwhile hits its own dispatch gate.
 	if optOut {
-		if err := s.stopScansForOptOut(repo.ID); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		return s.stopScansForOptOut(repo.ID)
 	}
-	s.redirect(w, r, fmt.Sprintf("/repositories/%d", repo.ID))
+	return nil
 }
 
 // stopScansForOptOut cancels every scan still alive on a repository that just

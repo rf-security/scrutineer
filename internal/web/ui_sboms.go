@@ -241,7 +241,7 @@ func (s *Server) uiSBOMShow(w http.ResponseWriter, r *http.Request) {
 	row["counts"] = map[string]any{
 		uiKeyPackages: c.Total, "resolved": c.Resolved, "linked": c.Linked,
 		"direct": c.Direct, "transitive": c.Transitive,
-		uiKeyFindings: findings, "advisories": advisories,
+		uiKeyFindings: findings, uiKeyAdvisories: advisories,
 	}
 	row["has_scope"] = c.Direct+c.Transitive > 0
 	writeUIJSON(w, http.StatusOK, row)
@@ -249,11 +249,11 @@ func (s *Server) uiSBOMShow(w http.ResponseWriter, r *http.Request) {
 
 // uiSBOMPackageRow is the SBOMPackage projection with its resolution state.
 func uiSBOMPackageRow(p db.SBOMPackage, importPending bool) map[string]any {
-	res := map[string]any{"repository": nil}
+	res := map[string]any{uiKeyRepository: nil}
 	switch {
 	case p.SourceRepository != nil:
 		res["state"] = sbomResolutionLinked
-		res["repository"] = uiRepoRefMap(*p.SourceRepository)
+		res[uiKeyRepository] = uiRepoRefMap(*p.SourceRepository)
 	case p.ResolveError != "":
 		res["state"] = sbomStateError
 		res[errorKey] = p.ResolveError
@@ -263,14 +263,14 @@ func uiSBOMPackageRow(p db.SBOMPackage, importPending bool) map[string]any {
 		res["state"] = sbomStateResolving
 	}
 	return map[string]any{
-		"id":         p.ID,
-		uiKeyName:    p.Name,
-		"version":    p.Version,
-		"ecosystem":  p.Ecosystem,
-		"purl":       p.PURL,
-		"license":    p.License,
-		uiKeyScope:   p.Scope,
-		"resolution": res,
+		"id":           p.ID,
+		uiKeyName:      p.Name,
+		"version":      p.Version,
+		uiKeyEcosystem: p.Ecosystem,
+		uiKeyPURL:      p.PURL,
+		"license":      p.License,
+		uiKeyScope:     p.Scope,
+		"resolution":   res,
 	}
 }
 
@@ -333,7 +333,7 @@ func (s *Server) uiSBOMFindings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	severity, category := q.Get("severity"), q.Get("category")
+	severity, category := q.Get(uiKeySeverity), q.Get("category")
 	if severity != "" && !slices.Contains(db.SeverityLevels, severity) {
 		uiBadParam(w, fmt.Sprintf("unknown severity %q", severity))
 		return

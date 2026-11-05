@@ -112,7 +112,7 @@ func (s *Server) uiRepoExists(w http.ResponseWriter, id uint) bool {
 		return false
 	}
 	if n == 0 {
-		uiNotFound(w, "repository")
+		uiNotFound(w, uiKeyRepository)
 		return false
 	}
 	return true

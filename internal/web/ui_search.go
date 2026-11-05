@@ -114,7 +114,7 @@ func (s *Server) uiSearch(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 	groups := map[string]searchGroup{}
-	for _, g := range []string{"repositories", uiKeyFindings, "scans", "packages", "orgs", "maintainers", "advisories", "skills", "sboms"} {
+	for _, g := range []string{"repositories", uiKeyFindings, "scans", "packages", "orgs", "maintainers", uiKeyAdvisories, "skills", "sboms"} {
 		groups[g] = searchGroup{Items: []searchRef{}}
 	}
 	if q != "" {
@@ -125,7 +125,7 @@ func (s *Server) uiSearch(w http.ResponseWriter, r *http.Request) {
 		groups["packages"] = s.searchPackages(t, limit)
 		groups["orgs"] = s.searchOrgs(t, limit)
 		groups["maintainers"] = s.searchMaintainers(t, limit)
-		groups["advisories"] = s.searchAdvisories(t, limit)
+		groups[uiKeyAdvisories] = s.searchAdvisories(t, limit)
 		groups["skills"] = s.searchSkills(t, limit)
 		groups["sboms"] = s.searchSBOMs(t, limit)
 	}
@@ -133,19 +133,19 @@ func (s *Server) uiSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) searchRepositories(t searchTerm, limit int) searchGroup {
-	cols := []string{uiKeyName, "full_name", "url"}
+	cols := []string{uiKeyName, "full_name", uiKeyURL}
 	q := reusable(withID(s.DB.Model(&db.Repository{}), likeAny(cols...), repeatArg(t.like, len(cols)), "id", t.id))
 	var g searchGroup
 	q.Count(&g.Total)
 	var rows []db.Repository
-	q.Select("id", uiKeyName, "full_name", "url").Order(uiKeyName).Limit(limit).Find(&rows)
+	q.Select("id", uiKeyName, "full_name", uiKeyURL).Order(uiKeyName).Limit(limit).Find(&rows)
 	g.Items = make([]searchRef, len(rows))
 	for i, r := range rows {
 		label := r.FullName
 		if label == "" {
 			label = r.Name
 		}
-		g.Items[i] = searchRef{Kind: "repository", ID: r.ID, Label: label, Sub: r.URL}
+		g.Items[i] = searchRef{Kind: uiKeyRepository, ID: r.ID, Label: label, Sub: r.URL}
 	}
 	return g
 }
@@ -156,7 +156,7 @@ func (s *Server) searchFindings(t searchTerm, limit int) searchGroup {
 	var g searchGroup
 	q.Count(&g.Total)
 	var rows []db.Finding
-	q.Select("id", "title", "severity", "status").Order("id desc").Limit(limit).Find(&rows)
+	q.Select("id", "title", uiKeySeverity, "status").Order("id desc").Limit(limit).Find(&rows)
 	g.Items = make([]searchRef, len(rows))
 	for i, f := range rows {
 		g.Items[i] = searchRef{Kind: "finding", ID: f.ID, Label: f.Title, Sub: f.Severity + searchSep + string(f.Status)}
@@ -187,7 +187,7 @@ func (s *Server) searchPackages(t searchTerm, limit int) searchGroup {
 	var g searchGroup
 	q.Count(&g.Total)
 	var rows []db.Package
-	q.Select("id", uiKeyName, "ecosystem").Order(uiKeyName).Limit(limit).Find(&rows)
+	q.Select("id", uiKeyName, uiKeyEcosystem).Order(uiKeyName).Limit(limit).Find(&rows)
 	g.Items = make([]searchRef, len(rows))
 	for i, p := range rows {
 		g.Items[i] = searchRef{Kind: "package", ID: p.ID, Label: p.Name, Sub: p.Ecosystem}
@@ -231,7 +231,7 @@ func (s *Server) searchAdvisories(t searchTerm, limit int) searchGroup {
 	var g searchGroup
 	q.Count(&g.Total)
 	var rows []db.Advisory
-	q.Select("id", "title", "uuid", "severity").Order("id desc").Limit(limit).Find(&rows)
+	q.Select("id", "title", "uuid", uiKeySeverity).Order("id desc").Limit(limit).Find(&rows)
 	g.Items = make([]searchRef, len(rows))
 	for i, a := range rows {
 		g.Items[i] = searchRef{Kind: "advisory", ID: a.ID, Label: a.Title, Sub: strings.TrimSpace(a.Severity + searchSep + a.UUID)}

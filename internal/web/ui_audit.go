@@ -74,7 +74,7 @@ func (s *Server) uiAudit(w http.ResponseWriter, r *http.Request) {
 		"metrics":        uiAuditMetrics(metrics),
 		"verdict_labels": auditVerdictLabels,
 		"exports": map[string]any{
-			"queue_json": map[string]string{"url": "/api/v1/audit/queue", "filename": "audit-queue.json"},
+			"queue_json": map[string]string{uiKeyURL: "/api/v1/audit/queue", "filename": "audit-queue.json"},
 		},
 	})
 }

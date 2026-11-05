@@ -49,10 +49,10 @@ func parseReportParams(r *http.Request) (reportInterval, string, error) {
 	if key != "" && iv.Key != key {
 		return iv, "", uiFieldErrors{"interval": "unknown interval " + strings.TrimSpace(key)}
 	}
-	raw := q.Get("severity")
+	raw := q.Get(uiKeySeverity)
 	sev := resolveMinSeverity(raw)
 	if raw != "" && sev == "" {
-		return iv, "", uiFieldErrors{"severity": "unknown severity " + strings.TrimSpace(raw)}
+		return iv, "", uiFieldErrors{uiKeySeverity: "unknown severity " + strings.TrimSpace(raw)}
 	}
 	return iv, sev, nil
 }
@@ -62,7 +62,7 @@ func parseReportParams(r *http.Request) (reportInterval, string, error) {
 func reportExportLinks(intervalKey, minSeverity string) uiReportExports {
 	v := url.Values{"interval": {intervalKey}}
 	if minSeverity != "" {
-		v.Set("severity", minSeverity)
+		v.Set(uiKeySeverity, minSeverity)
 	}
 	qs := "?" + v.Encode()
 	return uiReportExports{CSV: "/reporting/report.csv" + qs, JSON: "/reporting/report.json" + qs}

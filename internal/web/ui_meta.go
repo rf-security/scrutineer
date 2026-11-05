@@ -43,7 +43,7 @@ var uiRepoTabs = []uiRepoTab{
 	{uiKeyFindings, "Findings"}, {"scanners", "Findings"},
 	{"scans", "Scans"},
 	{"packages", "Supply chain"}, {"dependencies", "Supply chain"}, {"dependents", "Supply chain"},
-	{"advisories", "Supply chain"}, {"alternatives", "Supply chain"}, {"maintainers", "Supply chain"},
+	{uiKeyAdvisories, "Supply chain"}, {"alternatives", "Supply chain"}, {"maintainers", "Supply chain"},
 	{"compliance", "Supply chain"},
 	{"threat-model", "Analysis"}, {"workbench", "Analysis"}, {"benchmark", "Analysis"},
 	{"scan-config", "Config"}, {"data", "Config"},
@@ -54,7 +54,7 @@ var uiRepoTabs = []uiRepoTab{
 // #rt15 was both Alternatives and Chat and resolves to alternatives).
 var uiLegacyRepoTabs = map[string]string{
 	"rt1": "summary", "rt2": "data", "rt3": "scans", "rt4": uiKeyFindings, "rt5": "dependencies",
-	"rt6": "packages", "rt7": "dependents", "rt8": "advisories", "rt9": "maintainers",
+	"rt6": "packages", "rt7": "dependents", "rt8": uiKeyAdvisories, "rt9": "maintainers",
 	"rt10": "threat-model", "rt11": "scanners", "rt12": "workbench", "rt13": "benchmark",
 	"rt14": "scan-config", "rt15": "alternatives", "rt16": "compliance",
 }

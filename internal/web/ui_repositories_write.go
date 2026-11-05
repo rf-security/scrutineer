@@ -182,7 +182,7 @@ func (s *Server) writeRepoPatchResponse(w http.ResponseWriter, r *http.Request, 
 	cols := append(append([]string{}, uiRepoListColumns...), "disclosure_channel", "disclosure_channel_at",
 		"federation_opt_out_reason", "threat_model", "scan_config", "baseline_level")
 	if err := s.DB.Select(cols).First(&repo, repoID).Error; err != nil {
-		uiDBError(w, err, "repository")
+		uiDBError(w, err, uiKeyRepository)
 		return
 	}
 	setETag(w, repo.UpdatedAt)
@@ -262,7 +262,7 @@ func (s *Server) uiRepoAlternativeCreate(w http.ResponseWriter, r *http.Request)
 	}
 	row, err := buildPackageAlternative(repo.ID, body.PURL, body.Kind, body.Note)
 	if err != nil {
-		field := "purl"
+		field := uiKeyPURL
 		if strings.HasPrefix(err.Error(), "kind") {
 			field = "kind"
 		}

@@ -117,14 +117,14 @@ func (s *Server) uiOrgShow(w http.ResponseWriter, r *http.Request) {
 	writeUIJSON(w, http.StatusOK, map[string]any{
 		"owner":      owner,
 		"repo_count": len(repoIDs),
-		"counts":     map[string]any{uiKeyFindings: findings, "advisories": advisories, "maintainers": maintainers},
+		"counts":     map[string]any{uiKeyFindings: findings, uiKeyAdvisories: advisories, "maintainers": maintainers},
 		"exports": map[string]any{
 			"summary_md": map[string]any{
-				"url":      base + "/summary.md",
+				uiKeyURL:   base + "/summary.md",
 				"filename": fmt.Sprintf("scrutineer-%s-summary-%s.md", sanitiseFilename(owner), date),
 			},
 			"findings_md": map[string]any{
-				"url":      base + "/findings.md",
+				uiKeyURL:   base + "/findings.md",
 				"filename": fmt.Sprintf("scrutineer-%s-findings-%s.md", sanitiseFilename(owner), date),
 			},
 		},

@@ -232,7 +232,7 @@ func (s *Server) uiLoadRepo(w http.ResponseWriter, r *http.Request, extra ...str
 	var repo db.Repository
 	cols := append(append([]string{}, uiRepoListColumns...), extra...)
 	if err := s.DB.Select(cols).First(&repo, id).Error; err != nil {
-		uiDBError(w, err, "repository")
+		uiDBError(w, err, uiKeyRepository)
 		return repo, false
 	}
 	return repo, true
@@ -482,7 +482,7 @@ func (s *Server) uiRepoCounts(repo db.Repository, primary uiRepoPrimary) map[str
 		"alternatives":        count(&db.PackageAlternative{}, "repository_id = ?", id),
 		"dependencies":        count(&db.Dependency{}, "repository_id = ? AND dependency_type NOT IN ?", id, hiddenTypes),
 		"hidden_dependencies": count(&db.Dependency{}, "repository_id = ? AND dependency_type IN ?", id, hiddenTypes),
-		"advisories":          count(&db.Advisory{}, "repository_id = ?", id),
+		uiKeyAdvisories:       count(&db.Advisory{}, "repository_id = ?", id),
 		"dependents":          count(&db.Dependent{}, "repository_id = ?", id),
 		"maintainers":         maintainers,
 		"subprojects":         count(&db.Subproject{}, "repository_id = ?", id),

@@ -47,8 +47,8 @@ func uiPackagesOrder(q *gorm.DB, token string) *gorm.DB {
 		return q.Order(orderByExpr("downloads", dir, true))
 	case "dependents":
 		return q.Order(orderByExpr("dependent_repos", dir, true))
-	case "ecosystem":
-		return q.Order(orderByExpr("ecosystem", dir, false)).Order(uiKeyName)
+	case uiKeyEcosystem:
+		return q.Order(orderByExpr(uiKeyEcosystem, dir, false)).Order(uiKeyName)
 	case "registry":
 		return q.Order(orderByExpr("registry_url", dir, false)).Order(uiKeyName)
 	case "latest":
@@ -78,7 +78,7 @@ func uiPackageRow(p db.Package) map[string]any {
 	return map[string]any{
 		"id":                     p.ID,
 		uiKeyName:                p.Name,
-		"ecosystem":              p.Ecosystem,
+		uiKeyEcosystem:           p.Ecosystem,
 		"registry":               registryDomain(p.RegistryURL),
 		"registry_url":           p.RegistryURL,
 		"latest_version":         p.LatestVersion,
@@ -90,9 +90,9 @@ func uiPackageRow(p db.Package) map[string]any {
 		"dependent_packages":     p.DependentPackages,
 		"dependent_repos":        p.DependentRepos,
 		"dependent_packages_url": p.DependentPackagesURL,
-		"repository":             uiRepoRefMap(p.Repository),
+		uiKeyRepository:          uiRepoRefMap(p.Repository),
 		"subproject_id":          p.SubprojectID,
-		"purl":                   p.PURL,
+		uiKeyPURL:                p.PURL,
 		"risk_flags":             flags,
 		uiKeyCreatedAt:           p.CreatedAt,
 	}
@@ -100,7 +100,7 @@ func uiPackageRow(p db.Package) map[string]any {
 
 // uiPackageColumns are the columns a package row reads (metadata is only
 // loaded by the detail).
-var uiPackageColumns = []string{"id", repositoryIDKey, "subproject_id", uiKeyName, "ecosystem", "p_url", "licenses",
+var uiPackageColumns = []string{"id", repositoryIDKey, "subproject_id", uiKeyName, uiKeyEcosystem, "p_url", "licenses",
 	"latest_version", "versions_count", "downloads", "dependent_packages", "dependent_repos", "registry_url",
 	"latest_release_at", "dependent_packages_url", "risk_flags", uiKeyCreatedAt}
 
@@ -111,7 +111,7 @@ func (s *Server) uiPackageList(w http.ResponseWriter, r *http.Request) {
 		uiBadParam(w, err.Error())
 		return
 	}
-	p := uiPackageListParams{page: page, ecosystem: r.URL.Query().Get("ecosystem"),
+	p := uiPackageListParams{page: page, ecosystem: r.URL.Query().Get(uiKeyEcosystem),
 		search: strings.TrimSpace(r.URL.Query().Get("q")), sort: r.URL.Query().Get("sort")}
 	var total int64
 	if err := p.where(s.DB.Model(&db.Package{})).Count(&total).Error; err != nil {
@@ -131,7 +131,7 @@ func (s *Server) uiPackageList(w http.ResponseWriter, r *http.Request) {
 		items[i] = uiPackageRow(row)
 	}
 	var ecosystems []string
-	s.DB.Model(&db.Package{}).Distinct("ecosystem").Order("ecosystem").Pluck("ecosystem", &ecosystems)
+	s.DB.Model(&db.Package{}).Distinct(uiKeyEcosystem).Order(uiKeyEcosystem).Pluck(uiKeyEcosystem, &ecosystems)
 	writeListWith(w, items, total, p.page, map[string]any{"ecosystems": nonNilStrings(ecosystems)})
 }
 
@@ -152,10 +152,10 @@ func (s *Server) uiPackageShow(w http.ResponseWriter, r *http.Request) {
 		flags = append(flags, map[string]string{"id": f, "label": db.PackageRiskFlagLabel(f)})
 	}
 	writeUIJSON(w, http.StatusOK, map[string]any{
-		"package":    uiPackageRow(p),
-		"repository": uiRepoRefMap(p.Repository),
-		"risk_flags": flags,
-		"metadata":   uiPackageMetadata(p.Metadata),
+		"package":       uiPackageRow(p),
+		uiKeyRepository: uiRepoRefMap(p.Repository),
+		"risk_flags":    flags,
+		"metadata":      uiPackageMetadata(p.Metadata),
 	})
 }
 

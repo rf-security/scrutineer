@@ -445,7 +445,7 @@ func uiScanRow(sc db.Scan, sizes scanBlobSizes) map[string]any {
 	focus := scanFocus(sc)
 	m["skill_id"] = sc.SkillID
 	m["finding_id"] = sc.FindingID
-	m["repository"] = map[string]any{"id": sc.RepositoryID, uiKeyName: sc.Repository.Name}
+	m[uiKeyRepository] = map[string]any{"id": sc.RepositoryID, uiKeyName: sc.Repository.Name}
 	m["findings_count"] = sc.FindingsCount
 	m["cost_usd"] = sc.CostUSD
 	m["turns"] = sc.Turns
@@ -535,7 +535,7 @@ func uiLabel(l db.FindingLabel) map[string]any {
 func uiFindingRow(f db.Finding, repo db.Repository, skillName string) map[string]any {
 	m := findingSummary(f)
 	m["title_summary"] = f.Summary()
-	m["repository"] = map[string]any{"id": repo.ID, uiKeyName: repo.Name, "full_name": repo.FullName, "owner": repo.Owner}
+	m[uiKeyRepository] = map[string]any{"id": repo.ID, uiKeyName: repo.Name, "full_name": repo.FullName, "owner": repo.Owner}
 	labels := make([]map[string]any, len(f.Labels))
 	for i, l := range f.Labels {
 		labels[i] = uiLabel(l)

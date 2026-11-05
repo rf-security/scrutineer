@@ -173,7 +173,7 @@ func (s *Server) addUIScanDetail(m map[string]any, row uiScanDetailRow, findings
 	exports := map[string]any{}
 	if canExport {
 		exports["report_md"] = map[string]string{
-			"url":      fmt.Sprintf("/scans/%d/report.md", scan.ID),
+			uiKeyURL:   fmt.Sprintf("/scans/%d/report.md", scan.ID),
 			"filename": scanReportFilename(&scan),
 		}
 	}

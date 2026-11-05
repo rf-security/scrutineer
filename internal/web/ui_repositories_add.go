@@ -26,7 +26,7 @@ func (s *Server) uiRepoAddResult(res repoAddResult) (map[string]any, error) {
 		primary = res.ScanID
 	}
 	return map[string]any{
-		"repository": row, "created": res.Created, "scan_ids": ids, "scan_group": res.ScanGroup, uiEventScanIDKey: primary,
+		uiKeyRepository: row, "created": res.Created, "scan_ids": ids, "scan_group": res.ScanGroup, uiEventScanIDKey: primary,
 	}, nil
 }
 

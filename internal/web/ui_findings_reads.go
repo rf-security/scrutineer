@@ -317,7 +317,7 @@ func (s *Server) uiFindingRemediation(w http.ResponseWriter, r *http.Request) {
 // uiDependent projects a db.Dependent.
 func uiDependent(d db.Dependent) map[string]any {
 	return map[string]any{
-		"id": d.ID, uiKeyName: d.Name, "ecosystem": d.Ecosystem, "purl": d.PURL, "repository_url": d.RepositoryURL,
+		"id": d.ID, uiKeyName: d.Name, uiKeyEcosystem: d.Ecosystem, uiKeyPURL: d.PURL, "repository_url": d.RepositoryURL,
 		"downloads": d.Downloads, "dependent_repos": d.DependentRepos, "registry_url": d.RegistryURL,
 		"latest_version": d.LatestVersion,
 	}
@@ -380,7 +380,7 @@ func (s *Server) uiFindingExposures(w http.ResponseWriter, r *http.Request) {
 
 func uiMigrationDependent(row migrationDependentRow) map[string]any {
 	return map[string]any{
-		"dependent_id": row.DependentID, uiKeyName: row.Name, "ecosystem": row.Ecosystem,
+		"dependent_id": row.DependentID, uiKeyName: row.Name, uiKeyEcosystem: row.Ecosystem,
 		"repository_url": row.RepositoryURL, "dependent_repos": row.DependentRepos, statusKey: row.Status,
 		"rationale": row.Rationale, uiKeyUpdatedAt: row.UpdatedAt, "campaign_status": string(row.CampaignStatus),
 		"campaign_note": row.CampaignNote, "campaign_updated_at": row.CampaignUpdatedAt,
@@ -389,7 +389,7 @@ func uiMigrationDependent(row migrationDependentRow) map[string]any {
 
 func uiMigrationPackage(p db.Package) map[string]any {
 	return map[string]any{
-		"id": p.ID, uiKeyName: p.Name, "ecosystem": p.Ecosystem, "purl": p.PURL, "licenses": p.Licenses,
+		"id": p.ID, uiKeyName: p.Name, uiKeyEcosystem: p.Ecosystem, uiKeyPURL: p.PURL, "licenses": p.Licenses,
 		"latest_version": p.LatestVersion, "downloads": p.Downloads, "dependent_packages": p.DependentPackages,
 		"dependent_repos": p.DependentRepos, "registry_url": p.RegistryURL, "latest_release_at": p.LatestReleaseAt,
 		"risk_flags": p.RiskFlags,
@@ -429,7 +429,7 @@ func (s *Server) uiFindingMigrationGuide(w http.ResponseWriter, r *http.Request)
 	}
 	var repo db.Repository
 	if err := s.DB.First(&repo, f.RepositoryID).Error; err != nil {
-		uiDBError(w, err, "repository")
+		uiDBError(w, err, uiKeyRepository)
 		return
 	}
 	fdRows, deps, err := s.uiFindingExposureRows(f.ID)

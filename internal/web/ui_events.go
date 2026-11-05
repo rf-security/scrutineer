@@ -369,7 +369,7 @@ type uiTestPublishRequest struct {
 // uiTestPayloadKeys are the keys each event's payload must carry, so a fake
 // event is well-formed for the UI's types.
 var uiTestPayloadKeys = map[string][]string{
-	uiScanEvent:       {"id", repositoryIDKey, statusKey, "repository", "actions", uiEventToastKey},
+	uiScanEvent:       {"id", repositoryIDKey, statusKey, uiKeyRepository, "actions", uiEventToastKey},
 	uiScansEvent:      {repositoryIDKey},
 	scanLogEvent:      {uiEventScanIDKey, uiEventLineKey, uiEventOffsetKey},
 	uiFindingEvent:    {"id", repositoryIDKey, uiEventChangeKey, uiEventFieldsKey},

@@ -62,7 +62,7 @@ func parseUIRepoFindingParams(r *http.Request) (uiRepoFindingParams, error) {
 	if p.status != "" && p.status != allStatusValue && !slices.Contains(db.FindingLifecycles, db.FindingLifecycle(p.status)) {
 		return p, fmt.Errorf("invalid status filter %q", p.status)
 	}
-	p.severity = q.Get("severity")
+	p.severity = q.Get(uiKeySeverity)
 	if p.severity != "" && !slices.Contains(db.SeverityLevels, p.severity) {
 		return p, fmt.Errorf("invalid severity filter %q", p.severity)
 	}
@@ -244,7 +244,7 @@ func (s *Server) uiRepoDependencies(w http.ResponseWriter, r *http.Request) {
 	if query.Get("all") != uiParamOn {
 		q = q.Where("dependency_type NOT IN ?", hiddenTypes)
 	}
-	if eco := query.Get("ecosystem"); eco != "" {
+	if eco := query.Get(uiKeyEcosystem); eco != "" {
 		q = q.Where("ecosystem = ?", eco)
 	}
 	if search := strings.TrimSpace(query.Get("q")); search != "" {
@@ -285,10 +285,10 @@ func uiDependencyRow(d db.Dependency, known map[string]uint) map[string]any {
 		}
 	}
 	return map[string]any{
-		"id": d.ID, uiKeyName: d.Name, "ecosystem": d.Ecosystem, "version": d.Requirement,
+		"id": d.ID, uiKeyName: d.Name, uiKeyEcosystem: d.Ecosystem, "version": d.Requirement,
 		"unresolved": d.RequirementUnresolved, "resolution": d.RequirementResolution, "type": d.DependencyType,
 		"manifests":           []map[string]string{{"path": d.ManifestPath, "kind": d.ManifestKind}},
-		"purl":                d.PURL,
+		uiKeyPURL:             d.PURL,
 		"known_repository_id": knownRepo,
 	}
 }
@@ -351,7 +351,7 @@ func (s *Server) uiRepoDependents(w http.ResponseWriter, r *http.Request) {
 			knownRepo = id
 		}
 		items = append(items, map[string]any{
-			"id": d.ID, uiKeyName: d.Name, "ecosystem": d.Ecosystem, "purl": d.PURL, "repository_url": d.RepositoryURL,
+			"id": d.ID, uiKeyName: d.Name, uiKeyEcosystem: d.Ecosystem, uiKeyPURL: d.PURL, "repository_url": d.RepositoryURL,
 			"downloads": d.Downloads, "dependent_repos": d.DependentRepos, "registry_url": d.RegistryURL,
 			"latest_version": d.LatestVersion, "known_repository_id": knownRepo,
 		})
@@ -381,7 +381,7 @@ func (s *Server) uiRepoAdvisories(w http.ResponseWriter, r *http.Request) {
 			cert = fmt.Sprintf("/advisories/%d/certificate.json", a.ID)
 		}
 		items = append(items, map[string]any{
-			"id": a.ID, "uuid": a.UUID, uiKeyURL: a.URL, uiKeyTitle: a.Title, "severity": a.Severity,
+			"id": a.ID, "uuid": a.UUID, uiKeyURL: a.URL, uiKeyTitle: a.Title, uiKeySeverity: a.Severity,
 			"cvss_score": a.CVSSScore, "classification": a.Classification, uiKeyPackages: a.Packages,
 			"published_at": a.PublishedAt, "withdrawn_at": a.WithdrawnAt,
 			"audit_status": status, "certificate_url": cert,
@@ -657,7 +657,7 @@ func (s *Server) uiSubprojectView(repo db.Repository, sub db.Subproject, p listP
 		s.DB.Where("subproject_id = ?", sub.ID).Order("downloads desc").Find(&pkgs)
 		for _, pk := range pkgs {
 			packages = append(packages, map[string]any{
-				"id": pk.ID, uiKeyName: pk.Name, "ecosystem": pk.Ecosystem, "purl": pk.PURL,
+				"id": pk.ID, uiKeyName: pk.Name, uiKeyEcosystem: pk.Ecosystem, uiKeyPURL: pk.PURL,
 				"latest_version": pk.LatestVersion, "downloads": pk.Downloads, "registry_url": pk.RegistryURL,
 			})
 		}
@@ -665,20 +665,20 @@ func (s *Server) uiSubprojectView(repo db.Repository, sub db.Subproject, p listP
 		s.DB.Where("subproject_id = ?", sub.ID).Order("published_at desc").Find(&advs)
 		for _, a := range advs {
 			advisories = append(advisories, map[string]any{
-				"id": a.ID, "uuid": a.UUID, uiKeyURL: a.URL, uiKeyTitle: a.Title, "severity": a.Severity,
+				"id": a.ID, "uuid": a.UUID, uiKeyURL: a.URL, uiKeyTitle: a.Title, uiKeySeverity: a.Severity,
 				"cvss_score": a.CVSSScore, "published_at": a.PublishedAt, "withdrawn_at": a.WithdrawnAt,
 			})
 		}
 	}
 	view := s.loadRepoSubprojectView(repo.ID)
 	return map[string]any{
-		"subproject": uiSubprojectRow(sub, view.ScanCount[sub.ScanSubPath()]),
-		"repository": map[string]any{"id": repo.ID, uiKeyName: repo.Name},
+		"subproject":    uiSubprojectRow(sub, view.ScanCount[sub.ScanSubPath()]),
+		uiKeyRepository: map[string]any{"id": repo.ID, uiKeyName: repo.Name},
 		uiKeyFindings: map[string]any{
 			"items": s.uiRepoFindingRows(repo.ID, findings), "total": total, "page": p.Page, "page_size": p.PageSize,
 		},
-		uiKeyPackages: packages,
-		"advisories":  advisories,
+		uiKeyPackages:   packages,
+		uiKeyAdvisories: advisories,
 		"disclosure_channel": map[string]string{
 			"own": sub.DisclosureChannel, "effective": db.EffectiveDisclosureChannel(s.DB, repo.ID, sub.Path),
 		},

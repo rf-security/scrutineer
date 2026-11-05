@@ -30,14 +30,14 @@ func (s *Server) uiAdvisoryRows(advisories []db.Advisory) []map[string]any {
 			"uuid":            a.UUID,
 			uiKeyTitle:        a.Title,
 			"description":     a.Description,
-			"severity":        a.Severity,
+			uiKeySeverity:     a.Severity,
 			"cvss_score":      a.CVSSScore,
 			uiKeyPackages:     a.Packages,
 			"published_at":    a.PublishedAt,
 			"withdrawn_at":    a.WithdrawnAt,
-			"url":             a.URL,
+			uiKeyURL:          a.URL,
 			"classification":  a.Classification,
-			"repository":      uiRepoRefMap(repos[a.RepositoryID]),
+			uiKeyRepository:   uiRepoRefMap(repos[a.RepositoryID]),
 			"subproject_id":   a.SubprojectID,
 			"audit_status":    status,
 			"certificate_url": cert,
@@ -68,7 +68,7 @@ func parseUIAdvisoryListParams(r *http.Request) (uiAdvisoryListParams, error) {
 	q := r.URL.Query()
 	// Advisory severities are free-form upstream values; the `severities`
 	// facet lists the ones present, and an unknown value simply matches none.
-	p.severity = q.Get("severity")
+	p.severity = q.Get(uiKeySeverity)
 	p.search = strings.TrimSpace(q.Get("q"))
 	p.sort = q.Get("sort")
 	return p, nil
@@ -133,7 +133,7 @@ func (s *Server) uiAdvisoryList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var severities []string
-	s.DB.Model(&db.Advisory{}).Where("severity != ''").Distinct("severity").
-		Order("severity").Pluck("severity", &severities)
+	s.DB.Model(&db.Advisory{}).Where("severity != ''").Distinct(uiKeySeverity).
+		Order(uiKeySeverity).Pluck(uiKeySeverity, &severities)
 	writeListWith(w, s.uiAdvisoryRows(rows), total, p.page, map[string]any{"severities": nonNilStrings(severities)})
 }

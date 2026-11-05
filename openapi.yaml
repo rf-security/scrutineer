@@ -5055,7 +5055,8 @@ paths:
       operationId: listUIOrgs
       tags:
       - ui-inventory
-      x-status: planned
+      description: 'Sort tokens: `name` (default), `repos`, `findings` (by `findings_total`, the HTML page''s
+        number, closed findings included), `open_findings`, `newest` (last activity). Paged after the in-memory sort.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5083,7 +5084,6 @@ paths:
       operationId: getUIOrg
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5100,6 +5100,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/OrgDetail'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5112,7 +5114,6 @@ paths:
       operationId: listUIOrgRepositories
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5131,6 +5132,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RepoListPage'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5143,7 +5146,8 @@ paths:
       operationId: listUIOrgFindings
       tags:
       - ui-inventory
-      x-status: planned
+      description: Open, curated findings of the org's repositories, most severe first then newest. `category`
+        is a CWE View-1400 category name or `Uncategorized`; anything else is 400.
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5166,6 +5170,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FindingListPage'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5178,7 +5184,6 @@ paths:
       operationId: listUIOrgAdvisories
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5197,6 +5202,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdvisoryListPage'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5209,7 +5216,6 @@ paths:
       operationId: listUIOrgMaintainers
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5228,6 +5234,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MaintainerList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5240,7 +5248,7 @@ paths:
       operationId: listUIMaintainers
       tags:
       - ui-inventory
-      x-status: planned
+      description: 'Sort tokens: `name` (default), `login`, `email`, `company`, `repos`, `findings`, `status`, `newest`.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5253,6 +5261,10 @@ paths:
         in: query
         schema:
           type: string
+          enum:
+          - active
+          - inactive
+          - unknown
       responses:
         '200':
           description: OK
@@ -5272,7 +5284,6 @@ paths:
       operationId: getUIMaintainer
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5288,6 +5299,8 @@ paths:
           headers:
             ETag:
               $ref: '#/components/headers/UIETag'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5299,7 +5312,8 @@ paths:
       operationId: patchUIMaintainer
       tags:
       - ui-inventory
-      x-status: planned
+      description: Sets `do_not_contact`. With `If-Match` (the ETag from GET) a stale version is a 409 carrying
+        `current`; a missing `do_not_contact` is a 422.
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5319,6 +5333,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UIMaintainer'
+          headers:
+            ETag:
+              $ref: '#/components/headers/UIETag'
         '400':
           $ref: '#/components/responses/UIBadParam'
         '404':
@@ -5337,7 +5354,6 @@ paths:
       operationId: listUIMaintainerRepositories
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5352,6 +5368,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RepoListPage'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5364,7 +5382,7 @@ paths:
       operationId: listUIMaintainerFindings
       tags:
       - ui-inventory
-      x-status: planned
+      description: Open, curated findings across the maintainer's repositories, newest first.
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5379,6 +5397,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FindingListPage'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5391,7 +5411,7 @@ paths:
       operationId: listUIPackages
       tags:
       - ui-inventory
-      x-status: planned
+      description: 'Sort tokens: `name` (default), `ecosystem`, `registry`, `latest`, `downloads`, `dependents`.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5423,7 +5443,6 @@ paths:
       operationId: getUIPackage
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5436,6 +5455,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PackageDetail'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5448,7 +5469,9 @@ paths:
       operationId: listUIAdvisories
       tags:
       - ui-inventory
-      x-status: planned
+      description: 'Sort tokens: `severity` (CVSS, default), `newest`, `repository`, `title`. `severity` filters on
+        the stored upstream value (`severities` lists the ones present). `certificate_url` is set when the newest
+        fix audit is `fixed`.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5485,7 +5508,7 @@ paths:
       operationId: listUISBOMs
       tags:
       - ui-inventory
-      x-status: planned
+      description: 'Uploaded SBOMs only. Sort tokens: `newest` (default), `name`, `format`, `packages`, `uploaded`.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5511,7 +5534,8 @@ paths:
       operationId: uploadUISBOM
       tags:
       - ui-inventory
-      x-status: planned
+      description: Multipart `file` (CycloneDX or SPDX JSON, 32 MiB cap). The upload waits for import confirmation;
+        nothing is resolved or enqueued yet. A missing file is 400, an unparseable document 422.
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5548,7 +5572,6 @@ paths:
       operationId: getUISBOM
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5561,6 +5584,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SBOMDetail'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5572,7 +5597,6 @@ paths:
       operationId: deleteUISBOM
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5581,6 +5605,8 @@ paths:
       responses:
         '204':
           description: Deleted
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5593,7 +5619,6 @@ paths:
       operationId: listUISBOMPackages
       tags:
       - ui-inventory
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5606,6 +5631,9 @@ paths:
         in: query
         schema:
           type: string
+          enum:
+          - direct
+          - transitive
       responses:
         '200':
           description: OK
@@ -5613,6 +5641,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SBOMPackageList'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5625,7 +5655,9 @@ paths:
       operationId: listUISBOMFindings
       tags:
       - ui-inventory
-      x-status: planned
+      description: 'Open, curated findings of the repositories the SBOM''s packages resolved to (optionally one
+        `scope`). Sort tokens: `newest` (default), `severity`, `repository`. `severity` is one of Low, Medium,
+        High, Critical; `category` a CWE View-1400 category or `Uncategorized`.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5642,6 +5674,13 @@ paths:
         in: query
         schema:
           type: string
+      - name: scope
+        in: query
+        schema:
+          type: string
+          enum:
+          - direct
+          - transitive
       responses:
         '200':
           description: OK
@@ -5649,6 +5688,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FindingListPage'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5661,7 +5702,7 @@ paths:
       operationId: listUISBOMAdvisories
       tags:
       - ui-inventory
-      x-status: planned
+      description: Published (not withdrawn) advisories of the SBOM's resolved repositories, highest CVSS first.
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5669,6 +5710,13 @@ paths:
       - $ref: '#/components/parameters/UIPathID'
       - $ref: '#/components/parameters/UIPage'
       - $ref: '#/components/parameters/UIPageSize'
+      - name: scope
+        in: query
+        schema:
+          type: string
+          enum:
+          - direct
+          - transitive
       responses:
         '200':
           description: OK
@@ -5676,6 +5724,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdvisoryListPage'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -5688,8 +5738,8 @@ paths:
       operationId: confirmUISBOMImport
       tags:
       - ui-inventory
-      description: '**May enqueue model work.**'
-      x-status: planned
+      description: '**May enqueue model work.** Clears `import_pending` and resolves the packages in the background
+        (direct dependencies are triaged); `sbom` events report progress. 409 when the import was already confirmed.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5702,6 +5752,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SBOMConfirmResult'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '409':
@@ -5716,7 +5768,8 @@ paths:
       operationId: resolveUISBOM
       tags:
       - ui-inventory
-      x-status: planned
+      description: '**May enqueue model work.** Re-resolves unlinked packages in the background (an upload''s direct
+        dependencies are triaged); `sbom` events report progress. 409 while the import is unconfirmed.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5725,6 +5778,12 @@ paths:
       responses:
         '202':
           description: Resolving
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SBOM'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '409':
@@ -10163,6 +10222,15 @@ components:
           type: integer
         finding_count:
           type: integer
+          description: Curated findings across the maintainer's repositories, closed included (the HTML index's number).
+        open_finding_count:
+          type: integer
+          description: finding_count without closed findings.
+        notes:
+          type: string
+        created_at:
+          type: string
+          format: date-time
         updated_at:
           type: string
           format: date-time
@@ -10200,20 +10268,52 @@ components:
           type: string
         registry:
           type: string
+          description: Registry host (from registry_url).
+        registry_url:
+          type: string
         latest_version:
           type: string
+        versions_count:
+          type: integer
+        licenses:
+          type: string
+        latest_release_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
         downloads:
           type: integer
           format: int64
         dependents:
           type: integer
           format: int64
+          description: Dependent repositories (the `dependents` sort).
+        dependent_packages:
+          type: integer
+        dependent_repos:
+          type: integer
+        dependent_packages_url:
+          type: string
         repository:
           oneOf:
           - $ref: '#/components/schemas/RepoRef'
           - type: 'null'
+        subproject_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
         purl:
           type: string
+        risk_flags:
+          type: array
+          description: Risk-flag ids (labels in PackageDetail.risk_flags).
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
     PackageList:
       allOf:
       - $ref: '#/components/schemas/ListPage'
@@ -10252,7 +10352,10 @@ components:
               label:
                 type: string
         metadata:
-          type: object
+          description: The stored ecosyste.ms package metadata as raw JSON; null when absent.
+          type:
+          - object
+          - 'null'
           additionalProperties: true
     UIAdvisory:
       type: object
@@ -10267,6 +10370,8 @@ components:
         uuid:
           type: string
         title:
+          type: string
+        description:
           type: string
         severity:
           type: string
@@ -10292,10 +10397,20 @@ components:
           oneOf:
           - $ref: '#/components/schemas/RepoRef'
           - type: 'null'
+        subproject_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
         audit_status:
           type: string
+          description: Newest fix-audit verdict; empty when never audited.
         certificate_url:
           type: string
+          description: Root-absolute fix-audit certificate download path when audit_status is fixed; empty otherwise.
+        created_at:
+          type: string
+          format: date-time
     AdvisoryList:
       allOf:
       - $ref: '#/components/schemas/ListPage'
@@ -10332,12 +10447,18 @@ components:
           type: string
         spec_version:
           type: string
+        origin:
+          type: string
+          enum:
+          - uploaded
+          - generated
         package_count:
           type: integer
         import_pending:
           type: boolean
         resolving:
           type: boolean
+          description: Confirmed, with packages that have neither a repository nor a resolve error yet.
         created_at:
           type: string
           format: date-time
@@ -10407,6 +10528,8 @@ components:
         ecosystem:
           type: string
         purl:
+          type: string
+        license:
           type: string
         scope:
           type: string

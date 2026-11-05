@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,7 +37,20 @@ func (s *Server) sbomList(w http.ResponseWriter, r *http.Request) {
 	// dependencies scan; listing them here would bury the operator's uploads.
 	// They surface via the repository and portfolio views instead.
 	q := s.DB.Model(&db.SBOMUpload{}).Where("origin = ?", db.SBOMOriginUploaded)
-	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
+	q, sort := sbomListOrder(q, r.URL.Query().Get("sort"))
+
+	var total int64
+	q.Count(&total)
+	page := paginate(r, total)
+	var rows []db.SBOMUpload
+	q.Limit(perPage).Offset((page.N - 1) * perPage).Find(&rows)
+	s.render(w, r, "sboms.html", map[string]any{"SBOMs": rows, "Page": page, "Sort": sort})
+}
+
+// sbomListOrder applies the SBOM index's sort token and returns the
+// effective token. Shared by the HTML index and GET /api/v1/ui/sboms.
+func sbomListOrder(q *gorm.DB, token string) (*gorm.DB, string) {
+	sortCol, dir := splitSort(token)
 	switch sortCol {
 	case "name":
 		q = q.Order(orderByExpr("name", dir, false)).Order("id desc")
@@ -50,14 +64,7 @@ func (s *Server) sbomList(w http.ResponseWriter, r *http.Request) {
 		sortCol, dir = defaultSort, ""
 		q = q.Order("id desc")
 	}
-	sort := joinSort(sortCol, dir)
-
-	var total int64
-	q.Count(&total)
-	page := paginate(r, total)
-	var rows []db.SBOMUpload
-	q.Limit(perPage).Offset((page.N - 1) * perPage).Find(&rows)
-	s.render(w, r, "sboms.html", map[string]any{"SBOMs": rows, "Page": page, "Sort": sort})
+	return q, joinSort(sortCol, dir)
 }
 
 func (s *Server) sbomNew(w http.ResponseWriter, r *http.Request) {
@@ -79,15 +86,38 @@ func (s *Server) sbomUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc, err := sbom.Parse(data)
+	up, err := s.createSBOMUpload(data, header.Filename)
 	if err != nil {
-		http.Error(w, "parse SBOM: "+err.Error(), http.StatusUnprocessableEntity)
+		var perr sbomParseError
+		if errors.As(err, &perr) {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	s.redirect(w, r, fmt.Sprintf("/sboms/%d", up.ID))
+}
+
+// sbomParseError is an unparseable SBOM document (a 422, not a 500).
+type sbomParseError struct{ err error }
+
+func (e sbomParseError) Error() string { return "parse SBOM: " + e.err.Error() }
+func (e sbomParseError) Unwrap() error { return e.err }
+
+// createSBOMUpload parses an uploaded document and stores it, with its
+// packages, as an upload awaiting import confirmation. Shared by the HTML
+// upload and POST /api/v1/ui/sboms.
+func (s *Server) createSBOMUpload(data []byte, filename string) (db.SBOMUpload, error) {
+	doc, err := sbom.Parse(data)
+	if err != nil {
+		return db.SBOMUpload{}, sbomParseError{err}
+	}
+
 	up := db.SBOMUpload{
-		Name:          firstNonEmpty(doc.Document.Name, header.Filename),
-		Filename:      header.Filename,
+		Name:          firstNonEmpty(doc.Document.Name, filename),
+		Filename:      filename,
 		Format:        string(doc.Type),
 		SpecVersion:   doc.SpecVersion,
 		Raw:           data,
@@ -107,11 +137,9 @@ func (s *Server) sbomUpload(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	if err := s.DB.Session(&gorm.Session{CreateBatchSize: sbomInsertBatchSize}).Create(&up).Error; err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return db.SBOMUpload{}, err
 	}
-
-	s.redirect(w, r, fmt.Sprintf("/sboms/%d", up.ID))
+	return up, nil
 }
 
 type sbomScopeCounts struct {
@@ -196,30 +224,12 @@ func (s *Server) sbomShow(w http.ResponseWriter, r *http.Request) {
 		// Deep-dive findings only — the SBOM "Findings" tab is a
 		// downstream-impact view, where lint output from per-repo scanners
 		// (zizmor, semgrep) would be misleading at this level.
-		q := s.DB.Where("repository_id IN ? AND status NOT IN ?", repoIDs, db.ClosedFindingLifecycles).
-			Where("scan_id IN (?)", findingsScanIDs(s.DB))
-		if sev := r.URL.Query().Get("severity"); sev != "" {
-			q = q.Where("severity = ?", sev)
-		}
-		if category := r.URL.Query().Get("category"); category != "" {
-			q = applyCWECategoryFilter(q, category)
-		}
-		switch sortCol {
-		case sortSeverity:
-			// severityOrder ranks the most severe LOWEST, so the "desc" logical
-			// default is ascending on the expression; !wantDesc flips it.
-			q = q.Order(orderBySuffix("("+severityOrder+")", !wantDesc(dir, true))).Order("findings.id desc")
-		case sortRepository:
-			q = q.Joins("JOIN repositories r ON r.id = findings.repository_id").
-				Order(orderByExpr("r.name", dir, false)).Order("findings.id desc")
-		default:
-			sortCol, dir = defaultSort, ""
-			q = q.Order("id desc")
-		}
+		q := s.sbomFindingsQuery(repoIDs, r.URL.Query().Get("severity"), r.URL.Query().Get("category"))
+		q, sortCol, dir = sbomFindingsOrder(q, sortCol, dir)
 		q.Model(&db.Finding{}).Count(&findingsTotal)
 		q.Limit(tabRowCap).Find(&findings)
 
-		advQ := s.DB.Where("repository_id IN ? AND withdrawn_at IS NULL", repoIDs)
+		advQ := s.sbomAdvisoriesQuery(repoIDs)
 		advQ.Model(&db.Advisory{}).Count(&advisoriesTotal)
 		advQ.Order("cvss_score desc, published_at desc").Limit(tabRowCap).Find(&advisories)
 	}
@@ -247,6 +257,48 @@ func (s *Server) sbomShow(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// sbomFindingsQuery selects the open, curated findings of an SBOM's resolved
+// repositories, optionally narrowed by severity and CWE category. Shared by
+// sbomShow and GET /api/v1/ui/sboms/{id}/findings.
+func (s *Server) sbomFindingsQuery(repoIDs []uint, severity, category string) *gorm.DB {
+	// Deep-dive findings only — the SBOM "Findings" tab is a
+	// downstream-impact view, where lint output from per-repo scanners
+	// (zizmor, semgrep) would be misleading at this level.
+	q := s.DB.Where("repository_id IN ? AND status NOT IN ?", repoIDs, db.ClosedFindingLifecycles).
+		Where("scan_id IN (?)", findingsScanIDs(s.DB))
+	if severity != "" {
+		q = q.Where("severity = ?", severity)
+	}
+	if category != "" {
+		q = applyCWECategoryFilter(q, category)
+	}
+	return q
+}
+
+// sbomFindingsOrder applies the SBOM Findings tab's sort and returns the
+// effective column and direction.
+func sbomFindingsOrder(q *gorm.DB, sortCol, dir string) (*gorm.DB, string, string) {
+	switch sortCol {
+	case sortSeverity:
+		// severityOrder ranks the most severe LOWEST, so the "desc" logical
+		// default is ascending on the expression; !wantDesc flips it.
+		q = q.Order(orderBySuffix("("+severityOrder+")", !wantDesc(dir, true))).Order("findings.id desc")
+	case sortRepository:
+		q = q.Joins("JOIN repositories r ON r.id = findings.repository_id").
+			Order(orderByExpr("r.name", dir, false)).Order("findings.id desc")
+	default:
+		sortCol, dir = defaultSort, ""
+		q = q.Order("id desc")
+	}
+	return q, sortCol, dir
+}
+
+// sbomAdvisoriesQuery selects the published (not withdrawn) advisories of an
+// SBOM's resolved repositories.
+func (s *Server) sbomAdvisoriesQuery(repoIDs []uint) *gorm.DB {
+	return s.DB.Where("repository_id IN ? AND withdrawn_at IS NULL", repoIDs)
+}
+
 // sbomConfirm starts repository resolution for a newly parsed SBOM. The
 // conditional update makes a repeated click harmless: only the first request
 // changes the pending state and launches the background resolver.
@@ -255,18 +307,31 @@ func (s *Server) sbomConfirm(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result := s.DB.Model(&db.SBOMUpload{}).
-		Where("id = ? AND import_pending = ?", up.ID, true).
-		Update("import_pending", false)
-	if result.Error != nil {
-		http.Error(w, result.Error.Error(), http.StatusInternalServerError)
+	started, err := s.confirmSBOMImport(up.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if result.RowsAffected > 0 {
-		s.goResolve(up.ID)
+	if started {
 		setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("Importing %d SBOM packages", up.PackageCount)})
 	}
 	s.redirect(w, r, fmt.Sprintf("/sboms/%d", up.ID))
+}
+
+// confirmSBOMImport clears import_pending and launches the resolver. started
+// is false when the import was already confirmed (nothing is launched).
+func (s *Server) confirmSBOMImport(id uint) (started bool, err error) {
+	result := s.DB.Model(&db.SBOMUpload{}).
+		Where("id = ? AND import_pending = ?", id, true).
+		Update("import_pending", false)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return false, nil
+	}
+	s.goResolve(id)
+	return true, nil
 }
 
 func (s *Server) sbomResolve(w http.ResponseWriter, r *http.Request) {
@@ -284,12 +349,20 @@ func (s *Server) sbomResolve(w http.ResponseWriter, r *http.Request) {
 
 // goResolve launches resolveSBOMPackages. Indirected so tests can run it
 // synchronously and avoid racing the in-memory database teardown.
+//
+// It publishes an `sbom` event when the run starts and when it finishes, so
+// the UI updates resolution progress live.
 func (s *Server) goResolve(uploadID uint) {
-	if s.resolveSync {
+	s.publishSBOMProgress(uploadID, false)
+	run := func() {
 		s.resolveSBOMPackages(uploadID)
+		s.publishSBOMProgress(uploadID, true)
+	}
+	if s.resolveSync {
+		run()
 		return
 	}
-	go s.resolveSBOMPackages(uploadID)
+	go run()
 }
 
 func (s *Server) sbomDelete(w http.ResponseWriter, r *http.Request) {
@@ -304,16 +377,21 @@ func (s *Server) sbomDelete(w http.ResponseWriter, r *http.Request) {
 	// connection, so the cascade silently no-ops on most serving connections
 	// and orphans the package rows (same reason repoDelete deletes children
 	// by hand).
-	if err := s.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("sbom_upload_id = ?", id).Delete(&db.SBOMPackage{}).Error; err != nil {
-			return err
-		}
-		return tx.Delete(&db.SBOMUpload{}, id).Error
-	}); err != nil {
+	if err := s.deleteSBOM(id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	s.redirect(w, r, "/sboms")
+}
+
+// deleteSBOM removes an upload and its packages in one transaction.
+func (s *Server) deleteSBOM(id int) error {
+	return s.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("sbom_upload_id = ?", id).Delete(&db.SBOMPackage{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&db.SBOMUpload{}, id).Error
+	})
 }
 
 func (s *Server) autoResolveGeneratedSBOM(scan *db.Scan) {

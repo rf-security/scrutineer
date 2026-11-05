@@ -1980,7 +1980,6 @@ paths:
       operationId: patchUIFinding
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2082,7 +2081,6 @@ paths:
       operationId: createUIFindingNote
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2144,7 +2142,6 @@ paths:
       operationId: createUIFindingCommunication
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2206,7 +2203,6 @@ paths:
       operationId: createUIFindingReference
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2268,7 +2264,6 @@ paths:
       operationId: createUIFindingReview
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2358,7 +2353,6 @@ paths:
       operationId: putUIFindingLabels
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2547,7 +2541,6 @@ paths:
       operationId: patchUIFindingCampaign
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []

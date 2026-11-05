@@ -259,6 +259,8 @@ func writeSSEJSON(w http.ResponseWriter, name string, v any) {
 
 // publishFinding announces a finding write. fields is the fixed vocabulary of
 // changed fields/sub-resources (02 section 4.1); created/deleted pass none.
+//
+//nolint:unparam // created/deleted callers (finding delete, worker OnFindingCreated) land in later packages
 func (s *Server) publishFinding(id, repoID uint, change string, fields ...string) {
 	if fields == nil {
 		fields = []string{}

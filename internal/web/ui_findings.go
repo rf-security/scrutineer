@@ -33,6 +33,15 @@ func (s *Server) registerUIFindingRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /ui/findings/{id}/exposures", s.uiFindingExposures)
 	mux.HandleFunc("GET /ui/findings/{id}/migration-guide", s.uiFindingMigrationGuide)
 
+	// Writes (#11, #17, #18).
+	mux.HandleFunc("PATCH /ui/findings/{id}", s.uiFindingPatch)
+	mux.HandleFunc("POST /ui/findings/{id}/notes", s.uiFindingNoteCreate)
+	mux.HandleFunc("POST /ui/findings/{id}/communications", s.uiFindingCommunicationCreate)
+	mux.HandleFunc("POST /ui/findings/{id}/references", s.uiFindingReferenceCreate)
+	mux.HandleFunc("POST /ui/findings/{id}/reviews", s.uiFindingReviewCreate)
+	mux.HandleFunc("PUT /ui/findings/{id}/labels", s.uiFindingLabelsPut)
+	mux.HandleFunc("PATCH /ui/findings/{id}/dependents/{dependent_id}/campaign", s.uiFindingCampaignPatch)
+
 }
 
 // ---------------------------------------------------------------- GET /ui/findings (#9)

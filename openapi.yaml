@@ -7891,7 +7891,7 @@ components:
         error:
           type: string
         refusal_audit_warning:
-          type: string
+          type: boolean
         verification_feedback:
           type: string
         exploration_mode:

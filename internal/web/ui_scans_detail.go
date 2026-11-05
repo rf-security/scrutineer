@@ -27,6 +27,8 @@ func (s *Server) registerUIScanRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /ui/scans/actions/cancel-all", s.uiScansCancelAll)
 	mux.HandleFunc("POST /ui/scans/batch", s.uiScansBatch)
 
+	mux.HandleFunc("GET /ui/audit", s.uiAudit)
+
 }
 
 const (

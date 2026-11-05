@@ -110,13 +110,16 @@ func TestUIFindingListFiltersAndRowShape(t *testing.T) {
 	}
 	row := body.Items[0]
 	for _, key := range []string{"title_summary", "repository", "labels", "model", "created_at", "updated_at",
-		"location_ref", "locations", "extra_location_count", "commit", "last_seen_scan_id", "skill_name", "expected"} {
+		"location_ref", "locations", "extra_location_count", "commit", "last_seen_scan_id", "skill_name", "expected", "cwe_info"} {
 		if _, ok := row[key]; !ok {
 			t.Errorf("FindingRow missing %q", key)
 		}
 	}
 	if _, ok := row["disclosure_draft"]; ok {
 		t.Error("FindingRow must stay slim (no disclosure_draft)")
+	}
+	if info, ok := row["cwe_info"].(map[string]any); !ok || info["id"] != "CWE-79" || info["name"] == "" || info["category"] == "" {
+		t.Fatalf("FindingRow cwe_info = %v", row["cwe_info"])
 	}
 	if repo := row["repository"].(map[string]any); repo["name"] != "beta" {
 		t.Fatalf("repository = %v", repo)
@@ -221,7 +224,7 @@ func TestUIFindingDetail(t *testing.T) {
 	if _, ok := d["locations"].([]any); !ok {
 		t.Fatalf("locations must be the FindingRow array, got %T", d["locations"])
 	}
-	if d["cwe"] != "CWE-89" || d["cwe_info"].(map[string]any)["id"] != "CWE-89" {
+	if info := d["cwe_info"].(map[string]any); d["cwe"] != "CWE-89" || info["id"] != "CWE-89" || info["category"] == "" || info["url"] == "" {
 		t.Fatalf("cwe = %v / %v", d["cwe"], d["cwe_info"])
 	}
 	wf := d["workflow"].(map[string]any)

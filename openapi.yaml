@@ -8067,6 +8067,7 @@ components:
         - extra_location_count
         - skill_name
         - expected
+        - cwe_info
         properties:
           title_summary:
             type: string
@@ -8105,6 +8106,11 @@ components:
             format: int64
           skill_name:
             type: string
+          cwe_info:
+            description: The CWE catalogue entry for cwe; null when cwe is empty or unknown.
+            oneOf:
+            - $ref: '#/components/schemas/CWEEntry'
+            - type: 'null'
           expected:
             type:
             - string
@@ -8662,17 +8668,19 @@ components:
             - $ref: '#/components/schemas/ScanRow'
             - type: 'null'
           cwe_info:
+            description: FindingRow's CWEEntry plus the catalogue description and MITRE URL; null for an unknown CWE.
             oneOf:
-            - type: object
-              properties:
-                id:
-                  type: string
-                name:
-                  type: string
-                description:
-                  type: string
-                url:
-                  type: string
+            - allOf:
+              - $ref: '#/components/schemas/CWEEntry'
+              - type: object
+                required:
+                - description
+                - url
+                properties:
+                  description:
+                    type: string
+                  url:
+                    type: string
             - type: 'null'
           workflow:
             $ref: '#/components/schemas/FindingWorkflow'

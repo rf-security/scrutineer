@@ -532,6 +532,7 @@ func uiFindingRow(f db.Finding, repo db.Repository, skillName string) map[string
 		m["last_seen_scan_id"] = nil
 	}
 	m["skill_name"] = skillName
+	m["cwe_info"] = uiCWEBrief(f.CWE)
 	m["expected"] = nil
 	return m
 }

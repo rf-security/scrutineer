@@ -218,13 +218,25 @@ func uiFindingExports(f db.Finding, repo db.Repository) map[string]any {
 	}
 }
 
-// uiCWEInfo is FindingDetail.cwe_info, or nil for an unknown CWE.
+// uiCWEBrief is FindingRow.cwe_info (a CWEEntry: id, name, category), or
+// nil for an empty or unknown CWE, so a list renders CWE names without one
+// /meta/cwe call per id.
+func uiCWEBrief(raw string) any {
+	id, c, ok := LookupCWE(raw)
+	if !ok {
+		return nil
+	}
+	return map[string]any{"id": id, uiKeyName: c.Name, "category": c.Category}
+}
+
+// uiCWEInfo is FindingDetail.cwe_info: the FindingRow brief plus the
+// description and MITRE link, or nil for an unknown CWE.
 func uiCWEInfo(raw string) any {
 	id, c, ok := LookupCWE(raw)
 	if !ok {
 		return nil
 	}
-	return map[string]any{"id": id, uiKeyName: c.Name, "description": c.Description, uiKeyURL: cweURL(id)}
+	return map[string]any{"id": id, uiKeyName: c.Name, "category": c.Category, "description": c.Description, uiKeyURL: cweURL(id)}
 }
 
 // cweURL is the MITRE definition page for a canonical CWE-<n> id.

@@ -2585,8 +2585,9 @@ paths:
       summary: Bulk update findings (last-write-wins)
       description: |
         Per item: `set` fields other than status in one transaction, then the status transition (findingStatus
-        rules: rejected needs verdict+reason, ready needs a saved draft, reported runs the federation claim gate),
-        then the label delta. No If-Match. Per-item failures are reported in `results` with the envelope code
+        rules: rejected needs verdict+reason, ready needs a saved draft, reported runs the federation claim gate;
+        like the finding page, any lifecycle value may follow any other, there is no transition graph), then the label
+        delta. No If-Match. Per-item failures are reported in `results` with the envelope code
         (validation_failed, precondition_failed, federation_claimed, not_found, ...); the call itself is 200.
       operationId: batchUIFindings
       tags:
@@ -2731,7 +2732,9 @@ paths:
       operationId: setUIFindingStatus
       tags:
       - ui-finding-actions
-      description: 'The finding page''s status transition. `rejected` needs `verdict` (false_positive, already_fixed,
+      description: 'The finding page''s status transition. As on the HTML page there is no transition graph: any
+        lifecycle value (Meta.finding_statuses) may follow any other, including moving a closed finding back to new;
+        only the per-target rules below apply. `rejected` needs `verdict` (false_positive, already_fixed,
         uncertain) and `reason` and records the review atomically; `ready` needs a saved disclosure draft (422
         fields.status); a first move to `reported` asks the federation peers and answers 409 federation_claimed
         {contacts} when one holds it (the claim is recorded, so repeating the request goes through); 412 when the

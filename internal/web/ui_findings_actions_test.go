@@ -3,6 +3,7 @@ package web
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"testing"
 
 	"scrutineer/internal/db"
@@ -492,4 +493,25 @@ func TestUIFindingActionsConversations(t *testing.T) {
 	s.chatRunner = nil
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, path, map[string]any{"message": "hi"})),
 		http.StatusServiceUnavailable, uiCodeUnavailable)
+}
+
+// Parity with the finding page: there is no transition graph, so a closed
+// finding can move straight back to new and new can jump to fixed. The JSON
+// endpoint and the HTML form must agree on that.
+func TestUIFindingActionsStatusAnyTransition(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := uiActSeed(t, s)
+	for _, to := range []db.FindingLifecycle{db.FindingFixed, db.FindingNew, db.FindingPublished, db.FindingTriaged} {
+		w := serveUI(t, s, operatorReq(t, http.MethodPost, uiActPath(f.ID, "status"), map[string]any{"status": string(to)}))
+		if got := decodeUIJSON[uiActStatusResponse](t, w, http.StatusOK); got.Status != string(to) {
+			t.Fatalf("-> %s: status = %q", to, got.Status)
+		}
+	}
+	hw := postForm(t, s, fmt.Sprintf("/findings/%d/status", f.ID), url.Values{statusKey: {string(db.FindingFixed)}})
+	if hw.Code >= http.StatusBadRequest || reloadFinding(t, s, f.ID).Status != db.FindingFixed {
+		t.Fatalf("HTML triaged -> fixed = %d %q", hw.Code, reloadFinding(t, s, f.ID).Status)
+	}
+	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, uiActPath(f.ID, "status"), map[string]any{"status": "bogus"})),
+		http.StatusUnprocessableEntity, uiCodeValidationFailed)
 }

@@ -20,6 +20,9 @@ func (s *Server) registerUIInsightRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /ui/skills", s.uiSkillCreate)
 	mux.HandleFunc("GET /ui/skills/{id}", s.uiSkillShow)
 	mux.HandleFunc("PATCH /ui/skills/{id}", s.uiSkillPatch)
+	mux.HandleFunc("GET /ui/settings", s.uiSettingsShow)
+	mux.HandleFunc("PATCH /ui/settings", s.uiSettingsPatch)
+	mux.HandleFunc("POST /ui/settings/actions/restart-runner", s.uiSettingsRestartRunner)
 }
 
 // insightBodyMax caps skill and settings bodies. A SKILL.md body is the

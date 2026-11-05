@@ -5994,7 +5994,6 @@ paths:
       operationId: getUISettings
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -6019,7 +6018,6 @@ paths:
       operationId: patchUISettings
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -6053,7 +6051,6 @@ paths:
       operationId: restartUIRunner
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []

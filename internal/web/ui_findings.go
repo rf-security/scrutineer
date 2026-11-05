@@ -42,6 +42,12 @@ func (s *Server) registerUIFindingRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /ui/findings/{id}/labels", s.uiFindingLabelsPut)
 	mux.HandleFunc("PATCH /ui/findings/{id}/dependents/{dependent_id}/campaign", s.uiFindingCampaignPatch)
 
+	// Bulk (#22) and the label catalogue (#22a).
+	mux.HandleFunc("POST /ui/findings/batch", s.uiFindingBatch)
+	mux.HandleFunc("GET /ui/labels", s.uiLabelList)
+	mux.HandleFunc("POST /ui/labels", s.uiLabelCreate)
+	mux.HandleFunc("PATCH /ui/labels/{id}", s.uiLabelPatch)
+	mux.HandleFunc("DELETE /ui/labels/{id}", s.uiLabelDelete)
 }
 
 // ---------------------------------------------------------------- GET /ui/findings (#9)

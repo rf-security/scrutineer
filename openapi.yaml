@@ -2586,7 +2586,6 @@ paths:
       operationId: batchUIFindings
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2617,7 +2616,6 @@ paths:
       operationId: listUILabels
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2639,7 +2637,6 @@ paths:
       operationId: createUILabel
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2672,7 +2669,6 @@ paths:
       operationId: patchUILabel
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2708,7 +2704,6 @@ paths:
       operationId: deleteUILabel
       tags:
       - ui-findings
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []

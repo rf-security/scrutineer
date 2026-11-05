@@ -53,11 +53,7 @@ func (s *Server) repoBlob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	title := cleanPath + " · " + repo.Name
-	local := repo.IsLocal()
-	repoDir := filepath.Join(worker.RepoCacheRoot(s.Worker.DataDir, repo.URL), "src")
-	if local {
-		repoDir = repo.LocalPath()
-	}
+	repoDir, local := s.codeRepoDir(repo)
 	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
 		s.render(w, r, "code_browser.html", map[string]any{
 			pageTitleKey: title,
@@ -118,6 +114,16 @@ func (s *Server) repoBlob(w http.ResponseWriter, r *http.Request) {
 		"Language":    highlightLang(cleanPath, blob.Detection.Format),
 		"Local":       local,
 	})
+}
+
+// codeRepoDir is the checkout the code browser reads repo's history from:
+// the worker's repo cache for a remote repo, the local checkout itself for a
+// file:// repo (local is true then).
+func (s *Server) codeRepoDir(repo db.Repository) (dir string, local bool) {
+	if repo.IsLocal() {
+		return repo.LocalPath(), true
+	}
+	return filepath.Join(worker.RepoCacheRoot(s.Worker.DataDir, repo.URL), "src"), false
 }
 
 // sanitizeBlobPath rejects absolute paths, traversal segments and NUL bytes,

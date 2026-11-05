@@ -331,3 +331,25 @@ func TestUITestPublishDisabledByDefault(t *testing.T) {
 	w := serveUI(t, s, operatorReq(t, http.MethodPost, "/api/v1/ui/_test/publish", `{"event":"meta","payload":{"changed":[]}}`))
 	requireUIError(t, w, http.StatusNotFound, uiCodeNotFound)
 }
+
+// The stream must reach the client immediately, before any event or ping,
+// so EventSource leaves CONNECTING on every (re)connect.
+func TestUIEventsFlushesOnConnect(t *testing.T) {
+	_, srv := newUIEventServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), sseWait)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/v1/ui/events?events=scan", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(&http.Cookie{Name: testOperatorCookie, Value: testOperatorToken})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("headers not flushed on connect: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	line, err := bufio.NewReader(resp.Body).ReadString('\n')
+	if err != nil || line != ": connected\n" {
+		t.Fatalf("first frame = %q, %v", line, err)
+	}
+}

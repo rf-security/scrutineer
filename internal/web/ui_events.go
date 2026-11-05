@@ -134,6 +134,10 @@ func (s *Server) uiEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(cacheControlHeader, noStore)
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
+	// Send a first frame now: some stacks hold the headers until body bytes
+	// are written, which would leave EventSource in CONNECTING until the
+	// first event or ping.
+	_, _ = w.Write([]byte(": connected\n\n"))
 	flusher.Flush()
 
 	// Same race fix as the legacy stream: a turn that finished before this

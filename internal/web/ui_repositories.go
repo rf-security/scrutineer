@@ -384,6 +384,18 @@ func (s *Server) loadThreatModelScan(p uiRepoPrimary) *db.Scan {
 	return &sc
 }
 
+// repoUnpricedScans counts the repo's scans that used tokens but recorded no
+// cost: the worker prices usage from a per-model list price table, and a
+// model missing from it (e.g. gpt-daybreak-red-latest) stores cost_usd 0. A
+// zero total_cost_usd with a non-zero count means "unknown", not "free".
+func repoUnpricedScans(gdb *gorm.DB, repoID uint) int64 {
+	var n int64
+	gdb.Model(&db.Scan{}).
+		Where("repository_id = ? AND COALESCE(cost_usd, 0) = 0 AND COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) > 0", repoID).
+		Count(&n)
+	return n
+}
+
 func (s *Server) uiRepoDetailView(repo db.Repository) (map[string]any, error) {
 	m, err := s.loadUIRepoRow(repo.ID)
 	if err != nil {
@@ -408,6 +420,7 @@ func (s *Server) uiRepoDetailView(repo db.Repository) (map[string]any, error) {
 	m["has_threat_model_override"] = repo.ThreatModel != ""
 	m["scan_config_set"] = strings.TrimSpace(repo.ScanConfig) != ""
 	m["total_cost_usd"] = repoTotalCost(s.DB, repo.ID)
+	m["unpriced_scan_count"] = repoUnpricedScans(s.DB, repo.ID)
 	m["counts"] = counts
 	m["latest_scan"] = s.uiRepoLatestScan(repo.ID, primary.DeepDive)
 	m["compliance"] = uiRepoComplianceBadge(repo, counts)

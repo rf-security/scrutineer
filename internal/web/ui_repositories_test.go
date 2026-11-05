@@ -128,6 +128,19 @@ func TestUIRepoDetail(t *testing.T) {
 	if _, ok := body["exports"].(map[string]any)["report_md"]; !ok {
 		t.Fatal("missing exports.report_md")
 	}
+	if body["total_cost_usd"] != float64(0) || body["unpriced_scan_count"] != float64(0) {
+		t.Fatalf("cost = %v unpriced = %v", body["total_cost_usd"], body["unpriced_scan_count"])
+	}
+	// A priced scan sums into total_cost_usd like the HTML spend badge; a scan
+	// that used tokens on a model with no list price records 0 and is counted
+	// as unpriced instead.
+	s.DB.Model(&dd).Updates(map[string]any{"cost_usd": 1.5, "input_tokens": 100})
+	unpriced := seedUIScan(t, s.DB, repo, db.ScanDone, deepDiveSkillName)
+	s.DB.Model(&unpriced).Updates(map[string]any{"cost_usd": 0, "input_tokens": 5000, "output_tokens": 10})
+	body = getUI(t, s, fmt.Sprintf("/api/v1/ui/repositories/%d", repo.ID))
+	if body["total_cost_usd"] != repoTotalCost(s.DB, repo.ID) || body["total_cost_usd"] != 1.5 || body["unpriced_scan_count"] != float64(1) {
+		t.Fatalf("cost = %v unpriced = %v", body["total_cost_usd"], body["unpriced_scan_count"])
+	}
 
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodGet, "/api/v1/ui/repositories/9999", nil)), http.StatusNotFound, uiCodeNotFound)
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodGet, "/api/v1/ui/repositories/x", nil)), http.StatusBadRequest, uiCodeBadParam)

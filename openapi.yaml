@@ -9794,6 +9794,12 @@ components:
             type: boolean
           total_cost_usd:
             type: number
+            description: Sum of the repository's scans' recorded cost_usd, as the HTML repo page's spend badge. Scans run
+              on a model without a list price record 0, so see unpriced_scan_count before showing $0.
+          unpriced_scan_count:
+            type: integer
+            description: Scans that consumed tokens but recorded no cost because their model has no list price. When
+              non-zero, total_cost_usd is a lower bound.
           counts:
             type: object
             required:

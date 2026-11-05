@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
+
 	"scrutineer/internal/db"
 )
 
@@ -44,7 +46,18 @@ type orgRow struct {
 
 func (s *Server) orgsList(w http.ResponseWriter, r *http.Request) {
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
+	rows := s.orgRows(search)
+	sort := sortOrgRows(rows, r.URL.Query().Get("sort"))
 
+	s.render(w, r, "orgs.html", map[string]any{
+		"Orgs": rows, "Q": search, "Sort": sort,
+	})
+}
+
+// orgRows aggregates the repositories into one row per owner, optionally
+// narrowed by a case-insensitive owner substring. Shared by the HTML index
+// and GET /api/v1/ui/orgs.
+func (s *Server) orgRows(search string) []orgRow {
 	// SQLite returns MAX() over a datetime column as a string; scan into
 	// a string and parse to *time.Time ourselves rather than fight GORM.
 	type aggRow struct {
@@ -101,12 +114,18 @@ func (s *Server) orgsList(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = append(rows, row)
 	}
+	return rows
+}
 
-	// Org rows are aggregated in memory (Repos/FindingsTotal are computed, not
-	// columns), so unlike the SQL indexes this sorts the slice and flips the
-	// comparator for direction via dirLess rather than an ORDER BY.
+// sortOrgRows sorts rows in place by a sort token and returns the effective
+// token.
+//
+// Org rows are aggregated in memory (Repos/FindingsTotal are computed, not
+// columns), so unlike the SQL indexes this sorts the slice and flips the
+// comparator for direction via dirLess rather than an ORDER BY.
+func sortOrgRows(rows []orgRow, token string) string {
 	const nameSort = "name"
-	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
+	sortCol, dir := splitSort(token)
 	switch sortCol {
 	case "findings":
 		sortSlice(rows, dirLess(dir, "desc", func(a, b orgRow) bool { return a.FindingsTotal < b.FindingsTotal }))
@@ -120,11 +139,7 @@ func (s *Server) orgsList(w http.ResponseWriter, r *http.Request) {
 		sortCol, dir = nameSort, ""
 		sortSlice(rows, orgNameLess)
 	}
-	sort := joinSort(sortCol, dir)
-
-	s.render(w, r, "orgs.html", map[string]any{
-		"Orgs": rows, "Q": search, "Sort": sort,
-	})
+	return joinSort(sortCol, dir)
 }
 
 // sortSlice is a tiny wrapper so the handler reads like `sortSlice(rows,
@@ -204,12 +219,7 @@ func (s *Server) orgShow(w http.ResponseWriter, r *http.Request) {
 	// within a severity. Purely alphabetical severity would put Low
 	// before Medium, which misreads for a stakeholder scanning the tab.
 	category := r.URL.Query().Get("category")
-	findingsQ := s.DB.Where("repository_id IN ?", repoIDs).
-		Where("status NOT IN ?", db.ClosedFindingLifecycles).
-		Where("scan_id IN (?)", findingsScanIDs(s.DB))
-	if category != "" {
-		findingsQ = applyCWECategoryFilter(findingsQ, category)
-	}
+	findingsQ := s.orgFindingsQuery(repoIDs, category)
 	var findings []db.Finding
 	findingsQ.Order(severityOrder).Order("id desc").
 		Limit(orgTabLimit).Find(&findings)
@@ -239,4 +249,17 @@ func (s *Server) orgShow(w http.ResponseWriter, r *http.Request) {
 		"Categories":    CWECategories(),
 		"Uncategorized": UncategorizedCWE,
 	})
+}
+
+// orgFindingsQuery selects an org's open, curated findings (the Findings
+// tab), optionally narrowed to a CWE category. Shared by orgShow and
+// GET /api/v1/ui/orgs/{login}/findings.
+func (s *Server) orgFindingsQuery(repoIDs []uint, category string) *gorm.DB {
+	q := s.DB.Where("repository_id IN ?", repoIDs).
+		Where("status NOT IN ?", db.ClosedFindingLifecycles).
+		Where("scan_id IN (?)", findingsScanIDs(s.DB))
+	if category != "" {
+		q = applyCWECategoryFilter(q, category)
+	}
+	return q
 }

@@ -253,7 +253,7 @@ func uiSBOMPackageRow(p db.SBOMPackage, importPending bool) map[string]any {
 	switch {
 	case p.SourceRepository != nil:
 		res["state"] = sbomResolutionLinked
-		res["repository"] = uiRepoRef(*p.SourceRepository)
+		res["repository"] = uiRepoRefMap(*p.SourceRepository)
 	case p.ResolveError != "":
 		res["state"] = sbomStateError
 		res[errorKey] = p.ResolveError

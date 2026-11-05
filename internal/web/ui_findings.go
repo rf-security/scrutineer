@@ -59,12 +59,6 @@ const (
 	uiFacetOpen     = "open"
 	uiParamCategory = "category"
 	uiParamViabilty = "viability"
-	uiParamOn       = "1"
-
-	uiKeyURL      = "url"
-	uiKeyTitle    = "title"
-	uiKeyCWE      = "cwe"
-	uiKeyPackages = "packages"
 )
 
 // uiFindingListOmit are the prose columns a FindingRow never shows; the list

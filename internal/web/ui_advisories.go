@@ -37,7 +37,7 @@ func (s *Server) uiAdvisoryRows(advisories []db.Advisory) []map[string]any {
 			"withdrawn_at":    a.WithdrawnAt,
 			"url":             a.URL,
 			"classification":  a.Classification,
-			"repository":      uiRepoRef(repos[a.RepositoryID]),
+			"repository":      uiRepoRefMap(repos[a.RepositoryID]),
 			"subproject_id":   a.SubprojectID,
 			"audit_status":    status,
 			"certificate_url": cert,

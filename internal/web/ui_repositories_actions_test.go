@@ -10,8 +10,8 @@ import (
 // Tests for the repository enqueue actions (#45-#47). newTestServer only:
 // the queue is the in-memory sqlite goqite, nothing reaches a model.
 
-// seedUISkill installs an active skill named name.
-func seedUISkill(t *testing.T, s *Server, name string) db.Skill {
+// seedUIRepoSkill installs an active skill named name.
+func seedUIRepoSkill(t *testing.T, s *Server, name string) db.Skill {
 	t.Helper()
 	skill := db.Skill{Name: name, Active: true, Source: "ui", Body: name, OutputKind: "freeform", OutputFile: "report.json"}
 	if err := s.DB.Where(db.Skill{Name: name}).Assign(db.Skill{Active: true}).FirstOrCreate(&skill).Error; err != nil {
@@ -50,7 +50,7 @@ func TestUIRepoScanAction(t *testing.T) {
 	path := repoPath(repo.ID, "/actions/scan")
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, path, map[string]any{})), http.StatusPreconditionFailed, uiCodePreconditionFailed)
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, path, map[string]any{"rescan_mode": "diff"})), http.StatusPreconditionFailed, uiCodePreconditionFailed)
-	seedUISkill(t, s, deepDiveSkillName)
+	seedUIRepoSkill(t, s, deepDiveSkillName)
 
 	body := postUI(t, s, path, map[string]any{"model": ModelTierMid, "sub_path": " pkg/a "}, http.StatusAccepted)
 	sc := loadScan(t, s, body["scan_id"])
@@ -62,8 +62,8 @@ func TestUIRepoScanAction(t *testing.T) {
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, path, map[string]any{"rescan_mode": "partial"})), http.StatusUnprocessableEntity, uiCodeValidationFailed)
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, repoPath(9999, "/actions/scan"), map[string]any{})), http.StatusNotFound, uiCodeNotFound)
 
-	seedUISkill(t, s, reconSkillName)
-	seedUISkill(t, s, threatModelSkillName)
+	seedUIRepoSkill(t, s, reconSkillName)
+	seedUIRepoSkill(t, s, threatModelSkillName)
 	diff := postUI(t, s, path, map[string]any{"rescan_mode": "diff"}, http.StatusAccepted)
 	ids := diff["scan_ids"].([]any)
 	if diff["queued"] != float64(2) || len(ids) != 2 {
@@ -79,7 +79,7 @@ func TestUIRepoScanAction_optedOutIsConflict(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	repo := seedUIRepo(t, s.DB, "optedout")
-	seedUISkill(t, s, deepDiveSkillName)
+	seedUIRepoSkill(t, s, deepDiveSkillName)
 	s.DB.Model(&repo).Update("federation_opt_out_at", repo.CreatedAt)
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, repoPath(repo.ID, "/actions/scan"), nil)), http.StatusConflict, uiCodeConflict)
 	assertQueuedJobCount(t, s, 0)
@@ -90,7 +90,7 @@ func TestUIRepoScanAllAction(t *testing.T) {
 	defer done()
 	repo := seedUIRepo(t, s.DB, "mono")
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, repoPath(repo.ID, "/actions/scan-all"), nil)), http.StatusPreconditionFailed, uiCodePreconditionFailed)
-	skill := seedUISkill(t, s, deepDiveSkillName)
+	skill := seedUIRepoSkill(t, s, deepDiveSkillName)
 	s.DB.Create(&db.Subproject{RepositoryID: repo.ID, Path: "pkg/a", Name: "a"})
 	s.DB.Create(&db.Subproject{RepositoryID: repo.ID, Path: "pkg/b", Name: "b"})
 	busy := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanRunning, SkillName: deepDiveSkillName, SkillID: &skill.ID, SubPath: "pkg/b"}
@@ -115,7 +115,7 @@ func TestUIRepoVerifyAllAction(t *testing.T) {
 	seedUIFinding(t, s.DB, dd, "triaged", db.FindingTriaged)
 	path := repoPath(repo.ID, "/actions/verify-all")
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, path, nil)), http.StatusPreconditionFailed, uiCodePreconditionFailed)
-	seedUISkill(t, s, verifySkillName)
+	seedUIRepoSkill(t, s, verifySkillName)
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, path+"?category=bogus", nil)), http.StatusBadRequest, uiCodeBadParam)
 
 	body := postUI(t, s, path, map[string]any{"model": ModelTierMid}, http.StatusAccepted)
@@ -139,7 +139,7 @@ func TestUIRepoThreatModelRunAction(t *testing.T) {
 	path := repoPath(repo.ID, "/actions/threat-model-run")
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, path, map[string]any{"threat_model": "{"})), http.StatusUnprocessableEntity, uiCodeValidationFailed)
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, path, map[string]any{"threat_model": `{"x":1}`})), http.StatusPreconditionFailed, uiCodePreconditionFailed)
-	seedUISkill(t, s, deepDiveSkillName)
+	seedUIRepoSkill(t, s, deepDiveSkillName)
 	body := postUI(t, s, path, map[string]any{"threat_model": `{"x":2}`}, http.StatusAccepted)
 	sc := loadScan(t, s, body["scan_id"])
 	var stored db.Repository
@@ -159,7 +159,7 @@ func TestUIRepoRunSkillAction(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	repo := seedUIRepo(t, s.DB, "runskill")
-	skill := seedUISkill(t, s, "custom-audit")
+	skill := seedUIRepoSkill(t, s, "custom-audit")
 	inactive := db.Skill{Name: "retired", Active: false, Source: "ui", Body: "x", OutputKind: "freeform", OutputFile: "report.json"}
 	s.DB.Create(&inactive)
 	s.DB.Model(&inactive).Update("active", false)
@@ -179,8 +179,8 @@ func TestUIRepoValidateFixAction(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	repo := seedUIRepo(t, s.DB, "fix")
-	dd := seedUISkill(t, s, deepDiveSkillName)
-	seedUISkill(t, s, verifySkillName)
+	dd := seedUIRepoSkill(t, s, deepDiveSkillName)
+	seedUIRepoSkill(t, s, verifySkillName)
 	baseline := db.Scan{RepositoryID: repo.ID, Kind: "skill", Status: db.ScanDone, SkillName: deepDiveSkillName, SkillID: &dd.ID, SubPath: "pkg/a"}
 	s.DB.Create(&baseline)
 	f := seedUIFinding(t, s.DB, baseline, "bug", db.FindingNew)

@@ -17,7 +17,7 @@ import (
 func TestUIRepoCreate(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
-	triage := seedUISkill(t, s, defaultSkillName)
+	triage := seedUIRepoSkill(t, s, defaultSkillName)
 	c := s.Broker.Subscribe(0, 0, 0, uiRepositoryEvent)
 	defer s.Broker.Unsubscribe(c)
 
@@ -83,7 +83,7 @@ func TestUIRepoBranches(t *testing.T) {
 func TestUIRepoBulkCreate(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
-	seedUISkill(t, s, defaultSkillName)
+	seedUIRepoSkill(t, s, defaultSkillName)
 	seedUIRepo(t, s.DB, "present")
 	body := postUI(t, s, "/api/v1/ui/repositories/bulk", map[string]any{
 		"urls": []string{"https://github.com/acme/one"},
@@ -105,7 +105,7 @@ func TestUIRepoBulkCreate(t *testing.T) {
 func TestUIOrgImport(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
-	seedUISkill(t, s, defaultSkillName)
+	seedUIRepoSkill(t, s, defaultSkillName)
 	seedUIRepo(t, s.DB, "existing")
 	calls := 0
 	s.fetchOrgRepos = func(_ context.Context, org string) ([]OrgRepo, error) {
@@ -146,7 +146,7 @@ func TestUIInvestigationCreate(t *testing.T) {
 	defer done()
 	body := map[string]any{"url": "https://github.com/acme/inv", "report": "the parser overflows"}
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, "/api/v1/ui/investigations", body)), http.StatusServiceUnavailable, uiCodeUnavailable)
-	seedUISkill(t, s, investigateSkillName)
+	seedUIRepoSkill(t, s, investigateSkillName)
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, "/api/v1/ui/investigations", map[string]any{"url": "https://github.com/acme/inv", "report": " "})), http.StatusUnprocessableEntity, uiCodeValidationFailed)
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodPost, "/api/v1/ui/investigations", map[string]any{"url": "nope", "report": "x"})), http.StatusUnprocessableEntity, uiCodeValidationFailed)
 
@@ -163,7 +163,7 @@ func TestUIInvestigationCreate(t *testing.T) {
 func TestUIDependencyImport(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
-	seedUISkill(t, s, defaultSkillName)
+	seedUIRepoSkill(t, s, defaultSkillName)
 	repo := seedUIRepo(t, s.DB, "app")
 	dep := db.Dependency{RepositoryID: repo.ID, Name: "lib", Ecosystem: "npm", PURL: "pkg:npm/lib"}
 	s.DB.Create(&dep)

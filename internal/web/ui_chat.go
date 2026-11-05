@@ -18,7 +18,6 @@ import (
 const (
 	uiConversationWhat = "conversation"
 	uiChatMessageField = "message"
-	uiKeyTitle         = "title"
 )
 
 // uiConversationRow is the ConversationRow projection.

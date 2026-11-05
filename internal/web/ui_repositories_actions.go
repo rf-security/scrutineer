@@ -11,7 +11,6 @@ import (
 	"github.com/google/uuid"
 
 	"scrutineer/internal/db"
-	"scrutineer/internal/worker"
 )
 
 // Repository enqueue actions (02 #45-#47). Each one is the JSON twin of an
@@ -279,56 +278,6 @@ func (s *Server) uiRepoRunSkillAction(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- #47 validate-fix
 
-// uiValidateFixBody is the ValidateFixRequest.
-type uiValidateFixBody struct {
-	Ref        string `json:"ref"`
-	Model      string `json:"model"`
-	FindingIDs []uint `json:"finding_ids"`
-}
-
-// errValidateFix is a rejected validate-fix request (422 field error).
-type errValidateFix struct{ field, msg string }
-
-func (e errValidateFix) Error() string { return e.msg }
-
-// validateFixPlan resolves and checks a validate-fix request with the rules
-// of validateFix: a valid ref, findings on this repository sharing one
-// baseline scan that has a skill to re-run.
-func (s *Server) validateFixPlan(repoID uint, body uiValidateFixBody) ([]db.Finding, db.Scan, error) {
-	ref := strings.TrimSpace(body.Ref)
-	if ref == "" {
-		return nil, db.Scan{}, errValidateFix{"ref", "a fix ref is required"}
-	}
-	if err := worker.ValidateGitRef(ref); err != nil {
-		return nil, db.Scan{}, errValidateFix{"ref", fmt.Sprintf("invalid fix ref: %v", err)}
-	}
-	ids := uniqueIDs(body.FindingIDs)
-	if len(ids) == 0 {
-		return nil, db.Scan{}, errValidateFix{"finding_ids", "at least one finding id is required"}
-	}
-	var findings []db.Finding
-	if err := s.DB.Where("id IN ? AND repository_id = ?", ids, repoID).Find(&findings).Error; err != nil {
-		return nil, db.Scan{}, err
-	}
-	if len(findings) != len(ids) {
-		return nil, db.Scan{}, errValidateFix{"finding_ids", "some findings were not found on this repository"}
-	}
-	baselineID := findings[0].ScanID
-	for _, f := range findings {
-		if f.ScanID != baselineID {
-			return nil, db.Scan{}, errValidateFix{"finding_ids", "all findings must come from the same baseline scan"}
-		}
-	}
-	var baseline db.Scan
-	if err := s.DB.Omit(uiScanOmit...).First(&baseline, baselineID).Error; err != nil {
-		return nil, db.Scan{}, err
-	}
-	if baseline.SkillID == nil {
-		return nil, db.Scan{}, errValidateFix{"finding_ids", "baseline scan has no skill to re-run against the fix ref"}
-	}
-	return findings, baseline, nil
-}
-
 func uniqueIDs(ids []uint) []uint {
 	seen := map[uint]bool{}
 	out := make([]uint, 0, len(ids))
@@ -341,9 +290,9 @@ func uniqueIDs(ids []uint) []uint {
 	return out
 }
 
-// uiRepoValidateFixAction is the JSON twin of validateFix (repo-scoped).
-// TODO(WP-API-3): switch to WP-API-2's shared enqueueValidateFix helper once
-// both packages are merged; until then the guards are duplicated here.
+// uiRepoValidateFixAction is the JSON twin of validateFix (repo-scoped). The
+// request body is the ValidateFixRequest (uiValidateFixBody, shared with the
+// finding-scoped #21); the guards and enqueues live in enqueueValidateFix.
 func (s *Server) uiRepoValidateFixAction(w http.ResponseWriter, r *http.Request) {
 	repo, ok := s.uiLoadRepo(w, r)
 	if !ok {
@@ -353,40 +302,15 @@ func (s *Server) uiRepoValidateFixAction(w http.ResponseWriter, r *http.Request)
 	if !uiDecodeBody(w, r, &body) {
 		return
 	}
-	findings, baseline, err := s.validateFixPlan(repo.ID, body)
-	var vErr errValidateFix
+	res, err := s.enqueueValidateFix(r.Context(), repo.ID, strings.TrimSpace(body.Ref), uniqueIDs(body.FindingIDs), body.Model)
+	var input validateFixInputError
 	switch {
-	case errors.As(err, &vErr):
-		writeUIFields(w, uiFieldErrors{vErr.field: vErr.msg})
+	case errors.As(err, &input):
+		writeUIFields(w, uiFieldErrors{input.Field: input.Msg})
 		return
 	case err != nil:
-		uiInternal(w, err)
-		return
-	}
-	ref := strings.TrimSpace(body.Ref)
-	s.enqueueValidateFixVerify(r, repo.ID, findings, ref, body.Model)
-	baselineID := baseline.ID
-	anchorID, err := s.enqueueSkillWith(r.Context(), repo.ID, *baseline.SkillID, ScanOpts{
-		Model:          body.Model,
-		Ref:            ref,
-		SubPath:        baseline.SubPath,
-		ScopeMode:      baseline.ScopeMode,
-		BaselineScanID: &baselineID,
-	})
-	if err != nil {
 		mapEnqueueErr(w, err)
 		return
 	}
-	ids := make([]uint, len(findings))
-	for i, f := range findings {
-		ids[i] = f.ID
-	}
-	var verifyIDs []uint
-	s.DB.Model(&db.Scan{}).
-		Where("finding_id IN ? AND skill_name = ? AND ref = ? AND status IN ?", ids, verifySkillName, ref, inFlightScanStatuses()).
-		Order("id").Pluck("id", &verifyIDs)
-	if verifyIDs == nil {
-		verifyIDs = []uint{}
-	}
-	writeUIJSON(w, http.StatusAccepted, map[string]any{uiEventScanIDKey: anchorID, "verify_scan_ids": verifyIDs})
+	writeUIJSON(w, http.StatusAccepted, map[string]any{uiEventScanIDKey: res.AnchorID, "verify_scan_ids": res.VerifyScanIDs})
 }

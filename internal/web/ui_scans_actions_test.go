@@ -63,7 +63,7 @@ func TestUIScanActionRetry(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	repo := seedUIRepo(t, s.DB, "retry")
-	skill := seedUISkill(t, s)
+	skill := seedUIScanSkill(t, s)
 	failed := seedUIScan(t, s.DB, repo, db.ScanFailed, skill.Name)
 	s.DB.Model(&failed).Updates(map[string]any{
 		"skill_id": skill.ID, "effort": "high", "sub_path": "crates/a", "ref": "main",
@@ -135,7 +135,7 @@ func TestUIScansRetryFailed(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	repo := seedUIRepo(t, s.DB, "rf")
-	skill := seedUISkill(t, s)
+	skill := seedUIScanSkill(t, s)
 	old := seedUIScan(t, s.DB, repo, db.ScanFailed, skill.Name)
 	s.DB.Model(&old).Update("skill_id", skill.ID)
 
@@ -234,7 +234,7 @@ func TestUIScansBatchRetry(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	repo := seedUIRepo(t, s.DB, "batchretry")
-	skill := seedUISkill(t, s)
+	skill := seedUIScanSkill(t, s)
 	failed := seedUIScan(t, s.DB, repo, db.ScanFailed, skill.Name)
 	s.DB.Model(&failed).Update("skill_id", skill.ID)
 

@@ -19,7 +19,6 @@ const (
 	uiRepoTabPageSize   = 50
 	uiRepoLatestScanCap = 200
 	uiLatestParam       = "latest"
-	uiParamOn           = "1"
 )
 
 // pageSlice returns one page of an in-memory list.

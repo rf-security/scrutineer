@@ -74,11 +74,7 @@ func (s *Server) registerUIRepositoryRoutes(mux *http.ServeMux) {
 
 // JSON keys and column names the repository projections repeat.
 const (
-	uiKeyCommit   = "commit"
-	uiKeyCWE      = "cwe"
-	uiKeyPackages = "packages"
-	uiKeyTitle    = "title"
-	uiKeyURL      = "url"
+	uiKeyCommit = "commit"
 )
 
 // ---------------------------------------------------------------- RepoRow

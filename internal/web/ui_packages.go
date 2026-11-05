@@ -90,7 +90,7 @@ func uiPackageRow(p db.Package) map[string]any {
 		"dependent_packages":     p.DependentPackages,
 		"dependent_repos":        p.DependentRepos,
 		"dependent_packages_url": p.DependentPackagesURL,
-		"repository":             uiRepoRef(p.Repository),
+		"repository":             uiRepoRefMap(p.Repository),
 		"subproject_id":          p.SubprojectID,
 		"purl":                   p.PURL,
 		"risk_flags":             flags,
@@ -153,7 +153,7 @@ func (s *Server) uiPackageShow(w http.ResponseWriter, r *http.Request) {
 	}
 	writeUIJSON(w, http.StatusOK, map[string]any{
 		"package":    uiPackageRow(p),
-		"repository": uiRepoRef(p.Repository),
+		"repository": uiRepoRefMap(p.Repository),
 		"risk_flags": flags,
 		"metadata":   uiPackageMetadata(p.Metadata),
 	})

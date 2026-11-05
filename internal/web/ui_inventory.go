@@ -46,15 +46,9 @@ func (s *Server) registerUIInventoryRoutes(mux *http.ServeMux) {
 
 // ---------------------------------------------------------------- shared inventory helpers
 
-// JSON keys repeated across the inventory projections.
-const (
-	uiKeyTitle    = "title"
-	uiKeyPackages = "packages"
-)
-
-// uiRepoRef is the RepoRef object ({id,name}); nil when the repository is
+// uiRepoRefMap is the RepoRef object ({id,name}); nil when the repository is
 // unknown.
-func uiRepoRef(repo db.Repository) map[string]any {
+func uiRepoRefMap(repo db.Repository) map[string]any {
 	if repo.ID == 0 {
 		return nil
 	}

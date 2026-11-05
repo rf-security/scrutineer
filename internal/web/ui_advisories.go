@@ -28,11 +28,11 @@ func (s *Server) uiAdvisoryRows(advisories []db.Advisory) []map[string]any {
 		out[i] = map[string]any{
 			"id":              a.ID,
 			"uuid":            a.UUID,
-			"title":           a.Title,
+			uiKeyTitle:        a.Title,
 			"description":     a.Description,
 			"severity":        a.Severity,
 			"cvss_score":      a.CVSSScore,
-			"packages":        a.Packages,
+			uiKeyPackages:     a.Packages,
 			"published_at":    a.PublishedAt,
 			"withdrawn_at":    a.WithdrawnAt,
 			"url":             a.URL,
@@ -62,7 +62,7 @@ func parseUIAdvisoryListParams(r *http.Request) (uiAdvisoryListParams, error) {
 	if p.page, err = parseListPage(r); err != nil {
 		return p, err
 	}
-	if p.repositoryID, err = uiQueryID(r, "repository_id"); err != nil {
+	if p.repositoryID, err = uiQueryID(r, repositoryIDKey); err != nil {
 		return p, err
 	}
 	q := r.URL.Query()
@@ -104,7 +104,7 @@ func uiAdvisoriesOrder(q *gorm.DB, token string) *gorm.DB {
 		return q.Joins("JOIN repositories r ON r.id = advisories.repository_id").
 			Order(orderByExpr("r.name", dir, false)).
 			Order("advisories.cvss_score desc")
-	case "title":
+	case uiKeyTitle:
 		return q.Order(orderByExpr("advisories.title", dir, false)).Order("advisories.id desc")
 	case sortSeverity:
 		return q.Order(orderByExpr("advisories.cvss_score", dir, true)).Order("advisories.id desc")

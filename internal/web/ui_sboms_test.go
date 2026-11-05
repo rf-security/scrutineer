@@ -16,8 +16,8 @@ import (
 	"scrutineer/internal/db"
 )
 
-// uiMultipartReq builds an operator multipart upload to the UI surface.
-func uiMultipartReq(t *testing.T, path, field, filename, content string) *http.Request {
+// uiMultipartReq builds an operator multipart POST /api/v1/ui/sboms.
+func uiMultipartReq(t *testing.T, field, filename, content string) *http.Request {
 	t.Helper()
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
@@ -29,7 +29,7 @@ func uiMultipartReq(t *testing.T, path, field, filename, content string) *http.R
 		t.Fatal(err)
 	}
 	_ = mw.Close()
-	r := httptest.NewRequest("POST", path, &buf)
+	r := httptest.NewRequest("POST", "/api/v1/ui/sboms", &buf)
 	asOperator(r)
 	r.Header.Set("Content-Type", mw.FormDataContentType())
 	return r
@@ -40,7 +40,7 @@ func TestUIInventorySBOMUploadAndList(t *testing.T) {
 	defer done()
 	s.DB.Create(&db.SBOMUpload{Name: "generated", Origin: db.SBOMOriginGenerated})
 
-	got := decodeUIJSON[map[string]any](t, serveUI(t, s, uiMultipartReq(t, "/api/v1/ui/sboms", "file", "demo.cdx.json", cdxFixture)), http.StatusCreated)
+	got := decodeUIJSON[map[string]any](t, serveUI(t, s, uiMultipartReq(t, "file", "demo.cdx.json", cdxFixture)), http.StatusCreated)
 	if got["name"] != "demo" || got["format"] != "cyclonedx" || got["package_count"] != float64(2) ||
 		got["import_pending"] != true || got["resolving"] != false || got["filename"] != "demo.cdx.json" {
 		t.Fatalf("upload = %v", got)
@@ -51,14 +51,14 @@ func TestUIInventorySBOMUploadAndList(t *testing.T) {
 		t.Fatalf("upload enqueued %d scans", scans)
 	}
 
-	body := requireUIError(t, serveUI(t, s, uiMultipartReq(t, "/api/v1/ui/sboms", "file", "x.json", `{"hello":"world"}`)),
+	body := requireUIError(t, serveUI(t, s, uiMultipartReq(t, "file", "x.json", `{"hello":"world"}`)),
 		http.StatusUnprocessableEntity, uiCodeValidationFailed)
 	if body.Fields["file"] == "" {
 		t.Errorf("422 fields = %v", body.Fields)
 	}
-	requireUIError(t, serveUI(t, s, uiMultipartReq(t, "/api/v1/ui/sboms", "other", "x.json", cdxFixture)), http.StatusBadRequest, uiCodeBadParam)
+	requireUIError(t, serveUI(t, s, uiMultipartReq(t, "other", "x.json", cdxFixture)), http.StatusBadRequest, uiCodeBadParam)
 
-	serveUI(t, s, uiMultipartReq(t, "/api/v1/ui/sboms", "file", "second.json", strings.Replace(cdxFixture, `"demo"`, `"zzz"`, 1)))
+	serveUI(t, s, uiMultipartReq(t, "file", "second.json", strings.Replace(cdxFixture, `"demo"`, `"zzz"`, 1)))
 	list := decodeList[map[string]any](t, serveUI(t, s, operatorReq(t, "GET", "/api/v1/ui/sboms", nil)))
 	if list.Total != 2 || list.Items[0]["name"] != "zzz" {
 		t.Fatalf("list (uploads only, newest first) = %+v", list)

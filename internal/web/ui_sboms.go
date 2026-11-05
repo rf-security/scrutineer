@@ -239,7 +239,7 @@ func (s *Server) uiSBOMShow(w http.ResponseWriter, r *http.Request) {
 	}
 	row := s.uiSBOMRowFor(up)
 	row["counts"] = map[string]any{
-		"packages": c.Total, "resolved": c.Resolved, "linked": c.Linked,
+		uiKeyPackages: c.Total, "resolved": c.Resolved, "linked": c.Linked,
 		"direct": c.Direct, "transitive": c.Transitive,
 		uiKeyFindings: findings, "advisories": advisories,
 	}

@@ -100,9 +100,9 @@ func uiPackageRow(p db.Package) map[string]any {
 
 // uiPackageColumns are the columns a package row reads (metadata is only
 // loaded by the detail).
-var uiPackageColumns = []string{"id", "repository_id", "subproject_id", uiKeyName, "ecosystem", "p_url", "licenses",
+var uiPackageColumns = []string{"id", repositoryIDKey, "subproject_id", uiKeyName, "ecosystem", "p_url", "licenses",
 	"latest_version", "versions_count", "downloads", "dependent_packages", "dependent_repos", "registry_url",
-	"latest_release_at", "dependent_packages_url", "risk_flags", "created_at"}
+	"latest_release_at", "dependent_packages_url", "risk_flags", uiKeyCreatedAt}
 
 // GET /ui/packages
 func (s *Server) uiPackageList(w http.ResponseWriter, r *http.Request) {

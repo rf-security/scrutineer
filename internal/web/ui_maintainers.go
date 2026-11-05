@@ -199,7 +199,7 @@ func (s *Server) setMaintainerDoNotContact(m db.Maintainer, value bool) error {
 
 // uiMaintainerRepoIDs selects the repositories a maintainer is linked to.
 func (s *Server) uiMaintainerRepoIDs(id uint) *gorm.DB {
-	return s.DB.Table("repository_maintainers").Select("repository_id").Where("maintainer_id = ?", id)
+	return s.DB.Table("repository_maintainers").Select(repositoryIDKey).Where("maintainer_id = ?", id)
 }
 
 // uiMaintainerExists writes a 404 when maintainer {id} does not exist.

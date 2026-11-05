@@ -20,6 +20,13 @@ func (s *Server) registerUIScanRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /ui/scans/{id}/report", s.uiScanReport)
 	mux.HandleFunc("GET /ui/scans/{id}/refusal-audit", s.uiScanRefusalAudit)
 
+	mux.HandleFunc("POST /ui/scans/{id}/actions/{action}", s.uiScanAction)
+	mux.HandleFunc("POST /ui/scans/actions/pause-queued", s.uiScansPauseQueued)
+	mux.HandleFunc("POST /ui/scans/actions/resume-paused", s.uiScansResumePaused)
+	mux.HandleFunc("POST /ui/scans/actions/retry-failed", s.uiScansRetryFailed)
+	mux.HandleFunc("POST /ui/scans/actions/cancel-all", s.uiScansCancelAll)
+	mux.HandleFunc("POST /ui/scans/batch", s.uiScansBatch)
+
 }
 
 const (

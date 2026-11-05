@@ -9,9 +9,11 @@ import (
 	"scrutineer/internal/db"
 )
 
-func seedUISkill(t *testing.T, s *Server, name, outputKind string) db.Skill {
+// seedUISkill creates an active findings-kind skill.
+func seedUISkill(t *testing.T, s *Server) db.Skill {
 	t.Helper()
-	sk := db.Skill{Name: name, Active: true, Source: "ui", Body: name, OutputKind: outputKind, OutputFile: "report.json"}
+	const name = "security-deep-dive"
+	sk := db.Skill{Name: name, Active: true, Source: "ui", Body: name, OutputKind: "findings", OutputFile: "report.json"}
 	if err := s.DB.Create(&sk).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +24,7 @@ func TestUIScanDetail(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
 	repo := seedUIRepo(t, s.DB, "detail")
-	skill := seedUISkill(t, s, "security-deep-dive", "findings")
+	skill := seedUISkill(t, s)
 	sc := seedUIScan(t, s.DB, repo, db.ScanDone, skill.Name)
 	s.DB.Model(&sc).Updates(map[string]any{
 		"skill_id": skill.ID, "findings_count": 1, "commit": "abc123", "input_tokens": 100, "cache_read_tokens": 300,

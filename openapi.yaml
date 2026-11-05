@@ -4676,7 +4676,6 @@ paths:
     post:
       summary: Cancel, resume or retry a scan
       operationId: runUIScanAction
-      x-status: planned
       tags:
       - ui-scans
       description: '**retry and resume enqueue model work.** 200 ScanRow for cancel/resume, 202 EnqueueResult for
@@ -4728,7 +4727,6 @@ paths:
     post:
       summary: Pause every queued scan
       operationId: runUIScansPauseQueued
-      x-status: planned
       description: Body may be empty or `{}`. `affected` is the number of scans paused.
       tags:
       - ui-scans
@@ -4760,7 +4758,6 @@ paths:
     post:
       summary: Resume paused scans (**enqueues**)
       operationId: runUIScansResumePaused
-      x-status: planned
       description: '`repository_id` scopes it to one repository. `affected` is the number resumed, `errored` the ones
         whose enqueue failed (they stay paused).'
       tags:
@@ -4793,7 +4790,6 @@ paths:
     post:
       summary: Retry failed scans (**enqueues model work**)
       operationId: runUIScansRetryFailed
-      x-status: planned
       description: '`repository_id`, `skill` (comma list), `completeness`, `group` filter the failed scans; a failed
         scan superseded by a newer attempt is skipped. `affected` = `retried`; `scan_ids` are the new attempts. 422 on
         an unknown completeness.'
@@ -4827,7 +4823,6 @@ paths:
     post:
       summary: Cancel all scans of a repository
       operationId: runUIScansCancelAll
-      x-status: planned
       description: '`repository_id` is required (422 when missing). Cancels its queued and running scans.'
       tags:
       - ui-scans
@@ -4859,7 +4854,6 @@ paths:
     post:
       summary: Cancel/resume/retry a selection
       operationId: batchUIScans
-      x-status: planned
       tags:
       - ui-scans
       description: '**retry/resume enqueue model work.** Runs the single-scan action per id (same guards, so each item

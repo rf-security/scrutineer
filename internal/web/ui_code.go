@@ -46,6 +46,7 @@ type uiBlobView struct {
 	Missing        bool      `json:"missing,omitempty"`
 	Error          string    `json:"error,omitempty"`
 	Unsupported    bool      `json:"unsupported,omitempty"`
+	IsDir          bool      `json:"is_dir,omitempty"`
 	Content        string    `json:"content"`
 }
 
@@ -132,7 +133,9 @@ func (s *Server) uiRepoBlob(w http.ResponseWriter, r *http.Request) {
 }
 
 // loadBlobView reads <commit>:<path> the way repoBlob does; the missing,
-// error and unsupported states are flags on a 200, as on the HTML page.
+// error and unsupported states are flags on a 200, as on the HTML page. A
+// path that is a directory at commit is is_dir with no content, so the
+// client can switch to the tree view.
 func (s *Server) loadBlobView(ctx context.Context, repo db.Repository, commit, p string) uiBlobView {
 	view := uiBlobView{
 		Repo:           uiRepoRef{ID: repo.ID, Name: repo.Name},
@@ -151,6 +154,10 @@ func (s *Server) loadBlobView(ctx context.Context, repo db.Repository, commit, p
 		view.Error = err.Error()
 		return view
 	}
+	if isTreeAt(ctx, dir, commit, p) {
+		view.IsDir = true
+		return view
+	}
 	blob, err := gitShowBlob(ctx, dir, commit, p)
 	if err != nil {
 		view.Error = err.Error()
@@ -165,6 +172,15 @@ func (s *Server) loadBlobView(ctx context.Context, repo db.Repository, commit, p
 	}
 	view.Content = string(blob.Content)
 	return view
+}
+
+// isTreeAt reports whether <commit>:<p> names a directory. The blob reader
+// does not reject trees: go-git returns the raw tree object (an
+// "unsupported" binary) and the CLI fallback a `git show` listing, so the
+// type is checked up front.
+func isTreeAt(ctx context.Context, dir, commit, p string) bool {
+	out, err := clone.Run(ctx, dir, []string{"GIT_TERMINAL_PROMPT=0"}, "cat-file", "-t", commit+":"+p)
+	return err == nil && strings.TrimSpace(out) == "tree"
 }
 
 // ---------------------------------------------------------------- #55 tree

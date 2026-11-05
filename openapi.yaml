@@ -4484,7 +4484,7 @@ paths:
       operationId: getUIRepositoryBlob
       tags:
       - ui-repositories
-      description: 'Go pattern `{path...}`. Full-SHA commits are served with `ETag: "<commit>:<path>"` and `Cache-Control: private, max-age=31536000, immutable`; abbreviated SHAs and the missing/error states are `no-store`. Missing clone, git error and non-UTF-8 content are 200 with `missing`, `error` or `unsupported` set.'
+      description: 'Go pattern `{path...}`. Full-SHA commits are served with `ETag: "<commit>:<path>"` and `Cache-Control: private, max-age=31536000, immutable`; abbreviated SHAs and the missing/error states are `no-store`. Missing clone, git error and non-UTF-8 content are 200 with `missing`, `error` or `unsupported` set. A path that is a directory at the commit is 200 with `is_dir: true`, `size_bytes: 0` and empty `content`; fetch `/tree/{commit}/{path}` instead.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -10423,6 +10423,9 @@ components:
           type: string
         unsupported:
           type: boolean
+        is_dir:
+          type: boolean
+          description: The path is a directory at this commit; content is empty and the tree endpoint lists it.
     TreeView:
       type: object
       required:

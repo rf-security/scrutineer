@@ -72,6 +72,13 @@ func TestUIRepoBlob(t *testing.T) {
 	if decodeUIJSON[map[string]any](t, short, http.StatusOK)["content"] == "" || short.Header().Get("Cache-Control") != noStore {
 		t.Fatalf("short SHA cache = %q", short.Header().Get("Cache-Control"))
 	}
+	dir := getUI(t, s, repoPath(repo.ID, "/blob/"+commit+"/src"))
+	if dir["is_dir"] != true || dir["content"] != "" || dir["size_bytes"] != float64(0) || dir["unsupported"] != nil || dir["error"] != nil {
+		t.Fatalf("directory blob = %+v", dir)
+	}
+	if file := getUI(t, s, repoPath(repo.ID, "/blob/"+commit+"/src/deep/x.txt")); file["is_dir"] != nil || file["content"] != "x\n" {
+		t.Fatalf("nested file = %+v", file)
+	}
 	missingFile := getUI(t, s, repoPath(repo.ID, "/blob/"+commit+"/nope.go"))
 	if missingFile["error"] == nil {
 		t.Fatalf("missing file = %+v", missingFile)

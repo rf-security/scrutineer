@@ -4584,7 +4584,6 @@ paths:
       operationId: getUIScan
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4612,8 +4611,13 @@ paths:
       operationId: getUIScanLog
       tags:
       - ui-scans
-      description: Returns `log[offset:]`. Headers `X-Scan-Status`, `X-Log-Length`. See the scan-log SSE offset protocol.
-      x-status: planned
+      description: |-
+        Returns `log[offset:]` (byte offset). `X-Log-Length` is the total log length in bytes the body ends at, in the
+        same byte space as `scan-log` SSE event offsets. Protocol: subscribe to `/v1/ui/events?scan={id}` first, then
+        fetch `offset=0`, drop events whose `offset <= X-Log-Length`, and refetch `?offset=<last offset>` on a gap.
+        While the scan runs the body is served from an in-memory mirror of the published lines, so it is never behind
+        the event stream (the worker flushes the stored log only every few seconds). An offset past the end returns an
+        empty body.
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4628,6 +4632,16 @@ paths:
       responses:
         '200':
           description: Log bytes
+          headers:
+            X-Scan-Status:
+              description: The scan's status when the log was read
+              schema:
+                type: string
+            X-Log-Length:
+              description: Total log length in bytes after this body
+              schema:
+                type: integer
+                format: int64
           content:
             text/plain:
               schema:
@@ -4646,7 +4660,6 @@ paths:
       operationId: getUIScanPrompt
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4669,9 +4682,10 @@ paths:
     get:
       summary: Raw scan report (streamed)
       operationId: getUIScanReport
+      description: The stored report.json with `Content-Length`; 404 when the scan has no report. A report that is not
+        valid JSON (some freeform skills) is served as `text/plain`.
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4682,9 +4696,10 @@ paths:
           description: OK
           content:
             application/json:
+              schema: {}
+            text/plain:
               schema:
-                type: object
-                additionalProperties: true
+                type: string
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -4695,9 +4710,9 @@ paths:
     get:
       summary: Refusal audit
       operationId: getUIScanRefusalAudit
+      description: The stored refusal audit JSON; 404 when the scan has none (`UIScanDetail.has_refusal_audit`).
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4708,9 +4723,10 @@ paths:
           description: OK
           content:
             application/json:
+              schema: {}
+            text/plain:
               schema:
-                type: object
-                additionalProperties: true
+                type: string
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -4723,8 +4739,10 @@ paths:
       operationId: runUIScanAction
       tags:
       - ui-scans
-      description: '**retry enqueues model work.** 200 ScanRow for cancel/resume, 202 EnqueueResult for retry.'
-      x-status: planned
+      description: '**retry and resume enqueue model work.** 200 ScanRow for cancel/resume, 202 EnqueueResult for
+        retry. 400 when the scan is in the wrong state (cancel of a finished or paused scan, resume of a scan that is
+        not paused, retry of a non-skill scan); 409 when the repository opted out of federation; 412/422 as the HTML
+        retry (non-viable finding, egress policy, max cost).'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4770,9 +4788,9 @@ paths:
     post:
       summary: Pause every queued scan
       operationId: runUIScansPauseQueued
+      description: Body may be empty or `{}`. `affected` is the number of scans paused.
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4801,9 +4819,10 @@ paths:
     post:
       summary: Resume paused scans (**enqueues**)
       operationId: runUIScansResumePaused
+      description: '`repository_id` scopes it to one repository. `affected` is the number resumed, `errored` the ones
+        whose enqueue failed (they stay paused).'
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4832,9 +4851,11 @@ paths:
     post:
       summary: Retry failed scans (**enqueues model work**)
       operationId: runUIScansRetryFailed
+      description: '`repository_id`, `skill` (comma list), `completeness`, `group` filter the failed scans; a failed
+        scan superseded by a newer attempt is skipped. `affected` = `retried`; `scan_ids` are the new attempts. 422 on
+        an unknown completeness.'
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4863,9 +4884,9 @@ paths:
     post:
       summary: Cancel all scans of a repository
       operationId: runUIScansCancelAll
+      description: '`repository_id` is required (422 when missing). Cancels its queued and running scans.'
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4896,8 +4917,9 @@ paths:
       operationId: batchUIScans
       tags:
       - ui-scans
-      description: '**retry/resume enqueue model work.**'
-      x-status: planned
+      description: '**retry/resume enqueue model work.** Runs the single-scan action per id (same guards, so each item
+        carries the status `code` the single route would return); duplicate ids run once. `affected` counts ok items.
+        422 on an unknown action, no ids, or more than 200.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4913,7 +4935,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/BatchResult'
+                $ref: '#/components/schemas/ScanBatchResult'
         '400':
           $ref: '#/components/responses/UIBadParam'
         '422':
@@ -4928,7 +4950,6 @@ paths:
       operationId: getUIAudit
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4961,9 +4982,10 @@ paths:
     get:
       summary: Repository conversations
       operationId: listUIRepositoryConversations
+      description: Repository-wide chats (finding-scoped ones are under the finding), most recently updated first,
+        capped at 50 like the repository page.
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -4990,7 +5012,6 @@ paths:
       tags:
       - ui-scans
       description: '**Spends model credits (chat turn).**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5027,7 +5048,6 @@ paths:
       operationId: getUIConversation
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5036,6 +5056,9 @@ paths:
       responses:
         '200':
           description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/UIETag'
           content:
             application/json:
               schema:
@@ -5049,9 +5072,10 @@ paths:
     delete:
       summary: Delete a conversation
       operationId: deleteUIConversation
+      description: Removes the transcript and its working copy of the clone. 409 `in_flight` while a reply is being
+        written.
       tags:
       - ui-scans
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5074,8 +5098,9 @@ paths:
       operationId: postUIConversationMessage
       tags:
       - ui-scans
-      description: '**Spends model credits (chat turn).**'
-      x-status: planned
+      description: '**Spends model credits (chat turn).** 202 with the stored user message; the reply arrives on the
+        `chat-done` SSE event. 409 `in_flight` while a turn runs, 422 empty message, 503 when no chat runner is
+        configured.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -10738,21 +10763,56 @@ components:
       - $ref: '#/components/schemas/ScanRow'
       - type: object
         required:
+        - effort
+        - ref
+        - sub_path
+        - scope_mode
+        - profile
+        - egress_policy
+        - rescan_mode
+        - diff_base_commit
+        - verification_feedback
+        - skills_repo_sha
         - tokens
+        - skill
         - findings
+        - investigation
+        - submitted_report
+        - diff
+        - disclosure_review_finding_id
         - can_export_report
         - exports
+        - has_refusal_audit
         properties:
           effort:
             type: string
+          ref:
+            type: string
+            description: Always present on the detail (ScanRow omits it when empty).
+          sub_path:
+            type: string
+            description: Always present on the detail ("" = repository root).
           scope_mode:
             type: string
           profile:
             type: string
           egress_policy:
             type: string
+          rescan_mode:
+            type: string
+          diff_base_commit:
+            type: string
+          verification_feedback:
+            type: string
           tokens:
             type: object
+            required:
+            - input
+            - output
+            - cache_read
+            - cache_write
+            - total_input
+            - hit_ratio
             properties:
               input:
                 type: integer
@@ -10766,6 +10826,10 @@ components:
               cache_write:
                 type: integer
                 format: int64
+              total_input:
+                type: integer
+                format: int64
+                description: input + cache_read + cache_write; the HTML hides the token table when 0
               hit_ratio:
                 type: number
           skill:
@@ -10785,8 +10849,12 @@ components:
             items:
               $ref: '#/components/schemas/FindingRow'
           investigation:
+            description: Notes and claim assessments of an `investigate` scan; null otherwise.
             oneOf:
             - type: object
+              required:
+              - notes
+              - assessments
               properties:
                 notes:
                   type: string
@@ -10794,12 +10862,27 @@ components:
                   type: array
                   items:
                     type: object
-                    additionalProperties: true
+                    required:
+                    - claim
+                    - outcome
+                    - evidence
+                    properties:
+                      claim:
+                        type: string
+                      outcome:
+                        type: string
+                      evidence:
+                        type: string
             - type: 'null'
+          submitted_report:
+            description: The report an `investigate` scan was submitted with; null otherwise.
+            type:
+            - string
+            - 'null'
           diff:
+            description: Diff-rescan metadata (coverage + changed files); null when the scan carried neither.
             oneOf:
-            - type: object
-              additionalProperties: true
+            - $ref: '#/components/schemas/ScanDiffView'
             - type: 'null'
           disclosure_review_finding_id:
             type:
@@ -10812,9 +10895,65 @@ components:
             type: string
           exports:
             type: object
+            description: report_md is present only when can_export_report.
             properties:
               report_md:
                 $ref: '#/components/schemas/ExportLink'
+          has_refusal_audit:
+            type: boolean
+            description: GET /v1/ui/scans/{id}/refusal-audit has a body
+    ScanDiffView:
+      type: object
+      required:
+      - requested_mode
+      - actual_mode
+      - fallback_reason
+      - completeness
+      - completeness_reason
+      - changed_files
+      - patch_bytes
+      - files
+      properties:
+        requested_mode:
+          type: string
+        actual_mode:
+          type: string
+        fallback_reason:
+          type: string
+        completeness:
+          type: string
+        completeness_reason:
+          type: string
+        changed_files:
+          type: integer
+        patch_bytes:
+          type: integer
+          format: int64
+        files:
+          type: array
+          items:
+            type: object
+            required:
+            - status
+            - status_name
+            - path
+            - old
+            - linkable
+            properties:
+              status:
+                type: string
+                description: git --name-status letter (R100, M, ...)
+              status_name:
+                type: string
+                description: added, modified, deleted, renamed, copied, type change
+              path:
+                type: string
+              old:
+                type: string
+                description: Previous path of a rename/copy
+              linkable:
+                type: boolean
+                description: The file exists at the scan's commit (blob link)
     ScanBulkRequest:
       type: object
       properties:
@@ -10845,6 +10984,18 @@ components:
           items:
             type: integer
             format: int64
+    ScanBatchResult:
+      type: object
+      required:
+      - results
+      - affected
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/BatchItemResult'
+        affected:
+          type: integer
     ScanBatchRequest:
       type: object
       required:
@@ -10869,6 +11020,7 @@ components:
       - queue
       - metrics
       - verdict_labels
+      - exports
       properties:
         queue:
           type: array
@@ -10876,6 +11028,13 @@ components:
             $ref: '#/components/schemas/FindingRow'
         metrics:
           type: object
+          required:
+          - total_reviews
+          - with_automated_outcome
+          - agreements
+          - agreement_rate
+          - agreement_pct
+          - by_verdict
           properties:
             total_reviews:
               type: integer
@@ -10888,15 +11047,26 @@ components:
               format: int64
             agreement_rate:
               type: number
+            agreement_pct:
+              type: integer
+              description: agreement_rate as a whole percentage, truncated like the HTML tile
             by_verdict:
               type: object
               additionalProperties:
                 type: integer
                 format: int64
         verdict_labels:
-          type: object
-          additionalProperties:
+          type: array
+          description: The review verdicts to list under by_verdict, in display order
+          items:
             type: string
+        exports:
+          type: object
+          required:
+          - queue_json
+          properties:
+            queue_json:
+              $ref: '#/components/schemas/ExportLink'
     ConversationDetail:
       allOf:
       - $ref: '#/components/schemas/ConversationRow'

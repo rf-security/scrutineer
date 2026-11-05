@@ -13,6 +13,9 @@ import (
 // case here; a TOC asking for 10,000 rows is almost certainly a slip.
 const auditMaxLimit = 500
 
+// auditVerdictLabels are the review verdicts the audit page lists, in order.
+var auditVerdictLabels = []string{"true_positive", "false_positive", "already_fixed", "uncertain"}
+
 // apiListFindingReviews returns reviews on one finding, newest first.
 // The finding page renders the same data.
 func (s *Server) apiListFindingReviews(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +78,7 @@ func (s *Server) auditPage(w http.ResponseWriter, r *http.Request) {
 		"Queue":         rows,
 		"Metrics":       metrics,
 		"AgreementPct":  int(metrics.AgreementRate * pct),
-		"VerdictLabels": []string{"true_positive", "false_positive", "already_fixed", "uncertain"},
+		"VerdictLabels": auditVerdictLabels,
 	})
 }
 

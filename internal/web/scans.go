@@ -43,27 +43,7 @@ func (s *Server) jobs(w http.ResponseWriter, r *http.Request) {
 		q = q.Where("scan_group = ?", group)
 	}
 
-	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
-	switch sortCol {
-	case "id":
-		q = q.Order(orderByExpr("scans.id", dir, true))
-	case "skill":
-		q = q.Order(orderByExpr("skill_name", dir, false)).Order("scans.id desc")
-	case statusKey:
-		q = q.Order(orderByExpr("status", dir, false)).Order("scans.id desc")
-	case sortRepository:
-		// Backtick quoting is invalid on Postgres; let GORM quote the column.
-		const repositoryNameColumn = "name"
-		q = q.Joins("Repository", s.DB.Select("id", "name")).
-			Order(clause.OrderByColumn{Column: clause.Column{Table: "Repository", Name: repositoryNameColumn}, Desc: wantDesc(dir, false)}).
-			Order("scans.id desc")
-	case "findings":
-		// findings_count is a denormalised column on the scan row.
-		q = q.Order(orderByExpr("findings_count", dir, true)).Order("scans.id desc")
-	default:
-		sortCol, dir = defaultSort, ""
-		q = q.Order("status_priority, scans.id desc")
-	}
+	q, sortCol, dir := s.scansOrder(q, r.URL.Query().Get("sort"))
 	sort := joinSort(sortCol, dir)
 
 	var total int64
@@ -106,6 +86,35 @@ func (s *Server) jobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.render(w, r, "jobs.html", data)
+}
+
+// scansOrder applies the scans list's sort token to q and returns the
+// effective column and direction (the default when the token is unknown).
+// The HTML jobs page and GET /api/v1/ui/scans share it so URL sort tokens are
+// portable between the two.
+func (s *Server) scansOrder(q *gorm.DB, token string) (*gorm.DB, string, string) {
+	sortCol, dir := splitSort(token)
+	switch sortCol {
+	case "id":
+		q = q.Order(orderByExpr("scans.id", dir, true))
+	case "skill":
+		q = q.Order(orderByExpr("skill_name", dir, false)).Order("scans.id desc")
+	case statusKey:
+		q = q.Order(orderByExpr("status", dir, false)).Order("scans.id desc")
+	case sortRepository:
+		// Backtick quoting is invalid on Postgres; let GORM quote the column.
+		const repositoryNameColumn = "name"
+		q = q.Joins("Repository", s.DB.Select("id", "name")).
+			Order(clause.OrderByColumn{Column: clause.Column{Table: "Repository", Name: repositoryNameColumn}, Desc: wantDesc(dir, false)}).
+			Order("scans.id desc")
+	case "findings":
+		// findings_count is a denormalised column on the scan row.
+		q = q.Order(orderByExpr("findings_count", dir, true)).Order("scans.id desc")
+	default:
+		sortCol, dir = defaultSort, ""
+		q = q.Order("status_priority, scans.id desc")
+	}
+	return q, sortCol, dir
 }
 
 func parseScanCompletenessFilter(raw string) (string, error) {
@@ -365,12 +374,46 @@ func (s *Server) scanRetry(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if scan.Kind != worker.JobSkill || scan.SkillID == nil {
-		http.Error(w, "scan cannot be retried: no skill reference", http.StatusBadRequest)
+	newID, err := s.retryScan(r.Context(), scan)
+	if err != nil {
+		if errors.Is(err, errScanNotRetryable) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, db.ErrFindingNonViable) {
+			http.Error(w, err.Error(), http.StatusPreconditionFailed)
+			return
+		}
+		if errors.Is(err, ErrUnknownEgressPolicy) || errors.Is(err, ErrInvalidMaxCost) {
+			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.redirect(w, r, fmt.Sprintf("/scans/%d", newID))
+}
+
+// errScanNotRetryable refuses a retry of a scan with no skill to re-run.
+var errScanNotRetryable = errors.New("scan cannot be retried: no skill reference")
+
+// retryScan enqueues a fresh attempt of scan with the options it ran under,
+// resuming its harness session when resumeOpts allows. It returns the new
+// scan id. Shared by the HTML retry button and POST /api/v1/ui/scans/{id}/actions/retry.
+func (s *Server) retryScan(ctx context.Context, scan db.Scan) (uint, error) {
+	if scan.Kind != worker.JobSkill || scan.SkillID == nil {
+		return 0, errScanNotRetryable
+	}
+	return s.enqueueSkillWith(ctx, scan.RepositoryID, *scan.SkillID, s.retryScanOpts(scan))
+}
+
+// retryScanOpts are the ScanOpts a retry of scan runs with: everything the
+// scan was launched with, parented to it, plus the resume session when one
+// applies. scan must carry the columns retryFailedScanColumns selects.
+func (s *Server) retryScanOpts(scan db.Scan) ScanOpts {
 	sessionID, resumeOf := s.resumeOpts(scan)
-	newID, err := s.enqueueSkillWith(r.Context(), scan.RepositoryID, *scan.SkillID, ScanOpts{
+	parent := scan.ID
+	return ScanOpts{
 		AuditRetry:           true,
 		Model:                scan.Model,
 		Effort:               scan.Effort,
@@ -391,26 +434,13 @@ func (s *Server) scanRetry(w http.ResponseWriter, r *http.Request) {
 		ExplorationPath:      scan.ExplorationPath,
 		SessionID:            sessionID,
 		ResumedFromScanID:    resumeOf,
-		ParentScanID:         &scan.ID,
+		ParentScanID:         &parent,
 		VerificationFeedback: scan.VerificationFeedback,
 		// An ingest scan's input is the uploaded payload, not ./src;
 		// without it the retry stages no import/report and the model
 		// runs against a missing file.
 		ImportPayload: scan.ImportPayload,
-	})
-	if err != nil {
-		if errors.Is(err, db.ErrFindingNonViable) {
-			http.Error(w, err.Error(), http.StatusPreconditionFailed)
-			return
-		}
-		if errors.Is(err, ErrUnknownEgressPolicy) || errors.Is(err, ErrInvalidMaxCost) {
-			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
-			return
-		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
 	}
-	s.redirect(w, r, fmt.Sprintf("/scans/%d", newID))
 }
 
 // resumeOpts decides whether a retry of scan should resume its harness
@@ -456,89 +486,18 @@ func (s *Server) scansRetryFailed(w http.ResponseWriter, r *http.Request) {
 	}
 	skillFilter := parseScanSkillFilter(r.URL.Query().Get("skill"))
 	repoID, _ := strconv.Atoi(r.URL.Query().Get("repository"))
-	q := skillFilter.apply(s.DB.Model(&db.Scan{}).
-		Where("status = ? AND kind = ? AND skill_id IS NOT NULL", db.ScanFailed, worker.JobSkill))
-	q = applyScanCompletenessFilter(q, completeness)
 	group := r.URL.Query().Get("group")
-	if group != "" {
-		q = q.Where("scan_group = ?", group)
-	}
+	filter := retryFailedFilter{skill: skillFilter, completeness: completeness, group: group}
 	if repoID > 0 {
-		q = q.Where("repository_id = ?", repoID)
+		filter.repositoryID = uint(repoID)
 	}
-
-	var totalFailed int64
-	q.Count(&totalFailed)
-
-	// Skip a failed scan when a newer queued/running/done/failed/paused scan
-	// supersedes the same (repository, skill, sub_path, ref, finding_id) tuple.
-	// An unscoped focus area supersedes and is superseded by any area, while two
-	// scoped runs only supersede each other when their areas match. Cancelled is
-	// deliberately absent: a user-cancelled newer run must not block retrying an
-	// older genuine failure.
-	var scans []db.Scan
-	err = q.Select("id, repository_id, skill_id, model, effort, finding_id, remediation_attempt_id, sub_path, scope_mode, ref, profile, egress_policy, max_cost_usd, rescan_mode, diff_base_scan_id, scan_group, focus_area, triage_scan_id, exploration_mode, exploration_path, backend, status, session_id, resumed_from_scan_id, import_payload, verification_feedback").
-		Where(`NOT EXISTS (
-			SELECT 1 FROM scans n
-			WHERE n.id > scans.id
-			  AND n.repository_id = scans.repository_id
-			  AND COALESCE(n.skill_id, 0) = COALESCE(scans.skill_id, 0)
-			  AND COALESCE(n.sub_path, '') = COALESCE(scans.sub_path, '')
-			  AND COALESCE(n.ref, '') = COALESCE(scans.ref, '')
-			  AND COALESCE(n.finding_id, 0) = COALESCE(scans.finding_id, 0)
-			  AND (
-				COALESCE(n.focus_area, '') = COALESCE(scans.focus_area, '')
-				OR COALESCE(n.focus_area, '') = ''
-				OR COALESCE(scans.focus_area, '') = ''
-			  )
-			  AND n.status IN ?
-		)`, []db.ScanStatus{db.ScanQueued, db.ScanRunning, db.ScanDone, db.ScanFailed, db.ScanPaused}).
-		Find(&scans).Error
+	res, err := s.retryFailedScans(r.Context(), filter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	var retried, errored int
-	for _, sc := range scans {
-		sessionID, resumeOf := s.resumeOpts(sc)
-		parent := sc.ID
-		if _, err := s.enqueueSkillWith(r.Context(), sc.RepositoryID, *sc.SkillID, ScanOpts{
-			AuditRetry:           true,
-			Model:                sc.Model,
-			Effort:               sc.Effort,
-			FindingID:            sc.FindingID,
-			RemediationAttemptID: sc.RemediationAttemptID,
-			SubPath:              sc.SubPath,
-			ScopeMode:            sc.ScopeMode,
-			Ref:                  sc.Ref,
-			Profile:              sc.Profile,
-			EgressPolicy:         sc.EgressPolicy,
-			MaxCostUSD:           sc.MaxCostUSD,
-			RescanMode:           sc.RescanMode,
-			DiffBaseScanID:       sc.DiffBaseScanID,
-			ScanGroup:            sc.ScanGroup,
-			FocusArea:            sc.FocusArea,
-			TriageScanID:         sc.TriageScanID,
-			ExplorationMode:      sc.ExplorationMode,
-			ExplorationPath:      sc.ExplorationPath,
-			SessionID:            sessionID,
-			ResumedFromScanID:    resumeOf,
-			ParentScanID:         &parent,
-			VerificationFeedback: sc.VerificationFeedback,
-			ImportPayload:        sc.ImportPayload,
-		}); err != nil {
-			if errors.Is(err, db.ErrFindingNonViable) {
-				continue
-			}
-			errored++
-			continue
-		}
-		retried++
-	}
-	skipped := int(totalFailed) - retried - errored
-
-	setFlash(w, retryFailedToast(retried, skipped, errored))
+	setFlash(w, retryFailedToast(res.retried, res.skipped, res.errored))
 	// Repo-scoped retries return to that repo's Scans tab so the operator
 	// stays in context; otherwise we send them to the global jobs list
 	// filtered to failed.
@@ -557,7 +516,99 @@ func (s *Server) scansRetryFailed(w http.ResponseWriter, r *http.Request) {
 	s.redirect(w, r, target)
 }
 
+// retryFailedFilter selects the failed scans a bulk retry considers.
+type retryFailedFilter struct {
+	skill        scanSkillFilter
+	completeness string
+	group        string
+	repositoryID uint
+}
+
+// retryFailedResult counts a bulk retry; scanIDs are the new attempts.
+type retryFailedResult struct {
+	retried, skipped, errored int
+	scanIDs                   []uint
+}
+
+// retryFailedScanColumns are the columns retryScanOpts reads.
+const retryFailedScanColumns = "id, repository_id, skill_id, model, effort, finding_id, remediation_attempt_id, sub_path, scope_mode, ref, profile, egress_policy, max_cost_usd, rescan_mode, diff_base_scan_id, scan_group, focus_area, triage_scan_id, exploration_mode, exploration_path, backend, status, session_id, resumed_from_scan_id, import_payload, verification_feedback"
+
+// retryFailedScans re-enqueues every failed skill scan matching f that no
+// newer attempt supersedes. Shared by the HTML bulk button and
+// POST /api/v1/ui/scans/actions/retry-failed.
+func (s *Server) retryFailedScans(ctx context.Context, f retryFailedFilter) (retryFailedResult, error) {
+	var res retryFailedResult
+	q := f.skill.apply(s.DB.Model(&db.Scan{}).
+		Where("status = ? AND kind = ? AND skill_id IS NOT NULL", db.ScanFailed, worker.JobSkill))
+	q = applyScanCompletenessFilter(q, f.completeness)
+	if f.group != "" {
+		q = q.Where("scan_group = ?", f.group)
+	}
+	if f.repositoryID > 0 {
+		q = q.Where("repository_id = ?", f.repositoryID)
+	}
+
+	var totalFailed int64
+	q.Count(&totalFailed)
+
+	// Skip a failed scan when a newer queued/running/done/failed/paused scan
+	// supersedes the same (repository, skill, sub_path, ref, finding_id) tuple.
+	// An unscoped focus area supersedes and is superseded by any area, while two
+	// scoped runs only supersede each other when their areas match. Cancelled is
+	// deliberately absent: a user-cancelled newer run must not block retrying an
+	// older genuine failure.
+	var scans []db.Scan
+	err := q.Select(retryFailedScanColumns).
+		Where(`NOT EXISTS (
+			SELECT 1 FROM scans n
+			WHERE n.id > scans.id
+			  AND n.repository_id = scans.repository_id
+			  AND COALESCE(n.skill_id, 0) = COALESCE(scans.skill_id, 0)
+			  AND COALESCE(n.sub_path, '') = COALESCE(scans.sub_path, '')
+			  AND COALESCE(n.ref, '') = COALESCE(scans.ref, '')
+			  AND COALESCE(n.finding_id, 0) = COALESCE(scans.finding_id, 0)
+			  AND (
+				COALESCE(n.focus_area, '') = COALESCE(scans.focus_area, '')
+				OR COALESCE(n.focus_area, '') = ''
+				OR COALESCE(scans.focus_area, '') = ''
+			  )
+			  AND n.status IN ?
+		)`, []db.ScanStatus{db.ScanQueued, db.ScanRunning, db.ScanDone, db.ScanFailed, db.ScanPaused}).
+		Find(&scans).Error
+	if err != nil {
+		return res, err
+	}
+
+	for _, sc := range scans {
+		id, err := s.enqueueSkillWith(ctx, sc.RepositoryID, *sc.SkillID, s.retryScanOpts(sc))
+		if err != nil {
+			if errors.Is(err, db.ErrFindingNonViable) {
+				continue
+			}
+			res.errored++
+			continue
+		}
+		res.retried++
+		res.scanIDs = append(res.scanIDs, id)
+	}
+	res.skipped = int(totalFailed) - res.retried - res.errored
+	return res, nil
+}
+
 func (s *Server) scansPauseQueued(w http.ResponseWriter, r *http.Request) {
+	changed, err := s.pauseQueuedScans()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("%d queued scans paused", len(changed))})
+	s.redirect(w, r, "/scans?status=paused")
+}
+
+// pauseQueuedScans pauses every queued scan and tells each affected
+// repository's list to refetch. Shared by the HTML bulk button and
+// POST /api/v1/ui/scans/actions/pause-queued.
+func (s *Server) pauseQueuedScans() ([]db.Scan, error) {
 	now := time.Now()
 	changed, err := updateScansWithAudit(s.DB.Where("status = ?", db.ScanQueued), scanStatusUpdates(
 		db.ScanPaused,
@@ -566,8 +617,7 @@ func (s *Server) scansPauseQueued(w http.ResponseWriter, r *http.Request) {
 		nil,
 	), db.AuditEventScanPaused, db.ScanQueued, db.ScanPaused, db.SourceAnalyst)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, err
 	}
 	repos := make(map[uint]bool)
 	for _, scan := range changed {
@@ -576,8 +626,7 @@ func (s *Server) scansPauseQueued(w http.ResponseWriter, r *http.Request) {
 			repos[scan.RepositoryID] = true
 		}
 	}
-	setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("%d queued scans paused", len(changed))})
-	s.redirect(w, r, "/scans?status=paused")
+	return changed, nil
 }
 
 func scanStatusUpdates(status db.ScanStatus, msg string, finishedAt *time.Time, pausedUntil *time.Time) map[string]any {
@@ -660,22 +709,14 @@ func (s *Server) enqueueResumedScan(ctx context.Context, scan db.Scan) error {
 
 func (s *Server) scansResumePaused(w http.ResponseWriter, r *http.Request) {
 	repoID, _ := strconv.Atoi(r.URL.Query().Get("repository"))
-	q := s.DB
+	var scope uint
 	if repoID > 0 {
-		q = q.Where("repository_id = ?", repoID)
+		scope = uint(repoID)
 	}
-	scans, err := s.bulkResumePaused(q)
+	resumed, errored, err := s.resumePausedScans(r.Context(), scope)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	var resumed, errored int
-	for _, sc := range scans {
-		if err := s.enqueueResumedScan(r.Context(), sc); err != nil {
-			errored++
-			continue
-		}
-		resumed++
 	}
 	cat := successKey
 	if errored > 0 {
@@ -691,16 +732,38 @@ func (s *Server) scansResumePaused(w http.ResponseWriter, r *http.Request) {
 	s.redirect(w, r, "/scans?status=queued")
 }
 
+// resumePausedScans re-queues every paused scan (of one repository when
+// repoID is non-zero) and counts the ones whose enqueue failed. Shared by the
+// HTML bulk button and POST /api/v1/ui/scans/actions/resume-paused.
+func (s *Server) resumePausedScans(ctx context.Context, repoID uint) (resumed, errored int, err error) {
+	q := s.DB
+	if repoID > 0 {
+		q = q.Where("repository_id = ?", repoID)
+	}
+	scans, err := s.bulkResumePaused(q)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, sc := range scans {
+		if err := s.enqueueResumedScan(ctx, sc); err != nil {
+			errored++
+			continue
+		}
+		resumed++
+	}
+	return resumed, errored, nil
+}
+
 func (s *Server) scanResume(w http.ResponseWriter, r *http.Request) {
 	scan, ok := loadByID[db.Scan](s, w, r)
 	if !ok {
 		return
 	}
-	if scan.Status != db.ScanPaused {
-		http.Error(w, "scan is not paused", http.StatusBadRequest)
-		return
-	}
-	if err := s.resumeScan(r.Context(), &scan); err != nil {
+	if err := s.resumePausedScan(r.Context(), &scan); err != nil {
+		if errors.Is(err, errScanNotPaused) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if errors.Is(err, ErrRepoFederationOptOut) {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
@@ -709,6 +772,18 @@ func (s *Server) scanResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.redirect(w, r, fmt.Sprintf("/scans/%d", scan.ID))
+}
+
+// errScanNotPaused refuses a resume of a scan that is not paused.
+var errScanNotPaused = errors.New("scan is not paused")
+
+// resumePausedScan resumes scan after checking it is paused. Shared by the
+// HTML resume button and POST /api/v1/ui/scans/{id}/actions/resume.
+func (s *Server) resumePausedScan(ctx context.Context, scan *db.Scan) error {
+	if scan.Status != db.ScanPaused {
+		return errScanNotPaused
+	}
+	return s.resumeScan(ctx, scan)
 }
 
 func (s *Server) resumeScan(ctx context.Context, scan *db.Scan) error {
@@ -758,24 +833,13 @@ func (s *Server) scanCancel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if scan.Status.Terminal() {
-		http.Error(w, "scan already finished", http.StatusBadRequest)
-		return
-	}
-	if scan.Status == db.ScanPaused {
-		http.Error(w, "scan is paused", http.StatusBadRequest)
-		return
-	}
-	changed, err := s.cancelScanWithAudit(&scan, worker.CancelledByUser)
-	if err != nil {
+	if err := s.cancelScanByUser(&scan); err != nil {
+		if errors.Is(err, errScanFinished) || errors.Is(err, errScanPaused) {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	if changed {
-		// A queued scan isn't in flight, so the worker never publishes a
-		// scan-status event for it; push one ourselves so the repo Scans tab
-		// and the scan page reflect the cancellation live.
-		s.publishScanRow(&scan)
 	}
 	// Deliberately no redirect: cancelling from a list (repo Scans tab, jobs)
 	// should leave the operator on that list so they can cancel the next one,
@@ -790,6 +854,35 @@ func (s *Server) scanCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, fmt.Sprintf("/scans/%d", scan.ID), http.StatusSeeOther)
+}
+
+var (
+	// errScanFinished refuses a cancel of a scan that already finished.
+	errScanFinished = errors.New("scan already finished")
+	// errScanPaused refuses a cancel of a paused scan (resume or leave it).
+	errScanPaused = errors.New("scan is paused")
+)
+
+// cancelScanByUser cancels a queued or running scan on the operator's behalf.
+// Shared by the HTML cancel button and POST /api/v1/ui/scans/{id}/actions/cancel.
+func (s *Server) cancelScanByUser(scan *db.Scan) error {
+	if scan.Status.Terminal() {
+		return errScanFinished
+	}
+	if scan.Status == db.ScanPaused {
+		return errScanPaused
+	}
+	changed, err := s.cancelScanWithAudit(scan, worker.CancelledByUser)
+	if err != nil {
+		return err
+	}
+	if changed {
+		// A queued scan isn't in flight, so the worker never publishes a
+		// scan-status event for it; push one ourselves so the repo Scans tab
+		// and the scan page reflect the cancellation live.
+		s.publishScanRow(scan)
+	}
+	return nil
 }
 
 // sameOriginReferer returns the Referer header value only if it points back at
@@ -870,12 +963,27 @@ func (s *Server) scansCancelAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing repository", http.StatusBadRequest)
 		return
 	}
+	cancelled, err := s.cancelAllScans(uint(repoID))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("%d scan(s) cancelled", cancelled)})
+	// Back to the Scans tab: the redirect re-renders the table with fresh DB
+	// state, so every flipped row shows "cancelled" without per-scan SSE pushes.
+	// The push above is for the other pages left open on those rows.
+	s.redirect(w, r, fmt.Sprintf("/repositories/%d#rt3", repoID))
+}
+
+// cancelAllScans cancels every queued or running scan on a repository and
+// returns how many it cancelled. Shared by the HTML bulk button and
+// POST /api/v1/ui/scans/actions/cancel-all.
+func (s *Server) cancelAllScans(repoID uint) (int, error) {
 	now := time.Now()
 	queued, err := updateScansWithAudit(s.DB.Where("repository_id = ? AND status = ?", repoID, db.ScanQueued),
 		scanStatusUpdates(db.ScanCancelled, worker.CancelledByUser, &now, nil), db.AuditEventScanCancelled, db.ScanQueued, db.ScanCancelled, db.SourceAnalyst)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return 0, err
 	}
 	grouped := make([]uint, 0, len(queued))
 	for _, scan := range queued {
@@ -885,25 +993,19 @@ func (s *Server) scansCancelAll(w http.ResponseWriter, r *http.Request) {
 	var scans []db.Scan
 	if err := s.DB.Where("repository_id = ? AND status IN ?",
 		repoID, []db.ScanStatus{db.ScanRunning}).Find(&scans).Error; err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return 0, err
 	}
 	cancelled := len(queued)
 	for i := range scans {
 		if _, err := s.cancelScanWithAudit(&scans[i], worker.CancelledByUser); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return cancelled, err
 		}
 		cancelled++
 	}
 	if cancelled > 0 {
-		s.publishScanList(uint(repoID))
+		s.publishScanList(repoID)
 	}
-	setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("%d scan(s) cancelled", cancelled)})
-	// Back to the Scans tab: the redirect re-renders the table with fresh DB
-	// state, so every flipped row shows "cancelled" without per-scan SSE pushes.
-	// The push above is for the other pages left open on those rows.
-	s.redirect(w, r, fmt.Sprintf("/repositories/%d#rt3", repoID))
+	return cancelled, nil
 }
 
 // scanLog returns just the <pre> log block. The scan page polls this with

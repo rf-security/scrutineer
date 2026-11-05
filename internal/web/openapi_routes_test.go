@@ -420,8 +420,15 @@ func TestOpenAPIUIPlannedStatusMatchesRoutes(t *testing.T) {
 			continue
 		}
 		for method, raw := range ops {
-			op, ok := raw.(map[string]any)
-			if !ok {
+			// yaml decodes the nested operation as openAPIPath (the map
+			// type of the parent), not a bare map[string]any.
+			var op map[string]any
+			switch v := raw.(type) {
+			case openAPIPath:
+				op = v
+			case map[string]any:
+				op = v
+			default:
 				continue
 			}
 			key := method + " " + path

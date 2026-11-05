@@ -309,6 +309,10 @@ func (s *Server) storedScanLog(scanID uint) string {
 // afterBrokerPublish runs after every event: scan-status schedules the
 // debounced queue event and retires the log offset of a scan that stopped.
 func (s *Server) afterBrokerPublish(e Event) {
+	if e.Name == scanLogEvent && e.JSON == nil {
+		s.observeLiveLog(e)
+		return
+	}
 	if e.Name != scanStatusEvent || e.JSON != nil {
 		return
 	}
@@ -320,10 +324,12 @@ func (s *Server) afterBrokerPublish(e Event) {
 	s.DB.Model(&db.Scan{}).Where("id = ?", e.ScanID).Pluck("status", &statuses)
 	if len(statuses) == 0 {
 		s.Broker.forgetLogOffset(e.ScanID)
+		s.ui.liveLogs.forget(e.ScanID)
 		return
 	}
 	if st := db.ScanStatus(statuses[0]); st.Terminal() || st == db.ScanPaused {
 		s.Broker.forgetLogOffset(e.ScanID)
+		s.ui.liveLogs.forget(e.ScanID)
 	}
 }
 

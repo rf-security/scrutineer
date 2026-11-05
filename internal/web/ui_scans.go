@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"scrutineer/internal/coverage"
 	"scrutineer/internal/db"
@@ -80,28 +79,11 @@ func (p uiScanListParams) where(q *gorm.DB) *gorm.DB {
 	return q
 }
 
-// uiScanListOrder mirrors the sort switch of the HTML scans page (jobs) so
-// URL sort tokens are portable. TODO(WP-API-4): share one extracted
-// scansOrderBy with jobs once scans.go helper extraction lands.
+// uiScanListOrder applies the HTML scans page's sort (scansOrder) so URL sort
+// tokens are portable between the two lists.
 func (s *Server) uiScanListOrder(q *gorm.DB, token string) *gorm.DB {
-	col, dir := splitSort(token)
-	switch col {
-	case "id":
-		return q.Order(orderByExpr("scans.id", dir, true))
-	case "skill":
-		return q.Order(orderByExpr("scans.skill_name", dir, false)).Order("scans.id desc")
-	case statusKey:
-		return q.Order(orderByExpr("scans.status", dir, false)).Order("scans.id desc")
-	case sortRepository:
-		const repositoryNameColumn = "name"
-		return q.Joins("Repository", s.DB.Select("id", uiKeyName)).
-			Order(clause.OrderByColumn{Column: clause.Column{Table: "Repository", Name: repositoryNameColumn}, Desc: wantDesc(dir, false)}).
-			Order("scans.id desc")
-	case uiKeyFindings:
-		return q.Order(orderByExpr("scans.findings_count", dir, true)).Order("scans.id desc")
-	default:
-		return q.Order("scans.status_priority, scans.id desc")
-	}
+	q, _, _ = s.scansOrder(q, token)
+	return q
 }
 
 func (s *Server) uiScanList(w http.ResponseWriter, r *http.Request) {

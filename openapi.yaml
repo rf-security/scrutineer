@@ -2726,7 +2726,13 @@ paths:
       operationId: setUIFindingStatus
       tags:
       - ui-finding-actions
-      x-status: planned
+      description: 'The finding page''s status transition. `rejected` needs `verdict` (false_positive, already_fixed,
+        uncertain) and `reason` and records the review atomically; `ready` needs a saved disclosure draft (422
+        fields.status); a first move to `reported` asks the federation peers and answers 409 federation_claimed
+        {contacts} when one holds it (the claim is recorded, so repeating the request goes through); 412 when the
+        latest critic ruled the finding NON_VIABLE; 503 when the peers cannot be asked. Publishes `finding
+        {fields:[status,history(,reviews)]}`. `Prefer: return=representation` is accepted but currently answered
+        with the slim row.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2769,8 +2775,11 @@ paths:
       operationId: runUIFindingAction
       tags:
       - ui-finding-actions
-      description: '**Enqueues model work.** 409 in_flight for verify/critic/disclose/reattack.'
-      x-status: planned
+      description: '**Enqueues model work.** 202 {scan_id}. verify, critic, disclose and reattack are deduplicated:
+        an open scan of the same skill (and remediation attempt) answers 409 in_flight {scan_id}. 412 when the skill
+        is not installed, the finding is NON_VIABLE (disclose, public-issue) or reattack has no gated patch / base
+        commit; 409 federation_claimed {contacts} when a peer holds the finding for an outreach skill; 409 conflict
+        when the repository opted out of federation. `feedback` is verify-only (422 otherwise).'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2822,8 +2831,9 @@ paths:
       operationId: runUIFindingExposure
       tags:
       - ui-finding-actions
-      description: '**Enqueues model work.**'
-      x-status: planned
+      description: '**Enqueues model work.** One exposure scan per top-10 dependent; dependents without a repository
+        URL are recorded as under_investigation and counted as skipped. 422 for zizmor findings or a repository with
+        no dependents; 412 when the exposure skill is not installed. `message` is the toast text.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2860,8 +2870,10 @@ paths:
       operationId: runUIFindingValidateFix
       tags:
       - ui-finding-actions
-      description: '**Enqueues model work.**'
-      x-status: planned
+      description: '**Enqueues model work.** Re-runs the baseline scan''s skill against `ref` (the anchor, `scan_id`)
+        and a finding-scoped verify per finding (`verify_scan_ids`; skipped when one is already open for that ref).
+        `finding_ids` defaults to this finding and must share its repository and baseline scan (422 fields.finding_ids);
+        a bad ref is 422 fields.ref.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2884,6 +2896,8 @@ paths:
           $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
+        '409':
+          $ref: '#/components/responses/UIConflict'
         '412':
           $ref: '#/components/responses/UIPreconditionFailed'
         '422':
@@ -2898,7 +2912,10 @@ paths:
       operationId: getUIFindingVINCE
       tags:
       - ui-finding-actions
-      x-status: planned
+      description: 'The prefilled CERT/CC VINCE report (keys are the submit body''s field names) and the attachment
+        preview whose `generated_at`/`sha256` the submit must echo. 404 when VINCE is not configured; 409
+        precondition_failed when the finding is not eligible; 422 fields.selection for a package or reference that
+        is not the finding''s.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2906,11 +2923,19 @@ paths:
       - $ref: '#/components/parameters/UIPathID'
       - name: package_id
         in: query
+        description: Package to report as the product (0 or absent = the repository).
         schema:
-          type: array
-          items:
-            type: integer
-            format: int64
+          type: integer
+          format: int64
+      - name: attachment
+        in: query
+        description: Attachment choice to preview (default bundle).
+        schema:
+          type: string
+          enum:
+          - bundle
+          - report
+          - none
       - name: reference_id
         in: query
         schema:
@@ -2925,10 +2950,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/VinceView'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '409':
           $ref: '#/components/responses/UIConflict'
+        '422':
+          $ref: '#/components/responses/UIValidationFailed'
         '401':
           $ref: '#/components/responses/UIUnauthorized'
         '500':
@@ -2938,7 +2967,13 @@ paths:
       operationId: submitUIFindingVINCE
       tags:
       - ui-finding-actions
-      x-status: planned
+      description: '**Sends the report to CERT/CC.** Body: the preview''s `report` object plus `package_id`,
+        `reference_id` (array), `attachment`, `attachment_generated_at`, `attachment_sha256`, the `confirm_*` keys
+        (true or "yes") and `resend` (true when the finding was already sent). Strings, numbers, booleans and arrays
+        of those are accepted. 422 validation_failed carries `fields` (joined) and `field_errors` (per-field lists);
+        409 precondition_failed when ineligible, 409 federation_claimed {contacts} when a peer holds the finding
+        (submit again to send anyway); 502 network {upstream, ambiguous} when VINCE refuses (auth, rate limit) or
+        answers ambiguously; 500 {reconciliation_vrf_id} when VINCE accepted but the result could not be saved.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2968,6 +3003,8 @@ paths:
           $ref: '#/components/responses/UIValidationFailed'
         '502':
           $ref: '#/components/responses/UINetwork'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
         '401':
           $ref: '#/components/responses/UIUnauthorized'
         '500':
@@ -2978,7 +3015,9 @@ paths:
       operationId: getUIFindingAkrites
       tags:
       - ui-finding-actions
-      x-status: planned
+      description: 'The prefilled Akrites report (when a submission is possible) and earlier submissions. 404 when
+        Akrites is not configured and nothing was sent; 409 precondition_failed when the finding is not eligible and
+        nothing was sent (with earlier submissions it answers 200 with `show_form:false` and `error`).'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -2991,6 +3030,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AkritesView'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '409':
@@ -3004,7 +3045,10 @@ paths:
       operationId: submitUIFindingAkrites
       tags:
       - ui-finding-actions
-      x-status: planned
+      description: '**Sends the report to Akrites.** Body: the preview''s `report` object plus `confirm` (true or
+        "yes"), `endpoint` (the preview''s endpoint) and `resend` when sending again. 422 validation_failed, 409
+        precondition_failed / federation_claimed {contacts}, 502 network when intake fails (with `submission` when
+        an uncertain record was kept), 500 {submission} when intake accepted but bookkeeping failed.'
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3034,6 +3078,8 @@ paths:
           $ref: '#/components/responses/UIValidationFailed'
         '502':
           $ref: '#/components/responses/UINetwork'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
         '401':
           $ref: '#/components/responses/UIUnauthorized'
         '500':
@@ -3044,7 +3090,6 @@ paths:
       operationId: listUIFindingConversations
       tags:
       - ui-finding-actions
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -3059,6 +3104,8 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/ConversationRow'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -3071,7 +3118,6 @@ paths:
       tags:
       - ui-finding-actions
       description: '**Spends model credits (chat turn).**'
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -9239,44 +9285,150 @@ components:
       required:
       - eligible
       - reason
+      - sources
+      - selection
       - report
+      - attachment
+      - attachment_options
+      - recipient
+      - reports_url
+      - sent_before
+      - confirmations
       - submissions
+      - field_errors
       properties:
         eligible:
           type: boolean
+          description: Always true on 200 (an ineligible finding is 409).
         reason:
           type: string
         sources:
           type: object
+          required:
+          - packages
+          - references
           properties:
             packages:
               type: array
               items:
                 type: object
-                additionalProperties: true
+                required:
+                - id
+                - name
+                - ecosystem
+                properties:
+                  id:
+                    type: integer
+                    format: int64
+                  name:
+                    type: string
+                  ecosystem:
+                    type: string
             references:
               type: array
               items:
                 type: object
-                additionalProperties: true
+                required:
+                - id
+                - url
+                - tags
+                - summary
+                - vince
+                properties:
+                  id:
+                    type: integer
+                    format: int64
+                  url:
+                    type: string
+                  tags:
+                    type: string
+                  summary:
+                    type: string
+                  vince:
+                    type: boolean
+                    description: A VINCE reference (never sent as a public reference).
+        selection:
+          type: object
+          required:
+          - package_id
+          - reference_id
+          properties:
+            package_id:
+              type: integer
+              format: int64
+            reference_id:
+              type: array
+              items:
+                type: integer
+                format: int64
         report:
           type: object
+          description: The VINCE form fields keyed by their submit names (contact_name, contact_org, ..., vul_description,
+            cisa_please); `coord_status` is an array, every other value a string.
           additionalProperties: true
         attachment:
           type: object
+          required:
+          - choice
+          - size
+          - too_large
+          - generated_at
+          - sha256
           properties:
+            choice:
+              type: string
+            name:
+              type: string
             size:
               type: integer
               format: int64
             too_large:
               type: boolean
             generated_at:
-              type:
-              - string
-              - 'null'
-              format: date-time
+              type: string
+              description: Echo as attachment_generated_at on submit.
             sha256:
               type: string
+              description: Echo as attachment_sha256 on submit (empty for none).
+        attachment_options:
+          type: array
+          items:
+            type: object
+            required:
+            - value
+            - label
+            - name
+            - size
+            - too_large
+            - contents
+            properties:
+              value:
+                type: string
+              label:
+                type: string
+              name:
+                type: string
+              size:
+                type: integer
+                format: int64
+              too_large:
+                type: boolean
+              contents:
+                type: array
+                items:
+                  type: string
+        recipient:
+          type: string
+        reports_url:
+          type: string
+        sent_before:
+          type: boolean
+          description: Already sent to VINCE; a new submit needs resend.
+        confirmations:
+          type: array
+          description: The confirm_* keys a submit must carry.
+          items:
+            type: string
         submissions:
           type: array
           items:
@@ -9296,8 +9448,59 @@ components:
           type: string
     AkritesView:
       type: object
-      additionalProperties: true
-      description: AkritesPage, json-tagged.
+      required:
+      - show_form
+      - endpoint
+      - error
+      - report
+      - submissions
+      properties:
+        show_form:
+          type: boolean
+          description: False when submission is disabled or the finding is ineligible (history only).
+        endpoint:
+          type: string
+          description: Echo as `endpoint` on submit.
+        error:
+          type: string
+        report:
+          description: The Akrites form fields keyed by their submit names; null when show_form is false.
+          oneOf:
+          - type: 'null'
+          - type: object
+            properties:
+              software:
+                type: string
+              purl:
+                type: string
+              ecosystem:
+                type: string
+              versions:
+                type: string
+                description: One version per line.
+              raw:
+                type: string
+                description: The disclosure report.
+              exploit:
+                type: string
+              package_repo_url:
+                type: string
+              discovery_method:
+                type: string
+              email:
+                type: string
+              notify:
+                type: string
+              symbol_file:
+                type: string
+              symbol_function:
+                type: string
+              symbol_line:
+                type: string
+        submissions:
+          type: array
+          items:
+            $ref: '#/components/schemas/DisclosureSubmission'
     ConversationCreate:
       type: object
       required:

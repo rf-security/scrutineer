@@ -180,26 +180,6 @@ func (s *Server) claimPeerHold(ctx context.Context, f db.Finding) (string, error
 	}).Error
 }
 
-// federationClaimGate runs the outbound claim-check before a finding moves
-// to reported and reports whether the transition may proceed; when it may
-// not, the response has already been written. A peer holding the same
-// finding means two instances are about to report it separately, so the
-// analyst is sent back to the page where the banner names the contacts to
-// coordinate with, and the next submit goes through.
-func (s *Server) federationClaimGate(w http.ResponseWriter, r *http.Request, f db.Finding) bool {
-	claims, err := s.claimPeerHold(r.Context(), f)
-	if err != nil {
-		s.Log.Error("claim-check out", "finding", f.ID, "err", err)
-		http.Error(w, "failed to check federation peers", http.StatusInternalServerError)
-		return false
-	}
-	if claims == "" {
-		return true
-	}
-	s.redirect(w, r, fmt.Sprintf("/findings/%d", f.ID))
-	return false
-}
-
 // refuseClaimedOutreach runs the outbound claim-check when an outreach skill is
 // about to be enqueued on a finding, and returns ErrFederationClaimPending when
 // a peer holds it. The check sits at enqueue rather than on the skill's own

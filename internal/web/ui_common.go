@@ -263,6 +263,8 @@ func uiQueryID(r *http.Request, name string) (uint, error) {
 }
 
 // uiPathID parses the {id} path value, writing a 400 when it is malformed.
+//
+//nolint:unparam // every route so far names it {id}; the parameter is for the ones that do not
 func uiPathID(w http.ResponseWriter, r *http.Request, name string) (uint, bool) {
 	n, err := strconv.ParseUint(r.PathValue(name), 10, 64)
 	if err != nil || n == 0 {

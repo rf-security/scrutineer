@@ -46,6 +46,9 @@ type uiState struct {
 	// dir, when set, serves the SPA from disk instead of the embedded build,
 	// re-reading index.html per request so a rebuild needs no restart.
 	dir string
+	// liveLogs mirrors running scans' logs for GET /ui/scans/{id}/log
+	// (ui_scans_log.go).
+	liveLogs uiLiveLogs
 }
 
 // EnableTestHooks turns on the dev-only SSE publish seam. Call before

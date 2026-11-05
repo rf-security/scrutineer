@@ -83,6 +83,26 @@ func TestUIFindingActionsStatus(t *testing.T) {
 	}
 }
 
+// Prefer: return=representation answers the transition with the full
+// FindingDetail instead of the slim row.
+func TestUIFindingActionsStatusRepresentation(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	f := uiActSeed(t, s)
+
+	req := operatorReq(t, http.MethodPost, uiActPath(f.ID, "status"), map[string]any{"status": "triaged"})
+	req.Header.Set(uiPreferHeader, uiPreferFull)
+	got := decodeUIJSON[map[string]any](t, serveUI(t, s, req), http.StatusOK)
+	if got[statusKey] != string(db.FindingTriaged) {
+		t.Fatalf("status = %v", got[statusKey])
+	}
+	for _, key := range []string{"workflow", "counts", "exports", "cwe_info"} {
+		if _, ok := got[key]; !ok {
+			t.Errorf("representation missing %q", key)
+		}
+	}
+}
+
 func TestUIFindingActionsStatusErrors(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()

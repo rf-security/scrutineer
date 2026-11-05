@@ -2736,8 +2736,8 @@ paths:
         fields.status); a first move to `reported` asks the federation peers and answers 409 federation_claimed
         {contacts} when one holds it (the claim is recorded, so repeating the request goes through); 412 when the
         latest critic ruled the finding NON_VIABLE; 503 when the peers cannot be asked. Publishes `finding
-        {fields:[status,history(,reviews)]}`. `Prefer: return=representation` is accepted but currently answered
-        with the slim row.'
+        {fields:[status,history(,reviews)]}`. With `Prefer: return=representation` the 200 body is the full
+        UIFindingDetail (a superset of FindingStatusResponse: it carries `workflow` too).'
       security:
       - operatorToken: []
       - operatorCookie: []

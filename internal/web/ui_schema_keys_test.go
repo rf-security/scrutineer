@@ -257,3 +257,39 @@ func TestUISchemaKeysChecker(t *testing.T) {
 		t.Fatalf("undeclared = %v", bad)
 	}
 }
+
+// Every /api/v1/ui path parameter is a numeric id read by uiPathID except
+// the few that are names; the spec must say integer so generated clients
+// type them as numbers.
+func TestUIPathParamsNumericIDs(t *testing.T) {
+	raw, err := os.ReadFile("../../openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Paths map[string]map[string]any `yaml:"paths"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	stringParams := map[string]bool{"action": true, "commit": true, "path": true, "login": true}
+	for p, ops := range doc.Paths {
+		if !strings.HasPrefix(p, "/v1/ui/") {
+			continue
+		}
+		for method, op := range ops {
+			opMap, _ := op.(map[string]any)
+			params, _ := opMap["parameters"].([]any)
+			for _, v := range params {
+				prm, _ := v.(map[string]any)
+				name, _ := prm["name"].(string)
+				if prm["in"] != "path" || stringParams[name] {
+					continue
+				}
+				if sch, _ := prm["schema"].(map[string]any); sch["type"] != "integer" {
+					t.Errorf("%s %s: path param %q is %v, want integer", method, p, name, sch["type"])
+				}
+			}
+		}
+	}
+}

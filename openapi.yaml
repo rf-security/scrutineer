@@ -3953,8 +3953,10 @@ paths:
       - $ref: '#/components/parameters/UIPathID'
       - name: sub
         in: path
+        description: Subproject id (Subproject.id), not its path.
         schema:
-          type: string
+          type: integer
+          format: int64
         required: true
       - $ref: '#/components/parameters/UIPage'
       - $ref: '#/components/parameters/UIPageSize'
@@ -3985,8 +3987,10 @@ paths:
       - $ref: '#/components/parameters/UIPathID'
       - name: sub
         in: path
+        description: Subproject id (Subproject.id), not its path.
         schema:
-          type: string
+          type: integer
+          format: int64
         required: true
       requestBody:
         required: true

@@ -502,28 +502,6 @@ func (s *Server) loadUIScanRow(id uint) (map[string]any, error) {
 	return rows[0], nil
 }
 
-// uiLocationRef parses "path:12-34" into a LocationRef; nil when empty.
-func uiLocationRef(location, commit string) map[string]any {
-	if strings.TrimSpace(location) == "" {
-		return nil
-	}
-	path, lines := splitLocation(location)
-	ref := map[string]any{"path": path, "line_start": 0, "line_end": nil, "commit": commit}
-	if lines == "" {
-		return ref
-	}
-	a, b, ranged := strings.Cut(lines, "-")
-	if n, err := strconv.Atoi(a); err == nil {
-		ref["line_start"] = n
-	}
-	if ranged {
-		if n, err := strconv.Atoi(b); err == nil {
-			ref["line_end"] = n
-		}
-	}
-	return ref
-}
-
 // uiLabel is the Label object form.
 func uiLabel(l db.FindingLabel) map[string]any {
 	return map[string]any{"id": l.ID, uiKeyName: l.Name, "color": l.Color}
@@ -545,14 +523,9 @@ func uiFindingRow(f db.Finding, repo db.Repository, skillName string) map[string
 	m[uiKeyCreatedAt] = f.CreatedAt
 	m["updated_at"] = f.UpdatedAt
 	m["location_ref"] = uiLocationRef(f.Location, f.Commit)
-	locs := make([]map[string]any, 0)
-	for _, l := range f.LocationList() {
-		if ref := uiLocationRef(l, f.Commit); ref != nil {
-			locs = append(locs, ref)
-		}
-	}
+	locs := uiFindingLocations(f.Location, f.LocationList(), f.Commit)
 	m["locations"] = locs
-	m["extra_location_count"] = f.ExtraLocationCount()
+	m["extra_location_count"] = max(len(locs)-1, 0)
 	if f.LastSeenScanID != 0 {
 		m["last_seen_scan_id"] = f.LastSeenScanID
 	} else {

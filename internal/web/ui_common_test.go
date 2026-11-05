@@ -260,6 +260,45 @@ func TestUILocationRef(t *testing.T) {
 	if uiLocationRef("  ", "") != nil {
 		t.Fatal("empty location should be nil")
 	}
+	if ref := uiLocationRef("web/app.js:42:7", ""); ref["path"] != "web/app.js" || ref["line_start"] != 42 {
+		t.Fatalf("SARIF column ref = %v", ref)
+	}
+	if ref := uiLocationRef("the request router", ""); ref["path"] != "the request router" || ref["line_start"] != 0 {
+		t.Fatalf("prose without a file reference = %v", ref)
+	}
+}
+
+// A model-written prose location (finding 145 in the dev dataset) links each
+// file reference it names instead of one bogus path.
+func TestUILocationRefsProse(t *testing.T) {
+	const loc = "src/lib.rs:214-296 (get_or_try / insert); manifests in src/lib.rs:444-475 (RawIter::next_mut), see ./src/raw.rs:9 and src/lib.rs:214-296"
+	refs := uiFindingLocations(loc, nil, "c0ffee")
+	want := []struct {
+		path       string
+		start, end any
+	}{{"src/lib.rs", 214, 296}, {"src/lib.rs", 444, 475}, {"src/raw.rs", 9, nil}}
+	if len(refs) != len(want) {
+		t.Fatalf("refs = %v", refs)
+	}
+	for i, w := range want {
+		if refs[i]["path"] != w.path || refs[i]["line_start"] != w.start || refs[i]["line_end"] != w.end || refs[i]["commit"] != "c0ffee" {
+			t.Fatalf("refs[%d] = %v, want %+v", i, refs[i], w)
+		}
+	}
+	if first := uiLocationRef(loc, "c0ffee"); first["path"] != "src/lib.rs" || first["line_start"] != 214 {
+		t.Fatalf("location_ref = %v", first)
+	}
+	// Grouped positions stay one entry each, in order, as the HTML page lists them.
+	grouped := uiFindingLocations("a.go:1", []string{"a.go:1", "b.go:2-3"}, "")
+	if len(grouped) != 2 || grouped[1]["path"] != "b.go" || grouped[1]["line_end"] != 3 {
+		t.Fatalf("grouped = %v", grouped)
+	}
+	if one := uiFindingLocations("lib/x.rb:5", nil, ""); len(one) != 1 || one[0]["line_start"] != 5 {
+		t.Fatalf("single = %v", one)
+	}
+	if none := uiFindingLocations("", nil, ""); len(none) != 0 {
+		t.Fatalf("empty = %v", none)
+	}
 }
 
 func TestUIFindingRowsProjection(t *testing.T) {

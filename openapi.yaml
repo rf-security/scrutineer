@@ -7314,6 +7314,9 @@ components:
           description: '#rrggbb'
     LocationRef:
       type: object
+      description: 'One code reference parsed from a finding location. "path:N", "path:N-M" and SARIF "path:N:col" parse as
+        on the HTML page; prose locations contribute their first "path:N[-M]" reference. A location with no file reference
+        is returned whole in path with line_start 0.'
       required:
       - path
       - line_start
@@ -8087,10 +8090,14 @@ components:
             - type: 'null'
           locations:
             type: array
+            description: Every linkable location; locations[0] is location_ref and the rest are the extra links. Grouped
+              match positions map one to one; a single prose location ("a.rs:1-5 (x); also b.rs:9") yields one entry per
+              file reference in it. Empty only when location is empty.
             items:
               $ref: '#/components/schemas/LocationRef'
           extra_location_count:
             type: integer
+            description: len(locations) - 1, floored at 0.
           last_seen_scan_id:
             type:
             - integer

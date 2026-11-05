@@ -29,6 +29,11 @@ func (s *Server) registerUIScanRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /ui/audit", s.uiAudit)
 
+	mux.HandleFunc("GET /ui/repositories/{id}/conversations", s.uiRepoConversations)
+	mux.HandleFunc("POST /ui/repositories/{id}/conversations", s.uiRepoConversationCreate)
+	mux.HandleFunc("GET /ui/conversations/{id}", s.uiConversationDetail)
+	mux.HandleFunc("DELETE /ui/conversations/{id}", s.uiConversationDelete)
+	mux.HandleFunc("POST /ui/conversations/{id}/messages", s.uiConversationMessage)
 }
 
 const (

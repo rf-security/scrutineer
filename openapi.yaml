@@ -4921,7 +4921,6 @@ paths:
     get:
       summary: Repository conversations
       operationId: listUIRepositoryConversations
-      x-status: planned
       description: Repository-wide chats (finding-scoped ones are under the finding), most recently updated first,
         capped at 50 like the repository page.
       tags:
@@ -4949,7 +4948,6 @@ paths:
     post:
       summary: Start a chat about a repository
       operationId: createUIRepositoryConversation
-      x-status: planned
       tags:
       - ui-scans
       description: '**Spends model credits (chat turn).**'
@@ -4987,7 +4985,6 @@ paths:
     get:
       summary: Conversation with messages
       operationId: getUIConversation
-      x-status: planned
       tags:
       - ui-scans
       security:
@@ -5014,7 +5011,6 @@ paths:
     delete:
       summary: Delete a conversation
       operationId: deleteUIConversation
-      x-status: planned
       description: Removes the transcript and its working copy of the clone. 409 `in_flight` while a reply is being
         written.
       tags:
@@ -5039,7 +5035,6 @@ paths:
     post:
       summary: Send a chat message
       operationId: postUIConversationMessage
-      x-status: planned
       tags:
       - ui-scans
       description: '**Spends model credits (chat turn).** 202 with the stored user message; the reply arrives on the

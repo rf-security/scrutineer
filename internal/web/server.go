@@ -1653,35 +1653,14 @@ func (s *Server) findingStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status := db.FindingLifecycle(r.FormValue(statusKey))
-	if status == db.FindingRejected {
-		s.rejectFinding(w, r, f.ID)
-		return
+	in := findingStatusInput{
+		Status:   db.FindingLifecycle(r.FormValue(statusKey)),
+		Verdict:  r.FormValue("verdict"),
+		Reason:   r.FormValue("reason"),
+		Reviewer: r.FormValue("reviewer"),
 	}
-	if status == db.FindingReady && strings.TrimSpace(f.DisclosureDraft) == "" {
-		http.Error(w, "a saved disclosure draft is required before marking ready", http.StatusUnprocessableEntity)
-		return
-	}
-	// Nothing to ask a peer when the finding is already reported: the outreach
-	// this gates has happened, and a no-op transition writes nothing, so it
-	// would leave the claim it just recorded standing.
-	if status == db.FindingReported && f.Status != db.FindingReported && !s.federationClaimGate(w, r, f) {
-		return
-	}
-	switch status {
-	case db.FindingNew, db.FindingEnriched, db.FindingTriaged, db.FindingReady,
-		db.FindingReported, db.FindingAcknowledged, db.FindingFixed, db.FindingPublished,
-		db.FindingRejected, db.FindingDuplicate:
-		if err := db.WriteFindingField(s.DB.WithContext(r.Context()), f.ID, statusKey, string(status), db.SourceAnalyst, ""); err != nil {
-			if errors.Is(err, db.ErrFindingNonViable) {
-				http.Error(w, err.Error(), http.StatusPreconditionFailed)
-				return
-			}
-			http.Error(w, err.Error(), findingWriteErrorStatus(err, http.StatusInternalServerError))
-			return
-		}
-	default:
-		http.Error(w, "invalid status", http.StatusUnprocessableEntity)
+	if err := s.applyFindingStatus(r.Context(), f, in); err != nil {
+		s.writeFindingStatusHTMLError(w, r, f, in, err)
 		return
 	}
 	s.redirect(w, r, fmt.Sprintf("/findings/%d", f.ID))
@@ -1773,59 +1752,34 @@ func (s *Server) findingMitigate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runFindingSkill(w http.ResponseWriter, r *http.Request, name string, skipOpen bool) {
-	if skipOpen {
-		// Keep the open-scan check and enqueue atomic with other finding launches.
-		s.agentEnqueueMu.Lock()
-		defer s.agentEnqueueMu.Unlock()
-	}
 	f, ok := loadByID[db.Finding](s, w, r)
 	if !ok {
 		return
 	}
-	var scan db.Scan
-	if err := s.DB.First(&scan, f.ScanID).Error; err != nil {
-		http.Error(w, "scan for finding not found", http.StatusInternalServerError)
-		return
-	}
-	var skill db.Skill
-	if err := s.DB.Where("name = ? AND active = ?", name, true).First(&skill).Error; err != nil {
-		http.Error(w, name+" skill is not installed", http.StatusPreconditionFailed)
-		return
-	}
-	opts, err := s.findingSkillScanOpts(f.ID, name, r.FormValue("model"))
-	if err != nil {
+	model := r.FormValue("model")
+	res, err := s.enqueueFindingSkillAction(r.Context(), f, findingSkillLaunch{
+		Skill: name, Model: model, Feedback: r.PostForm.Get("feedback"), SkipOpen: skipOpen,
+	})
+	var missing findingSkillMissingError
+	var precondition findingSkillPreconditionError
+	switch {
+	case err == nil && res.Existing:
+		setFlash(w, Flash{Category: warningKey, Title: name + " already queued or running"})
+		s.redirect(w, r, fmt.Sprintf("/scans/%d", res.ScanID))
+	case err == nil:
+		s.redirect(w, r, fmt.Sprintf("/scans/%d", res.ScanID))
+	case errors.Is(err, errFindingScanMissing):
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	case errors.As(err, &missing), errors.As(err, &precondition), errors.Is(err, db.ErrFindingNonViable):
 		http.Error(w, err.Error(), http.StatusPreconditionFailed)
-		return
-	}
-	if skipOpen {
-		if openScan, ok := s.openFindingSkillScanForAttempt(f.ID, name, opts.RemediationAttemptID); ok {
-			setFlash(w, Flash{Category: warningKey, Title: name + " already queued or running"})
-			s.redirect(w, r, fmt.Sprintf("/scans/%d", openScan.ID))
-			return
-		}
-	}
-	opts.FindingID = new(f.ID)
-	opts.AuditDisclosure = externalReportingSkill(name)
-	if name == verifySkillName {
-		opts.VerificationFeedback = r.PostForm.Get("feedback")
-	}
-	scanID, err := s.enqueueSkillWith(r.Context(), scan.RepositoryID, skill.ID, opts)
-	if errors.Is(err, ErrFederationClaimPending) {
+	case errors.Is(err, ErrFederationClaimPending):
 		// The claim is now recorded on the finding, so the page shows who to
 		// coordinate with and running the skill again goes through.
 		setFlash(w, Flash{Category: warningKey, Title: "A federation peer already holds this finding"})
 		s.redirect(w, r, fmt.Sprintf("/findings/%d", f.ID))
-		return
-	}
-	if err != nil {
-		if errors.Is(err, db.ErrFindingNonViable) {
-			http.Error(w, err.Error(), http.StatusPreconditionFailed)
-			return
-		}
+	default:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
 	}
-	s.redirect(w, r, fmt.Sprintf("/scans/%d", scanID))
 }
 
 func (s *Server) openFindingSkillScan(findingID uint, skillName string) (db.Scan, bool) {

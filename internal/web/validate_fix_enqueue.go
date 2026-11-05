@@ -1,14 +1,15 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"scrutineer/internal/db"
-	"scrutineer/internal/worker"
 )
 
 // validateFix composes the fix-validation pipeline into one operation.
@@ -34,12 +35,8 @@ func (s *Server) validateFix(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ref := strings.TrimSpace(r.FormValue("ref"))
-	if ref == "" {
-		s.validateFixReject(w, r, repo.ID, "a fix ref is required")
-		return
-	}
-	if err := worker.ValidateGitRef(ref); err != nil {
-		s.validateFixReject(w, r, repo.ID, fmt.Sprintf("invalid fix ref: %v", err))
+	if err := checkValidateFixRef(ref); err != nil {
+		s.validateFixReject(w, r, repo.ID, err.Error())
 		return
 	}
 
@@ -49,48 +46,17 @@ func (s *Server) validateFix(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var findings []db.Finding
-	if err := s.DB.Where("id IN ? AND repository_id = ?", findingIDs, repo.ID).Find(&findings).Error; err != nil {
+	res, err := s.enqueueValidateFix(r.Context(), repo.ID, ref, findingIDs, r.FormValue("model"))
+	var input validateFixInputError
+	switch {
+	case errors.As(err, &input):
+		s.validateFixReject(w, r, repo.ID, err.Error())
+		return
+	case err != nil:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if len(findings) != len(findingIDs) {
-		s.validateFixReject(w, r, repo.ID, "some findings were not found on this repository")
-		return
-	}
-	baselineScanID := findings[0].ScanID
-	for _, f := range findings {
-		if f.ScanID != baselineScanID {
-			s.validateFixReject(w, r, repo.ID, "all findings must come from the same baseline scan")
-			return
-		}
-	}
-
-	var baseline db.Scan
-	if err := s.DB.First(&baseline, baselineScanID).Error; err != nil {
-		http.Error(w, "baseline scan not found", http.StatusInternalServerError)
-		return
-	}
-	if baseline.SkillID == nil {
-		s.validateFixReject(w, r, repo.ID, "baseline scan has no skill to re-run against the fix ref")
-		return
-	}
-
-	model := r.FormValue("model")
-	s.enqueueValidateFixVerify(r, repo.ID, findings, ref, model)
-
-	anchorID, err := s.enqueueSkillWith(r.Context(), repo.ID, *baseline.SkillID, ScanOpts{
-		Model:          model,
-		Ref:            ref,
-		SubPath:        baseline.SubPath,
-		ScopeMode:      baseline.ScopeMode, // match the baseline's scope so the fix comparison is apples-to-apples
-		BaselineScanID: &baselineScanID,
-	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	s.redirect(w, r, fmt.Sprintf("/scans/%d", anchorID))
+	s.redirect(w, r, fmt.Sprintf("/scans/%d", res.AnchorID))
 }
 
 // enqueueValidateFixVerify runs the verify skill finding-scoped against the
@@ -98,24 +64,29 @@ func (s *Server) validateFix(w http.ResponseWriter, r *http.Request) {
 // reproduction-level check" rather than failing the operation; a verify for
 // the same finding against the same ref already in flight is skipped so a
 // re-submit does not pile up duplicates.
-func (s *Server) enqueueValidateFixVerify(r *http.Request, repoID uint, findings []db.Finding, ref, model string) {
+func (s *Server) enqueueValidateFixVerify(ctx context.Context, repoID uint, findings []db.Finding, ref, model string) []uint {
+	ids := []uint{}
 	var verifySkill db.Skill
 	if err := s.DB.Where("name = ? AND active = ?", verifySkillName, true).First(&verifySkill).Error; err != nil {
-		return
+		return ids
 	}
 	for _, f := range findings {
 		fid := f.ID
 		if s.hasOpenScan("finding_id = ? AND skill_id = ? AND ref = ?", fid, verifySkill.ID, ref) {
 			continue
 		}
-		if _, err := s.enqueueSkillWith(r.Context(), repoID, verifySkill.ID, ScanOpts{
+		scanID, err := s.enqueueSkillWith(ctx, repoID, verifySkill.ID, ScanOpts{
 			Model:     model,
 			FindingID: &fid,
 			Ref:       ref,
-		}); err != nil {
+		})
+		if err != nil {
 			s.Log.Warn("validate-fix: enqueue verify", "finding", fid, "ref", ref, "err", err)
+			continue
 		}
+		ids = append(ids, scanID)
 	}
+	return ids
 }
 
 func (s *Server) validateFixReject(w http.ResponseWriter, r *http.Request, repoID uint, msg string) {

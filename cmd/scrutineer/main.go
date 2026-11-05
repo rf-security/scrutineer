@@ -749,6 +749,11 @@ func newApp(f *flags, cfg *config.Config, log *slog.Logger, setup runnerSetup) (
 		return nil, err
 	}
 	srv.SkillsRepoSHA = skillsRepoSHA
+	srv.SetUIDir(cfg.Web.UIDir)
+	if cfg.Web.TestHooks || web.TestHooksFromEnv() {
+		srv.EnableTestHooks()
+		log.Warn("test hooks enabled — development only: POST /api/v1/ui/_test/publish can inject synthetic SSE events")
+	}
 	srv.ModelProxy = worker.ModelProxyOf(runner)
 	srv.ScanEgressPolicies = slices.Sorted(maps.Keys(cfg.ScanEgressPolicies))
 	srv.Version = version

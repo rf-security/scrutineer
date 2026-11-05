@@ -39,6 +39,18 @@ func (s *Server) exportHandler() http.Handler {
 	// exports rather than under per-scan bearer auth (#454).
 	mux.HandleFunc("GET /audit/queue", s.apiAuditQueue)
 	mux.HandleFunc("GET /audit/metrics", s.apiAuditMetrics)
+	// UI v2 JSON surface (/api/v1/ui/*). One registrar per work package;
+	// each lists its routes in its own file. Keep in sync with
+	// uiRouteRegistrars in openapi_routes_test.go.
+	// --- ui registrars begin ---
+	s.registerUICoreRoutes(mux)
+	s.registerUIFindingRoutes(mux)
+	s.registerUIFindingActionRoutes(mux)
+	s.registerUIRepositoryRoutes(mux)
+	s.registerUIScanRoutes(mux)
+	s.registerUIInventoryRoutes(mux)
+	s.registerUIInsightRoutes(mux)
+	// --- ui registrars end ---
 	return mux
 }
 

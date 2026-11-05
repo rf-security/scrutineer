@@ -116,6 +116,9 @@ type Server struct {
 	Worker *worker.Worker
 	tmpl   *template.Template
 
+	// ui is the Svelte UI v2 state (SPA dir, test hooks, SSE debounce).
+	ui uiState
+
 	// ModelProxy, when set (-model-proxy), serves worker.ModelProxyPathPrefix
 	// for scan containers. It shares the scan-facing /api/ exemption from the
 	// browser checks: securityHeaders rejects the host.docker.internal Host
@@ -664,6 +667,11 @@ func (s *Server) Handler() http.Handler {
 	// share the browser's boundary: loopback Host plus the operator token;
 	// see threatmodel.md.
 	root := http.NewServeMux()
+	s.initUIEvents()
+	// The SPA session routes and document sit outside requireOperator: the
+	// session check answers 401 itself and the document carries no data.
+	s.registerUISessionRoutes(root)
+	root.Handle("GET /ui/", securityHeaders(s.uiHandler()))
 	root.Handle("/api/v1/", securityHeaders(s.requireOperator(http.StripPrefix(exportPrefix, s.exportHandler()))))
 	// Reachable without the operator token: the login page has to be, and
 	// claim-check is called by federation peers through a reverse proxy.
@@ -3892,12 +3900,14 @@ func securityHeaders(h http.Handler) http.Handler {
 			http.Error(w, "forbidden: invalid host", http.StatusForbidden)
 			return
 		}
-		if r.Method == http.MethodPost {
+		if !safeMethod(r.Method) {
 			fetchSite := r.Header.Get("Sec-Fetch-Site")
 			// Browsers always send Sec-Fetch-Site; its absence means a non-browser
 			// client (curl, etc) which is fine. But "cross-site" means CSRF.
+			// Every unsafe method is checked, not only POST: the JSON UI
+			// writes with PATCH, PUT and DELETE.
 			if fetchSite == "cross-site" {
-				http.Error(w, "forbidden: cross-site POST", http.StatusForbidden)
+				http.Error(w, "forbidden: cross-site "+r.Method, http.StatusForbidden)
 				return
 			}
 		}
@@ -3905,10 +3915,17 @@ func securityHeaders(h http.Handler) http.Handler {
 	})
 }
 
+// safeMethod reports the methods that must not change state, which the
+// cross-site check lets through.
+func safeMethod(m string) bool {
+	return m == http.MethodGet || m == http.MethodHead || m == http.MethodOptions
+}
+
 func logRequests(log *slog.Logger, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		id := withRequestID(w)
 		h.ServeHTTP(w, r)
-		log.Info("http", "method", r.Method, "path", r.URL.Path, "dur", time.Since(start).Round(time.Millisecond))
+		log.Info("http", "method", r.Method, "path", r.URL.Path, "dur", time.Since(start).Round(time.Millisecond), "request_id", id)
 	})
 }

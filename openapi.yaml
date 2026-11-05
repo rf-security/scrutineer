@@ -7295,7 +7295,7 @@ components:
       - resolutions
       - campaign_statuses
       - review_verdicts
-      - review_reasons
+      - offered_help
       - communication_channels
       - communication_directions
       - efforts
@@ -7348,7 +7348,7 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/LabelledValue'
-        review_reasons:
+        offered_help:
           type: array
           items:
             $ref: '#/components/schemas/LabelledValue'

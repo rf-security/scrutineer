@@ -66,13 +66,14 @@ func (s *Server) apiDeleteRepository(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, errRepositoryDeleteInFlight) {
-			writeAPIError(w, http.StatusConflict, err.Error())
+			s.writeRepoDeleteInFlight(w, repo.ID, err)
 			return
 		}
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.removeRepositoryArtifacts(deleted)
+	s.publishRepository(repo.ID, uiChangeDeleted)
 	w.WriteHeader(http.StatusNoContent)
 }
 

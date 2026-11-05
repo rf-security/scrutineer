@@ -49,6 +49,7 @@ func newTestServer(t testing.TB) (*Server, func()) {
 	s.resolveSync = true
 	s.prefetchEcosystems = func(uint) {}
 	s.OperatorToken = testOperatorToken
+	s.EnableTestHooks()
 	return s, func() { _ = sqldb.Close() }
 }
 

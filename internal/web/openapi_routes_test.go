@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -193,6 +194,7 @@ func TestAPIRouteFromPatternRejectsUnsupportedMethod(t *testing.T) {
 func registeredOpenAPIRoutes(t *testing.T) []registeredAPIRoute {
 	t.Helper()
 	routes := append(routesInFunction(t, "api.go", "apiHandler", ""), routesInFunction(t, "api_export.go", "exportHandler", "/v1")...)
+	routes = append(routes, registeredUIRoutes(t)...)
 	// claim-check is documented in openapi.yaml but registered on the root
 	// browser mux, outside apiHandler/exportHandler.
 	routes = append(routes, registeredAPIRoute{Method: "POST", Path: "/claim-check"})
@@ -290,5 +292,154 @@ func apiRouteFromPattern(pathPrefix, pattern string) (registeredAPIRoute, error)
 		return registeredAPIRoute{Method: fields[0], Path: pathPrefix + fields[1]}, nil
 	default:
 		return registeredAPIRoute{}, strconv.ErrSyntax
+	}
+}
+
+// uiRouteRegistration names one /api/v1/ui registrar: the file it lives in,
+// the function, and how its patterns map onto spec paths (prefix is added,
+// trim removed first).
+type uiRouteRegistration struct {
+	file, fn, prefix, trim string
+	// onRoot registrars are called from Handler on the root mux rather than
+	// from exportHandler.
+	onRoot bool
+}
+
+// uiRouteRegistrars lists every registerUI*Routes function. A new registrar
+// must be added here (TestUIRouteRegistrarsAreListed enforces it) so its
+// routes are held to openapi.yaml.
+var uiRouteRegistrars = []uiRouteRegistration{
+	{file: "ui.go", fn: "registerUICoreRoutes", prefix: "/v1"},
+	{file: "ui_session.go", fn: "registerUISessionRoutes", trim: "/api", onRoot: true},
+	{file: "ui_findings.go", fn: "registerUIFindingRoutes", prefix: "/v1"},
+	{file: "ui_findings_actions.go", fn: "registerUIFindingActionRoutes", prefix: "/v1"},
+	{file: "ui_repositories.go", fn: "registerUIRepositoryRoutes", prefix: "/v1"},
+	{file: "ui_scans_detail.go", fn: "registerUIScanRoutes", prefix: "/v1"},
+	{file: "ui_inventory.go", fn: "registerUIInventoryRoutes", prefix: "/v1"},
+	{file: "ui_insights.go", fn: "registerUIInsightRoutes", prefix: "/v1"},
+}
+
+func registeredUIRoutes(t *testing.T) []registeredAPIRoute {
+	t.Helper()
+	var routes []registeredAPIRoute
+	for _, reg := range uiRouteRegistrars {
+		for _, route := range routesInFunction(t, reg.file, reg.fn, reg.prefix) {
+			route.Path = strings.TrimPrefix(route.Path, reg.trim)
+			// Go's {path...} wildcard is a plain {path} parameter in OpenAPI.
+			route.Path = strings.ReplaceAll(route.Path, "...}", "}")
+			routes = append(routes, route)
+		}
+	}
+	return routes
+}
+
+// Every registerUI*Routes function must be listed in uiRouteRegistrars and
+// actually called, otherwise its routes would ship unchecked or not at all.
+func TestUIRouteRegistrarsAreListed(t *testing.T) {
+	listed := map[string]uiRouteRegistration{}
+	for _, reg := range uiRouteRegistrars {
+		listed[reg.fn] = reg
+	}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || !strings.HasPrefix(fn.Name.Name, "registerUI") || !strings.HasSuffix(fn.Name.Name, "Routes") {
+				continue
+			}
+			reg, ok := listed[fn.Name.Name]
+			if !ok {
+				t.Errorf("%s: %s is not listed in uiRouteRegistrars", name, fn.Name.Name)
+				continue
+			}
+			if reg.file != name {
+				t.Errorf("uiRouteRegistrars says %s lives in %s, found in %s", reg.fn, reg.file, name)
+			}
+		}
+	}
+	exportCalls := callsInFunction(t, "api_export.go", "exportHandler")
+	rootCalls := callsInFunction(t, "server.go", "Handler")
+	for _, reg := range uiRouteRegistrars {
+		calls := exportCalls
+		where := "exportHandler"
+		if reg.onRoot {
+			calls, where = rootCalls, "Handler"
+		}
+		if !calls[reg.fn] {
+			t.Errorf("%s is not called from %s", reg.fn, where)
+		}
+	}
+}
+
+// callsInFunction returns the names of the methods/functions funcName calls.
+func callsInFunction(t *testing.T, filename, funcName string) map[string]bool {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := map[string]bool{}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != funcName {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+					calls[sel.Sel.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	return calls
+}
+
+// A registered /v1/ui route must not still be marked `x-status: planned`, and
+// an operation the spec claims is implemented (no marker) must be registered.
+func TestOpenAPIUIPlannedStatusMatchesRoutes(t *testing.T) {
+	doc := loadOpenAPIDoc(t)
+	registered := map[string]bool{}
+	for _, route := range registeredUIRoutes(t) {
+		registered[strings.ToLower(route.Method)+" "+route.Path] = true
+	}
+	var stale, phantom []string
+	for path, ops := range doc.Paths {
+		if !strings.HasPrefix(path, "/v1/ui/") {
+			continue
+		}
+		for method, raw := range ops {
+			op, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			key := method + " " + path
+			planned := op["x-status"] == "planned"
+			switch {
+			case registered[key] && planned:
+				stale = append(stale, key)
+			case !registered[key] && !planned:
+				phantom = append(phantom, key)
+			}
+		}
+	}
+	sort.Strings(stale)
+	sort.Strings(phantom)
+	if len(stale) > 0 {
+		t.Errorf("implemented /v1/ui routes still marked x-status: planned:\n%s", strings.Join(stale, "\n"))
+	}
+	if len(phantom) > 0 {
+		t.Errorf("/v1/ui operations without x-status: planned that no registrar serves:\n%s", strings.Join(phantom, "\n"))
 	}
 }

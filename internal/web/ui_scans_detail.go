@@ -51,27 +51,50 @@ const (
 // submitted payload are loaded on demand (loadUIScanDetail).
 var uiScanDetailOmit = []string{"log", "report", "prompt", "refusal_audit", "import_payload", "api_token", "recipe"}
 
+// uiLargeReportBytes is the report size above which the detail treats a
+// report as exportable without parsing it: HasExportableReport only says no
+// to an empty report or a JSON object of empty values, and no real report
+// that large is either. It keeps the 49 MB outlier's detail from parsing the
+// whole blob on every refetch.
+const uiLargeReportBytes = 1 << 20
+
+// uiScanDetailRow is the detail's scan row and what was loaded alongside.
+type uiScanDetailRow struct {
+	scan  db.Scan
+	skill *db.Skill
+	sizes scanBlobSizes
+	// largeReport is set when the report was left unloaded because of its
+	// size; it counts as exportable.
+	largeReport bool
+}
+
 // loadUIScanDetail loads the scan row for the detail without its blobs, plus
 // the blobs the detail's derived fields need: the report when the result
 // projection reads it (investigation, disclosure, exportability without
 // findings) and the submitted payload of an investigate scan.
-func (s *Server) loadUIScanDetail(id uint) (db.Scan, *db.Skill, error) {
-	var scan db.Scan
-	err := s.DB.Omit(uiScanDetailOmit...).Preload("Repository").First(&scan, id).Error
+func (s *Server) loadUIScanDetail(id uint) (uiScanDetailRow, error) {
+	var row uiScanDetailRow
+	err := s.DB.Omit(uiScanDetailOmit...).Preload("Repository").First(&row.scan, id).Error
 	if err != nil {
-		return scan, nil, err
+		return row, err
 	}
-	skill := loadScanReportSkill(s.DB, &scan)
-	disclose := isDiscloseScanReport(&scan, skill)
+	row.sizes = loadScanBlobSizes(s.DB, []uint{id})[id]
+	row.skill = loadScanReportSkill(s.DB, &row.scan)
+	scan := &row.scan
+	disclose := isDiscloseScanReport(scan, row.skill)
 	needsReport := scan.SkillName == investigateSkillName || scan.SkillName == discloseSkillName ||
 		(!disclose && scan.FindingsCount == 0)
+	if needsReport && scan.SkillName != investigateSkillName && scan.SkillName != discloseSkillName &&
+		row.sizes.ReportBytes > uiLargeReportBytes {
+		needsReport, row.largeReport = false, true
+	}
 	if needsReport {
 		scan.Report = s.scanBlob(id, "report")
 	}
 	if scan.SkillName == investigateSkillName {
 		scan.ImportPayload = []byte(s.scanBlob(id, "import_payload"))
 	}
-	return scan, skill, nil
+	return row, nil
 }
 
 // scanBlob plucks one blob column of a scan; "" when absent or NULL.
@@ -99,25 +122,25 @@ func (s *Server) uiScanDetail(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	scan, skill, err := s.loadUIScanDetail(id)
+	row, err := s.loadUIScanDetail(id)
 	if err != nil {
 		uiDBError(w, err, uiScanWhat)
 		return
 	}
 	var findings []db.Finding
-	if err := s.DB.Where("scan_id = ?", scan.ID).Order("id").Find(&findings).Error; err != nil {
+	if err := s.DB.Where("scan_id = ?", id).Order("id").Find(&findings).Error; err != nil {
 		uiInternal(w, err)
 		return
 	}
-	sizes := loadScanBlobSizes(s.DB, []uint{scan.ID})[scan.ID]
-	m := uiScanRow(scan, sizes)
-	s.addUIScanDetail(m, scan, skill, s.uiFindingRows(findings))
-	setETag(w, scan.UpdatedAt)
+	m := uiScanRow(row.scan, row.sizes)
+	s.addUIScanDetail(m, row, s.uiFindingRows(findings))
+	setETag(w, row.scan.UpdatedAt)
 	writeUIJSON(w, http.StatusOK, m)
 }
 
 // addUIScanDetail adds the UIScanDetail keys to a ScanRow projection.
-func (s *Server) addUIScanDetail(m map[string]any, scan db.Scan, skill *db.Skill, findings []map[string]any) {
+func (s *Server) addUIScanDetail(m map[string]any, row uiScanDetailRow, findings []map[string]any) {
+	scan, skill := row.scan, row.skill
 	m["effort"] = scan.Effort
 	m["ref"] = scan.Ref
 	m["sub_path"] = scan.SubPath
@@ -145,7 +168,7 @@ func (s *Server) addUIScanDetail(m map[string]any, scan db.Scan, skill *db.Skill
 	if fid := s.disclosureReviewFindingID(scan); fid != 0 {
 		m["disclosure_review_finding_id"] = fid
 	}
-	canExport := hasExportableScanReport(s.DB, &scan, skill)
+	canExport := row.largeReport || hasExportableScanReport(s.DB, &scan, skill)
 	m["can_export_report"] = canExport
 	exports := map[string]any{}
 	if canExport {

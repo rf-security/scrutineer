@@ -236,3 +236,25 @@ func TestUIScanBlobs(t *testing.T) {
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodGet, base+"/prompt", nil)), http.StatusNotFound, uiCodeNotFound)
 	requireUIError(t, serveUI(t, s, operatorReq(t, http.MethodGet, "/api/v1/ui/scans/999/report", nil)), http.StatusNotFound, uiCodeNotFound)
 }
+
+// A report past uiLargeReportBytes is exportable without being parsed; a
+// small JSON object of empty values is not.
+func TestUIScanDetailExportability(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	repo := seedUIRepo(t, s.DB, "export")
+	large := seedUIScan(t, s.DB, repo, db.ScanDone, "packages")
+	s.DB.Model(&large).Update("report", `{"packages":"`+strings.Repeat("x", uiLargeReportBytes)+`"}`)
+	empty := seedUIScan(t, s.DB, repo, db.ScanDone, "packages")
+	s.DB.Model(&empty).Update("report", `{"packages":[],"notes":""}`)
+
+	for id, want := range map[uint]bool{large.ID: true, empty.ID: false} {
+		got := decodeUIJSON[map[string]any](t, serveUI(t, s, operatorReq(t, http.MethodGet, fmt.Sprintf("/api/v1/ui/scans/%d", id), nil)), http.StatusOK)
+		if got["can_export_report"] != want {
+			t.Errorf("scan %d can_export_report = %v, want %v", id, got["can_export_report"], want)
+		}
+		if _, ok := got["exports"].(map[string]any)["report_md"]; ok != want {
+			t.Errorf("scan %d report_md present = %v", id, ok)
+		}
+	}
+}

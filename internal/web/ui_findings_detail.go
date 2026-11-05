@@ -118,8 +118,11 @@ func uiScanRef(sc db.Scan, ok bool) any {
 	return sc.ID
 }
 
-// uiFindingWorkflow is FindingDetail.workflow: the in-flight scans and the
-// gating flags the finding page's workflow buttons read.
+// uiFindingWorkflow is FindingDetail.workflow (the FindingWorkflow object):
+// the in-flight scans and the gating flags the finding page's workflow
+// buttons read. scan is the finding's scan when the caller already loaded it
+// (zero value otherwise); it is only consulted for the repository id when the
+// finding row has none.
 func (s *Server) uiFindingWorkflow(f db.Finding, scan db.Scan) map[string]any {
 	verify, verifyOK := s.openFindingSkillScan(f.ID, verifySkillName)
 	critic, criticOK := s.openFindingSkillScan(f.ID, criticSkillName)
@@ -129,9 +132,19 @@ func (s *Server) uiFindingWorkflow(f db.Finding, scan db.Scan) map[string]any {
 		attemptID = &attempt.ID
 	}
 	reattack, reattackOK := s.openFindingSkillScanForAttempt(f.ID, reattackSkillName, attemptID)
-	hasDependents, err := repoHasDependents(s.DB, scan.RepositoryID)
+	repoID := f.RepositoryID
+	if repoID == 0 {
+		repoID = scan.RepositoryID
+	}
+	if repoID == 0 && scan.ID == 0 {
+		var sc db.Scan
+		if s.DB.Select("id", "repository_id").First(&sc, f.ScanID).Error == nil {
+			repoID = sc.RepositoryID
+		}
+	}
+	hasDependents, err := repoHasDependents(s.DB, repoID)
 	if err != nil {
-		s.Log.Warn("count dependents", "repo", scan.RepositoryID, "err", err)
+		s.Log.Warn("count dependents", "repo", repoID, "err", err)
 	}
 	var notes []db.FindingNote
 	s.DB.Where("finding_id = ?", f.ID).Order("created_at desc").Find(&notes)

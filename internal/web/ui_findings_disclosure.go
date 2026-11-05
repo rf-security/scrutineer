@@ -30,21 +30,11 @@ const (
 	uiActKeyPackages    = "packages"
 )
 
-// uiActionSubmission is the DisclosureSubmission projection (the same
-// shape as WP-API-1's uiDisclosureSubmission; TODO(lead): keep one). Request and
-// Response are never exposed: they carry the report and attachment as sent.
-func uiActionSubmission(sub db.DisclosureSubmission) map[string]any {
-	return map[string]any{
-		"id": sub.ID, "channel": sub.Channel, uiActKeyEndpoint: sub.Endpoint, "external_id": sub.ExternalID,
-		"url": sub.URL, uiActKeyStatus: sub.Status, "status_at": sub.StatusAt, "last_error": sub.LastError,
-		"actor": sub.Actor, uiKeyCreatedAt: sub.CreatedAt, "updated_at": sub.UpdatedAt,
-	}
-}
-
+// uiActionSubmissions projects submissions with uiDisclosureSubmission.
 func uiActionSubmissions(subs []db.DisclosureSubmission) []map[string]any {
 	out := make([]map[string]any, len(subs))
 	for i, sub := range subs {
-		out[i] = uiActionSubmission(sub)
+		out[i] = uiDisclosureSubmission(sub)
 	}
 	return out
 }
@@ -153,11 +143,11 @@ func uiVINCEReportForm(r vince.Report) map[string]any {
 func uiVINCEView(p vincePageData) map[string]any {
 	packages := make([]map[string]any, len(p.Packages))
 	for i, pkg := range p.Packages {
-		packages[i] = map[string]any{"id": pkg.ID, uiKeyName: pkg.Name, "ecosystem": pkg.Ecosystem}
+		packages[i] = map[string]any{"id": pkg.ID, uiKeyName: pkg.Name, uiKeyEcosystem: pkg.Ecosystem}
 	}
 	refs := make([]map[string]any, len(p.References))
 	for i, ref := range p.References {
-		refs[i] = map[string]any{"id": ref.ID, "url": ref.URL, "tags": ref.Tags, "summary": ref.Summary, "vince": vinceReference(ref)}
+		refs[i] = map[string]any{"id": ref.ID, uiKeyURL: ref.URL, "tags": ref.Tags, "summary": ref.Summary, "vince": vinceReference(ref)}
 	}
 	selectedRefs := slices.Sorted(maps.Keys(p.SelectedReferences))
 	if selectedRefs == nil {
@@ -254,7 +244,7 @@ func (s *Server) uiFindingVINCESubmit(w http.ResponseWriter, r *http.Request) {
 			uiInternal(w, err)
 			return
 		}
-		writeUIJSON(w, http.StatusOK, map[string]any{"submission": uiActionSubmission(sub), "reports_url": out.ReportsURL})
+		writeUIJSON(w, http.StatusOK, map[string]any{"submission": uiDisclosureSubmission(sub), "reports_url": out.ReportsURL})
 	case disclosureUpstream:
 		if out.Ambiguous {
 			s.publishFinding(ctx.Finding.ID, ctx.Finding.RepositoryID, uiChangeUpdated, uiActKeySubmissions)
@@ -323,7 +313,7 @@ func uiAkritesReportForm(p akritesPage) map[string]any {
 		line = strconv.Itoa(symbol.Line)
 	}
 	return map[string]any{
-		"software": p.Report.Software, "purl": p.Report.PURL, "ecosystem": p.Report.Ecosystem,
+		"software": p.Report.Software, uiKeyPURL: p.Report.PURL, uiKeyEcosystem: p.Report.Ecosystem,
 		"versions": strings.Join(p.Report.Versions, "\n"), "raw": p.Disclosure, "exploit": p.Exploit,
 		"package_repo_url": p.Report.PackageRepoURL, "discovery_method": p.Report.DiscoveryMethod,
 		"email": p.Report.Email, "notify": p.Report.Notify,
@@ -387,11 +377,11 @@ func (s *Server) uiFindingAkritesSubmit(w http.ResponseWriter, r *http.Request) 
 	}
 	var persist map[string]any
 	if out.Submission != nil {
-		persist = map[string]any{"submission": uiActionSubmission(*out.Submission)}
+		persist = map[string]any{"submission": uiDisclosureSubmission(*out.Submission)}
 	}
 	switch out.Kind {
 	case disclosureSubmitted:
-		writeUIJSON(w, http.StatusOK, map[string]any{"submission": uiActionSubmission(*out.Submission)})
+		writeUIJSON(w, http.StatusOK, map[string]any{"submission": uiDisclosureSubmission(*out.Submission)})
 	case disclosureUpstream:
 		code := uiCodeNetwork
 		status := http.StatusBadGateway

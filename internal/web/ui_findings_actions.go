@@ -82,65 +82,6 @@ func uiClaimContacts(claims string) []string {
 	return out
 }
 
-// uiActionFindingRow is the FindingRow projection of one finding.
-func (s *Server) uiActionFindingRow(f db.Finding) map[string]any {
-	return s.uiFindingRows([]db.Finding{f})[0]
-}
-
-// ---------------------------------------------------------------- workflow
-
-// uiFindingActionWorkflow is the FindingWorkflow object: which skills are in
-// flight (scan id or null) and the gates the finding page derives from it.
-// TODO(lead): same object as WP-API-1's uiFindingWorkflow (#10); keep one
-// after both merge.
-func (s *Server) uiFindingActionWorkflow(f db.Finding) map[string]any {
-	open := func(skill string, attemptID *uint) any {
-		if sc, ok := s.openFindingSkillScanForAttempt(f.ID, skill, attemptID); ok {
-			return sc.ID
-		}
-		return nil
-	}
-	var attemptID *uint
-	if attempt, err := db.LatestRemediationAttempt(s.DB, f.ID); err == nil && attempt != nil {
-		attemptID = &attempt.ID
-	}
-	repoID := f.RepositoryID
-	if repoID == 0 {
-		var scan db.Scan
-		if s.DB.Select("id", "repository_id").First(&scan, f.ScanID).Error == nil {
-			repoID = scan.RepositoryID
-		}
-	}
-	hasDependents, err := repoHasDependents(s.DB, repoID)
-	if err != nil {
-		s.Log.Warn("count dependents", "repo", repoID, "err", err)
-	}
-	vinceReason := "VINCE API key is not configured"
-	vinceReady := false
-	if s.VINCE.Enabled() {
-		var notes []db.FindingNote
-		s.DB.Where("finding_id = ?", f.ID).Order("created_at desc").Find(&notes)
-		if err := vinceEligibility(f, notes); err != nil {
-			vinceReason = err.Error()
-		} else {
-			vinceReady, vinceReason = true, ""
-		}
-	}
-	var akritesSubmissions int64
-	s.DB.Model(&db.DisclosureSubmission{}).Where("finding_id = ? AND channel = ?", f.ID, db.DisclosureChannelAkrites).Count(&akritesSubmissions)
-	return map[string]any{
-		"verify_in_flight":     open(verifySkillName, nil),
-		"critic_in_flight":     open(criticSkillName, nil),
-		"disclose_in_flight":   open(discloseSkillName, nil),
-		"reattack_in_flight":   open(reattackSkillName, attemptID),
-		"has_dependents":       hasDependents,
-		"has_disclosure_draft": strings.TrimSpace(f.DisclosureDraft) != "",
-		"disclosure_blocked":   db.FindingDisclosureBlocked(f),
-		"vince":                map[string]any{"ready": vinceReady, "reason": vinceReason},
-		"akrites":              map[string]any{"enabled": s.Akrites.Enabled(), "has_submissions": akritesSubmissions > 0},
-	}
-}
-
 // ---------------------------------------------------------------- #12 status
 
 type uiFindingStatusBody struct {
@@ -166,7 +107,7 @@ func (s *Server) uiFindingStatus(w http.ResponseWriter, r *http.Request) {
 		writeUIFields(w, uiFieldErrors{uiActKeyStatus: "status is required"})
 		return
 	}
-	if !checkIfMatch(w, r, f.UpdatedAt, s.uiActionFindingRow(f)) {
+	if !checkIfMatch(w, r, f.UpdatedAt, s.uiFindingRowFor(f)) {
 		return
 	}
 	in := findingStatusInput{
@@ -186,8 +127,13 @@ func (s *Server) uiFindingStatus(w http.ResponseWriter, r *http.Request) {
 		uiDBError(w, err, uiActFindingWhat)
 		return
 	}
-	row := s.uiActionFindingRow(f)
-	row["workflow"] = s.uiFindingActionWorkflow(f)
+	if wantsUIRepresentation(r) {
+		// Prefer: return=representation -> the full FindingDetail.
+		s.writeUIFindingResult(w, r, f.ID, nil)
+		return
+	}
+	row := s.uiFindingRowFor(f)
+	row["workflow"] = s.uiFindingWorkflow(f, db.Scan{})
 	setETag(w, f.UpdatedAt)
 	writeUIJSON(w, http.StatusOK, row)
 }
@@ -379,15 +325,6 @@ func (s *Server) uiFindingValidateFix(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- #26/#27 conversations
 
-// uiFindingConversationRow is the ConversationRow projection.
-// TODO(lead): WP-API-4 owns the chat projections; fold this into theirs.
-func (s *Server) uiFindingConversationRow(c db.Conversation) map[string]any {
-	return map[string]any{
-		"id": c.ID, repositoryIDKey: c.RepositoryID, "finding_id": c.FindingID, uiActKeyTitle: c.Title,
-		uiKeyModel: c.Model, "active": s.chatTurnActive(c.ID), uiKeyCreatedAt: c.CreatedAt, "updated_at": c.UpdatedAt,
-	}
-}
-
 // uiFindingConversations is GET /ui/findings/{id}/conversations.
 func (s *Server) uiFindingConversations(w http.ResponseWriter, r *http.Request) {
 	f, ok := s.uiActionFinding(w, r)
@@ -399,15 +336,7 @@ func (s *Server) uiFindingConversations(w http.ResponseWriter, r *http.Request) 
 		uiInternal(w, err)
 		return
 	}
-	out := make([]map[string]any, len(convs))
-	for i, c := range convs {
-		out[i] = s.uiFindingConversationRow(c)
-	}
-	writeUIJSON(w, http.StatusOK, out)
-}
-
-type uiConversationBody struct {
-	Message string `json:"message"`
+	writeUIJSON(w, http.StatusOK, s.uiConversationRows(convs))
 }
 
 // errConversationRepoUnknown is a legacy finding whose repository cannot be
@@ -416,74 +345,24 @@ var errConversationRepoUnknown = errors.New("could not resolve which repository 
 
 // uiFindingConversationCreate is POST /ui/findings/{id}/conversations: the
 // finding page's chat starter. It persists the first message and starts the
-// opening turn (model work), returning 201 ConversationDetail.
+// opening turn (model work) via uiCreateConversation, returning 201
+// ConversationDetail.
 func (s *Server) uiFindingConversationCreate(w http.ResponseWriter, r *http.Request) {
 	f, ok := s.uiActionFinding(w, r)
 	if !ok {
 		return
 	}
-	var body uiConversationBody
-	if !decodeUIActionBody(w, r, &body, uiActionBodyMax, false) {
-		return
-	}
-	if s.chatRunner == nil {
-		writeUIError(w, http.StatusServiceUnavailable, uiCodeUnavailable, "chat is unavailable: no agent runner is configured", nil)
-		return
-	}
-	message := strings.TrimSpace(body.Message)
-	if message == "" {
-		writeUIFields(w, uiFieldErrors{uiActKeyMessage: "type a message to start the conversation"})
-		return
-	}
-	conv, err := s.startFindingConversation(f, message)
-	if err != nil {
-		uiInternal(w, err)
-		return
-	}
-	s.publishFinding(f.ID, conv.RepositoryID, uiChangeUpdated, "conversations")
-	loaded, err := db.LoadConversation(s.DB, conv.ID)
-	if err != nil {
-		uiDBError(w, err, "conversation")
-		return
-	}
-	row := s.uiFindingConversationRow(*loaded)
-	messages := make([]map[string]any, len(loaded.Messages))
-	for i, m := range loaded.Messages {
-		messages[i] = uiChatMessage(m)
-	}
-	row["messages"] = messages
-	row["back"] = map[string]any{repositoryIDKey: loaded.RepositoryID, "finding_id": loaded.FindingID}
-	writeUIJSON(w, http.StatusCreated, row)
-}
-
-// startFindingConversation mirrors startConversation (chat.go) without the
-// redirect/flash: create the conversation, persist the first message and
-// start the opening turn.
-// TODO(lead): WP-API-4 extracts startConversation to return the
-// conversation; switch to it after both merge.
-func (s *Server) startFindingConversation(f db.Finding, message string) (*db.Conversation, error) {
 	repoID := f.RepositoryID
 	if repoID == 0 {
 		// Legacy rows may not have the denormalized repository_id; fall back to
 		// the producing scan, mirroring conversationCreateFinding.
 		var scan db.Scan
-		if err := s.DB.First(&scan, f.ScanID).Error; err != nil {
-			return nil, errConversationRepoUnknown
+		if err := s.DB.Select("id", "repository_id").First(&scan, f.ScanID).Error; err != nil {
+			uiInternal(w, errConversationRepoUnknown)
+			return
 		}
 		repoID = scan.RepositoryID
 	}
 	fid := f.ID
-	conv, err := db.CreateConversation(s.DB, repoID, &fid, s.DefaultModel(), message)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := db.AddChatMessage(s.DB, conv.ID, db.ChatRoleUser, message); err != nil {
-		// The conversation row is already committed; drop it rather than leave
-		// a titled, message-less chat in the panel.
-		s.DB.Delete(&db.Conversation{}, conv.ID)
-		return nil, err
-	}
-	s.beginChatTurn(conv.ID)
-	s.spawnTurn(conv.ID, message)
-	return conv, nil
+	s.uiCreateConversation(w, r, repoID, &fid)
 }

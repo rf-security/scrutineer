@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -104,40 +105,24 @@ func parseUIFindingBatch(b uiFindingBatchBody) (uiFindingBatchPlan, error) {
 	return p, nil
 }
 
-// uiBatchFindingStatus applies one status transition with the HTML
-// findingStatus rules: rejected goes through db.RejectFinding (verdict and
-// reason required), ready needs a saved disclosure draft, reported runs the
-// federation claim gate first (a recorded claim refuses the item with
-// ErrFederationClaimPending; resubmitting goes through, as on the page).
-// Returns whether the status changed.
-//
-// TODO(WP-API-2): once applyFindingStatus is extracted from
-// server.go:findingStatus, call it here instead of mirroring the rules.
+// uiBatchFindingStatus applies one status transition through
+// applyFindingStatus (the finding page's rules). A move to the status the
+// finding already has is a no-op (rejected excepted: it always records the
+// review). Draft and lifecycle refusals become status field errors; a peer
+// claim unwraps to ErrFederationClaimPending. Returns whether the status
+// changed.
 func (s *Server) uiBatchFindingStatus(ctx context.Context, f db.Finding, p uiFindingBatchPlan) (bool, error) {
 	status := db.FindingLifecycle(p.status)
-	gdb := s.DB.WithContext(ctx)
-	if status == db.FindingRejected {
-		if err := db.RejectFinding(gdb, f.ID, p.verdict, p.reason, p.reviewer); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	if f.Status == status {
+	if status != db.FindingRejected && f.Status == status {
 		return false, nil
 	}
-	if status == db.FindingReady && strings.TrimSpace(f.DisclosureDraft) == "" {
-		return false, uiFieldErrors{statusKey: "a saved disclosure draft is required before marking ready"}
-	}
-	if status == db.FindingReported {
-		claims, err := s.claimPeerHold(ctx, f)
-		if err != nil {
-			return false, err
-		}
-		if claims != "" {
-			return false, ErrFederationClaimPending
-		}
-	}
-	if err := db.WriteFindingField(gdb, f.ID, statusKey, string(status), db.SourceAnalyst, p.by); err != nil {
+	err := s.applyFindingStatus(ctx, f, findingStatusInput{
+		Status: status, Verdict: p.verdict, Reason: p.reason, Reviewer: p.reviewer, By: p.by,
+	})
+	switch {
+	case errors.Is(err, errFindingReadyNeedsDraft), errors.Is(err, errInvalidFindingStatus):
+		return false, uiFieldErrors{statusKey: err.Error()}
+	case err != nil:
 		return false, err
 	}
 	return true, nil

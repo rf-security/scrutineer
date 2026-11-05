@@ -91,52 +91,53 @@ func exitCodeFor(err error) int {
 // parseFlags fills defaults and CLI overrides; merge layers the config
 // file underneath any flag the user set explicitly.
 type flags struct {
-	configPath            string
-	addr                  string
-	dataDir               string
-	effort                string
-	defaultModel          string
-	backend               string
-	codexAuthFile         string
-	noContainer           bool
-	modelProxy            bool
-	hostSkills            []string
-	runtime               string
-	selinux               string
-	hardened              bool
-	hardenedRuntimeOnly   bool
-	runnerImage           string
-	profilesDir           string
-	skillsRepo            string
-	skillsRepoToken       string
-	concurrency           int
-	cloneMode             string
-	scanTimeout           time.Duration
-	backendPreflightTTL   time.Duration
-	smokeTimeout          time.Duration
-	maxTurns              int
-	modelBaseURL          string
-	forkOrg               string
-	metadataDir           string
-	schemaStrict          bool
-	downgradeOnOverage    bool
-	pauseOnOverage        bool
-	recipientsFile        string
-	identityFile          string
-	identityPlugins       pluginNames
-	autoRejectMissedCount int
-	ecosystemsEnrichment  bool
-	federationSalt        string
-	federationContact     string
-	federationPublicFeed  string
-	federationMembersFeed string
-	federationImportFeeds []string
-	federationPeers       []string
-	subprojectScope       string
-	monorepoAttribution   bool
-	allowRemote           bool
-	noOperatorToken       bool
-	skillLocal            skillDirs
+	configPath              string
+	addr                    string
+	dataDir                 string
+	effort                  string
+	defaultModel            string
+	backend                 string
+	codexAuthFile           string
+	codexCyberAccessProgram string
+	noContainer             bool
+	modelProxy              bool
+	hostSkills              []string
+	runtime                 string
+	selinux                 string
+	hardened                bool
+	hardenedRuntimeOnly     bool
+	runnerImage             string
+	profilesDir             string
+	skillsRepo              string
+	skillsRepoToken         string
+	concurrency             int
+	cloneMode               string
+	scanTimeout             time.Duration
+	backendPreflightTTL     time.Duration
+	smokeTimeout            time.Duration
+	maxTurns                int
+	modelBaseURL            string
+	forkOrg                 string
+	metadataDir             string
+	schemaStrict            bool
+	downgradeOnOverage      bool
+	pauseOnOverage          bool
+	recipientsFile          string
+	identityFile            string
+	identityPlugins         pluginNames
+	autoRejectMissedCount   int
+	ecosystemsEnrichment    bool
+	federationSalt          string
+	federationContact       string
+	federationPublicFeed    string
+	federationMembersFeed   string
+	federationImportFeeds   []string
+	federationPeers         []string
+	subprojectScope         string
+	monorepoAttribution     bool
+	allowRemote             bool
+	noOperatorToken         bool
+	skillLocal              skillDirs
 	// Keep connection credentials out of command-line arguments.
 	dbDriver string
 	dbDSN    string
@@ -327,6 +328,7 @@ func (f *flags) merge(cfg *config.Config) {
 	if cfg.Codex.AuthFile != "" {
 		f.codexAuthFile = cfg.Codex.AuthFile
 	}
+	f.codexCyberAccessProgram = cfg.Codex.CyberAccessProgram
 	if cfg.Runtime != "" && !f.set["runtime"] {
 		f.runtime = cfg.Runtime
 	}
@@ -551,16 +553,8 @@ func validateFlags(f *flags) error {
 	if _, err := worker.HarnessByName(f.backend); err != nil {
 		return err
 	}
-	if f.codexAuthFile != "" {
-		if f.backend != "codex" {
-			return fmt.Errorf("codex.auth_file requires backend %q", "codex")
-		}
-		if os.Getenv("CODEX_API_KEY") != "" || os.Getenv("OPENAI_API_KEY") != "" {
-			return errors.New("codex.auth_file cannot be combined with CODEX_API_KEY or OPENAI_API_KEY; unset API keys to prevent accidental credit usage")
-		}
-		if err := worker.ValidateCodexAuthFile(f.codexAuthFile); err != nil {
-			return err
-		}
+	if err := validateCodexFlags(f); err != nil {
+		return err
 	}
 	if err := config.ValidateRuntime(f.runtime); err != nil {
 		return err
@@ -584,6 +578,29 @@ func validateFlags(f *flags) error {
 		return err
 	}
 	return validateModelBaseURL(f.modelBaseURL, f.trustedModelHost)
+}
+
+// validateCodexFlags checks the config-only codex block: both settings are
+// codex-specific, and the account credential must not be mixed with API keys.
+func validateCodexFlags(f *flags) error {
+	if f.codexCyberAccessProgram != "" {
+		if f.backend != "codex" {
+			return fmt.Errorf("codex.cyber_access_program requires backend %q", "codex")
+		}
+		if err := worker.ValidateCodexCyberAccessProgram(f.codexCyberAccessProgram); err != nil {
+			return err
+		}
+	}
+	if f.codexAuthFile == "" {
+		return nil
+	}
+	if f.backend != "codex" {
+		return fmt.Errorf("codex.auth_file requires backend %q", "codex")
+	}
+	if os.Getenv("CODEX_API_KEY") != "" || os.Getenv("OPENAI_API_KEY") != "" {
+		return errors.New("codex.auth_file cannot be combined with CODEX_API_KEY or OPENAI_API_KEY; unset API keys to prevent accidental credit usage")
+	}
+	return worker.ValidateCodexAuthFile(f.codexAuthFile)
 }
 
 // validateModelProxyFlags refuses a -model-proxy configuration this narrow
@@ -1279,11 +1296,12 @@ func setupRunner(f *flags, cfg *config.Config, log *slog.Logger) (worker.SkillRu
 			ContainerHost: apiHost,
 			Log:           log,
 		},
-		EgressPolicies:     policies,
-		ScanEgressPolicies: scanPolicies,
-		OpencodeProviders:  opencodeProviders,
-		OpencodeReadiness:  worker.NewOpencodeReadinessCache(),
-		CodexAccountAuth:   worker.NewCodexAccountAuth(f.codexAuthFile),
+		EgressPolicies:          policies,
+		ScanEgressPolicies:      scanPolicies,
+		OpencodeProviders:       opencodeProviders,
+		OpencodeReadiness:       worker.NewOpencodeReadinessCache(),
+		CodexAccountAuth:        worker.NewCodexAccountAuth(f.codexAuthFile),
+		CodexCyberAccessProgram: f.codexCyberAccessProgram,
 	}
 	if err := applyModelProxy(f, log, apiHost, &runner); err != nil {
 		return nil, "", err

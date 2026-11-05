@@ -81,14 +81,22 @@ func (s *Server) skillCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
-	skill := db.Skill{Source: "ui", Active: true, Version: 1}
-	form.apply(&skill)
-	skill.Active = true
-	if err := s.DB.Create(&skill).Error; err != nil {
+	skill, err := s.createSkill(form)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	http.Redirect(w, r, "/skills/"+strconv.Itoa(int(skill.ID)), http.StatusSeeOther)
+}
+
+// createSkill inserts a validated form as a new, active, UI-sourced skill.
+// Shared by the HTML form and POST /api/v1/ui/skills.
+func (s *Server) createSkill(form skillFormValues) (db.Skill, error) {
+	skill := db.Skill{Source: "ui", Active: true, Version: 1}
+	form.apply(&skill)
+	skill.Active = true
+	err := s.DB.Create(&skill).Error
+	return skill, err
 }
 
 func (s *Server) skillUpdate(w http.ResponseWriter, r *http.Request) {

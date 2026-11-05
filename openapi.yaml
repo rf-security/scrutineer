@@ -5883,16 +5883,18 @@ paths:
   /v1/ui/benchmark:
     get:
       summary: Benchmark scores
+      description: Recall/precision/F1 against expected findings, one row per repository with expected findings,
+        scored against its latest matching completed deep-dive/vuln-scan (or `skill`) scan. Not paginated.
       operationId: getUIBenchmark
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
       parameters:
       - name: skill
         in: query
+        description: Score against this skill's scans instead of security-deep-dive/vuln-scan.
         schema:
           type: string
       - name: model
@@ -5901,6 +5903,7 @@ paths:
           type: string
       - name: harness
         in: query
+        description: Skills repo SHA.
         schema:
           type: string
       responses:
@@ -5917,10 +5920,11 @@ paths:
   /v1/ui/usage:
     get:
       summary: Usage and cost
+      description: Cost and token usage over completed and failed skill scans. `by_skill` and `by_day` are always
+        present; `drivers` is computed only for `view=drivers` and is null otherwise.
       operationId: getUIUsage
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5929,6 +5933,7 @@ paths:
         in: query
         schema:
           type: string
+          default: skill
           enum:
           - skill
           - day
@@ -5948,11 +5953,12 @@ paths:
           $ref: '#/components/responses/UIInternal'
   /v1/ui/reporting:
     get:
-      summary: Reporting export
+      summary: Reporting snapshot
+      description: The /reporting/report.json document for the selection, plus the picker vocabularies, the derived
+        rates and the CSV/JSON download links. Unknown `interval`/`severity` values are a 400.
       operationId: getUIReporting
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -5961,8 +5967,15 @@ paths:
         in: query
         schema:
           type: string
+          default: all
+          enum:
+          - all
+          - month
+          - week
+          - day
       - name: severity
         in: query
+        description: Minimum severity (case-insensitive); absent = unfiltered. Applies to findings only.
         schema:
           type: string
       responses:
@@ -5981,10 +5994,10 @@ paths:
   /v1/ui/skills:
     get:
       summary: Skills
+      description: Every skill, active first then by name. Not paginated.
       operationId: listUISkills
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -6007,16 +6020,19 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/UISkill'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '401':
           $ref: '#/components/responses/UIUnauthorized'
         '500':
           $ref: '#/components/responses/UIInternal'
     post:
       summary: Create a skill
+      description: Creates an active, UI-sourced skill (version 1). Publishes `meta {changed:["skills"]}`. Unknown
+        body keys are a 400; field rules are a 422 with `fields`.
       operationId: createUISkill
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -6029,6 +6045,9 @@ paths:
       responses:
         '201':
           description: Created
+          headers:
+            ETag:
+              $ref: '#/components/headers/UIETag'
           content:
             application/json:
               schema:
@@ -6047,7 +6066,6 @@ paths:
       operationId: getUISkill
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -6063,6 +6081,8 @@ paths:
           headers:
             ETag:
               $ref: '#/components/headers/UIETag'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
         '404':
           $ref: '#/components/responses/UINotFound'
         '401':
@@ -6071,10 +6091,12 @@ paths:
           $ref: '#/components/responses/UIInternal'
     patch:
       summary: Autosave a skill
+      description: Partial update for field-level autosave, including the `active` toggle. A body equal to the stored
+        skill is a no-op (version and ETag unchanged); any real change bumps `version`. `If-Match` mismatch is a 409
+        with `current` (UISkill). Publishes `meta {changed:["skills"]}` on a change.
       operationId: patchUISkill
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -6090,6 +6112,9 @@ paths:
       responses:
         '200':
           description: OK
+          headers:
+            ETag:
+              $ref: '#/components/headers/UIETag'
           content:
             application/json:
               schema:
@@ -6109,10 +6134,11 @@ paths:
   /v1/ui/settings:
     get:
       summary: Settings
+      description: Everything the settings page shows. `runner` comes from a 5-minute cache of container shell-outs,
+        so the first call after a restart can take several seconds.
       operationId: getUISettings
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -6129,10 +6155,14 @@ paths:
           $ref: '#/components/responses/UIInternal'
     patch:
       summary: Update settings (last-write-wins)
+      description: Every sent field is validated before any is written (422 leaves all settings untouched).
+        `default_model`/`default_effort` are process memory only. `theme`/`color_scheme` set the legacy cookies.
+        A `concurrency` change applies at once when no scan is running; otherwise it is saved and
+        `concurrency_restart_required` is true (POST restart-runner applies it, cancelling running scans).
+        Publishes `meta {changed:["models"]}` when `model_tiers` or `default_model` is sent. If-Match is ignored.
       operationId: patchUISettings
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
@@ -6160,18 +6190,22 @@ paths:
   /v1/ui/settings/actions/restart-runner:
     post:
       summary: Restart the runner
+      description: Rebuilds the runner at the saved concurrency. In-flight scans are cancelled; queued scans survive.
+        When a backend credential caps concurrency so nothing would change, nothing is restarted
+        (`restarted:false`, `note` explains).
       operationId: restartUIRunner
       tags:
       - ui-insights
-      x-status: planned
       security:
       - operatorToken: []
       - operatorCookie: []
       responses:
         '202':
-          description: Restarting
-        '409':
-          $ref: '#/components/responses/UIConflict'
+          description: Restarted (or unchanged, see `restarted`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerRestartResult'
         '401':
           $ref: '#/components/responses/UIUnauthorized'
         '500':
@@ -11640,85 +11674,397 @@ components:
           type: integer
     # --- ui:inventory schemas end ---
     # --- ui:insights schemas begin --- (WP-API-6)
+    BenchmarkTotals:
+      type: object
+      required: [expected, matched, findings, true_positive_findings, recall, precision, f1]
+      properties:
+        expected:
+          type: integer
+        matched:
+          type: integer
+        findings:
+          type: integer
+        true_positive_findings:
+          type: integer
+        recall:
+          type: number
+        precision:
+          type: number
+        f1:
+          type: number
+    BenchmarkRow:
+      allOf:
+      - $ref: '#/components/schemas/BenchmarkTotals'
+      - type: object
+        required: [repository, scan, skill, model, harness_sha, skill_schema_version]
+        properties:
+          repository:
+            type: object
+            required: [id, name, full_name, url]
+            properties:
+              id:
+                type: integer
+                format: int64
+              name:
+                type: string
+              full_name:
+                type: string
+              url:
+                type: string
+          scan:
+            description: The scan the row was scored against; null when none matches the filters.
+            oneOf:
+            - type: object
+              required: [id, skill_name, model, status, finished_at]
+              properties:
+                id:
+                  type: integer
+                  format: int64
+                skill_name:
+                  type: string
+                model:
+                  type: string
+                status:
+                  type: string
+                finished_at:
+                  type:
+                  - string
+                  - 'null'
+                  format: date-time
+            - type: 'null'
+          skill:
+            type: string
+          model:
+            type: string
+          harness_sha:
+            type: string
+          skill_schema_version:
+            type: integer
     BenchmarkView:
       type: object
-      required:
-      - totals
-      - rows
+      required: [totals, rows]
       properties:
         totals:
-          type: object
-          properties:
-            recall:
-              type: number
-            precision:
-              type: number
-            f1:
-              type: number
-            matched:
-              type: integer
-            expected:
-              type: integer
+          $ref: '#/components/schemas/BenchmarkTotals'
         rows:
           type: array
           items:
+            $ref: '#/components/schemas/BenchmarkRow'
+    UsageStats:
+      type: object
+      required: [min, median, p90, max, sum]
+      properties:
+        min:
+          type: number
+        median:
+          type: number
+        p90:
+          type: number
+        max:
+          type: number
+        sum:
+          type: number
+    UsageSkillRow:
+      type: object
+      required: [skill, runs, cost, turns, tokens_in, tokens_out]
+      properties:
+        skill:
+          type: string
+        runs:
+          type: integer
+        cost:
+          $ref: '#/components/schemas/UsageStats'
+        turns:
+          $ref: '#/components/schemas/UsageStats'
+        tokens_in:
+          type: integer
+        tokens_out:
+          type: integer
+    UsageDayRow:
+      type: object
+      required: [date, runs, total_cost, tokens_in, tokens_out]
+      properties:
+        date:
+          type: string
+          description: UTC calendar day, YYYY-MM-DD (newest first).
+        runs:
+          type: integer
+        total_cost:
+          type: number
+        tokens_in:
+          type: integer
+        tokens_out:
+          type: integer
+    UsageRateLimit:
+      type: object
+      required: [windows, paused, downgrading]
+      properties:
+        windows:
+          type: array
+          items:
             type: object
-            additionalProperties: true
+            required: [window, status, reset_at, overage]
+            properties:
+              window:
+                type: string
+                description: Display label (5-hour, 7-day, or the raw window type).
+              status:
+                type: string
+              reset_at:
+                type: string
+                description: Display string "YYYY-MM-DD HH:MM UTC"; empty when unknown.
+              overage:
+                type: boolean
+        paused:
+          type: boolean
+        downgrading:
+          type: boolean
+    UsageDrivers:
+      type: object
+      required: [correlations, outliers]
+      properties:
+        correlations:
+          type: array
+          items:
+            type: object
+            required: [skill, driver, samples, r, summary]
+            properties:
+              skill:
+                type: string
+              driver:
+                type: string
+              samples:
+                type: integer
+              r:
+                type: number
+                description: Pearson r.
+              summary:
+                type: string
+        outliers:
+          type: array
+          items:
+            type: object
+            required: [scan_id, repository_id, repository, skill, model, profile, cost, median, multiple, turns, sloc,
+              manifests, sinks]
+            properties:
+              scan_id:
+                type: integer
+                format: int64
+              repository_id:
+                type: integer
+                format: int64
+              repository:
+                type: string
+              skill:
+                type: string
+              model:
+                type: string
+              profile:
+                type: string
+              cost:
+                type: number
+              median:
+                type: number
+              multiple:
+                type: number
+              turns:
+                type: integer
+              sloc:
+                type: string
+                description: Display value; empty when unknown. Same for manifests and sinks.
+              manifests:
+                type: string
+              sinks:
+                type: string
     UsageView:
       type: object
-      required:
-      - total_runs
-      - total_cost_usd
-      - rate_limit
-      - by_skill
-      - by_day
+      required: [view, total_runs, total_cost_usd, rate_limit, by_skill, by_day, drivers]
       properties:
+        view:
+          type: string
+          enum: [skill, day, drivers]
         total_runs:
           type: integer
           format: int64
         total_cost_usd:
           type: number
         rate_limit:
-          type: object
-          properties:
-            windows:
-              type: array
-              items:
-                type: object
-                additionalProperties: true
-            paused:
-              type: boolean
-            downgrading:
-              type: boolean
+          $ref: '#/components/schemas/UsageRateLimit'
         by_skill:
           type: array
           items:
-            type: object
-            additionalProperties: true
+            $ref: '#/components/schemas/UsageSkillRow'
         by_day:
           type: array
           items:
-            type: object
-            additionalProperties: true
+            $ref: '#/components/schemas/UsageDayRow'
         drivers:
           oneOf:
-          - type: object
-            properties:
-              correlations:
-                type: array
-                items:
-                  type: object
-                  additionalProperties: true
-              outliers:
-                type: array
-                items:
-                  type: object
-                  additionalProperties: true
+          - $ref: '#/components/schemas/UsageDrivers'
           - type: 'null'
+    ReportingAverages:
+      type: object
+      required: [scans_averaged, avg_cost_usd, avg_input_tokens, avg_output_tokens, avg_cache_read_tokens,
+        avg_cache_write_tokens, avg_total_tokens]
+      properties:
+        scans_averaged:
+          type: integer
+        avg_cost_usd:
+          type: number
+        avg_input_tokens:
+          type: number
+        avg_output_tokens:
+          type: number
+        avg_cache_read_tokens:
+          type: number
+        avg_cache_write_tokens:
+          type: number
+        avg_total_tokens:
+          type: number
+    ReportingActivityRow:
+      type: object
+      required: [scans_started, scans_completed, findings, cost_usd, total_tokens, scans_averaged, avg_cost_usd,
+        avg_total_tokens]
+      properties:
+        date:
+          type: string
+          description: by_day rows only (UTC day).
+        repositories_scanned:
+          type: integer
+          description: by_day rows only.
+        model:
+          type: string
+          description: by_model rows only ("" = no model attribution).
+        scans_started:
+          type: integer
+        scans_completed:
+          type: integer
+        findings:
+          type: integer
+        cost_usd:
+          type: number
+        total_tokens:
+          type: integer
+        scans_averaged:
+          type: integer
+        avg_cost_usd:
+          type: number
+        avg_total_tokens:
+          type: number
     ReportingView:
       type: object
-      additionalProperties: true
-      description: reporting.Export + intervals, severities, exports:{csv,json}.
+      description: reporting.Export (the /reporting/report.json document) plus intervals, severities, rates and exports.
+      required: [generated_at, period, filters, activity_in_period, cost_averages_per_scan, activity_by_model,
+        activity_by_day, intervals, severities, rates, exports]
+      properties:
+        generated_at:
+          type: string
+          format: date-time
+        period:
+          type: object
+          required: [key, label, meaning, starts_at, ends_at]
+          properties:
+            key:
+              type: string
+            label:
+              type: string
+            meaning:
+              type: string
+            starts_at:
+              type:
+              - string
+              - 'null'
+              format: date-time
+            ends_at:
+              type: string
+              format: date-time
+        filters:
+          type: object
+          required: [minimum_severity, applies_to, severity_ordering]
+          properties:
+            minimum_severity:
+              type:
+              - string
+              - 'null'
+            applies_to:
+              type: array
+              items:
+                type: string
+            severity_ordering:
+              type: array
+              items:
+                type: string
+        activity_in_period:
+          type: object
+          required: [repositories_scanned, scans_started, scans_completed, findings, cost_usd, total_tokens, measured_by]
+          properties:
+            repositories_scanned:
+              type: integer
+            scans_started:
+              type: integer
+            scans_completed:
+              type: integer
+            findings:
+              type: integer
+            cost_usd:
+              type: number
+            total_tokens:
+              type: integer
+            measured_by:
+              type: string
+        cost_averages_per_scan:
+          type: object
+          required: [population, in_period, all_time]
+          properties:
+            population:
+              type: string
+            in_period:
+              $ref: '#/components/schemas/ReportingAverages'
+            all_time:
+              $ref: '#/components/schemas/ReportingAverages'
+        activity_by_model:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportingActivityRow'
+        activity_by_day:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReportingActivityRow'
+        intervals:
+          type: array
+          items:
+            type: object
+            required: [key, label, meaning]
+            properties:
+              key:
+                type: string
+              label:
+                type: string
+              meaning:
+                type: string
+        severities:
+          type: array
+          description: Selectable minimum severities, least severe first.
+          items:
+            type: string
+        rates:
+          type: object
+          required: [scans_per_repo, completion_rate]
+          properties:
+            scans_per_repo:
+              type: number
+            completion_rate:
+              type: number
+              description: 0..1 fraction; may exceed 1 in a rolling window.
+        exports:
+          type: object
+          required: [csv, json]
+          description: Root-absolute, cookie-authenticated download URLs for the current selection.
+          properties:
+            csv:
+              type: string
+            json:
+              type: string
     UISkill:
       type: object
       required:
@@ -11726,8 +12072,18 @@ components:
       - name
       - description
       - output_kind
+      - output_file
+      - max_turns
+      - model
       - version
       - active
+      - source
+      - path
+      - license
+      - compatibility
+      - requires_remote
+      - created_at
+      - updated_at
       properties:
         id:
           type: integer
@@ -11778,10 +12134,39 @@ components:
             type: string
     SkillCreate:
       type: object
+      additionalProperties: false
       required:
       - name
       - description
-      - body
+      properties:
+        name:
+          type: string
+          pattern: ^[a-z0-9]+(-[a-z0-9]+)*$
+          maxLength: 64
+        description:
+          type: string
+          maxLength: 1024
+        body:
+          type: string
+        output_file:
+          type: string
+          description: Plain filename, no path separators.
+        output_kind:
+          type: string
+          description: One of the registered parsers (skills.OutputKinds); "" is the default parser.
+        max_turns:
+          type: integer
+          minimum: 0
+          description: 0 = server default.
+        model:
+          type: string
+          description: A configured model id or a model tier (mid/high/max); "" = scan default.
+        schema_json:
+          type: string
+          description: Valid JSON or "".
+    SkillPatch:
+      type: object
+      additionalProperties: false
       properties:
         name:
           type: string
@@ -11798,38 +12183,38 @@ components:
           type: string
         max_turns:
           type: integer
-        model:
-          type: string
-        schema_json:
-          type: string
-    SkillPatch:
-      type: object
-      properties:
-        name:
-          type: string
-        description:
-          type: string
-        body:
-          type: string
-        output_file:
-          type: string
-        output_kind:
-          type: string
-        max_turns:
-          type: integer
+          minimum: 0
         model:
           type: string
         schema_json:
           type: string
         active:
           type: boolean
+    SettingsLabelled:
+      type: object
+      required: [value, label]
+      properties:
+        value:
+          type: string
+        label:
+          type: string
+        tier:
+          type: string
+          description: models only; the tier the entry is tagged as default for ("" = none).
+        description:
+          type: string
+          description: tiers only.
     SettingsView:
       type: object
-      additionalProperties: true
       description: 'settingsShow projection (02 #89).'
+      required: [model_tiers, default_model, default_effort, volatile, concurrency, default_max_turns, builtin_max_turns,
+        scan_schedule, limits, theme, color_scheme, themes, color_schemes, models, efforts, tiers, runner, stats, db,
+        work_dir, version]
       properties:
         model_tiers:
           type: object
+          required: [mid, high, max]
+          description: Resolved model id per tier (persisted setting, else built-in heuristic, else default_model).
           properties:
             mid:
               type: string
@@ -11843,30 +12228,162 @@ components:
           type: string
         volatile:
           type: array
+          description: Keys held in process memory only; a restart reverts them to the configured defaults.
           items:
             type: string
+            enum: [default_model, default_effort]
         concurrency:
           type: object
+          required: [saved, input, effective, live, capped_note]
           properties:
             saved:
               type: integer
+              description: Persisted value; 0 when never set.
+            input:
+              type: integer
+              description: The value the form pre-fills (saved, else live).
             effective:
               type: integer
+              description: What the runner would run for `input` after backend caps.
             live:
               type: integer
+              description: What the runner runs now.
             capped_note:
               type: string
         default_max_turns:
           type: integer
+          description: 0 when unset (builtin_max_turns applies).
+        builtin_max_turns:
+          type: integer
         scan_schedule:
+          type: string
+          description: '"" (off), daily, weekly, or a cron expression.'
+        limits:
+          type: object
+          required: [concurrency, default_max_turns]
+          properties:
+            concurrency:
+              $ref: '#/components/schemas/SettingsRange'
+            default_max_turns:
+              $ref: '#/components/schemas/SettingsRange'
+        theme:
+          type: string
+        color_scheme:
+          type: string
+          enum: [system, light, dark]
+        themes:
+          type: array
+          items:
+            type: string
+        color_schemes:
+          type: array
+          items:
+            type: string
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/SettingsLabelled'
+        efforts:
+          type: array
+          items:
+            $ref: '#/components/schemas/SettingsLabelled'
+        tiers:
+          type: array
+          items:
+            $ref: '#/components/schemas/SettingsLabelled'
+        runner:
+          type: object
+          required: [image, image_ref, revision, backend, harness, stale, stale_days, pull_command, tools]
+          properties:
+            image:
+              type: string
+            image_ref:
+              type: string
+              description: Image annotated with its build commit when known.
+            revision:
+              type: string
+            backend:
+              type: string
+            harness:
+              type: string
+              description: Harness CLI version inside the runner image.
+            stale:
+              type: boolean
+            stale_days:
+              type: integer
+            pull_command:
+              type: string
+            tools:
+              type: object
+              required: [semgrep, zizmor, bandit, betterleaks, container_runtime]
+              properties:
+                semgrep:
+                  type: string
+                zizmor:
+                  type: string
+                bandit:
+                  type: string
+                betterleaks:
+                  type: string
+                container_runtime:
+                  type: string
+        stats:
+          type: object
+          required: [repos, scans, findings, scanner_findings, packages, advisories, maintainers, skills]
+          properties:
+            repos:
+              type: integer
+              format: int64
+            scans:
+              type: integer
+              format: int64
+            findings:
+              type: integer
+              format: int64
+            scanner_findings:
+              type: integer
+              format: int64
+            packages:
+              type: integer
+              format: int64
+            advisories:
+              type: integer
+              format: int64
+            maintainers:
+              type: integer
+              format: int64
+            skills:
+              type: integer
+              format: int64
+        db:
+          type: object
+          required: [size_bytes, path]
+          properties:
+            size_bytes:
+              type: integer
+              format: int64
+            path:
+              type: string
+              description: File path on SQLite, database name on PostgreSQL.
+        work_dir:
           type: string
         version:
           $ref: '#/components/schemas/VersionInfo'
+    SettingsRange:
+      type: object
+      required: [min, max]
+      properties:
+        min:
+          type: integer
+        max:
+          type: integer
     SettingsPatch:
       type: object
+      additionalProperties: false
       properties:
         model_tiers:
           type: object
+          additionalProperties: false
           properties:
             mid:
               type: string
@@ -11876,8 +12393,10 @@ components:
               type: string
         default_model:
           type: string
+          description: Process memory only.
         default_effort:
           type: string
+          description: Process memory only.
         concurrency:
           type: integer
           minimum: 1
@@ -11888,13 +12407,51 @@ components:
           maximum: 500
         scan_schedule:
           type: string
+          description: '"" or "off" (disabled), daily, weekly, or a cron expression.'
+        theme:
+          type: string
+        color_scheme:
+          type: string
+          enum: [system, light, dark]
     SettingsPatchResponse:
       allOf:
       - $ref: '#/components/schemas/SettingsView'
       - type: object
         required:
         - concurrency_restart_required
+        - concurrency_outcome
         properties:
           concurrency_restart_required:
             type: boolean
+            description: True when the concurrency was saved but applying it needs POST restart-runner, which cancels
+              the running scans.
+          concurrency_outcome:
+            description: What the concurrency write did; null when concurrency was not sent.
+            oneOf:
+            - type: object
+              required: [applied, restart_required, running, note]
+              properties:
+                applied:
+                  type: boolean
+                restart_required:
+                  type: boolean
+                running:
+                  type: integer
+                  format: int64
+                  description: Running scans a restart would cancel.
+                note:
+                  type: string
+                  description: Explains a backend cap when the saved value will not take effect.
+            - type: 'null'
+    RunnerRestartResult:
+      type: object
+      required: [restarted, concurrency, note]
+      properties:
+        restarted:
+          type: boolean
+        concurrency:
+          type: integer
+          description: The runner's concurrency after the call.
+        note:
+          type: string
     # --- ui:insights schemas end ---

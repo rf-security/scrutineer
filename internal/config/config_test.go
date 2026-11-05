@@ -222,6 +222,19 @@ codex:
 	}
 }
 
+func TestLoad_codexCyberAccessProgram(t *testing.T) {
+	c, err := Load(write(t, `
+codex:
+  cyber_access_program: daybreak_blue
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Codex.CyberAccessProgram != "daybreak_blue" {
+		t.Errorf("codex.cyber_access_program: %q", c.Codex.CyberAccessProgram)
+	}
+}
+
 func TestLoad_parsesOpencodeProviders(t *testing.T) {
 	c, err := Load(write(t, `
 opencode:

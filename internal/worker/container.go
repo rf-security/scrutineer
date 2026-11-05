@@ -104,6 +104,10 @@ type ContainerRunner struct {
 	// Its semaphore serializes Codex execution because the CLI can rotate
 	// auth.json.
 	CodexAccountAuth *CodexAccountAuth
+	// CodexCyberAccessProgram, when set, is passed to every codex exec as
+	// --cyber-access-program (the Responses API's access_programs.cyber).
+	// Ignored by non-codex harnesses.
+	CodexCyberAccessProgram string
 	// ModelProxy, when set, keeps ANTHROPIC_API_KEY on the host. Each RunSkill
 	// issues a scan token the container presents to ModelProxyURL instead.
 	ModelProxy *ModelProxy
@@ -913,7 +917,11 @@ func (d ContainerRunner) harnessArgv(sj SkillJob) []string {
 	h := d.harness()
 	job := sj.toJob(d.Effort, d.MaxTurns, d.ModelBaseURL)
 	job.Effort = CappedEffort(h, job.Effort)
-	return append([]string{h.Binary()}, h.Args(job)...)
+	args := h.Args(job)
+	if HarnessName(h) == "codex" {
+		args = withCodexCyberAccessProgram(args, d.CodexCyberAccessProgram)
+	}
+	return append([]string{h.Binary()}, args...)
 }
 
 // profileGuidePath returns the profile's on-disk PROFILE.md if present.

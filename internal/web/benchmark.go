@@ -9,30 +9,32 @@ import (
 	"scrutineer/internal/db"
 )
 
+// benchmarkRow is one repository with expected findings. The JSON tags serve
+// GET /api/v1/ui/benchmark; Repo and Scan are projected separately there.
 type benchmarkRow struct {
-	Repo                 db.Repository
-	Scan                 *db.Scan
-	Expected             int
-	Matched              int
-	Findings             int
-	TruePositiveFindings int
-	Recall               float64
-	Precision            float64
-	F1                   float64
-	Skill                string
-	Model                string
-	HarnessSHA           string
-	SkillSchemaVersion   int
+	Repo                 db.Repository `json:"-"`
+	Scan                 *db.Scan      `json:"-"`
+	Expected             int           `json:"expected"`
+	Matched              int           `json:"matched"`
+	Findings             int           `json:"findings"`
+	TruePositiveFindings int           `json:"true_positive_findings"`
+	Recall               float64       `json:"recall"`
+	Precision            float64       `json:"precision"`
+	F1                   float64       `json:"f1"`
+	Skill                string        `json:"skill"`
+	Model                string        `json:"model"`
+	HarnessSHA           string        `json:"harness_sha"`
+	SkillSchemaVersion   int           `json:"skill_schema_version"`
 }
 
 type benchmarkTotals struct {
-	Expected             int
-	Matched              int
-	Findings             int
-	TruePositiveFindings int
-	Recall               float64
-	Precision            float64
-	F1                   float64
+	Expected             int     `json:"expected"`
+	Matched              int     `json:"matched"`
+	Findings             int     `json:"findings"`
+	TruePositiveFindings int     `json:"true_positive_findings"`
+	Recall               float64 `json:"recall"`
+	Precision            float64 `json:"precision"`
+	F1                   float64 `json:"f1"`
 }
 
 func (s *Server) benchmark(w http.ResponseWriter, r *http.Request) {

@@ -24,32 +24,32 @@ const (
 )
 
 type usageDriverAnalysis struct {
-	Correlations []usageDriverCorrelation
-	Outliers     []usageCostOutlier
+	Correlations []usageDriverCorrelation `json:"correlations"`
+	Outliers     []usageCostOutlier       `json:"outliers"`
 }
 
 type usageDriverCorrelation struct {
-	Skill   string
-	Driver  string
-	Samples int
-	R       float64
-	Summary string
+	Skill   string  `json:"skill"`
+	Driver  string  `json:"driver"`
+	Samples int     `json:"samples"`
+	R       float64 `json:"r"`
+	Summary string  `json:"summary"`
 }
 
 type usageCostOutlier struct {
-	ScanID       uint
-	RepositoryID uint
-	Repository   string
-	Skill        string
-	Model        string
-	Profile      string
-	Cost         float64
-	Median       float64
-	Multiple     float64
-	Turns        int
-	SLOC         string
-	Manifests    string
-	Sinks        string
+	ScanID       uint    `json:"scan_id"`
+	RepositoryID uint    `json:"repository_id"`
+	Repository   string  `json:"repository"`
+	Skill        string  `json:"skill"`
+	Model        string  `json:"model"`
+	Profile      string  `json:"profile"`
+	Cost         float64 `json:"cost"`
+	Median       float64 `json:"median"`
+	Multiple     float64 `json:"multiple"`
+	Turns        int     `json:"turns"`
+	SLOC         string  `json:"sloc"`
+	Manifests    string  `json:"manifests"`
+	Sinks        string  `json:"sinks"`
 }
 
 type usageDriverValues struct {

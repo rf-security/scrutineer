@@ -6657,6 +6657,8 @@ components:
         scan_id:       { type: integer, format: int64 }
         repository_id: { type: integer, format: int64 }
         finding_id:    { type: string, description: Short id within the scan report (F1, F2, ...). }
+        commit:        { type: string, description: "Commit the producing scan analysed; location line numbers refer to it." }
+        missed_count:  { type: integer, description: "Consecutive later scans of the same skill that did not report this finding again." }
         poc_capture_error: { type: string, description: "Present on streamed publication when the finding was saved but PoC capture failed." }
         sinks:         { type: string, description: Comma-joined sink ids. }
         title:         { type: string }
@@ -8068,6 +8070,8 @@ components:
         - skill_name
         - expected
         - cwe_info
+        - commit
+        - missed_count
         properties:
           title_summary:
             type: string
@@ -8629,7 +8633,68 @@ components:
         - workflow
         - counts
         - exports
+        - fingerprint
+        - seen_count
+        - last_seen_commit
+        - last_missed_scan_id
+        - confidence
+        - snippet
+        - imported_from
+        - duplicate_of_id
+        - last_revalidate_verdict
+        - released_at
+        - release_tag
+        - release_url
+        - suggested_fix_commit
+        - breaking_change
+        - breaking_change_rationale
         properties:
+          fingerprint:
+            type: string
+            description: Stable identity used to match the finding across rescans.
+          seen_count:
+            type: integer
+            description: Scans that reported this finding (the producing scan counts as one).
+          last_seen_commit:
+            type: string
+          last_missed_scan_id:
+            type: integer
+            format: int64
+            description: Latest scan that did not report the finding again; 0 when none has.
+          confidence:
+            type: string
+            description: Audit's certainty (high, medium, low); empty when not stated.
+          snippet:
+            type: string
+          imported_from:
+            type: string
+            description: Import source (e.g. a SARIF tool name); empty for native findings.
+          duplicate_of_id:
+            type: integer
+            format: int64
+            description: Finding this one duplicates; 0 when not a duplicate.
+          last_revalidate_verdict:
+            type: string
+            description: Latest revalidate skill verdict (true_positive, false_positive, already_fixed, uncertain); empty when
+              revalidate has not run.
+          released_at:
+            type:
+            - string
+            - 'null'
+            format: date-time
+          release_tag:
+            type: string
+          release_url:
+            type: string
+          suggested_fix_commit:
+            type: string
+            description: Commit the suggested_fix diff applies to.
+          breaking_change:
+            type: string
+            description: Breaking-change skill verdict on suggested_fix (breaking, non_breaking, unknown); empty when it has not
+              run.
+          breaking_change_rationale:
+            type: string
           trace:
             type: string
           boundary:

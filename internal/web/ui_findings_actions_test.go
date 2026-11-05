@@ -167,6 +167,11 @@ func TestUIFindingActionsStatusIfMatch(t *testing.T) {
 	if body.Current["id"] == nil {
 		t.Errorf("conflict must carry the current row: %+v", body)
 	}
+	for _, k := range []string{"disclosure_draft", "disclosure_title", "suggested_recipients", "exploited_in_wild_evidence"} {
+		if _, ok := body.Current[k]; !ok {
+			t.Errorf("status 409 current missing %q", k)
+		}
+	}
 
 	fresh := operatorReq(t, http.MethodPost, uiActPath(f.ID, "status"), map[string]any{"status": "triaged"})
 	fresh.Header.Set("If-Match", etagFor(reloadFinding(t, s, f.ID).UpdatedAt))

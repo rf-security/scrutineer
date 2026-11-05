@@ -107,7 +107,7 @@ func (s *Server) uiFindingStatus(w http.ResponseWriter, r *http.Request) {
 		writeUIFields(w, uiFieldErrors{uiActKeyStatus: "status is required"})
 		return
 	}
-	if !checkIfMatch(w, r, f.UpdatedAt, s.uiFindingRowFor(f)) {
+	if !checkIfMatch(w, r, f.UpdatedAt, withUIFindingEditable(s.uiFindingRowFor(f), &f)) {
 		return
 	}
 	in := findingStatusInput{

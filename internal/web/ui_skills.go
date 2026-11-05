@@ -217,7 +217,7 @@ func (s *Server) uiSkillPatch(w http.ResponseWriter, r *http.Request) {
 	if !decodeInsightBody(w, r, &body) {
 		return
 	}
-	if !checkIfMatch(w, r, sk.UpdatedAt, uiSkillRow(sk)) {
+	if !checkIfMatch(w, r, sk.UpdatedAt, uiSkillDetail(sk)) {
 		return
 	}
 	form := skillFormFrom(sk)
@@ -239,7 +239,7 @@ func (s *Server) uiSkillPatch(w http.ResponseWriter, r *http.Request) {
 	}
 	saved, err := s.saveSkillIfUnchanged(sk, form)
 	if errors.Is(err, errSkillChanged) {
-		writeUIErrorExtra(w, http.StatusConflict, uiCodeConflict, err.Error(), map[string]any{"current": uiSkillRow(saved)})
+		writeUIErrorExtra(w, http.StatusConflict, uiCodeConflict, err.Error(), map[string]any{"current": uiSkillDetail(saved)})
 		return
 	}
 	if err != nil {

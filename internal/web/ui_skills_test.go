@@ -206,6 +206,15 @@ func TestUISkillPatch(t *testing.T) {
 	if e.Code != uiCodeConflict || e.Current.Version != 3 || e.Current.Description != "Sharper" {
 		t.Errorf("conflict = %+v", e)
 	}
+	if e.Current.Body != stored.Body || e.Current.Body == "" || e.Current.SchemaJSON != stored.SchemaJSON {
+		t.Errorf("conflict current must carry body and schema_json: %+v", e.Current)
+	}
+	raw := decodeUIJSON[struct {
+		Current map[string]any `json:"current"`
+	}](t, serveUI(t, s, patch(map[string]any{"description": "Lost"}, etag)), http.StatusConflict)
+	if _, ok := raw.Current["schema_json"]; !ok {
+		t.Errorf("conflict current lacks schema_json: %v", raw.Current)
+	}
 
 	requireUIError(t, serveUI(t, s, patch(map[string]any{"output_kind": "nope"}, "")),
 		http.StatusUnprocessableEntity, uiCodeValidationFailed)

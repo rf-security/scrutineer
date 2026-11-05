@@ -114,12 +114,23 @@ func TestUIFindingPatchConflicts(t *testing.T) {
 	defer cleanup()
 	fx := seedUIFindingFixture(t, s)
 	id := fx.high.ID
+	s.DB.Model(&fx.high).Update("disclosure_draft", "draft")
 
 	// previous mismatch → 409 with the current row.
 	w := patchFinding(t, s, id, map[string]any{"fields": map[string]string{"assignee": "a"}, "previous": map[string]string{"assignee": "someone"}}, nil)
 	body := requireUIError(t, w, http.StatusConflict, uiCodeConflict)
 	if body.Current == nil || body.Fields["assignee"] == "" || w.Header().Get("ETag") == "" {
 		t.Fatalf("conflict body = %+v", body)
+	}
+	// current carries every analyst-editable field, not just the slim
+	// FindingRow, so "use theirs" can restore any of them.
+	for name := range uiFindingFieldGetters {
+		if _, ok := body.Current[name]; !ok {
+			t.Errorf("409 current missing editable field %q", name)
+		}
+	}
+	if body.Current["disclosure_draft"] != "draft" {
+		t.Errorf("409 current disclosure_draft = %v", body.Current["disclosure_draft"])
 	}
 
 	// A client loads (ETag v0), then saves twice in a row with the fresh ETag

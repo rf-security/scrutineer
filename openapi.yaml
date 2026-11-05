@@ -2001,7 +2001,7 @@ paths:
       description: |
         Partial, field-level autosave. Accepts analystFields plus exploited_in_wild(_evidence); status and every
         automation-owned field are 422. Multi-field bodies run in one transaction. A value equal to the stored one
-        is a no-op. 409 `conflict` (with `current` FindingRow and `fields` naming the moved fields) when a
+        is a no-op. 409 `conflict` (with `current` = FindingRow plus every analyst-editable field this PATCH accepts, so "use theirs" can restore any of them, and `fields` naming the moved fields) when a
         `previous` value differs from the stored one, or when `If-Match` is stale and that field itself changed
         since (field history, not the whole-row updated_at, which worker writes also bump). Publishes one
         `finding` event with the written field names. `Prefer: return=representation` returns UIFindingDetail.
@@ -2735,7 +2735,8 @@ paths:
         uncertain) and `reason` and records the review atomically; `ready` needs a saved disclosure draft (422
         fields.status); a first move to `reported` asks the federation peers and answers 409 federation_claimed
         {contacts} when one holds it (the claim is recorded, so repeating the request goes through); 412 when the
-        latest critic ruled the finding NON_VIABLE; 503 when the peers cannot be asked. Publishes `finding
+        latest critic ruled the finding NON_VIABLE; 503 when the peers cannot be asked. A stale `If-Match` is 409
+        conflict with `current` (FindingRow plus every analyst-editable field, as on the PATCH). Publishes `finding
         {fields:[status,history(,reviews)]}`. With `Prefer: return=representation` the 200 body is the full
         UIFindingDetail (a superset of FindingStatusResponse: it carries `workflow` too).'
       security:
@@ -6097,7 +6098,7 @@ paths:
       summary: Autosave a skill
       description: Partial update for field-level autosave, including the `active` toggle. A body equal to the stored
         skill is a no-op (version and ETag unchanged); any real change bumps `version`. `If-Match` mismatch is a 409
-        with `current` (UISkill). Publishes `meta {changed:["skills"]}` on a change.
+        with `current` (UISkillDetail, including body and schema_json). Publishes `meta {changed:["skills"]}` on a change.
       operationId: patchUISkill
       tags:
       - ui-insights
@@ -7223,7 +7224,8 @@ components:
           type: string
           description: Per-request id, also logged by the server, so toasts are greppable.
         current:
-          description: Row projection of the entity on 409 conflict (FindingRow, RepoRow, ...).
+          description: Row projection of the entity on 409 conflict (FindingRow plus every analyst-editable finding field,
+            RepoRow, UISkillDetail, ...).
           type: object
           additionalProperties: true
         scan_id:

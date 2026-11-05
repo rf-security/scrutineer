@@ -359,7 +359,17 @@ func (s *Server) writeUIFindingConflict(w http.ResponseWriter, id uint, fields [
 	}
 	setETag(w, f.UpdatedAt)
 	writeUIErrorExtra(w, http.StatusConflict, uiCodeConflict, errUIFindingConflict(fields).Error(),
-		map[string]any{"current": row, "fields": perField})
+		map[string]any{"current": withUIFindingEditable(row, &f), "fields": perField})
+}
+
+// withUIFindingEditable adds every analyst-editable field's stored value to
+// a FindingRow, so a 409's current can resolve "use theirs" for fields the
+// slim row omits (disclosure_draft, suggested_recipients, ...).
+func withUIFindingEditable(row map[string]any, f *db.Finding) map[string]any {
+	for name, get := range uiFindingFieldGetters {
+		row[name] = get(f)
+	}
+	return row
 }
 
 // ---------------------------------------------------------------- notes, communications, references, reviews (#17)

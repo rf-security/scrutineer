@@ -1272,32 +1272,7 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
 	viability := productionViabilityFilter(r.URL.Query().Get("viability"))
 
-	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
-	switch sortCol {
-	case sortSeverity:
-		// severityOrder ranks the most severe LOWEST, so the intuitive default
-		// (most severe first, shown as "desc") is ascending on the expression;
-		// !wantDesc flips the SQL direction relative to the logical one.
-		q = q.Order(orderBySuffix("("+severityOrder+")", !wantDesc(dir, true))).Order("findings.id desc")
-	case sortRepository:
-		q = q.Joins("JOIN repositories r ON r.id = findings.repository_id").
-			Order(orderByExpr("r.name", dir, false)).Order("findings.id desc")
-	case "title":
-		q = q.Order(orderByExpr("findings.title", dir, false)).Order("findings.id desc")
-	case statusKey:
-		q = q.Order(orderByExpr("findings.status", dir, false)).Order("findings.id desc")
-	case "repo_id":
-		q = q.Order(orderByExpr("findings.repository_id", dir, false)).Order("findings.id desc")
-	case "cwe":
-		q = q.Order(orderByExpr("findings.cwe", dir, false)).Order("findings.id desc")
-	case "model":
-		q = q.Order(orderByExpr("findings.model", dir, false)).Order("findings.id desc")
-	case "scan":
-		q = q.Order(orderByExpr("findings.scan_id", dir, true)).Order("findings.id desc")
-	default:
-		sortCol, dir = defaultSort, ""
-		q = q.Order("id desc")
-	}
+	q, sortCol, dir := applyFindingsOrder(q, r.URL.Query().Get("sort"))
 	sort := joinSort(sortCol, dir)
 
 	var total int64
@@ -1333,6 +1308,39 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 		"Status": status, "Statuses": db.FindingLifecycles,
 		"Viability": viability,
 	})
+}
+
+// applyFindingsOrder applies the findings list's sort token to q and returns
+// the effective sort key and direction. Shared by the HTML findings page and
+// GET /api/v1/ui/findings so URL sort tokens stay portable.
+func applyFindingsOrder(q *gorm.DB, token string) (*gorm.DB, string, string) {
+	sortCol, dir := splitSort(token)
+	switch sortCol {
+	case sortSeverity:
+		// severityOrder ranks the most severe LOWEST, so the intuitive default
+		// (most severe first, shown as "desc") is ascending on the expression;
+		// !wantDesc flips the SQL direction relative to the logical one.
+		q = q.Order(orderBySuffix("("+severityOrder+")", !wantDesc(dir, true))).Order("findings.id desc")
+	case sortRepository:
+		q = q.Joins("JOIN repositories r ON r.id = findings.repository_id").
+			Order(orderByExpr("r.name", dir, false)).Order("findings.id desc")
+	case "title":
+		q = q.Order(orderByExpr("findings.title", dir, false)).Order("findings.id desc")
+	case statusKey:
+		q = q.Order(orderByExpr("findings.status", dir, false)).Order("findings.id desc")
+	case "repo_id":
+		q = q.Order(orderByExpr("findings.repository_id", dir, false)).Order("findings.id desc")
+	case "cwe":
+		q = q.Order(orderByExpr("findings.cwe", dir, false)).Order("findings.id desc")
+	case "model":
+		q = q.Order(orderByExpr("findings.model", dir, false)).Order("findings.id desc")
+	case "scan":
+		q = q.Order(orderByExpr("findings.scan_id", dir, true)).Order("findings.id desc")
+	default:
+		sortCol, dir = defaultSort, ""
+		q = q.Order("id desc")
+	}
+	return q, sortCol, dir
 }
 
 func (s *Server) findingsIndexQuery(r *http.Request, includeScanners, includeMissed bool) *gorm.DB {

@@ -591,6 +591,7 @@ func (s *Server) uiFindingRows(findings []db.Finding) []map[string]any {
 	for i, f := range findings {
 		out[i] = uiFindingRow(f, repos[f.RepositoryID], skills[f.ScanID])
 	}
+	s.applyUIExpectedMatches(findings, out)
 	return out
 }
 

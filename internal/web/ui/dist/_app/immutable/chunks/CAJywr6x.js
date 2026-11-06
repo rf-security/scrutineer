@@ -1,0 +1,1 @@
+import"./xihTtKlq.js";import{V as e,_t as t,mt as n,q as r,rt as i,vt as a,wt as o,z as s}from"./BZJaQ5U5.js";import{t as c}from"./1yUtQ9KU.js";var l=e(`<div class="pk svelte-1yrwm1o"><!></div>`);function u(e,u){a(u,!0);var d=l(),f=i(d);{let e=n(()=>Number(u.target.id));c(f,{get repoId(){return r(e)}})}o(d),s(e,d),t()}export{u as default};

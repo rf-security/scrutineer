@@ -1,0 +1,1 @@
+import{t as e}from"../chunks/DK3Fl9T5.js";import{r as t}from"../chunks/K2KP6ZR7.js";import{n}from"../chunks/rd6gNbkY.js";import"../chunks/CRcuMg-U.js";var r=e({load:()=>i}),i=()=>{n(307,`${t(`/`)}skills?new=1`)};export{r as universal};

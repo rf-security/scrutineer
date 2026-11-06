@@ -1,0 +1,1 @@
+import{R as e,m as t}from"./B3kiE-nt.js";import{a as n,i as r}from"./CeEfbD8h.js";var i=()=>e({queryKey:t,queryFn:({signal:e})=>n(r.GET(`/v1/ui/activity`,{signal:e})),staleTime:6e4,refetchOnWindowFocus:!1});export{i as t};

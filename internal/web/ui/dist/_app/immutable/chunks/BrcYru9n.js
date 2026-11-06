@@ -1,0 +1,1 @@
+import"./xihTtKlq.js";import{B as e,O as t,_t as n,it as r,mt as i,q as a,vt as o,z as s}from"./BZJaQ5U5.js";import{t as c}from"./C8QxiSgZ.js";function l(l,u){o(u,!0);var d=e(),f=r(d);t(f,()=>u.target.id,e=>{{let t=i(()=>String(u.target.id));c(e,{get login(){return a(t)},compact:!0})}}),s(l,d),n()}export{l as default};

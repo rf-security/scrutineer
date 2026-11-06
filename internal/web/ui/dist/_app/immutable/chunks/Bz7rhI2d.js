@@ -1,0 +1,1 @@
+var e=0;function t(t=`id`){return e+=1,`${t}-${String(e)}`}export{t};

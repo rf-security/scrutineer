@@ -1,0 +1,1 @@
+import{t as e}from"../chunks/DK3Fl9T5.js";import{r as t}from"../chunks/K2KP6ZR7.js";import{n}from"../chunks/rd6gNbkY.js";import"../chunks/CRcuMg-U.js";var r=e({load:()=>i}),i=({params:e})=>{n(307,`${t(`/`)}skills/${encodeURIComponent(e.id)}`)};export{r as universal};

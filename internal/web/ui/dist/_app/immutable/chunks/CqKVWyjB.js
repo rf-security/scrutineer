@@ -1,1 +1,0 @@
-import"./BZJaQ5U5.js";import{B as e}from"./DN80vuV4.js";var t=1600,n=new class{#e=new e;#t=new Map;mark(e,n){let r=`${e}:${String(n)}`;this.#e.set(r,Date.now());let i=this.#t.get(r);i&&clearTimeout(i),this.#t.set(r,setTimeout(()=>{this.#e.delete(r),this.#t.delete(r)},t))}isFresh(e,t){return this.#e.has(`${e}:${String(t)}`)}};export{n as t};

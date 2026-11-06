@@ -360,10 +360,20 @@ func FindingWriteTransaction(gdb *gorm.DB, findingID uint, write func(*gorm.DB) 
 // conditionalFindingUpdate is the optimistic compare-and-swap shared by
 // string, timestamp, and derived-score writes. clause.Eq renders nil as IS
 // NULL, which is required for an unset ReleasedAt value.
+//
+// An empty string old value also matches NULL: text columns added by a
+// later AutoMigrate are NULL on pre-existing rows, GORM scans that NULL
+// into "" on the Go side, and a plain `col = ''` never matches it, so the
+// write would retry as a phantom conflict until its deadline.
 func conditionalFindingUpdate(gdb *gorm.DB, findingID uint, column string, oldValue, newValue any) error {
+	col := clause.Column{Name: column}
+	var match clause.Expression = clause.Eq{Column: col, Value: oldValue}
+	if s, ok := oldValue.(string); ok && s == "" {
+		match = clause.Or(match, clause.Eq{Column: col, Value: nil})
+	}
 	result := gdb.Model(&Finding{}).
 		Where("id = ?", findingID).
-		Where(clause.Eq{Column: clause.Column{Name: column}, Value: oldValue}).
+		Where(match).
 		Update(column, newValue)
 	if result.Error != nil {
 		return result.Error

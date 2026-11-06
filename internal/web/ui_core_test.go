@@ -11,6 +11,25 @@ import (
 	"scrutineer/internal/db"
 )
 
+func TestUISessionGetOperatorTokenDisabled(t *testing.T) {
+	s, cleanup := newTestServer(t)
+	defer cleanup()
+	s.DisableOperatorToken = true
+
+	anon := httptest.NewRequest(http.MethodGet, "/api/v1/ui/session", nil)
+	anon.Host = testHost
+	body := decodeUIJSON[map[string]any](t, serveUI(t, s, anon), http.StatusOK)
+	if body["authenticated"] != true {
+		t.Fatalf("session = %v", body)
+	}
+	// The host check still applies when the token gate is off.
+	foreign := httptest.NewRequest(http.MethodGet, "/api/v1/ui/session", nil)
+	foreign.Host = "evil.example:8080"
+	if w := serveUI(t, s, foreign); w.Code != http.StatusForbidden {
+		t.Fatalf("foreign host: status %d, want 403", w.Code)
+	}
+}
+
 func TestUISessionGet(t *testing.T) {
 	s, cleanup := newTestServer(t)
 	defer cleanup()

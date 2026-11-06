@@ -31,7 +31,10 @@ func (s *Server) operatorRequestToken(r *http.Request) string {
 }
 
 func (s *Server) uiSessionGet(w http.ResponseWriter, r *http.Request) {
-	if !s.validOperatorToken(s.operatorRequestToken(r)) {
+	// require_operator_token: false opens the rest of /api/v1 via
+	// requireOperator; this route sits outside it, so honour the opt-out here
+	// too or the SPA would stop at its login screen.
+	if !s.DisableOperatorToken && !s.validOperatorToken(s.operatorRequestToken(r)) {
 		writeUIError(w, http.StatusUnauthorized, uiCodeUnauthorized, "operator token required", nil)
 		return
 	}

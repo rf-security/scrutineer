@@ -1,0 +1,1 @@
+import"./xihTtKlq.js";import{B as e,H as t,J as n,Tt as r,ht as i,it as a,vt as o,yt as s}from"./BZp-bRJk.js";import{t as c}from"./BHmzKH-y.js";var l=t(`<div class="pk svelte-1vz87p8"><!></div>`);function u(t,u){s(u,!0);var d=l(),f=a(d);{let e=i(()=>Number(u.target.id));c(f,{get id(){return n(e)},mode:`peek`,ondeleted:()=>u.onclose?.()})}r(d),e(t,d),o()}export{u as default};

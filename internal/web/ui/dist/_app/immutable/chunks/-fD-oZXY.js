@@ -1,0 +1,1 @@
+import{J as e,ft as t,ut as n}from"./BZp-bRJk.js";var r=new class{#e=t(null);get target(){return e(this.#e)}set target(e){n(this.#e,e,!0)}#t=t(0);get hosts(){return e(this.#t)}set hosts(e){n(this.#t,e,!0)}open(e){this.target={...e}}close(){this.target=null}};export{r as t};

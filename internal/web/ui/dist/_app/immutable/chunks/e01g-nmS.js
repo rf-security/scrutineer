@@ -1,0 +1,1 @@
+import{a as e,i as t}from"./BacPuu-B.js";import{n}from"./DTtp0vy1.js";async function r(r){try{return await e(t.GET(`/v1/ui/session`,{signal:r}))}catch(e){if(e instanceof n&&e.status===401)return null;throw e}}async function i(n){await e(t.POST(`/v1/ui/session`,{body:{token:n}}))}async function a(){await e(t.DELETE(`/v1/ui/session`))}export{i as n,a as r,r as t};

@@ -1,0 +1,1 @@
+import"./xihTtKlq.js";import{B as e,J as t,V as n,at as r,ht as i,k as a,vt as o,yt as s}from"./BZp-bRJk.js";import{t as c}from"./DXs2DUDy.js";function l(l,u){s(u,!0);let d=i(()=>Number(u.target.id));var f=n(),p=r(f);a(p,()=>t(d),e=>{c(e,{get id(){return t(d)},compact:!0})}),e(l,f),o()}export{l as default};

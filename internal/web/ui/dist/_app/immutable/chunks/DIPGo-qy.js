@@ -1,0 +1,1 @@
+import"./xihTtKlq.js";import{B as e,H as t,J as n,Tt as r,ht as i,it as a,vt as o,yt as s}from"./BZp-bRJk.js";import{t as c}from"./BYIgqoYh.js";var l=t(`<div class="pk svelte-lynad4"><!></div>`);function u(t,u){s(u,!0);var d=l(),f=a(d);{let e=i(()=>Number(u.target.id));c(f,{get repoId(){return n(e)}})}r(d),e(t,d),o()}export{u as default};

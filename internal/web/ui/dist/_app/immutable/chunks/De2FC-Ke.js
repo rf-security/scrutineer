@@ -1,0 +1,1 @@
+import"./xihTtKlq.js";import{n as e,r as t}from"./BZJaQ5U5.js";import{N as n}from"./BZSB9icL.js";var r={name:`pause`,size:24,node:[[`rect`,{x:`14`,y:`3`,width:`5`,height:`18`,rx:`1`}],[`rect`,{x:`5`,y:`3`,width:`5`,height:`18`,rx:`1`}]]};r.node;var i=new Set([`$$slots`,`$$events`,`$$legacy`]);function a(a,o){let s=e(o,i);n(a,t(()=>s,{get icon(){return r}}))}export{a as t};

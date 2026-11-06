@@ -781,12 +781,24 @@ func TestAPIRunSkill_deduplicatesEquivalentOpenScan(t *testing.T) {
 func TestAPIRunSkill_enforcesRepositoryOpenScanLimit(t *testing.T) {
 	s, done := newTestServer(t)
 	defer done()
+	assertRepositoryOpenScanLimit(t, s, DefaultMaxAgentAPIOpenScansPerRepository)
+}
+
+func TestAPIRunSkill_enforcesConfiguredRepositoryOpenScanLimit(t *testing.T) {
+	s, done := newTestServer(t)
+	defer done()
+	s.MaxAgentAPIOpenScansPerRepository = 3
+	assertRepositoryOpenScanLimit(t, s, 3)
+}
+
+func assertRepositoryOpenScanLimit(t *testing.T, s *Server, limit int) {
+	t.Helper()
 	repo, scan := seedRunningScan(t, s)
 
 	// The authenticated parent is already one open scan. Fill the remaining
 	// slots with different work so the target request reaches the repo cap,
 	// not the equivalent-scan guard.
-	for i := 1; i < maxAgentAPIOpenScansPerRepository; i++ {
+	for i := 1; i < limit; i++ {
 		s.DB.Create(&db.Scan{RepositoryID: repo.ID, Kind: worker.JobSkill, Status: db.ScanQueued})
 	}
 	skill := db.Skill{Name: "metadata", Description: "m", Body: "b", OutputFile: "report.json", Version: 1, Active: true, Source: "ui"}
@@ -800,8 +812,8 @@ func TestAPIRunSkill_enforcesRepositoryOpenScanLimit(t *testing.T) {
 	s.DB.Model(&db.Scan{}).
 		Where("repository_id = ? AND status IN ?", repo.ID, []db.ScanStatus{db.ScanQueued, db.ScanRunning}).
 		Count(&open)
-	if open != maxAgentAPIOpenScansPerRepository {
-		t.Errorf("open scans = %d, want capped at %d", open, maxAgentAPIOpenScansPerRepository)
+	if open != int64(limit) {
+		t.Errorf("open scans = %d, want capped at %d", open, limit)
 	}
 	var targetCount int64
 	s.DB.Model(&db.Scan{}).Where("skill_id = ?", skill.ID).Count(&targetCount)

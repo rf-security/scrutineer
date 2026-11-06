@@ -3,7 +3,6 @@ package web
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -11,8 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
 	"scrutineer/internal/vince"
@@ -117,165 +114,40 @@ func (s *Server) findingVINCESubmit(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := vinceEligibility(ctx.Finding, ctx.Notes); err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
+	out := s.submitVINCE(r, ctx)
+	switch {
+	case out.Page != nil:
+		w.WriteHeader(out.Status)
+		s.render(w, r, "finding_vince.html", map[string]any{"VINCE": *out.Page, pageTitleKey: out.Page.title()})
+	case out.Kind != disclosureSubmitted:
+		http.Error(w, out.Message, out.Status)
+	default:
+		setFlash(w, Flash{
+			Category: successKey,
+			Title:    "Submitted to VINCE as " + out.VRFID,
+			Href:     out.ReportsURL,
+			Label:    "Open VINCE reports",
+		})
+		s.redirect(w, r, fmt.Sprintf("/findings/%d", ctx.Finding.ID))
 	}
-
-	report := vinceReportFromForm(r.Form)
-	attachmentChoice := r.FormValue("attachment")
-	confirmations := vinceConfirmations(r.Form)
-	fieldErrors := vince.ValidationErrors{}
-	packageID, selectedRefs, selectionErr := vinceSelections(r.Form, ctx)
-	if selectionErr != nil {
-		addVINCEError(fieldErrors, "selection", selectionErr.Error())
-	}
-	if err := report.Validate(); err != nil {
-		var validation vince.ValidationErrors
-		if errors.As(err, &validation) {
-			mergeVINCEErrors(fieldErrors, validation)
-		}
-	}
-	for field, confirmed := range confirmations {
-		if !confirmed {
-			addVINCEError(fieldErrors, field, "confirmation is required")
-		}
-	}
-
-	attachment := s.vinceFormAttachment(r, ctx, attachmentChoice, fieldErrors)
-	prior, err := db.FindingDisclosureSubmissions(s.DB, ctx.Finding.ID, db.DisclosureChannelVINCE)
-	if err != nil {
-		http.Error(w, "could not load VINCE submissions", http.StatusInternalServerError)
-		return
-	}
-	if err := disclosureResendError(r, len(prior) > 0 || slices.ContainsFunc(ctx.References, vinceReference), "VINCE"); err != nil {
-		addVINCEError(fieldErrors, "resend", err.Error())
-	}
-
-	if len(fieldErrors) > 0 {
-		page := s.vincePage(ctx, report, packageID, selectedRefs, attachmentChoice,
-			time.Now().UTC(), fieldErrors, confirmations)
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		s.render(w, r, "finding_vince.html", map[string]any{"VINCE": page, pageTitleKey: page.title()})
-		return
-	}
-
-	// Asked after the field errors, so an invalid form costs no peer round trip,
-	// and before the submission, because that request is the outreach the
-	// claim-check exists to deduplicate.
-	claims, err := s.claimPeerHold(r.Context(), ctx.Finding)
-	if err != nil {
-		s.Log.Error("claim-check out", "finding", ctx.Finding.ID, "err", err)
-		http.Error(w, "failed to check federation peers", http.StatusInternalServerError)
-		return
-	}
-	if claims != "" {
-		page := s.vincePage(ctx, report, packageID, selectedRefs, attachmentChoice,
-			time.Now().UTC(), nil, confirmations)
-		page.Error = "A federation peer already holds this finding: " + claims +
-			". Coordinate through that contact, then submit again to send it anyway."
-		w.WriteHeader(http.StatusConflict)
-		s.render(w, r, "finding_vince.html", map[string]any{"VINCE": page, pageTitleKey: page.title()})
-		return
-	}
-
-	client := vince.Client{Config: s.VINCE, HTTPClient: s.vinceHTTPClient}
-	vrfID, err := client.Submit(r.Context(), report, attachment)
-	if err != nil {
-		submitErr, _ := vince.AsSubmitError(err)
-		status := http.StatusBadGateway
-		message := err.Error()
-		ambiguous := false
-		if submitErr != nil {
-			mergeVINCEErrors(fieldErrors, submitErr.FieldErrors)
-			switch submitErr.Kind {
-			case vince.ErrorValidation:
-				status = http.StatusUnprocessableEntity
-			case vince.ErrorAuth:
-				status = http.StatusUnauthorized
-			case vince.ErrorRateLimit:
-				status = http.StatusTooManyRequests
-			case vince.ErrorAmbiguous:
-				ambiguous = true
-			}
-		}
-		if ambiguous {
-			recipient, _ := s.VINCE.Endpoint()
-			if err := s.DB.Create(&db.DisclosureSubmission{
-				FindingID: ctx.Finding.ID, Channel: db.DisclosureChannelVINCE, Endpoint: recipient,
-				Status: "uncertain", LastError: message, Actor: "analyst", Request: vinceRequest(report, attachment),
-			}).Error; err != nil {
-				s.Log.Error("record uncertain VINCE submission", "finding", ctx.Finding.ID, "err", err)
-			}
-		}
-		page := s.vincePage(ctx, report, packageID, selectedRefs, attachmentChoice,
-			time.Now().UTC(), fieldErrors, confirmations)
-		page.Error = message
-		page.Ambiguous = ambiguous
-		w.WriteHeader(status)
-		s.render(w, r, "finding_vince.html", map[string]any{"VINCE": page, pageTitleKey: page.title()})
-		return
-	}
-
-	reportsURL, _ := s.VINCE.ReportsURL()
-	attachmentName := "none"
-	if attachment != nil {
-		attachmentName = attachment.Name
-	}
-	if err := s.persistVINCESubmission(ctx.Finding, vrfID, reportsURL, attachmentName, report, attachment); err != nil {
-		page := s.vincePage(ctx, report, packageID, selectedRefs, attachmentChoice,
-			time.Now().UTC(), nil, confirmations)
-		page.Error = "VINCE returned " + vrfID + " but Scrutineer could not save the result. Record the ID and reconcile it manually. Do not submit the report again."
-		page.ReconciliationVRFID = vrfID
-		w.WriteHeader(http.StatusInternalServerError)
-		s.render(w, r, "finding_vince.html", map[string]any{"VINCE": page, pageTitleKey: page.title()})
-		return
-	}
-
-	setFlash(w, Flash{
-		Category: successKey,
-		Title:    "Submitted to VINCE as " + vrfID,
-		Href:     reportsURL,
-		Label:    "Open VINCE reports",
-	})
-	s.redirect(w, r, fmt.Sprintf("/findings/%d", ctx.Finding.ID))
 }
 
 func (s *Server) loadDisclosureFinding(w http.ResponseWriter, r *http.Request) (disclosureFindingContext, bool) {
-	var out disclosureFindingContext
 	id, err := strconv.Atoi(r.PathValue("id"))
 	if err != nil {
 		http.NotFound(w, r)
-		return out, false
+		return disclosureFindingContext{}, false
 	}
-	if err := s.DB.First(&out.Finding, id).Error; err != nil {
+	out, status, msg := s.loadDisclosureContext(uint(id))
+	switch status {
+	case 0:
+		return out, true
+	case http.StatusNotFound:
 		http.NotFound(w, r)
-		return out, false
+	default:
+		http.Error(w, msg, status)
 	}
-	if err := s.DB.First(&out.Repository, out.Finding.RepositoryID).Error; err != nil {
-		http.Error(w, "repository missing for finding", http.StatusInternalServerError)
-		return out, false
-	}
-	if err := s.DB.First(&out.Scan, out.Finding.ScanID).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		http.Error(w, "could not load finding scan", http.StatusInternalServerError)
-		return out, false
-	}
-	queries := []struct {
-		label string
-		err   error
-	}{
-		{"packages", s.DB.Where("repository_id = ?", out.Finding.RepositoryID).Order("name").Find(&out.Packages).Error},
-		{"references", s.DB.Where("finding_id = ?", out.Finding.ID).Order("id").Find(&out.References).Error},
-		{"communications", s.DB.Where("finding_id = ?", out.Finding.ID).Order("at").Find(&out.Communications).Error},
-		{"notes", s.DB.Where("finding_id = ?", out.Finding.ID).Order("created_at").Find(&out.Notes).Error},
-	}
-	for _, query := range queries {
-		if query.err != nil {
-			http.Error(w, "could not load finding "+query.label, http.StatusInternalServerError)
-			return out, false
-		}
-	}
-	return out, true
+	return out, false
 }
 
 func vinceEligibility(f db.Finding, notes []db.FindingNote) error {

@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"gorm.io/gorm"
+
 	"scrutineer/internal/db"
 )
 
@@ -31,20 +33,51 @@ type maintainerListRow struct {
 }
 
 func (s *Server) maintainersList(w http.ResponseWriter, r *http.Request) {
-	q := s.DB.Model(&db.Maintainer{})
 	status := r.URL.Query().Get(statusKey)
+	search := strings.TrimSpace(r.URL.Query().Get("q"))
+	q := maintainersFilter(s.DB.Model(&db.Maintainer{}), status, search)
+	q, sort := maintainersOrder(q, r.URL.Query().Get("sort"))
+
+	var total int64
+	q.Count(&total)
+	page := paginate(r, total)
+
+	var rows []maintainerListRow
+	q.Select(maintainerListSelect).
+		Limit(perPage).Offset((page.N - 1) * perPage).Scan(&rows)
+
+	s.render(w, r, "maintainers.html", map[string]any{
+		"Maintainers": rows,
+		"Page":        page,
+		"Status":      status,
+		"Q":           search,
+		"Sort":        sort,
+	})
+}
+
+// maintainerListSelect projects maintainers with their repository and
+// curated-finding counts (maintainerListRow).
+var maintainerListSelect = "maintainers.*, " + maintainerRepositoryCountSQL + " AS repository_count, " +
+	maintainerFindingCountSQL + " AS finding_count"
+
+// maintainersFilter applies the index's status and free-text filters.
+func maintainersFilter(q *gorm.DB, status, search string) *gorm.DB {
 	if status != "" {
 		q = q.Where("status = ?", status)
 	}
-	search := strings.TrimSpace(r.URL.Query().Get("q"))
 	if search != "" {
 		like := "%" + search + "%"
 		q = q.Where("LOWER(login) LIKE LOWER(?) OR LOWER(name) LIKE LOWER(?) OR LOWER(email) LIKE LOWER(?) OR LOWER(company) LIKE LOWER(?) OR LOWER(notes) LIKE LOWER(?)",
 			like, like, like, like, like)
 	}
+	return q
+}
 
+// maintainersOrder applies the index's sort token and returns the effective
+// token. Shared by the HTML index and GET /api/v1/ui/maintainers.
+func maintainersOrder(q *gorm.DB, token string) (*gorm.DB, string) {
 	const nameSort = "name"
-	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
+	sortCol, dir := splitSort(token)
 	switch sortCol {
 	case "findings":
 		q = q.Order(orderByExpr(maintainerFindingCountSQL, dir, true)).
@@ -70,24 +103,7 @@ func (s *Server) maintainersList(w http.ResponseWriter, r *http.Request) {
 		sortCol, dir = nameSort, ""
 		q = q.Order("CASE WHEN name = '' THEN 1 ELSE 0 END, name, login")
 	}
-	sort := joinSort(sortCol, dir)
-
-	var total int64
-	q.Count(&total)
-	page := paginate(r, total)
-
-	var rows []maintainerListRow
-	q.Select("maintainers.*, " + maintainerRepositoryCountSQL + " AS repository_count, " +
-		maintainerFindingCountSQL + " AS finding_count").
-		Limit(perPage).Offset((page.N - 1) * perPage).Scan(&rows)
-
-	s.render(w, r, "maintainers.html", map[string]any{
-		"Maintainers": rows,
-		"Page":        page,
-		"Status":      status,
-		"Q":           search,
-		"Sort":        sort,
-	})
+	return q, joinSort(sortCol, dir)
 }
 
 // maintainerDoNotContact flips the DoNotContact flag on a maintainer.

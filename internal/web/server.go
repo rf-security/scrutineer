@@ -116,6 +116,9 @@ type Server struct {
 	Worker *worker.Worker
 	tmpl   *template.Template
 
+	// ui is the Svelte UI v2 state (SPA dir, test hooks, SSE debounce).
+	ui uiState
+
 	// ModelProxy, when set (-model-proxy), serves worker.ModelProxyPathPrefix
 	// for scan containers. It shares the scan-facing /api/ exemption from the
 	// browser checks: securityHeaders rejects the host.docker.internal Host
@@ -697,6 +700,11 @@ func (s *Server) Handler() http.Handler {
 	// share the browser's boundary: loopback Host plus the operator token;
 	// see threatmodel.md.
 	root := http.NewServeMux()
+	s.initUIEvents()
+	// The SPA session routes and document sit outside requireOperator: the
+	// session check answers 401 itself and the document carries no data.
+	s.registerUISessionRoutes(root)
+	root.Handle("GET /ui/", securityHeaders(s.AllowRemote, s.uiHandler()))
 	root.Handle("/api/v1/", securityHeaders(s.AllowRemote, s.requireOperator(http.StripPrefix(exportPrefix, s.exportHandler()))))
 	// Reachable without the operator token: the login page has to be, and
 	// claim-check is called by federation peers through a reverse proxy.
@@ -1362,32 +1370,7 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
 	viability := productionViabilityFilter(r.URL.Query().Get("viability"))
 
-	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
-	switch sortCol {
-	case sortSeverity:
-		// severityOrder ranks the most severe LOWEST, so the intuitive default
-		// (most severe first, shown as "desc") is ascending on the expression;
-		// !wantDesc flips the SQL direction relative to the logical one.
-		q = q.Order(orderBySuffix("("+severityOrder+")", !wantDesc(dir, true))).Order("findings.id desc")
-	case sortRepository:
-		q = q.Joins("JOIN repositories r ON r.id = findings.repository_id").
-			Order(orderByExpr("r.name", dir, false)).Order("findings.id desc")
-	case "title":
-		q = q.Order(orderByExpr("findings.title", dir, false)).Order("findings.id desc")
-	case statusKey:
-		q = q.Order(orderByExpr("findings.status", dir, false)).Order("findings.id desc")
-	case "repo_id":
-		q = q.Order(orderByExpr("findings.repository_id", dir, false)).Order("findings.id desc")
-	case "cwe":
-		q = q.Order(orderByExpr("findings.cwe", dir, false)).Order("findings.id desc")
-	case "model":
-		q = q.Order(orderByExpr("findings.model", dir, false)).Order("findings.id desc")
-	case "scan":
-		q = q.Order(orderByExpr("findings.scan_id", dir, true)).Order("findings.id desc")
-	default:
-		sortCol, dir = defaultSort, ""
-		q = q.Order("id desc")
-	}
+	q, sortCol, dir := applyFindingsOrder(q, r.URL.Query().Get("sort"))
 	sort := joinSort(sortCol, dir)
 
 	var total int64
@@ -1423,6 +1406,44 @@ func (s *Server) findings(w http.ResponseWriter, r *http.Request) {
 		"Status": status, "Statuses": db.FindingLifecycles,
 		"Viability": viability,
 	})
+}
+
+// applyFindingsOrder applies the findings list's sort token to q and returns
+// the effective sort key and direction. Shared by the HTML findings page and
+// GET /api/v1/ui/findings so URL sort tokens stay portable.
+func applyFindingsOrder(q *gorm.DB, token string) (*gorm.DB, string, string) {
+	sortCol, dir := splitSort(token)
+	switch sortCol {
+	case sortSeverity:
+		// severityOrder ranks the most severe LOWEST, so the intuitive default
+		// (most severe first, shown as "desc") is ascending on the expression;
+		// !wantDesc flips the SQL direction relative to the logical one.
+		q = q.Order(orderBySuffix("("+severityOrder+")", !wantDesc(dir, true))).Order("findings.id desc")
+	case sortRepository:
+		q = q.Joins("JOIN repositories r ON r.id = findings.repository_id").
+			Order(orderByExpr("r.name", dir, false)).Order("findings.id desc")
+	case "title":
+		q = q.Order(orderByExpr("findings.title", dir, false)).Order("findings.id desc")
+	case statusKey:
+		q = q.Order(orderByExpr("findings.status", dir, false)).Order("findings.id desc")
+	case "repo_id":
+		q = q.Order(orderByExpr("findings.repository_id", dir, false)).Order("findings.id desc")
+	case "cwe":
+		q = q.Order(orderByExpr("findings.cwe", dir, false)).Order("findings.id desc")
+	case "model":
+		q = q.Order(orderByExpr("findings.model", dir, false)).Order("findings.id desc")
+	case "scan":
+		q = q.Order(orderByExpr("findings.scan_id", dir, true)).Order("findings.id desc")
+	case uiSortDate:
+		// SPA-only token (its Date column); the HTML findings page never sends
+		// it. id breaks created_at ties in the same direction.
+		desc := wantDesc(dir, true)
+		q = q.Order(orderBySuffix("findings.created_at", desc)).Order(orderBySuffix("findings.id", desc))
+	default:
+		sortCol, dir = defaultSort, ""
+		q = q.Order("id desc")
+	}
+	return q, sortCol, dir
 }
 
 func (s *Server) findingsIndexQuery(r *http.Request, includeScanners, includeMissed bool) *gorm.DB {
@@ -1769,35 +1790,14 @@ func (s *Server) findingStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status := db.FindingLifecycle(r.FormValue(statusKey))
-	if status == db.FindingRejected {
-		s.rejectFinding(w, r, f.ID)
-		return
+	in := findingStatusInput{
+		Status:   db.FindingLifecycle(r.FormValue(statusKey)),
+		Verdict:  r.FormValue("verdict"),
+		Reason:   r.FormValue("reason"),
+		Reviewer: r.FormValue("reviewer"),
 	}
-	if status == db.FindingReady && strings.TrimSpace(f.DisclosureDraft) == "" {
-		http.Error(w, "a saved disclosure draft is required before marking ready", http.StatusUnprocessableEntity)
-		return
-	}
-	// Nothing to ask a peer when the finding is already reported: the outreach
-	// this gates has happened, and a no-op transition writes nothing, so it
-	// would leave the claim it just recorded standing.
-	if status == db.FindingReported && f.Status != db.FindingReported && !s.federationClaimGate(w, r, f) {
-		return
-	}
-	switch status {
-	case db.FindingNew, db.FindingEnriched, db.FindingTriaged, db.FindingReady,
-		db.FindingReported, db.FindingAcknowledged, db.FindingFixed, db.FindingPublished,
-		db.FindingRejected, db.FindingDuplicate:
-		if err := db.WriteFindingField(s.DB.WithContext(r.Context()), f.ID, statusKey, string(status), db.SourceAnalyst, ""); err != nil {
-			if errors.Is(err, db.ErrFindingNonViable) {
-				http.Error(w, err.Error(), http.StatusPreconditionFailed)
-				return
-			}
-			http.Error(w, err.Error(), findingWriteErrorStatus(err, http.StatusInternalServerError))
-			return
-		}
-	default:
-		http.Error(w, "invalid status", http.StatusUnprocessableEntity)
+	if err := s.applyFindingStatus(r.Context(), f, in); err != nil {
+		s.writeFindingStatusHTMLError(w, r, f, in, err)
 		return
 	}
 	s.redirect(w, r, fmt.Sprintf("/findings/%d", f.ID))
@@ -1889,59 +1889,34 @@ func (s *Server) findingMitigate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runFindingSkill(w http.ResponseWriter, r *http.Request, name string, skipOpen bool) {
-	if skipOpen {
-		// Keep the open-scan check and enqueue atomic with other finding launches.
-		s.agentEnqueueMu.Lock()
-		defer s.agentEnqueueMu.Unlock()
-	}
 	f, ok := loadByID[db.Finding](s, w, r)
 	if !ok {
 		return
 	}
-	var scan db.Scan
-	if err := s.DB.First(&scan, f.ScanID).Error; err != nil {
-		http.Error(w, "scan for finding not found", http.StatusInternalServerError)
-		return
-	}
-	var skill db.Skill
-	if err := s.DB.Where("name = ? AND active = ?", name, true).First(&skill).Error; err != nil {
-		http.Error(w, name+" skill is not installed", http.StatusPreconditionFailed)
-		return
-	}
-	opts, err := s.findingSkillScanOpts(f.ID, name, r.FormValue("model"))
-	if err != nil {
+	model := r.FormValue("model")
+	res, err := s.enqueueFindingSkillAction(r.Context(), f, findingSkillLaunch{
+		Skill: name, Model: model, Feedback: r.PostForm.Get("feedback"), SkipOpen: skipOpen,
+	})
+	var missing findingSkillMissingError
+	var precondition findingSkillPreconditionError
+	switch {
+	case err == nil && res.Existing:
+		setFlash(w, Flash{Category: warningKey, Title: name + " already queued or running"})
+		s.redirect(w, r, fmt.Sprintf("/scans/%d", res.ScanID))
+	case err == nil:
+		s.redirect(w, r, fmt.Sprintf("/scans/%d", res.ScanID))
+	case errors.Is(err, errFindingScanMissing):
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	case errors.As(err, &missing), errors.As(err, &precondition), errors.Is(err, db.ErrFindingNonViable):
 		http.Error(w, err.Error(), http.StatusPreconditionFailed)
-		return
-	}
-	if skipOpen {
-		if openScan, ok := s.openFindingSkillScanForAttempt(f.ID, name, opts.RemediationAttemptID); ok {
-			setFlash(w, Flash{Category: warningKey, Title: name + " already queued or running"})
-			s.redirect(w, r, fmt.Sprintf("/scans/%d", openScan.ID))
-			return
-		}
-	}
-	opts.FindingID = new(f.ID)
-	opts.AuditDisclosure = externalReportingSkill(name)
-	if name == verifySkillName {
-		opts.VerificationFeedback = r.PostForm.Get("feedback")
-	}
-	scanID, err := s.enqueueSkillWith(r.Context(), scan.RepositoryID, skill.ID, opts)
-	if errors.Is(err, ErrFederationClaimPending) {
+	case errors.Is(err, ErrFederationClaimPending):
 		// The claim is now recorded on the finding, so the page shows who to
 		// coordinate with and running the skill again goes through.
 		setFlash(w, Flash{Category: warningKey, Title: "A federation peer already holds this finding"})
 		s.redirect(w, r, fmt.Sprintf("/findings/%d", f.ID))
-		return
-	}
-	if err != nil {
-		if errors.Is(err, db.ErrFindingNonViable) {
-			http.Error(w, err.Error(), http.StatusPreconditionFailed)
-			return
-		}
+	default:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
 	}
-	s.redirect(w, r, fmt.Sprintf("/scans/%d", scanID))
 }
 
 func (s *Server) openFindingSkillScan(findingID uint, skillName string) (db.Scan, bool) {
@@ -2494,81 +2469,11 @@ func (s *Server) repoBulkCreate(w http.ResponseWriter, r *http.Request) {
 // It creates the Repository row and its audit event, then enqueues the default
 // skill when the row is new and triage is true. isNew reports whether the repo was
 // actually created (so callers can distinguish "queued" from "already present").
+// The body lives in repository_add.go (addRepositoryInput), which also reports the
+// enqueued scan for the JSON add endpoints.
 func (s *Server) createOrTriageRepo(ctx context.Context, input RepoInput, model string, triage bool) (db.Repository, bool, error) {
-	if input.Local {
-		path := strings.TrimPrefix(input.CloneURL, LocalScheme)
-		info, err := os.Stat(path)
-		if err != nil {
-			return db.Repository{}, false, fmt.Errorf("local path %s: %w", path, err)
-		}
-		if !info.IsDir() {
-			return db.Repository{}, false, fmt.Errorf("local path %s is not a directory", path)
-		}
-	}
-	// Reject a traversal attempt in a submitted sub-path (repo#../x) before it
-	// is stored on a Subproject or a scan, and normalise it so equivalent forms
-	// dedupe.
-	cleanedSub, err := worker.CleanSubPath(input.SubPath)
-	if err != nil {
-		return db.Repository{}, false, err
-	}
-	input.SubPath = cleanedSub
-	// Owner, FullName, and HTMLURL seed from ParseRepoInput so the orgs
-	// view groups newly added repos and finding-location links work before
-	// the metadata job has run; the metadata job later overwrites them
-	// with the canonical forge values.
-	repo := db.Repository{
-		URL:     input.CloneURL,
-		Name:    input.Name,
-		Owner:   input.Owner,
-		HTMLURL: DefaultHTMLURL(input.CloneURL),
-	}
-	if input.Owner != "" {
-		repo.FullName = input.Owner + "/" + input.Name
-	}
-	isNew, err := s.createRepositoryWithAudit(ctx, &repo)
-	if err != nil {
-		return repo, false, err
-	}
-	// Eagerly warm the ecosyste.ms cache for a freshly added remote repo, in
-	// parallel with the triage enqueue below. Local repos have no
-	// upstream entry; the goroutine is best-effort and detached from ctx.
-	if isNew && !repo.IsLocal() && s.prefetchEcosystems != nil {
-		s.prefetchEcosystems(repo.ID)
-	}
-	// A repo#sub/dir (or /tree/<branch>/<path>) submission names a specific
-	// sub-package. Record it as a first-class Subproject now so it is navigable
-	// immediately, without waiting for the subprojects skill to rediscover it;
-	// the skill's later upsert (keyed on repo+path) adopts and enriches this
-	// row rather than duplicating it.
-	if input.SubPath != "" {
-		if err := db.EnsureSubproject(s.DB, repo.ID, input.SubPath); err != nil {
-			s.Log.Warn("ensure submitted subproject", "repo", repo.ID, "path", input.SubPath, "err", err)
-		}
-	}
-	if !triage {
-		return repo, isNew, nil
-	}
-	if !isNew && input.Branch == "" && input.SubPath == "" {
-		return repo, false, nil
-	}
-	var skill db.Skill
-	if err := s.DB.Where("name = ? AND active = ?", defaultSkillName, true).First(&skill).Error; err != nil {
-		s.Log.Warn("default skill not found, repo added with no scans", "skill", defaultSkillName)
-		return repo, isNew, nil
-	}
-	if repo.IsLocal() && skill.RequiresRemote {
-		s.Log.Info("default skill requires remote, skipping for local repo", "skill", skill.Name, "repo", repo.URL)
-		return repo, isNew, nil
-	}
-	if _, err := s.enqueueSkillWith(ctx, repo.ID, skill.ID, ScanOpts{
-		Model:   model,
-		SubPath: input.SubPath,
-		Ref:     input.Branch,
-	}); err != nil {
-		return repo, isNew, err
-	}
-	return repo, isNew, nil
+	res, err := s.addRepositoryInput(ctx, input, model, triage)
+	return res.Repo, res.Created, err
 }
 
 func bulkToastCategory(created, queued int, invalid []string) string {
@@ -4029,12 +3934,14 @@ func securityHeaders(allowRemote bool, h http.Handler) http.Handler {
 			http.Error(w, "forbidden: invalid host", http.StatusForbidden)
 			return
 		}
-		if r.Method == http.MethodPost {
+		if !safeMethod(r.Method) {
 			fetchSite := r.Header.Get("Sec-Fetch-Site")
 			// Browsers always send Sec-Fetch-Site; its absence means a non-browser
 			// client (curl, etc) which is fine. But "cross-site" means CSRF.
+			// Every unsafe method is checked, not only POST: the JSON UI
+			// writes with PATCH, PUT and DELETE.
 			if fetchSite == "cross-site" {
-				http.Error(w, "forbidden: cross-site POST", http.StatusForbidden)
+				http.Error(w, "forbidden: cross-site "+r.Method, http.StatusForbidden)
 				return
 			}
 		}
@@ -4042,10 +3949,17 @@ func securityHeaders(allowRemote bool, h http.Handler) http.Handler {
 	})
 }
 
+// safeMethod reports the methods that must not change state, which the
+// cross-site check lets through.
+func safeMethod(m string) bool {
+	return m == http.MethodGet || m == http.MethodHead || m == http.MethodOptions
+}
+
 func logRequests(log *slog.Logger, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		id := withRequestID(w)
 		h.ServeHTTP(w, r)
-		log.Info("http", "method", r.Method, "path", r.URL.Path, "dur", time.Since(start).Round(time.Millisecond))
+		log.Info("http", "method", r.Method, "path", r.URL.Path, "dur", time.Since(start).Round(time.Millisecond), "request_id", id)
 	})
 }

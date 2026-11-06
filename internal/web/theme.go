@@ -57,61 +57,24 @@ func resolveColorScheme(r *http.Request) string {
 	return "system"
 }
 
+// settingsStatsCounts is the settings page's system stats panel, shared with
+// GET /api/v1/ui/settings.
+type settingsStatsCounts struct {
+	Repos           int64 `json:"repos"`
+	Scans           int64 `json:"scans"`
+	Findings        int64 `json:"findings"`
+	ScannerFindings int64 `json:"scanner_findings"`
+	Packages        int64 `json:"packages"`
+	Advisories      int64 `json:"advisories"`
+	Maintainers     int64 `json:"maintainers"`
+	Skills          int64 `json:"skills"`
+}
+
 func (s *Server) settingsShow(w http.ResponseWriter, r *http.Request) {
-	var stats struct {
-		Repos           int64
-		Scans           int64
-		Findings        int64
-		ScannerFindings int64
-		Packages        int64
-		Advisories      int64
-		Maintainers     int64
-		Skills          int64
-	}
-	s.DB.Table("repositories").Count(&stats.Repos)
-	s.DB.Table("scans").Count(&stats.Scans)
-	// Split findings the same way the repo page does: deep-dive (curated
-	// audit) findings versus tool-scanner output (zizmor, semgrep, …).
-	dd := findingsScanIDs(s.DB)
-	s.DB.Model(&db.Finding{}).Where("scan_id IN (?)", dd).Count(&stats.Findings)
-	s.DB.Model(&db.Finding{}).Where("scan_id NOT IN (?)", dd).Count(&stats.ScannerFindings)
-	s.DB.Table("packages").Count(&stats.Packages)
-	s.DB.Table("advisories").Count(&stats.Advisories)
-	s.DB.Table("maintainers").Count(&stats.Maintainers)
-	s.DB.Table("skills").Count(&stats.Skills)
-
-	// DB size + location are introspected differently per backend: SQLite
-	// exposes them via table-valued pragmas, PostgreSQL via catalog
-	// functions. dbPath is a filesystem path on SQLite and the database name
-	// on PostgreSQL (the file lives on the server, not here).
-	var dbSizeBytes int64
-	var dbPath string
-	if s.DB.Name() == string(db.DialectPostgres) {
-		s.DB.Raw("SELECT pg_database_size(current_database())").Scan(&dbSizeBytes)
-		s.DB.Raw("SELECT current_database()").Scan(&dbPath)
-	} else {
-		s.DB.Raw("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()").Scan(&dbSizeBytes)
-		s.DB.Raw("SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&dbPath)
-	}
-
-	meta := s.toolMetadataCached(r.Context())
-	// Overlay the boot-time staleness verdict onto the (separately cached)
-	// version metadata. This is the verdict from the startup check; it is not
-	// re-probed per request, so it reflects the runner image as of boot.
-	if st := s.runnerImageStatus(); st.Stale {
-		meta.Stale = true
-		meta.StaleDays = st.AgeDays
-		meta.PullCommand = st.PullCommand
-	}
-
-	// ConcurrencyInput pre-fills the form with the persisted value when set,
-	// else the value the runner is actually using now. MaxTurns is 0 when
-	// unconfigured; the template then shows an empty field whose placeholder
-	// names the built-in fallback rather than asserting an active number.
-	concurrencyInput := s.Queue.Concurrency()
-	if v := db.SettingInt(s.DB, db.SettingConcurrency); v > 0 {
-		concurrencyInput = v
-	}
+	stats := s.settingsStats()
+	dbSizeBytes, dbPath := s.databaseSizeAndPath()
+	meta := s.runnerMetadata(r.Context())
+	concurrencyInput := s.concurrencyInput()
 	scanSchedule, _ := db.GetSetting(s.DB, db.SettingScanSchedule)
 
 	s.render(w, r, "settings.html", map[string]any{
@@ -136,6 +99,62 @@ func (s *Server) settingsShow(w http.ResponseWriter, r *http.Request) {
 		"CommitDate":       s.CommitDate,
 		"Meta":             meta,
 	})
+}
+
+func (s *Server) settingsStats() settingsStatsCounts {
+	var stats settingsStatsCounts
+	s.DB.Table("repositories").Count(&stats.Repos)
+	s.DB.Table("scans").Count(&stats.Scans)
+	// Split findings the same way the repo page does: deep-dive (curated
+	// audit) findings versus tool-scanner output (zizmor, semgrep, …).
+	dd := findingsScanIDs(s.DB)
+	s.DB.Model(&db.Finding{}).Where("scan_id IN (?)", dd).Count(&stats.Findings)
+	s.DB.Model(&db.Finding{}).Where("scan_id NOT IN (?)", dd).Count(&stats.ScannerFindings)
+	s.DB.Table("packages").Count(&stats.Packages)
+	s.DB.Table("advisories").Count(&stats.Advisories)
+	s.DB.Table("maintainers").Count(&stats.Maintainers)
+	s.DB.Table("skills").Count(&stats.Skills)
+	return stats
+}
+
+func (s *Server) databaseSizeAndPath() (dbSizeBytes int64, dbPath string) {
+	// DB size + location are introspected differently per backend: SQLite
+	// exposes them via table-valued pragmas, PostgreSQL via catalog
+	// functions. dbPath is a filesystem path on SQLite and the database name
+	// on PostgreSQL (the file lives on the server, not here).
+	if s.DB.Name() == string(db.DialectPostgres) {
+		s.DB.Raw("SELECT pg_database_size(current_database())").Scan(&dbSizeBytes)
+		s.DB.Raw("SELECT current_database()").Scan(&dbPath)
+	} else {
+		s.DB.Raw("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()").Scan(&dbSizeBytes)
+		s.DB.Raw("SELECT file FROM pragma_database_list WHERE name = 'main'").Scan(&dbPath)
+	}
+	return dbSizeBytes, dbPath
+}
+
+func (s *Server) runnerMetadata(ctx context.Context) toolMetadata {
+	meta := s.toolMetadataCached(ctx)
+	// Overlay the boot-time staleness verdict onto the (separately cached)
+	// version metadata. This is the verdict from the startup check; it is not
+	// re-probed per request, so it reflects the runner image as of boot.
+	if st := s.runnerImageStatus(); st.Stale {
+		meta.Stale = true
+		meta.StaleDays = st.AgeDays
+		meta.PullCommand = st.PullCommand
+	}
+	return meta
+}
+
+func (s *Server) concurrencyInput() int {
+	// ConcurrencyInput pre-fills the form with the persisted value when set,
+	// else the value the runner is actually using now. MaxTurns is 0 when
+	// unconfigured; the template then shows an empty field whose placeholder
+	// names the built-in fallback rather than asserting an active number.
+	concurrencyInput := s.Queue.Concurrency()
+	if v := db.SettingInt(s.DB, db.SettingConcurrency); v > 0 {
+		concurrencyInput = v
+	}
+	return concurrencyInput
 }
 
 // toolMetadata is the runtime version info shown on the settings page:
@@ -232,6 +251,12 @@ func (s *Server) settingsUpdateTheme(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown theme", http.StatusUnprocessableEntity)
 		return
 	}
+	setThemeCookie(w, theme)
+	setFlash(w, Flash{Category: successKey, Title: "Theme updated"})
+	s.redirect(w, r, "/settings")
+}
+
+func setThemeCookie(w http.ResponseWriter, theme string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "theme",
 		Value:    theme,
@@ -240,8 +265,6 @@ func (s *Server) settingsUpdateTheme(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
-	setFlash(w, Flash{Category: successKey, Title: "Theme updated"})
-	s.redirect(w, r, "/settings")
 }
 
 func (s *Server) settingsUpdateModel(w http.ResponseWriter, r *http.Request) {
@@ -286,6 +309,12 @@ func (s *Server) settingsUpdateColorScheme(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "unknown color scheme", http.StatusUnprocessableEntity)
 		return
 	}
+	setColorSchemeCookie(w, scheme)
+	setFlash(w, Flash{Category: successKey, Title: "Color scheme updated"})
+	s.redirect(w, r, "/settings")
+}
+
+func setColorSchemeCookie(w http.ResponseWriter, scheme string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "color_scheme",
 		Value:    scheme,
@@ -293,8 +322,6 @@ func (s *Server) settingsUpdateColorScheme(w http.ResponseWriter, r *http.Reques
 		MaxAge:   cookieMaxAge,
 		SameSite: http.SameSiteStrictMode,
 	})
-	setFlash(w, Flash{Category: successKey, Title: "Color scheme updated"})
-	s.redirect(w, r, "/settings")
 }
 
 func (s *Server) settingsUpdateConcurrency(w http.ResponseWriter, r *http.Request) {
@@ -303,14 +330,49 @@ func (s *Server) settingsUpdateConcurrency(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "concurrency must be between 1 and 64", http.StatusUnprocessableEntity)
 		return
 	}
-	if err := db.SetSetting(s.DB, db.SettingConcurrency, strconv.Itoa(n)); err != nil {
+	out, err := s.saveConcurrency(n)
+	if err != nil {
 		http.Error(w, "could not save setting", http.StatusInternalServerError)
 		return
 	}
-	if eff := s.Queue.EffectiveConcurrency(n); eff == s.Queue.Concurrency() {
-		setFlash(w, Flash{Category: successKey, Title: "Concurrency saved", Description: cappedConcurrencyNote(n, eff)})
+	switch {
+	case out.Applied:
+		setFlash(w, Flash{Category: successKey, Title: "Concurrency applied", Description: fmt.Sprintf("Runner now runs %d scans in parallel.", s.Queue.Concurrency())})
 		s.redirect(w, r, "/settings")
-		return
+	case out.RestartRequired:
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if execErr := s.tmpl.ExecuteTemplate(w, "concurrency-confirm-oob", map[string]any{
+			"Concurrency": n,
+			"Running":     out.Running,
+		}); execErr != nil {
+			s.Log.Error("render concurrency-confirm-oob", "err", execErr)
+		}
+	default:
+		setFlash(w, Flash{Category: successKey, Title: "Concurrency saved", Description: out.Note})
+		s.redirect(w, r, "/settings")
+	}
+}
+
+// concurrencyOutcome is what saving a concurrency value did. Exactly one of
+// three cases: the value was only saved (the effective limit is unchanged,
+// Note explains a cap), it was applied to an idle runner (Applied), or
+// scans are running and applying it needs a runner restart that would
+// cancel them (RestartRequired, with Running in flight).
+type concurrencyOutcome struct {
+	Applied         bool
+	RestartRequired bool
+	Running         int64
+	Note            string
+}
+
+// saveConcurrency persists n and applies it when that cancels nothing.
+// Callers validate the range first.
+func (s *Server) saveConcurrency(n int) (concurrencyOutcome, error) {
+	if err := db.SetSetting(s.DB, db.SettingConcurrency, strconv.Itoa(n)); err != nil {
+		return concurrencyOutcome{}, err
+	}
+	if eff := s.Queue.EffectiveConcurrency(n); eff == s.Queue.Concurrency() {
+		return concurrencyOutcome{Note: cappedConcurrencyNote(n, eff)}, nil
 	}
 	// The runner's limit is fixed at construction, so applying a new value
 	// means standing up a fresh runner, which aborts whatever is mid-flight.
@@ -320,17 +382,9 @@ func (s *Server) settingsUpdateConcurrency(w http.ResponseWriter, r *http.Reques
 	s.DB.Model(&db.Scan{}).Where("status = ?", db.ScanRunning).Count(&running)
 	if running == 0 {
 		s.Queue.Reconfigure(n)
-		setFlash(w, Flash{Category: successKey, Title: "Concurrency applied", Description: fmt.Sprintf("Runner now runs %d scans in parallel.", s.Queue.Concurrency())})
-		s.redirect(w, r, "/settings")
-		return
+		return concurrencyOutcome{Applied: true}, nil
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if execErr := s.tmpl.ExecuteTemplate(w, "concurrency-confirm-oob", map[string]any{
-		"Concurrency": n,
-		"Running":     running,
-	}); execErr != nil {
-		s.Log.Error("render concurrency-confirm-oob", "err", execErr)
-	}
+	return concurrencyOutcome{RestartRequired: true, Running: running}, nil
 }
 
 // cappedConcurrencyNote explains a saved value the queue will not apply, so a
@@ -346,18 +400,28 @@ func cappedConcurrencyNote(requested, effective int) string {
 // settingsRestartRunner rebuilds the runner at the saved concurrency, applying
 // it live. In-flight scans are cancelled by the swap; queued scans survive.
 func (s *Server) settingsRestartRunner(w http.ResponseWriter, r *http.Request) {
+	if restarted, note := s.restartRunner(); !restarted {
+		setFlash(w, Flash{Category: successKey, Title: "Runner unchanged", Description: note})
+		s.redirect(w, r, "/settings")
+		return
+	}
+	setFlash(w, Flash{Category: successKey, Title: "Runner restarted", Description: fmt.Sprintf("Now running %d scans in parallel; in-flight scans were cancelled.", s.Queue.Concurrency())})
+	s.redirect(w, r, "/settings")
+}
+
+// restartRunner rebuilds the runner at the saved concurrency. It reports false
+// with the cap explanation when a backend cap means the rebuild would change
+// nothing, in which case nothing is cancelled.
+func (s *Server) restartRunner() (restarted bool, note string) {
 	n := db.SettingInt(s.DB, db.SettingConcurrency)
 	if n <= 0 {
 		n = s.Queue.Concurrency()
 	}
 	if eff := s.Queue.EffectiveConcurrency(n); eff < n && eff == s.Queue.Concurrency() {
-		setFlash(w, Flash{Category: successKey, Title: "Runner unchanged", Description: cappedConcurrencyNote(n, eff)})
-		s.redirect(w, r, "/settings")
-		return
+		return false, cappedConcurrencyNote(n, eff)
 	}
 	s.Queue.Reconfigure(n)
-	setFlash(w, Flash{Category: successKey, Title: "Runner restarted", Description: fmt.Sprintf("Now running %d scans in parallel; in-flight scans were cancelled.", s.Queue.Concurrency())})
-	s.redirect(w, r, "/settings")
+	return true, ""
 }
 
 // settingsUpdateScanSchedule saves the global default scan schedule.
@@ -369,25 +433,44 @@ func (s *Server) settingsUpdateScanSchedule(w http.ResponseWriter, r *http.Reque
 	if schedule == "custom" {
 		schedule = strings.TrimSpace(r.FormValue("scan_schedule_cron"))
 	}
+	schedule, err := normalizeScanSchedule(schedule)
+	if err != nil {
+		http.Error(w, "invalid schedule: "+err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	if err := s.saveScanSchedule(schedule); err != nil {
+		http.Error(w, "could not save setting", http.StatusInternalServerError)
+		return
+	}
+	setFlash(w, Flash{Category: successKey, Title: "Default scan schedule updated"})
+	s.redirect(w, r, "/settings")
+}
+
+// normalizeScanSchedule folds "off" to "" and validates anything else as a
+// schedule expression (daily, weekly or a cron line).
+func normalizeScanSchedule(schedule string) (string, error) {
 	if schedule == ScheduleOff {
 		schedule = ""
 	}
 	if schedule != "" {
 		if _, err := ScheduleNext(schedule, time.Now()); err != nil {
-			http.Error(w, "invalid schedule: "+err.Error(), http.StatusUnprocessableEntity)
-			return
+			return "", err
 		}
 	}
+	return schedule, nil
+}
+
+// saveScanSchedule persists a normalised global schedule and resets the next
+// run of every repository that inherits it.
+func (s *Server) saveScanSchedule(schedule string) error {
 	if err := db.SetSetting(s.DB, db.SettingScanSchedule, schedule); err != nil {
-		http.Error(w, "could not save setting", http.StatusInternalServerError)
-		return
+		return err
 	}
 	if err := s.DB.Model(&db.Repository{}).Where("scan_schedule = '' OR scan_schedule IS NULL").
 		UpdateColumn("next_scheduled_scan_at", nil).Error; err != nil {
 		s.Log.Error("reset inherited schedules", "err", err)
 	}
-	setFlash(w, Flash{Category: successKey, Title: "Default scan schedule updated"})
-	s.redirect(w, r, "/settings")
+	return nil
 }
 
 func (s *Server) settingsUpdateMaxTurns(w http.ResponseWriter, r *http.Request) {

@@ -29,6 +29,10 @@ const DefaultPath = "./scrutineer.yaml"
 // Config mirrors the supported YAML keys. Every field is optional; missing
 // fields leave the corresponding flag at its built-in default.
 type Config struct {
+	// Web holds the Svelte UI v2 serving options (web.ui_dir,
+	// web.test_hooks); see WebConfig.
+	Web WebConfig `yaml:"web"`
+
 	Addr         string   `yaml:"addr"`
 	Data         string   `yaml:"data"`
 	Effort       string   `yaml:"effort"`
@@ -629,6 +633,16 @@ type Model struct {
 	Name string `yaml:"name"`
 	ID   string `yaml:"id"`
 	Tier string `yaml:"tier"`
+}
+
+// WebConfig configures the Svelte UI v2 served under /ui/.
+type WebConfig struct {
+	// UIDir serves the SPA from a build directory on disk instead of the
+	// copy embedded in the binary (handy while developing the SPA).
+	UIDir string `yaml:"ui_dir"`
+	// TestHooks enables the development-only POST /api/v1/ui/_test/publish
+	// SSE seam. Never enable it on a real deployment.
+	TestHooks bool `yaml:"test_hooks"`
 }
 
 // Themes lists every valid theme name.

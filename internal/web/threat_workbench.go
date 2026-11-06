@@ -42,22 +42,22 @@ type Workbench struct {
 // deep-dive runs. A sink is keyed by its inventory location (file:line)
 // since the per-run S<n> ids are not stable across runs.
 type WorkbenchDiff struct {
-	NowReported   []DiffRow
-	NowSuppressed []DiffRow
-	ReasonChanged []DiffRow
-	Unchanged     int
+	NowReported   []DiffRow `json:"now_reported"`
+	NowSuppressed []DiffRow `json:"now_suppressed"`
+	ReasonChanged []DiffRow `json:"reason_changed"`
+	Unchanged     int       `json:"unchanged"`
 	// OnlyInCurr / OnlyInPrev are sinks one run inventoried that the
 	// other did not. Non-determinism in the inventory pass shows up
 	// here rather than as a model effect.
-	OnlyInCurr int
-	OnlyInPrev int
+	OnlyInCurr int `json:"only_in_curr"`
+	OnlyInPrev int `json:"only_in_prev"`
 }
 
 type DiffRow struct {
-	Location string
-	Class    string
-	Before   string
-	After    string
+	Location string `json:"location"`
+	Class    string `json:"class"`
+	Before   string `json:"before"`
+	After    string `json:"after"`
 }
 
 func (d WorkbenchDiff) Empty() bool {

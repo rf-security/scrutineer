@@ -23,6 +23,15 @@ type Event struct {
 	ScanID uint
 	RepoID uint
 	ConvID uint
+	// FindingID scopes `finding` events for /api/v1/ui/events subscribers
+	// that filter on one finding; the legacy stream never sets it.
+	FindingID uint
+	// JSON is a pre-built payload for the JSON stream. Events that carry it
+	// exist only for /api/v1/ui/events; the legacy HTML stream skips them.
+	JSON any
+	// Offset is the byte position in scan.log after a scan-log line, filled
+	// in by the broker's offset tracker (see Broker.trackLogOffset).
+	Offset int64
 }
 
 const sseBuf = 64
@@ -32,6 +41,9 @@ type client struct {
 	scanID uint // 0 = all scans
 	repoID uint // 0 = all repos
 	convID uint // 0 = all conversations
+	// findingID filters on Event.FindingID; 0 = all findings. Only the JSON
+	// stream sets it.
+	findingID uint
 	// names restricts delivery to these event names; nil = every name. A list
 	// page only reacts to scan-status, and without this filter it would be sent
 	// every log line of every running scan and the whole chat activity stream.
@@ -42,18 +54,44 @@ type client struct {
 type Broker struct {
 	mu      sync.RWMutex
 	clients map[*client]struct{}
+
+	// hookMu guards the hooks the web server installs; Publish reads them on
+	// every event.
+	hookMu sync.RWMutex
+	// logSeed returns the stored scan.log for a scan the offset tracker has
+	// not seen yet in this process.
+	logSeed func(scanID uint) string
+	// afterPublish runs after fan-out (the debounced `queue` event and
+	// offset bookkeeping on status changes hang off it).
+	afterPublish func(Event)
+
+	offsetMu   sync.Mutex
+	logOffsets map[uint]int64
 }
 
 func NewBroker() *Broker {
-	return &Broker{clients: make(map[*client]struct{})}
+	return &Broker{clients: make(map[*client]struct{}), logOffsets: make(map[uint]int64)}
+}
+
+// subscription is the full filter set a client can ask for; Subscribe keeps
+// its positional signature for the legacy callers.
+type subscription struct {
+	scanID, repoID, convID, findingID uint
+	names                             []string
 }
 
 func (b *Broker) Subscribe(scanID, repoID, convID uint, names ...string) *client {
+	return b.subscribe(subscription{scanID: scanID, repoID: repoID, convID: convID, names: names})
+}
+
+func (b *Broker) subscribe(sub subscription) *client {
+	names := sub.names
 	c := &client{
-		ch:     make(chan Event, sseBuf),
-		scanID: scanID,
-		repoID: repoID,
-		convID: convID,
+		ch:        make(chan Event, sseBuf),
+		scanID:    sub.scanID,
+		repoID:    sub.repoID,
+		convID:    sub.convID,
+		findingID: sub.findingID,
 	}
 	if len(names) > 0 {
 		c.names = make(map[string]bool, len(names))
@@ -76,6 +114,19 @@ func (b *Broker) Unsubscribe(c *client) {
 // Publish sends an event to all matching clients. Non-blocking: slow
 // clients get their channel drained.
 func (b *Broker) Publish(e Event) {
+	if e.Name == scanLogEvent && e.ScanID != 0 {
+		e.Offset = b.trackLogOffset(e.ScanID, e.Data)
+	}
+	b.fanOut(e)
+	b.hookMu.RLock()
+	after := b.afterPublish
+	b.hookMu.RUnlock()
+	if after != nil {
+		after(e)
+	}
+}
+
+func (b *Broker) fanOut(e Event) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	for c := range b.clients {
@@ -89,6 +140,9 @@ func (b *Broker) Publish(e Event) {
 			continue
 		}
 		if c.convID != 0 && c.convID != e.ConvID {
+			continue
+		}
+		if c.findingID != 0 && c.findingID != e.FindingID {
 			continue
 		}
 		select {
@@ -141,6 +195,11 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case e := <-c.ch:
+			if e.JSON != nil {
+				// JSON-stream-only event (finding, queue, meta, ...); the
+				// HTML pages have no swap target for it.
+				continue
+			}
 			var data string
 			// A scan-status with no scan ID comes from a bulk action or an
 			// enqueue, which name no row to swap: it carries no payload and
@@ -177,34 +236,21 @@ func (s *Server) publishScanList(repoID uint) {
 // renderScanStatus loads a scan and renders the OOB row (plus a toast once it
 // finished) pushed to repo_show via the scan-status SSE event.
 func (s *Server) renderScanStatus(scanID uint) string {
-	var scan db.Scan
-	if err := s.DB.Preload("Repository").First(&scan, scanID).Error; err != nil {
+	st, ok := s.scanStatusData(scanID)
+	if !ok {
 		return ""
 	}
-	var n int64
-	s.DB.Model(&db.Finding{}).Where("scan_id = ?", scan.ID).Count(&n)
-	scan.FindingsCount = int(n)
-
-	data := map[string]any{"Scan": scan}
-	// Only an outcome is worth a toast. A scan reaching `running` pushes a row
-	// update like any other status, but announcing every start would spam the
-	// toaster, and the category below would paint it as an error.
-	if scan.Status.Terminal() {
-		cat := successKey
-		if scan.Status != db.ScanDone {
-			cat = errorKey
-		}
+	data := map[string]any{"Scan": st.Scan}
+	if st.Toast != nil {
 		flash := Flash{
-			Category:    cat,
-			Title:       fmt.Sprintf("%s %s", scan.SkillName, scan.Status),
-			Description: scan.Repository.Name,
-			Href:        fmt.Sprintf("/scans/%d", scan.ID),
-			Label:       "View",
+			Category:    st.Toast.Category,
+			Title:       st.Toast.Title,
+			Description: st.Toast.Description,
+			Href:        fmt.Sprintf("/scans/%d", st.Scan.ID),
+			Label:       st.Toast.Label,
 		}
-		if findingID := s.disclosureReviewFindingID(scan); findingID != 0 {
-			flash.Title = "Disclosure draft generated"
-			flash.Href = fmt.Sprintf("/findings/%d#disclosure", findingID)
-			flash.Label = "Review disclosure"
+		if st.DisclosureFindingID != 0 {
+			flash.Href = fmt.Sprintf("/findings/%d#disclosure", st.DisclosureFindingID)
 		}
 		data["Flash"] = flash
 	}
@@ -214,6 +260,97 @@ func (s *Server) renderScanStatus(scanID uint) string {
 		return ""
 	}
 	return buf.String()
+}
+
+// scanStatus is what a scan-status event says about one scan, shared by the
+// HTML OOB row and the JSON `scan` event.
+type scanStatus struct {
+	Scan  db.Scan
+	Toast *uiToast
+	// DisclosureFindingID is set when the scan drafted a disclosure the
+	// operator should review; the toast then targets that finding.
+	DisclosureFindingID uint
+}
+
+// scanStatusData loads a scan for a scan-status event. Only an outcome is
+// worth a toast: a scan reaching `running` pushes a row update like any other
+// status, but announcing every start would spam the toaster, and the error
+// category would paint it as a failure.
+func (s *Server) scanStatusData(scanID uint) (scanStatus, bool) {
+	var scan db.Scan
+	if err := s.DB.Preload("Repository").First(&scan, scanID).Error; err != nil {
+		return scanStatus{}, false
+	}
+	var n int64
+	s.DB.Model(&db.Finding{}).Where("scan_id = ?", scan.ID).Count(&n)
+	scan.FindingsCount = int(n)
+
+	st := scanStatus{Scan: scan}
+	if !scan.Status.Terminal() {
+		return st, true
+	}
+	cat := successKey
+	if scan.Status != db.ScanDone {
+		cat = errorKey
+	}
+	st.Toast = &uiToast{
+		Category:    cat,
+		Title:       fmt.Sprintf("%s %s", scan.SkillName, scan.Status),
+		Description: scan.Repository.Name,
+		Label:       "View",
+		Target:      &uiTarget{Kind: "scan", ID: scan.ID},
+	}
+	if findingID := s.disclosureReviewFindingID(scan); findingID != 0 {
+		st.DisclosureFindingID = findingID
+		st.Toast.Title = "Disclosure draft generated"
+		st.Toast.Label = "Review disclosure"
+		st.Toast.Target = &uiTarget{Kind: "finding", ID: findingID, Section: "disclosure"}
+	}
+	return st, true
+}
+
+// trackLogOffset returns the byte offset in scan.log after line. Offsets live
+// in memory per scan; the first line seen for a scan seeds from the stored
+// log. The worker flushes the log to the database in batches, so the stored
+// copy may or may not already end with this line: when it does, the line is
+// already counted.
+func (b *Broker) trackLogOffset(scanID uint, line string) int64 {
+	b.offsetMu.Lock()
+	defer b.offsetMu.Unlock()
+	if off, ok := b.logOffsets[scanID]; ok {
+		off += int64(len(line))
+		b.logOffsets[scanID] = off
+		return off
+	}
+	b.hookMu.RLock()
+	seed := b.logSeed
+	b.hookMu.RUnlock()
+	var stored string
+	if seed != nil {
+		stored = seed(scanID)
+	}
+	off := int64(len(stored))
+	if !strings.HasSuffix(stored, line) || line == "" {
+		off += int64(len(line))
+	}
+	b.logOffsets[scanID] = off
+	return off
+}
+
+// forgetLogOffset drops a scan's tracked offset once it stops producing
+// lines (paused or terminal), so a resume re-seeds from the fully flushed log.
+func (b *Broker) forgetLogOffset(scanID uint) {
+	b.offsetMu.Lock()
+	delete(b.logOffsets, scanID)
+	b.offsetMu.Unlock()
+}
+
+// setHooks installs the server's broker hooks. Safe to call repeatedly.
+func (b *Broker) setHooks(logSeed func(uint) string, afterPublish func(Event)) {
+	b.hookMu.Lock()
+	b.logSeed = logSeed
+	b.afterPublish = afterPublish
+	b.hookMu.Unlock()
 }
 
 // discloseScanGeneratedDraft excludes refused or malformed runs.

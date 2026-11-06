@@ -1,7 +1,9 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -34,41 +36,50 @@ func (s *Server) investigationCreate(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		s.render(w, r, "investigation_new.html", data)
 	}
-	report := r.PostForm.Get("report")
-	if strings.TrimSpace(report) == "" || len(report) > maxInvestigationBytes || !utf8.ValidString(report) {
-		fail("Enter a report of up to 64 KB of UTF-8 text.", http.StatusUnprocessableEntity)
-		return
-	}
-	input, err := ParseRepoInput(r.PostForm.Get("url"))
+	scanID, _, status, err := s.startInvestigation(r.Context(), r.PostForm.Get("url"), r.PostForm.Get("ref"), r.PostForm.Get("report"))
 	if err != nil {
-		fail(err.Error(), http.StatusUnprocessableEntity)
-		return
-	}
-	if ref := strings.TrimSpace(r.PostForm.Get("ref")); ref != "" {
-		input.Branch = ref
-	}
-	if err := worker.ValidateGitRef(input.Branch); err != nil {
-		fail(err.Error(), http.StatusUnprocessableEntity)
-		return
-	}
-	var skill db.Skill
-	if err := s.DB.Where("name = ? AND active = ?", investigateSkillName, true).First(&skill).Error; err != nil {
-		fail("The investigate skill is unavailable. Load the bundled skills and try again.", http.StatusServiceUnavailable)
-		return
-	}
-	repo, err := s.ensureImportRepo(input.CloneURL)
-	if err != nil {
-		fail(err.Error(), http.StatusUnprocessableEntity)
-		return
-	}
-	scanID, err := s.enqueueSkillWith(r.Context(), repo.ID, skill.ID, ScanOpts{
-		Ref: input.Branch, SubPath: input.SubPath, ImportPayload: []byte(report),
-	})
-	if err != nil {
-		fail(err.Error(), http.StatusUnprocessableEntity)
+		fail(err.Error(), status)
 		return
 	}
 	s.redirect(w, r, fmt.Sprintf("/scans/%d", scanID))
+}
+
+// errInvestigationReport is the report-size/encoding rejection message.
+var errInvestigationReport = errors.New("Enter a report of up to 64 KB of UTF-8 text.") //nolint:staticcheck // shown verbatim in the form
+
+// startInvestigation validates an investigate request, creates or reuses the
+// repository and enqueues the investigate skill with the report as its import
+// payload. On failure it returns the HTTP status the form (and the JSON
+// endpoint) reports: 422 for bad input, 503 when the skill is unavailable.
+func (s *Server) startInvestigation(ctx context.Context, rawURL, rawRef, report string) (scanID, repoID uint, status int, err error) {
+	if strings.TrimSpace(report) == "" || len(report) > maxInvestigationBytes || !utf8.ValidString(report) {
+		return 0, 0, http.StatusUnprocessableEntity, errInvestigationReport
+	}
+	input, err := ParseRepoInput(rawURL)
+	if err != nil {
+		return 0, 0, http.StatusUnprocessableEntity, err
+	}
+	if ref := strings.TrimSpace(rawRef); ref != "" {
+		input.Branch = ref
+	}
+	if err := worker.ValidateGitRef(input.Branch); err != nil {
+		return 0, 0, http.StatusUnprocessableEntity, err
+	}
+	var skill db.Skill
+	if err := s.DB.Where("name = ? AND active = ?", investigateSkillName, true).First(&skill).Error; err != nil {
+		return 0, 0, http.StatusServiceUnavailable, errors.New("The investigate skill is unavailable. Load the bundled skills and try again.") //nolint:staticcheck // shown verbatim in the form
+	}
+	repo, err := s.ensureImportRepo(input.CloneURL)
+	if err != nil {
+		return 0, 0, http.StatusUnprocessableEntity, err
+	}
+	scanID, err = s.enqueueSkillWith(ctx, repo.ID, skill.ID, ScanOpts{
+		Ref: input.Branch, SubPath: input.SubPath, ImportPayload: []byte(report),
+	})
+	if err != nil {
+		return 0, repo.ID, http.StatusUnprocessableEntity, err
+	}
+	return scanID, repo.ID, http.StatusAccepted, nil
 }
 
 type investigationReport struct {

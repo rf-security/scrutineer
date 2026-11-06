@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -58,56 +59,90 @@ func (s *Server) conversationCreateFinding(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	backTo := fmt.Sprintf("/findings/%d", f.ID)
-	repoID := f.RepositoryID
-	if repoID == 0 {
-		// Legacy rows may not have the denormalized repository_id; fall back to
-		// the producing scan, mirroring findingShow.
-		var scan db.Scan
-		if err := s.DB.First(&scan, f.ScanID).Error; err != nil {
-			s.Log.Error("chat: load finding scan", "finding", f.ID, "scan", f.ScanID, "err", err)
-			setFlash(w, Flash{Category: errorKey, Title: "Chat unavailable", Description: "Could not resolve which repository this finding belongs to."})
-			s.redirect(w, r, backTo)
-			return
-		}
-		repoID = scan.RepositoryID
+	repoID, err := s.findingChatRepoID(f)
+	if err != nil {
+		setFlash(w, Flash{Category: errorKey, Title: "Chat unavailable", Description: "Could not resolve which repository this finding belongs to."})
+		s.redirect(w, r, backTo)
+		return
 	}
 	fid := f.ID
 	s.startConversation(w, r, repoID, &fid, backTo)
 }
 
+// findingChatRepoID is the repository a finding-scoped chat belongs to.
+// Legacy rows may not have the denormalized repository_id; fall back to the
+// producing scan, mirroring findingShow.
+func (s *Server) findingChatRepoID(f db.Finding) (uint, error) {
+	if f.RepositoryID != 0 {
+		return f.RepositoryID, nil
+	}
+	var scan db.Scan
+	if err := s.DB.First(&scan, f.ScanID).Error; err != nil {
+		s.Log.Error("chat: load finding scan", "finding", f.ID, "scan", f.ScanID, "err", err)
+		return 0, err
+	}
+	return scan.RepositoryID, nil
+}
+
+// Chat refusals shared by the HTML handlers (which flash them) and the
+// /api/v1/ui chat routes (which map them to statuses).
+var (
+	errChatUnavailable  = errors.New("chat unavailable: no agent runner is configured")
+	errChatEmptyMessage = errors.New("message is empty")
+	errChatBusy         = errors.New("still thinking: wait for the current reply")
+	errChatCreate       = errors.New("the conversation could not be created")
+	errChatPersist      = errors.New("the message could not be saved")
+)
+
 // startConversation creates a conversation from the first message, persists that
 // message, kicks off the opening turn, and sends the analyst to the chat page.
 func (s *Server) startConversation(w http.ResponseWriter, r *http.Request, repoID uint, findingID *uint, backTo string) {
-	if s.chatRunner == nil {
-		setFlash(w, Flash{Category: errorKey, Title: "Chat unavailable", Description: "No agent runner is configured."})
+	conv, err := s.createConversation(repoID, findingID, r.FormValue("message"))
+	if err != nil {
+		var f Flash
+		switch {
+		case errors.Is(err, errChatUnavailable):
+			f = Flash{Category: errorKey, Title: "Chat unavailable", Description: "No agent runner is configured."}
+		case errors.Is(err, errChatEmptyMessage):
+			f = Flash{Category: errorKey, Title: "Empty message", Description: "Type a message to start the conversation."}
+		case errors.Is(err, errChatPersist):
+			f = Flash{Category: errorKey, Title: "Chat unavailable", Description: "The message could not be saved."}
+		default:
+			f = Flash{Category: errorKey, Title: "Chat unavailable", Description: "The conversation could not be created."}
+		}
+		setFlash(w, f)
 		s.redirect(w, r, backTo)
 		return
 	}
-	message := strings.TrimSpace(r.FormValue("message"))
+	s.redirect(w, r, fmt.Sprintf("/conversations/%d", conv.ID))
+}
+
+// createConversation creates a conversation from the first message, persists
+// that message and kicks off the opening turn. Shared by the HTML create
+// handlers and the /api/v1/ui create routes.
+func (s *Server) createConversation(repoID uint, findingID *uint, message string) (*db.Conversation, error) {
+	if s.chatRunner == nil {
+		return nil, errChatUnavailable
+	}
+	message = strings.TrimSpace(message)
 	if message == "" {
-		setFlash(w, Flash{Category: errorKey, Title: "Empty message", Description: "Type a message to start the conversation."})
-		s.redirect(w, r, backTo)
-		return
+		return nil, errChatEmptyMessage
 	}
 	conv, err := db.CreateConversation(s.DB, repoID, findingID, s.DefaultModel(), message)
 	if err != nil {
 		s.Log.Error("chat: create conversation", "repo", repoID, "err", err)
-		setFlash(w, Flash{Category: errorKey, Title: "Chat unavailable", Description: "The conversation could not be created."})
-		s.redirect(w, r, backTo)
-		return
+		return nil, errChatCreate
 	}
 	if _, err := db.AddChatMessage(s.DB, conv.ID, db.ChatRoleUser, message); err != nil {
 		// The conversation row is already committed; drop it rather than leave
 		// a titled, message-less chat in the panel.
 		s.Log.Error("chat: persist first message", "conv", conv.ID, "err", err)
 		s.DB.Delete(&db.Conversation{}, conv.ID)
-		setFlash(w, Flash{Category: errorKey, Title: "Chat unavailable", Description: "The message could not be saved."})
-		s.redirect(w, r, backTo)
-		return
+		return nil, errChatPersist
 	}
 	s.beginChatTurn(conv.ID)
 	s.spawnTurn(conv.ID, message)
-	s.redirect(w, r, fmt.Sprintf("/conversations/%d", conv.ID))
+	return conv, nil
 }
 
 // conversationShow renders the full chat page.
@@ -142,31 +177,45 @@ func (s *Server) conversationMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dest := fmt.Sprintf("/conversations/%d", conv.ID)
-	message := strings.TrimSpace(r.FormValue("message"))
+	if _, err := s.postChatMessage(conv.ID, r.FormValue("message")); err != nil {
+		var f Flash
+		switch {
+		case errors.Is(err, errChatEmptyMessage):
+			f = Flash{Category: errorKey, Title: "Empty message", Description: "Type a message to send."}
+		case errors.Is(err, errChatUnavailable):
+			f = Flash{Category: errorKey, Title: "Chat unavailable", Description: "No agent runner is configured."}
+		case errors.Is(err, errChatBusy):
+			f = Flash{Category: errorKey, Title: "Still thinking", Description: "Wait for the current reply before sending another message."}
+		default:
+			f = Flash{Category: errorKey, Title: "Chat unavailable", Description: "The message could not be saved."}
+		}
+		setFlash(w, f)
+	}
+	s.redirect(w, r, dest)
+}
+
+// postChatMessage persists the analyst's message and starts the next turn,
+// returning the stored message. Shared by the HTML form and
+// POST /api/v1/ui/conversations/{id}/messages.
+func (s *Server) postChatMessage(convID uint, message string) (*db.ChatMessage, error) {
+	message = strings.TrimSpace(message)
 	if message == "" {
-		setFlash(w, Flash{Category: errorKey, Title: "Empty message", Description: "Type a message to send."})
-		s.redirect(w, r, dest)
-		return
+		return nil, errChatEmptyMessage
 	}
 	if s.chatRunner == nil {
-		setFlash(w, Flash{Category: errorKey, Title: "Chat unavailable", Description: "No agent runner is configured."})
-		s.redirect(w, r, dest)
-		return
+		return nil, errChatUnavailable
 	}
-	if !s.beginChatTurn(conv.ID) {
-		setFlash(w, Flash{Category: errorKey, Title: "Still thinking", Description: "Wait for the current reply before sending another message."})
-		s.redirect(w, r, dest)
-		return
+	if !s.beginChatTurn(convID) {
+		return nil, errChatBusy
 	}
-	if _, err := db.AddChatMessage(s.DB, conv.ID, db.ChatRoleUser, message); err != nil {
-		s.endChatTurn(conv.ID)
-		s.Log.Error("chat: persist message", "conv", conv.ID, "err", err)
-		setFlash(w, Flash{Category: errorKey, Title: "Chat unavailable", Description: "The message could not be saved."})
-		s.redirect(w, r, dest)
-		return
+	msg, err := db.AddChatMessage(s.DB, convID, db.ChatRoleUser, message)
+	if err != nil {
+		s.endChatTurn(convID)
+		s.Log.Error("chat: persist message", "conv", convID, "err", err)
+		return nil, errChatPersist
 	}
-	s.spawnTurn(conv.ID, message)
-	s.redirect(w, r, dest)
+	s.spawnTurn(convID, message)
+	return msg, nil
 }
 
 // conversationDelete drops a conversation, its messages and its on-disk
@@ -178,28 +227,41 @@ func (s *Server) conversationDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Claiming the slot rather than just reading it, so no turn can start
-	// between the check and the removal either.
-	if !s.beginChatTurn(conv.ID) {
-		setFlash(w, Flash{Category: errorKey, Title: "Still thinking",
-			Description: "Wait for the current reply before deleting this conversation."})
-		s.redirect(w, r, fmt.Sprintf("/conversations/%d", conv.ID))
-		return
-	}
-	defer s.endChatTurn(conv.ID)
-	if err := db.DeleteConversation(s.DB, conv.ID); err != nil {
-		s.Log.Error("chat: delete conversation", "conv", conv.ID, "err", err)
+	if err := s.deleteConversation(conv.ID); err != nil {
+		if errors.Is(err, errChatBusy) {
+			setFlash(w, Flash{Category: errorKey, Title: "Still thinking",
+				Description: "Wait for the current reply before deleting this conversation."})
+			s.redirect(w, r, fmt.Sprintf("/conversations/%d", conv.ID))
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	// After the commit, so a failed transaction never strands a live
-	// conversation whose workspace is already gone.
-	if err := s.Worker.RemoveChatArtifacts(conv.ID); err != nil {
-		s.Log.Error("chat: remove chat workspace", "conv", conv.ID, "err", err)
 	}
 	setFlash(w, Flash{Category: "success", Title: "Conversation deleted",
 		Description: "The transcript and its working copy of the clone were removed."})
 	s.redirect(w, r, conversationBackHref(&conv))
+}
+
+// deleteConversation removes a conversation and its workspace, refusing with
+// errChatBusy while a turn runs. Shared by the HTML delete form and
+// DELETE /api/v1/ui/conversations/{id}.
+func (s *Server) deleteConversation(convID uint) error {
+	// Claiming the slot rather than just reading it, so no turn can start
+	// between the check and the removal either.
+	if !s.beginChatTurn(convID) {
+		return errChatBusy
+	}
+	defer s.endChatTurn(convID)
+	if err := db.DeleteConversation(s.DB, convID); err != nil {
+		s.Log.Error("chat: delete conversation", "conv", convID, "err", err)
+		return err
+	}
+	// After the commit, so a failed transaction never strands a live
+	// conversation whose workspace is already gone.
+	if err := s.Worker.RemoveChatArtifacts(convID); err != nil {
+		s.Log.Error("chat: remove chat workspace", "conv", convID, "err", err)
+	}
+	return nil
 }
 
 // runChatTurn executes one turn in the background: it streams activity to the

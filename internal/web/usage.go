@@ -13,37 +13,70 @@ import (
 // corpus. Percentiles are computed in Go because sqlite has no
 // percentile_cont; with low-thousands of scans the sort is trivial.
 type SkillUsage struct {
-	Skill     string
-	Runs      int
-	Cost      Stats
-	Turns     Stats
-	TokensIn  int
-	TokensOut int
+	Skill     string `json:"skill"`
+	Runs      int    `json:"runs"`
+	Cost      Stats  `json:"cost"`
+	Turns     Stats  `json:"turns"`
+	TokensIn  int    `json:"tokens_in"`
+	TokensOut int    `json:"tokens_out"`
 }
 
 // DayUsage is one row of the /usage?view=day table: total cost and
 // token spend for all skill scans that finished on a given calendar day.
 type DayUsage struct {
-	Date      string
-	Runs      int
-	TotalCost float64
-	TokensIn  int
-	TokensOut int
+	Date      string  `json:"date"`
+	Runs      int     `json:"runs"`
+	TotalCost float64 `json:"total_cost"`
+	TokensIn  int     `json:"tokens_in"`
+	TokensOut int     `json:"tokens_out"`
 }
 
 type Stats struct {
-	Min    float64
-	Median float64
-	P90    float64
-	Max    float64
-	Sum    float64
+	Min    float64 `json:"min"`
+	Median float64 `json:"median"`
+	P90    float64 `json:"p90"`
+	Max    float64 `json:"max"`
+	Sum    float64 `json:"sum"`
 }
+
+// Usage views: the per-skill table (default), the per-day table and the
+// cost-driver analysis.
+const (
+	usageViewSkill   = "skill"
+	usageViewDay     = "day"
+	usageViewDrivers = "drivers"
+)
 
 func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	view := r.URL.Query().Get("view")
-	if view != "day" && view != "drivers" {
-		view = "skill"
+	if view != usageViewDay && view != usageViewDrivers {
+		view = usageViewSkill
 	}
+	data := s.loadUsage(view)
+	s.render(w, r, "usage.html", map[string]any{
+		"Rows":               data.Rows,
+		"DayRows":            data.DayRows,
+		"DriverCorrelations": data.Drivers.Correlations,
+		"Outliers":           data.Drivers.Outliers,
+		"TotalCost":          data.TotalCost,
+		"TotalRuns":          data.TotalRuns,
+		"View":               view,
+		"RateLimit":          data.RateLimit,
+	})
+}
+
+// usageData is everything the usage page shows, shared by the HTML page and
+// GET /api/v1/ui/usage. Drivers is only loaded for the drivers view.
+type usageData struct {
+	Rows      []SkillUsage
+	DayRows   []DayUsage
+	TotalCost float64
+	TotalRuns int
+	RateLimit rateLimitPanel
+	Drivers   usageDriverAnalysis
+}
+
+func (s *Server) loadUsage(view string) usageData {
 
 	// Only completed runs contribute to the distribution; queued/running
 	// rows have zero cost and would drag the floor down, and failed runs
@@ -53,7 +86,7 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 		"skill_name", "cost_usd", "turns", "input_tokens", "output_tokens",
 		"cache_read_tokens", "cache_write_tokens", "finished_at", "created_at",
 	}
-	if view == "drivers" {
+	if view == usageViewDrivers {
 		columns = append(columns, "id", "repository_id", "model", "profile", "sub_path", "focus_area")
 	}
 	s.DB.Select(columns).
@@ -121,19 +154,17 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	rl.Downgrading = s.Worker.ShouldDowngradeModel()
 	rl.Paused = s.Worker.ShouldPauseOnOverage()
 	drivers := usageDriverAnalysis{}
-	if view == "drivers" {
+	if view == usageViewDrivers {
 		drivers = s.loadUsageDriverAnalysis(scans)
 	}
-	s.render(w, r, "usage.html", map[string]any{
-		"Rows":               rows,
-		"DayRows":            dayRows,
-		"DriverCorrelations": drivers.Correlations,
-		"Outliers":           drivers.Outliers,
-		"TotalCost":          totalCost,
-		"TotalRuns":          totalRuns,
-		"View":               view,
-		"RateLimit":          rl,
-	})
+	return usageData{
+		Rows:      rows,
+		DayRows:   dayRows,
+		TotalCost: totalCost,
+		TotalRuns: totalRuns,
+		RateLimit: rl,
+		Drivers:   drivers,
+	}
 }
 
 const (
@@ -177,18 +208,18 @@ func percentile(sorted []float64, p float64) float64 {
 
 // rateLimitPanel is the usage page's in-memory Claude rate-limit snapshot.
 type rateLimitPanel struct {
-	Rows []rateLimitRow
+	Rows []rateLimitRow `json:"windows"`
 	// Downgrading is true when the overage model fallback is enabled and active,
 	// i.e. new scans are running on the mid (Sonnet) tier instead of max/high.
-	Downgrading bool
-	Paused      bool
+	Downgrading bool `json:"downgrading"`
+	Paused      bool `json:"paused"`
 }
 
 type rateLimitRow struct {
-	Window  string
-	Status  string
-	ResetAt string
-	Overage bool
+	Window  string `json:"window"`
+	Status  string `json:"status"`
+	ResetAt string `json:"reset_at"`
+	Overage bool   `json:"overage"`
 }
 
 func rateLimitWindowLabel(t string) string {

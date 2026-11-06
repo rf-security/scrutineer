@@ -22,6 +22,8 @@ type OrgRepo struct {
 	Fork      bool   `json:"fork"`
 	Archived  bool   `json:"archived"`
 	MirrorURL string `json:"mirror_url"`
+	HTMLURL   string `json:"html_url"`
+	Stars     int    `json:"stargazers_count"`
 }
 
 // githubAPI is the API base. It is a var, not a const, so tests can point the
@@ -179,25 +181,7 @@ func (s *Server) repoOrgImport(w http.ResponseWriter, r *http.Request) {
 
 	// Apply the fork/archived filters once so the preview count and the import
 	// operate on the same candidate set.
-	var toImport []OrgRepo
-	var filtered int
-	for _, repo := range repos {
-		if repo.Fork && !includeForks {
-			filtered++
-			continue
-		}
-		if repo.Archived && !includeArchived {
-			filtered++
-			continue
-		}
-		// Mirrors track an upstream and are never worth scanning on their own;
-		// skip them unconditionally (no opt-in toggle).
-		if repo.MirrorURL != "" {
-			filtered++
-			continue
-		}
-		toImport = append(toImport, repo)
-	}
+	toImport, filtered := filterOrgRepos(repos, includeForks, includeArchived)
 
 	if r.FormValue("confirm") == "" {
 		s.orgImportConfirm(w, r, OrgImportPreview{
@@ -249,6 +233,31 @@ func (s *Server) repoOrgImport(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.redirect(w, r, "/")
 	}
+}
+
+// filterOrgRepos applies the org import's fork/archived toggles and drops
+// mirrors, returning the candidates and how many were held back.
+func filterOrgRepos(repos []OrgRepo, includeForks, includeArchived bool) ([]OrgRepo, int) {
+	var toImport []OrgRepo
+	var filtered int
+	for _, repo := range repos {
+		if repo.Fork && !includeForks {
+			filtered++
+			continue
+		}
+		if repo.Archived && !includeArchived {
+			filtered++
+			continue
+		}
+		// Mirrors track an upstream and are never worth scanning on their own;
+		// skip them unconditionally (no opt-in toggle).
+		if repo.MirrorURL != "" {
+			filtered++
+			continue
+		}
+		toImport = append(toImport, repo)
+	}
+	return toImport, filtered
 }
 
 // orgImportConfirm renders the "this will add N repos" confirmation step.

@@ -1,0 +1,1 @@
+import{R as e,m as t}from"./DN80vuV4.js";import{a as n,i as r}from"./DSRRKTV2.js";var i=()=>e({queryKey:t,queryFn:({signal:e})=>n(r.GET(`/v1/ui/activity`,{signal:e})),staleTime:6e4,refetchOnWindowFocus:!1});export{i as t};

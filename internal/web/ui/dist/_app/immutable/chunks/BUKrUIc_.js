@@ -1,0 +1,1 @@
+import"./xihTtKlq.js";import{_t as e,mt as t,q as n,vt as r}from"./BZJaQ5U5.js";import{t as i}from"./EbEVw_CK.js";function a(a,o){r(o,!0);{let e=t(()=>Number(o.target.id));i(a,{get id(){return n(e)},compact:!0})}e()}export{a as default};

@@ -1,0 +1,1 @@
+import{dt as e,lt as t,q as n}from"./BZJaQ5U5.js";var r=new class{#e=e(null);get target(){return n(this.#e)}set target(e){t(this.#e,e,!0)}#t=e(0);get hosts(){return n(this.#t)}set hosts(e){t(this.#t,e,!0)}open(e){this.target={...e}}close(){this.target=null}};export{r as t};

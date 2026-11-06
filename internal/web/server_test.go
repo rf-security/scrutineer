@@ -43,6 +43,13 @@ func newTestServerWith(t testing.TB, opts ...Option) (*Server, func()) {
 	}
 	s.Backend = worker.HarnessName(worker.ClaudeHarness{})
 	s.resolvePURL = func(context.Context, string) string { return "" }
+	s.resolvePURLs = func(ctx context.Context, purls []string) (map[string]string, error) {
+		resolved := make(map[string]string, len(purls))
+		for _, purl := range purls {
+			resolved[purl] = s.resolvePURL(ctx, purl)
+		}
+		return resolved, nil
+	}
 	s.resolveSync = true
 	s.prefetchEcosystems = func(uint) {}
 	s.OperatorToken = testOperatorToken

@@ -23,6 +23,11 @@ func TestParseRefusalAudit(t *testing.T) {
 		t.Error("audit with skipped paths should warn")
 	}
 
+	dir := `{"refused":false,"reason":null,"skipped":[{"path":"tools/","reason":"removed by scan config"}]}`
+	if _, err := parseRefusalAudit(dir); err != nil {
+		t.Errorf("directory path with trailing slash: %v", err)
+	}
+
 	for _, tc := range []struct {
 		name string
 		raw  string
@@ -38,6 +43,8 @@ func TestParseRefusalAudit(t *testing.T) {
 		{"windows drive skipped path", `{"refused":false,"reason":null,"skipped":[{"path":"C:/temp/file","reason":"outside repo"}]}`, "repository-relative"},
 		{"parent skipped path", `{"refused":false,"reason":null,"skipped":[{"path":"src/../secret","reason":"outside repo"}]}`, "repository-relative"},
 		{"empty skipped segment", `{"refused":false,"reason":null,"skipped":[{"path":"src//parser.c","reason":"outside repo"}]}`, "repository-relative"},
+		{"root skipped path", `{"refused":false,"reason":null,"skipped":[{"path":"/","reason":"outside repo"}]}`, "repository-relative"},
+		{"double trailing slash", `{"refused":false,"reason":null,"skipped":[{"path":"src//","reason":"outside repo"}]}`, "repository-relative"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := parseRefusalAudit(tc.raw); err == nil || !strings.Contains(err.Error(), tc.want) {

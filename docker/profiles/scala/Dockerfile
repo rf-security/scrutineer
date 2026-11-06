@@ -48,7 +48,7 @@ ENV COURSIER_CACHE=/opt/coursier \
     SBT_OPTS="-Dsbt.global.base=/opt/sbt-home -Dsbt.boot.directory=/opt/sbt-home/boot -Dsbt.ivy.home=/opt/ivy2 -Dsbt.server.autostart=false -Djava.io.tmpdir=/opt/java-tmp" \
     PATH=/opt/sbt/bin:$PATH
 
-RUN curl -fsSL -o /tmp/sbt.tgz \
+RUN curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/sbt.tgz \
         "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" \
  && echo "${SBT_SHA256}  /tmp/sbt.tgz" | sha256sum -c - \
  && tar -xzf /tmp/sbt.tgz -C /opt \

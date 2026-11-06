@@ -233,6 +233,15 @@
 #   - artifactory.internal
 #   - "*.mycorp.net"
 
+# Point scan package managers (npm, pip, uv, Go, pub, Hex) at an existing
+# package repository or caching proxy. git_pkgs_proxy derives the npm, PyPI, Go
+# and pub URLs; Hex needs an explicit hex key. An explicit key overrides the
+# derived one. HTTPS only, no credentials in the URL. The hosts join the egress
+# allowlist unless hardened. See docs/package-repositories.md.
+# package_repositories:
+#   git_pkgs_proxy: https://pkgs.example.com
+#   npm: https://npm.mycorp.net/repository/npm/
+
 # Per-skill egress under --hardened. egress_allow is ignored there, so grant a
 # named skill exact host:port pairs instead. The port is required and enforced;
 # every other skill keeps the strict allowlist. Needs hardened: true. See
@@ -269,6 +278,13 @@
 # false also leaves the Dependents tab empty and dependent-exposure analysis
 # with nothing to run against. Flag: -ecosystems-enrichment.
 # ecosystems_enrichment: true
+
+# Threat-model and verify scans look the repository up in Anthropic's OSS
+# Scanner registry (or its .oss-scanner/ files) and stage the maintainer
+# threat model and Dockerfile as read-only reference data. The registry fetch
+# is best-effort and never fails a scan. See docs/oss-scanner.md.
+# oss_scanner: true
+# oss_scanner_registry: https://github.com/anthropics/oss-scanner
 
 # How many scans run in parallel. Default is 4; raise on bigger hosts,
 # lower if you want model calls serialised.

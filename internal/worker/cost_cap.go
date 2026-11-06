@@ -96,6 +96,24 @@ func startCostGuardRun(ctx context.Context, scan *db.Scan, emit func(Event)) (co
 	return runCtx, guard.wrap(emit), guard, func() { cancel(nil) }
 }
 
+func (w *Worker) runFollowupSkill(ctx context.Context, scan *db.Scan, job SkillJob, emit func(Event)) (SkillResult, error) {
+	if err := ctx.Err(); err != nil {
+		return SkillResult{}, err
+	}
+	if scan.MaxCostUSD > 0 && scan.CostUSD >= scan.MaxCostUSD {
+		return SkillResult{}, errCostCapped
+	}
+	runCtx, runEmit, guard, stop := startCostGuardRun(ctx, scan, emit)
+	defer stop()
+	res, err := w.Runner.RunSkill(runCtx, job, runEmit)
+	w.applySkillResult(scan, res)
+	if err != nil && guard.Tripped() && ctx.Err() == nil {
+		guard.foldPending()
+		return res, errCostCapped
+	}
+	return res, err
+}
+
 func costCapPrompt(skill *db.Skill) string {
 	outputFile := skillOutputFile(skill)
 	return fmt.Sprintf(`The cost budget for this %q scan is exhausted. Stop investigating now. Do not start any new analysis or tool-heavy work.
@@ -121,18 +139,23 @@ func markCostCapped(scan *db.Scan) error {
 // finishCostCappedRun handles a run the guard stopped: it asks the agent to
 // write its report from the saved session, parses it and marks the scan capped.
 func (w *Worker) finishCostCappedRun(ctx context.Context, skill *db.Skill, scan *db.Scan, sj SkillJob, report string, emit func(Event)) (string, error) {
-	report = w.finalizeCostCapped(ctx, skill, scan, sj, report, emit)
+	valid := func(r string) bool {
+		return r != "" && (skill.SchemaJSON == "" || ValidateSkillReport(skill.Name, skill.SchemaJSON, skill.PoCField, r) == "")
+	}
+	final := w.finalizeCostCapped(ctx, skill, scan, sj, report, emit)
+	if valid(report) && !valid(final) {
+		emit(Event{Kind: KindText, Text: "cost cap: finalized report does not validate; keeping the earlier valid report"})
+	} else {
+		report = final
+	}
+	var parseErr error
 	if report != "" {
-		var err error
-		report, err = w.repairAndParseSkillOutput(ctx, skill, scan, sj, report, emit)
-		if err != nil {
-			return report, err
-		}
+		parseErr = w.parseSkillOutput(ctx, skill, scan, report, emit)
 	}
 	if err := markCostCapped(scan); err != nil {
 		return report, err
 	}
-	return report, nil
+	return report, parseErr
 }
 
 // finalizeCostCapped resumes the session for a short turn so the agent writes

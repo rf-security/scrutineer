@@ -65,7 +65,7 @@ RUN apt-get update \
         arm64) arch=arm64; sha="${NODE_SHA256_ARM64}" ;; \
         *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /tmp/node.tar.xz \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/node.tar.xz \
         "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${arch}.tar.xz" \
  && echo "${sha}  /tmp/node.tar.xz" | sha256sum -c - \
  && mkdir -p /usr/local/node \

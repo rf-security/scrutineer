@@ -205,11 +205,12 @@ type Server struct {
 	// deployments where a trusted front end already authenticates users.
 	DisableOperatorToken bool
 
-	// resolvePURL maps a Package URL to its source repository URL via
-	// packages.ecosyste.ms. Field rather than direct call so tests can
+	// resolvePURL and resolvePURLs map Package URLs to source repository URLs
+	// via packages.ecosyste.ms. Field rather than direct call so tests can
 	// stub the network lookup.
-	resolvePURL func(ctx context.Context, purl string) string
-	resolveSync bool
+	resolvePURL  func(ctx context.Context, purl string) string
+	resolvePURLs func(ctx context.Context, purls []string) (map[string]string, error)
+	resolveSync  bool
 
 	// listBranches enumerates a remote's branches for the add-repo branch
 	// picker. Field rather than a direct worker call so tests can stub the
@@ -516,6 +517,7 @@ func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *work
 	}
 	s := &Server{DB: gdb, Queue: q, Log: log, Broker: broker, Worker: w, tmpl: t,
 		resolvePURL: resolvePURLRepo, listBranches: worker.ListRemoteBranches,
+		resolvePURLs:      worker.ResolvePURLRepositoryURLs,
 		fetchOrgRepos:     fetchGitHubOrgRepos,
 		resolveRemoteHead: defaultResolveRemoteHead,
 		syncUpstream:      w.SyncUpstream}
@@ -550,6 +552,7 @@ func (s *Server) DisableEcosystems() {
 	s.ecosystemsEnrichment = false
 	s.prefetchEcosystems = nil
 	s.resolvePURL = func(context.Context, string) string { return "" }
+	s.resolvePURLs = func(context.Context, []string) (map[string]string, error) { return nil, nil }
 }
 
 // ecosystemsPrefetch warms the ecosyste.ms cache for a freshly added repo in a
@@ -2214,6 +2217,7 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.Log.Warn("load finding attack paths", "finding", f.ID, "err", err)
 	}
+	observations := s.findingObservations(f.ID)
 	remediationAttempts, err := loadRemediationAttemptViews(s.DB, f.ID)
 	if err != nil {
 		s.Log.Warn("load remediation attempts", "finding", f.ID, "err", err)
@@ -2284,6 +2288,7 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 		"Reviews":             reviews,
 		"Verifications":       verifications,
 		"AttackPaths":         attackPaths,
+		"Observations":        observations,
 		"RemediationAttempts": remediationAttempts,
 		"ReattackInFlight":    reattackInFlight,
 		"LatestRevalidate":    latestRevalidate,
@@ -3456,7 +3461,7 @@ func findingChildModels() []any {
 	return []any{
 		&db.FindingNote{}, &db.FindingCommunication{}, &db.FindingReference{},
 		&db.FindingHistory{}, &db.FindingDependent{}, &db.FindingReview{}, &db.FeedbackConfirmation{}, &db.DisclosureSubmission{},
-		&db.FindingVerification{}, &db.FindingAttackPath{}, &db.FindingPoC{},
+		&db.FindingVerification{}, &db.FindingAttackPath{}, &db.FindingObservation{}, &db.FindingPoC{},
 		&db.RemediationValidation{}, &db.RemediationAttempt{},
 	}
 }

@@ -94,13 +94,13 @@ RUN apt-get update \
         arm64) sw_plat=debian12-aarch64; sw_sha="${SWIFT_SHA256_ARM64}"; sy_arch=aarch64; sy_sha="${SWIFTLY_SHA256_ARM64}" ;; \
         *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /tmp/swift.tar.gz \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/swift.tar.gz \
         "https://download.swift.org/swift-${SWIFT_VERSION}-release/${sw_plat}/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-${sw_plat}.tar.gz" \
  && echo "${sw_sha}  /tmp/swift.tar.gz" | sha256sum -c - \
  && mkdir -p /opt/swift \
  && tar -xzf /tmp/swift.tar.gz -C /opt/swift --strip-components=1 \
  && rm /tmp/swift.tar.gz \
- && curl -fsSL -o /tmp/swiftly.tar.gz \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/swiftly.tar.gz \
         "https://download.swift.org/swiftly/linux/swiftly-${SWIFTLY_VERSION}-${sy_arch}.tar.gz" \
  && echo "${sy_sha}  /tmp/swiftly.tar.gz" | sha256sum -c - \
  && install -d -m 1777 /opt/swiftly /opt/swiftly/bin /opt/swiftly/toolchains \

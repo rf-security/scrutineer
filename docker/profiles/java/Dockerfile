@@ -71,21 +71,21 @@ RUN apt-get update \
         *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
  # JDK
- && curl -fsSL -o /tmp/jdk.tar.gz \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/jdk.tar.gz \
         "https://github.com/adoptium/temurin25-binaries/releases/download/${JDK_PATH_VERSION}/OpenJDK25U-jdk_${jdkarch}_linux_hotspot_${JDK_VERSION}.tar.gz" \
  && echo "${jdksha}  /tmp/jdk.tar.gz" | sha256sum -c - \
  && mkdir -p /opt/java \
  && tar -xzf /tmp/jdk.tar.gz -C /opt/java --strip-components=1 \
  && rm /tmp/jdk.tar.gz \
  # Maven
- && curl -fsSL -o /tmp/maven.tar.gz \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/maven.tar.gz \
         "https://dlcdn.apache.org/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" \
  && echo "${MAVEN_SHA512}  /tmp/maven.tar.gz" | sha512sum -c - \
  && mkdir -p /opt/maven \
  && tar -xzf /tmp/maven.tar.gz -C /opt/maven --strip-components=1 \
  && rm /tmp/maven.tar.gz \
  # Gradle
- && curl -fsSL -o /tmp/gradle.zip \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/gradle.zip \
         "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" \
  && echo "${GRADLE_SHA256}  /tmp/gradle.zip" | sha256sum -c - \
  && unzip -q /tmp/gradle.zip -d /opt \

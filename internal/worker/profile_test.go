@@ -548,6 +548,30 @@ func TestProfileGuidesShip(t *testing.T) {
 	}
 }
 
+func TestEnsureImage_buildErrorIncludesOutput(t *testing.T) {
+	bin := t.TempDir()
+	rt := writeFakeBin(t, bin, "runtime", `#!/bin/sh
+case "$1" in
+  image) exit 1 ;;
+  build) echo "step 7/9: apt-get stalled on deb.debian.org"; exit 1 ;;
+esac
+`)
+	profiles := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(profiles, "node"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profiles, "node", "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Profile{Name: "node"}.EnsureImage(context.Background(), ContainerRuntime{Bin: rt}, profiles, "", func(Event) {})
+	if err == nil {
+		t.Fatal("expected build error, got nil")
+	}
+	if !strings.Contains(err.Error(), "apt-get stalled on deb.debian.org") {
+		t.Errorf("build output not in error: %v", err)
+	}
+}
+
 // TestProfileBuildArgs pins the runner-vs-chained build-arg wiring EnsureImage
 // relies on, without a container runtime: a runner profile --pull's (only with
 // a resolved digest) and passes RUNNER_IMAGE; a chained profile passes

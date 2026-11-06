@@ -25,6 +25,7 @@ import (
 	"scrutineer/internal/db"
 	"scrutineer/internal/db/dbtest"
 	"scrutineer/internal/interchange"
+	"scrutineer/internal/ossscanner"
 	"scrutineer/internal/web"
 	"scrutineer/internal/worker"
 )
@@ -828,6 +829,40 @@ func TestBuildEgressAllow_hardenedDropsConfigKeepsHarness(t *testing.T) {
 	}
 	if !slices.Contains(allow, "proxy.corp.com") {
 		t.Errorf("hardened dropped the model base URL host: %v", allow)
+	}
+}
+
+func TestBuildEgressAllow_defaultIncludesPackageRepositoryHosts(t *testing.T) {
+	cfg := &config.Config{PackageRepositories: config.PackageRepositories{
+		GitPkgsProxy: "https://pkgs.example.com",
+		NPM:          "https://npm.example.org/",
+	}}
+	allow := buildEgressAllow(worker.ClaudeHarness{}.EgressHosts(), false, cfg, "", quietLog())
+	if !slices.Contains(allow, "pkgs.example.com") || !slices.Contains(allow, "npm.example.org") {
+		t.Errorf("default mode did not add package repository hosts: %v", allow)
+	}
+}
+
+func TestBuildEgressAllow_hardenedExcludesPackageRepositoryHosts(t *testing.T) {
+	cfg := &config.Config{PackageRepositories: config.PackageRepositories{
+		GitPkgsProxy: "https://pkgs.example.com",
+		NPM:          "https://npm.example.org/",
+	}}
+	allow := buildEgressAllow(worker.ClaudeHarness{}.EgressHosts(), true, cfg, "", quietLog())
+	if slices.Contains(allow, "pkgs.example.com") || slices.Contains(allow, "npm.example.org") {
+		t.Errorf("hardened added package repository hosts: %v", allow)
+	}
+}
+
+func TestBuildEgressAllow_hardenedLogsPackageRepositoryGrants(t *testing.T) {
+	cfg := &config.Config{PackageRepositories: config.PackageRepositories{
+		GitPkgsProxy: "https://pkgs.example.com:8443",
+		NPM:          "https://npm.example.org/",
+	}}
+	var buf bytes.Buffer
+	buildEgressAllow(worker.ClaudeHarness{}.EgressHosts(), true, cfg, "", slog.New(slog.NewTextHandler(&buf, nil)))
+	if out := buf.String(); !strings.Contains(out, "npm.example.org:443") || !strings.Contains(out, "pkgs.example.com:8443") {
+		t.Errorf("hardened log missing host:port grants: %s", out)
 	}
 }
 
@@ -1779,5 +1814,25 @@ func TestScanEgressPolicyGrants(t *testing.T) {
 	bad := &config.Config{ScanEgressPolicies: map[string]config.EgressPolicy{"x": {Allow: []string{"10.0.0.1:443"}}}}
 	if _, err := scanEgressPolicyGrants(bad); err == nil || !strings.Contains(err.Error(), "scan_egress_policies.x") {
 		t.Errorf("bad grant error = %v", err)
+	}
+}
+
+func TestOSSScannerRegistry(t *testing.T) {
+	off, on := false, true
+	tests := []struct {
+		name string
+		cfg  *config.Config
+		want string
+	}{
+		{"nil config", nil, ossscanner.DefaultRegistryURL},
+		{"default", &config.Config{}, ossscanner.DefaultRegistryURL},
+		{"explicitly on", &config.Config{OSSScanner: &on}, ossscanner.DefaultRegistryURL},
+		{"off", &config.Config{OSSScanner: &off, OSSScannerRegistry: "https://example.test/r"}, ""},
+		{"override", &config.Config{OSSScannerRegistry: "https://example.test/r"}, "https://example.test/r"},
+	}
+	for _, tt := range tests {
+		if got := ossScannerRegistry(tt.cfg); got != tt.want {
+			t.Errorf("%s: got %q, want %q", tt.name, got, tt.want)
+		}
 	}
 }

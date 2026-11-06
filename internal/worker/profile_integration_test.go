@@ -4,13 +4,26 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// Profiles exercised here build in under three minutes on CI; cap each build
+// so a network stall surfaces its log instead of a `go test` timeout panic.
+const integrationProfileBuildTimeout = 5 * time.Minute
+
+func setIntegrationProfileBuildTimeout(t *testing.T) {
+	t.Helper()
+	was := profileBuildTimeout
+	profileBuildTimeout = integrationProfileBuildTimeout
+	t.Cleanup(func() { profileBuildTimeout = was })
+}
 
 func TestIntegration_DetectProjectProfile(t *testing.T) {
 	image := os.Getenv("SCRUTINEER_TEST_RUNNER_IMAGE")
 	if image == "" {
 		t.Skip("set SCRUTINEER_TEST_RUNNER_IMAGE to run profile detection in Docker")
 	}
+	setIntegrationProfileBuildTimeout(t)
 	for _, tt := range []struct {
 		name    string
 		subPath string

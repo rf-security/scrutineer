@@ -54,7 +54,7 @@ ENV KOTLIN_HOME=/opt/kotlinc \
     JAVA_OPTS=-Djava.io.tmpdir=/opt/java-tmp \
     PATH=/opt/kotlinc/bin:$PATH
 
-RUN curl -fsSL -o /tmp/kotlinc.zip \
+RUN curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/kotlinc.zip \
         "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" \
  && echo "${KOTLIN_SHA256}  /tmp/kotlinc.zip" | sha256sum -c - \
  # unzip is inherited from the java base. The archive extracts as kotlinc/,

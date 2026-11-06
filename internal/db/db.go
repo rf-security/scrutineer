@@ -980,6 +980,9 @@ type Finding struct {
 	FederationClaimContacts string `gorm:"type:text"`
 	FederationClaimAt       *time.Time
 	Assignee                string `gorm:"index"`
+	// DuplicateOfID is the canonical finding that finding-dedup merged this
+	// one into. It is only meaningful while Status is duplicate.
+	DuplicateOfID uint `gorm:"index"`
 	// LastRevalidateVerdict caches the latest verdict from the
 	// revalidate skill (true_positive | false_positive | already_fixed
 	// | uncertain; empty when revalidate has not run) so the audit
@@ -1718,7 +1721,7 @@ func Models() []any {
 	return []any{
 		&Repository{}, &Scan{},
 		&Finding{}, &FindingLabel{}, &FindingNote{}, &DisclosureSubmission{},
-		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{}, &FeedbackConfirmation{}, &FindingVerification{}, &FindingAttackPath{}, &ScanPreflightReceipt{},
+		&FindingCommunication{}, &FindingReference{}, &FindingHistory{}, &FindingReview{}, &FeedbackConfirmation{}, &FindingVerification{}, &FindingAttackPath{}, &FindingObservation{}, &ScanPreflightReceipt{},
 		&RemediationAttempt{}, &RemediationValidation{}, &AuditEvent{}, &FindingPoC{},
 		&Dependency{}, &ExpectedFinding{}, &Package{}, &PackageAlternative{}, &Dependent{}, &FindingDependent{}, &Advisory{}, &AdvisoryAudit{},
 		&Maintainer{}, &Skill{}, &Subproject{}, &ComplianceControl{},

@@ -7,24 +7,24 @@
 # update the selected asset and checksum atomically. A mismatched tag/digest in
 # a Renovate PR fails sha256sum below and usually means asset identification
 # failed upstream.
-ARG CLAUDE_AMD64_LOCK=v2.1.304@sha256:ea6ae29e6eea7dd35d4b05a5a1db5a040a0b294c5ab7d0f7fa299db9b6e625c0
-ARG CLAUDE_ARM64_LOCK=v2.1.304@sha256:17cc5d933babad064bed65b3a4fbafab29556fbbfc12aa7888ae1f6c320e08c5
+ARG CLAUDE_AMD64_LOCK=v2.1.312@sha256:d9324231c4e3dfe342e853f56c752348ae060f9f221cdf4b0f90ef1dc47ee907
+ARG CLAUDE_ARM64_LOCK=v2.1.312@sha256:0635c6245b11bbb4ca16e4119b0ac3980ee99e2f8cf5ab6e8d6c0e9e0db3ee5b
 
-ARG CODEX_AMD64_LOCK=rust-v0.163.0@sha256:582646c6bf0561eb0de540f7fc85b9121b0091a826bc6e96830b7f1722122182
-ARG CODEX_ARM64_LOCK=rust-v0.163.0@sha256:9d8ecf2d19d3e184877983902d6c85de48b3888dcb72c382a8a0c975845927fb
+ARG CODEX_AMD64_LOCK=rust-v0.165.0@sha256:e97c4463d7f146692a955d7b0e1c8cf48f97cd4d616cd45c5dcab2e8d9743316
+ARG CODEX_ARM64_LOCK=rust-v0.165.0@sha256:c8b2844fdef57498572db960344aee8c836ce9f75c203379da0a9c3a334fc3b7
 
-ARG OPENCODE_AMD64_LOCK=v1.19.3@sha256:13a8fb2978302071b86f9d7e00da9c8895f9cd846978379c3bdc6a5333536c9b
-ARG OPENCODE_ARM64_LOCK=v1.19.3@sha256:7900818a6a98881edbbadab4b7525940eff3b9750040c200481f9f56cacee405
+ARG OPENCODE_AMD64_LOCK=v2.2.0@sha256:6d597970a8cc448f1b9a9f645532584b339dd3ab9583bb5f063f13d83e54768f
+ARG OPENCODE_ARM64_LOCK=v2.2.0@sha256:1f1ce0fc07b9245a815ffa9d652dbb80e6b0f07e5bf74ea87d2b1c0339fbac52
 
-ARG COPILOT_AMD64_LOCK=v1.0.100@sha256:65dfb019192afebed7abb385323a232a5ac32fa8c40a230880d4013cffb6b0b3
-ARG COPILOT_ARM64_LOCK=v1.0.100@sha256:e7eee160da29e47fe471997f43366cc0606e3a8a1ae97ac74df612f1894dde6a
+ARG COPILOT_AMD64_LOCK=v1.0.105@sha256:aba1f06f27bc0447656647f76e0a4cf58b4b2a341c75ff04a750982b6aeb6bd2
+ARG COPILOT_ARM64_LOCK=v1.0.105@sha256:e7b488cc04ac3e2ed800e1bf0aace33ada42dcf167529b3d2f48a61e1535a847
 
-ARG SEMGREP_VERSION=1.181.0
+ARG SEMGREP_VERSION=1.182.1
 
 ARG BANDIT_VERSION=1.9.4
 ARG DARNIT_VERSION=0.1.1
 
-FROM golang:1.27.3-trixie@sha256:1896654cfc5c2b5ad74c07f29cb36f5d2d1cbed42e3054070fbfe444e521e83c AS go-tools
+FROM golang:1.27.3-trixie@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385 AS go-tools
 
 COPY scripts/retry-build-command.sh /usr/local/bin/retry-build-command.sh
 # Go proxy/checksum requests can fail transiently.
@@ -40,7 +40,7 @@ RUN cargo install --locked --root /out zizmor@1.31.1
 # The runner image carries the proxy commands used by Scrutineer and by
 # harness/container consumers. Both are built CGO-free so they can be copied
 # into the slim runtime without a glibc dependency.
-FROM golang:1.27.3-trixie@sha256:1896654cfc5c2b5ad74c07f29cb36f5d2d1cbed42e3054070fbfe444e521e83c AS scrutineer-build
+FROM golang:1.27.3-trixie@sha256:c65ecfe613b539ac74c62a4c3b2c27e8f8a6076384c8f27e8a3c0f3be17cc385 AS scrutineer-build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -68,7 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv python3-jsonschema \
         libstdc++6 ripgrep \
  && install -d -m 0755 /etc/apt/keyrings \
- && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
  && echo "deb [signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
@@ -116,7 +116,7 @@ RUN set -eux; \
     esac; \
     tag="${lock%@*}"; \
     sha="${lock#*@sha256:}"; \
-    curl -fsSL -o /tmp/claude.tgz \
+    curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/claude.tgz \
       "https://github.com/anthropics/claude-code/releases/download/${tag}/claude-linux-${arch}.tar.gz"; \
     echo "${sha}  /tmp/claude.tgz" | sha256sum -c -; \
     tar -xzf /tmp/claude.tgz -C /usr/local/bin claude && rm /tmp/claude.tgz
@@ -131,7 +131,7 @@ RUN set -eux; \
     esac; \
     tag="${lock%@*}"; \
     sha="${lock#*@sha256:}"; \
-    curl -fsSL -o /tmp/codex.tgz \
+    curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/codex.tgz \
       "https://github.com/openai/codex/releases/download/${tag}/codex-package-${triple}.tar.gz"; \
     echo "${sha}  /tmp/codex.tgz" | sha256sum -c -; \
     tar -xzf /tmp/codex.tgz -C /tmp bin/codex bin/codex-code-mode-host; \
@@ -152,7 +152,7 @@ RUN set -eux; \
     esac; \
     tag="${lock%@*}"; \
     sha="${lock#*@sha256:}"; \
-    curl -fsSL -o /tmp/opencode.tgz \
+    curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/opencode.tgz \
       "https://github.com/anomalyco/opencode/releases/download/${tag}/opencode-linux-${ocarch}.tar.gz"; \
     echo "${sha}  /tmp/opencode.tgz" | sha256sum -c -; \
     tar -xzf /tmp/opencode.tgz -C /usr/local/bin opencode; \
@@ -182,7 +182,7 @@ RUN set -eux; \
     esac; \
     tag="${lock%@*}"; \
     sha="${lock#*@sha256:}"; \
-    curl -fsSL -o /tmp/copilot.tgz \
+    curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/copilot.tgz \
       "https://github.com/github/copilot-cli/releases/download/${tag}/copilot-linux-${cparch}.tar.gz"; \
     echo "${sha}  /tmp/copilot.tgz" | sha256sum -c -; \
     tar -xzf /tmp/copilot.tgz -C /usr/local/bin copilot; \

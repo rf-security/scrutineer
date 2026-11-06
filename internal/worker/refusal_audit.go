@@ -40,8 +40,11 @@ func (w *Worker) auditSkillRefusals(ctx context.Context, skill *db.Skill, scan *
 	auditJob.ResumePrompt = buildRefusalAuditPrompt()
 	auditJob.OutputFile = refusalAuditOutputFile
 	auditJob.MaxTurns = refusalAuditMaxTurns
-	res, err := w.Runner.RunSkill(ctx, auditJob, emit)
-	w.applySkillResult(scan, res)
+	res, err := w.runFollowupSkill(ctx, scan, auditJob, emit)
+	if errors.Is(err, errCostCapped) {
+		emit(Event{Kind: KindText, Text: "refusal audit skipped or stopped at the cost cap; primary report retained"})
+		return
+	}
 	if err != nil {
 		emit(Event{Kind: KindError, Text: fmt.Sprintf("refusal audit failed: %v; primary report retained", err)})
 		return
@@ -98,12 +101,13 @@ func parseRefusalAudit(raw string) (refusalAudit, error) {
 
 // isRepositoryRelativePath accepts slash-separated repository paths without
 // normalising them, so malformed agent output cannot escape or ambiguously
-// describe the repository root.
+// describe the repository root. A single trailing slash is allowed because
+// agents write skipped directories as "docs/".
 func isRepositoryRelativePath(path string) bool {
 	if path == "" || strings.ContainsRune(path, '\\') || strings.ContainsRune(path, 0) || strings.HasPrefix(path, "/") {
 		return false
 	}
-	segments := strings.Split(path, "/")
+	segments := strings.Split(strings.TrimSuffix(path, "/"), "/")
 	if isWindowsDrivePrefix(segments[0]) {
 		return false
 	}

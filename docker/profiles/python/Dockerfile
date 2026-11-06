@@ -70,7 +70,7 @@ RUN apt-get update \
         arm64) arch=aarch64; sha="${UV_SHA256_ARM64}" ;; \
         *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /tmp/uv.tar.gz \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/uv.tar.gz \
         "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${arch}-unknown-linux-gnu.tar.gz" \
  && echo "${sha}  /tmp/uv.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/uv.tar.gz -C /tmp \

@@ -72,7 +72,7 @@ RUN apt-get update \
         arm64) arch=arm64; sha="${GO_SHA256_ARM64}" ;; \
         *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /tmp/go.tar.gz \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/go.tar.gz \
         "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" \
  && echo "${sha}  /tmp/go.tar.gz" | sha256sum -c - \
  && tar -C /usr/local -xzf /tmp/go.tar.gz \

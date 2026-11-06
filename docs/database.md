@@ -325,6 +325,7 @@ One row per vulnerability. Lifecycle columns are mutated through `db.WriteFindin
 | federation_claim_contacts | text | Peers that answered the outbound claim-check with a match when this finding was about to be reported, comma-joined as `<peer> (<contact>)`. Non-empty means the attempt was refused so the analyst coordinates first, and is itself the acknowledgement: the next attempt goes through. Cleared by any status change, so a claim never outlives the transition it was recorded for. See [interchange.md](interchange.md). |
 | federation_claim_at | datetime | When that claim-check ran. Cleared with `federation_claim_contacts`. |
 | assignee | text | Free-text. |
+| duplicate_of_id | integer, indexed | The canonical finding that `finding-dedup` merged this one into. Only meaningful while `status` is `duplicate`. Used to gather the duplicate's observations onto the canonical finding; zero for findings never merged. When the report names a `better_evidence_id` and the canonical is `new`, `enriched` or `triaged`, `finding-dedup` also copies that duplicate's report prose (title, sinks, trace, boundary, validation, reach and prior art, never the location) onto the canonical, logging each field to `finding_history` (analyst-edited fields are skipped). |
 | suggested_fix | text | Unified diff from the `patch` skill that passed the applicability gate. Empty when no patch run or the gate rejected it. |
 | suggested_fix_commit | text | Sha the suggested_fix applies cleanly against. |
 | breaking_change | text | `breaking`, `non_breaking`, or `unknown`; verdict of the `breaking-change` skill on the suggested fix. Empty when the skill has not run. |
@@ -461,6 +462,33 @@ Append-only release-build assessments produced by finding-scoped `critic` scans.
 | production_viability | text | `VIABLE`, `NON_VIABLE`, `SAMPLE_OR_TEST`, or `CONDITIONAL_VIABLE`. Moved or missing source cannot by itself justify `NON_VIABLE`. |
 | report | text | Complete structured JSON report, including source state, reason, counterevidence, attacker position, preconditions, impact, likelihood, applied adjustments, and facts that would change the result. |
 | created_at | datetime | |
+
+## finding_observations
+
+Append-only record of each scan reporting a finding. The `findings` row is the analyst's mutable case and keeps the first report's content when a later scan rediscovers the same fingerprint, so this table preserves what every scan itself said (severity, rating, evidence) alongside the model and backend that produced it. Nothing edits a row after its scan finishes. Agreement between rows is never treated as verification. The finding page and `GET /api/findings/{id}/observations` also include the observations of findings merged into this one as duplicates (via `findings.duplicate_of_id`), so merging never discards reviewer evidence. The page shows the newest 20 while the API returns all of them. The `evidence` and text columns are untrusted model output, stored and shown as data.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | integer PK | |
+| finding_id | integer FK | References `findings.id`; deleted with the finding. Unique with `scan_id`. |
+| scan_id | integer | The scan that reported the finding. Unique with `finding_id`, so parser retries are idempotent. A rewrite from the same scan refreshes the row because the final report supersedes that scan's streamed preview. |
+| repository_id | integer | Denormalized from the scan. |
+| skill_name | text | Skill the scan ran. |
+| backend | text | Backend the scan ran on. |
+| model | text | Model id of the scan. |
+| commit | text | Commit the scan inspected. |
+| report_finding_id | text | The finding's id inside the scan report, e.g. `F1`. |
+| fingerprint | text | Fingerprint the scan computed. |
+| title | text | Title as this scan reported it. |
+| severity | text | Severity as this scan reported it. |
+| confidence | text | `high`, `medium` or `low` as this scan reported it. |
+| cwe | text | CWE as this scan reported it. |
+| location | text | Primary `file:line` as this scan reported it. |
+| reachability | text | `reachable`, `harness_only` or `unclear` as this scan reported it. |
+| rating | text | The scan's rating prose. |
+| evidence | text | JSON object of the scan's other evidence fields (`locations`, `sinks`, `trace`, `boundary`, `validation`, `reach`, `affected`, `quality_tier`, `prior_art`, `dup_check`). Empty fields are omitted. |
+| created_at | datetime | |
+| updated_at | datetime | |
 
 ## remediation_attempts
 

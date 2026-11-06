@@ -964,6 +964,7 @@ func findingExport(f db.Finding) map[string]any {
 		"federation_claim_contacts":       f.FederationClaimContacts,
 		"federation_claim_at":             f.FederationClaimAt,
 		"assignee":                        f.Assignee,
+		"duplicate_of_id":                 f.DuplicateOfID,
 		"last_revalidate_verdict":         f.LastRevalidateVerdict,
 		"production_viability":            f.ProductionViability,
 		"novelty":                         string(f.Novelty),

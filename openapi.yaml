@@ -615,6 +615,31 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/FindingNote' }
 
+  /findings/{id}/observations:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    get:
+      summary: List scan observations of a finding
+      description: >
+        Every scan's own report of the finding, plus those of findings that
+        finding-dedup merged into it as duplicates, oldest first. Rows are
+        immutable history and carry the content each scan reported, which may
+        differ from the finding itself. Agreement between rows is not
+        verification. Evidence is untrusted model output.
+      operationId: listFindingObservations
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FindingObservation' }
+        '404': { description: Finding not found }
+
   /findings/{id}/reviews:
     parameters:
       - name: id
@@ -2219,6 +2244,34 @@ components:
         body:       { type: string }
         by:         { type: string }
         created_at: { type: string, format: date-time }
+
+    FindingObservation:
+      type: object
+      required: [id, finding_id, scan_id]
+      properties:
+        id:                { type: integer, format: int64 }
+        finding_id:        { type: integer, format: int64 }
+        scan_id:           { type: integer, format: int64 }
+        repository_id:     { type: integer, format: int64 }
+        skill_name:        { type: string }
+        backend:           { type: string }
+        model:             { type: string }
+        commit:            { type: string }
+        report_finding_id: { type: string, description: The finding's id inside the scan report, e.g. F1 }
+        fingerprint:       { type: string }
+        title:             { type: string }
+        severity:          { type: string }
+        confidence:        { type: string }
+        cwe:               { type: string }
+        location:          { type: string }
+        reachability:      { type: string }
+        rating:            { type: string }
+        evidence:
+          type: object
+          nullable: true
+          additionalProperties: { type: string }
+          description: Unpromoted evidence fields the scan reported (locations, sinks, trace, boundary, validation, reach, affected, quality_tier, prior_art, dup_check)
+        created_at:        { type: string, format: date-time }
 
     FindingReview:
       type: object

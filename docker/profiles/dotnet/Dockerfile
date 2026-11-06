@@ -70,7 +70,7 @@ RUN apt-get update \
         arm64) arch=arm64; sha="${DOTNET_SHA512_ARM64}" ;; \
         *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /tmp/dotnet.tar.gz \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/dotnet.tar.gz \
         "https://builds.dotnet.microsoft.com/dotnet/Sdk/${DOTNET_VERSION}/dotnet-sdk-${DOTNET_VERSION}-linux-${arch}.tar.gz" \
  && echo "${sha}  /tmp/dotnet.tar.gz" | sha512sum -c - \
  && mkdir -p /usr/share/dotnet \

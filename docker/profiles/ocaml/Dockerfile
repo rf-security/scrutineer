@@ -47,7 +47,7 @@ RUN apt-get update \
         arm64) opam_arch=arm64;  opam_sha="${OPAM_SHA256_ARM64}" ;; \
         *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac \
- && curl -fsSL -o /usr/local/bin/opam \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /usr/local/bin/opam \
         "https://github.com/ocaml/opam/releases/download/${OPAM_VERSION}/opam-${OPAM_VERSION}-${opam_arch}-linux" \
  && echo "${opam_sha}  /usr/local/bin/opam" | sha256sum -c - \
  && chmod +x /usr/local/bin/opam \

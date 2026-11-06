@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"time"
 
 	ecosystems "github.com/ecosyste-ms/ecosystems-go"
 	"github.com/git-pkgs/enrichment"
+	"github.com/git-pkgs/purl"
 	"gorm.io/gorm"
 
 	"scrutineer/internal/db"
@@ -103,6 +105,57 @@ func ResolvePURLRepositoryURL(ctx context.Context, purl string) string {
 		}
 	}
 	return ""
+}
+
+// ResolvePURLRepositoryURLs resolves package identities in bulk, retaining
+// the original versioned PURLs as result keys.
+func ResolvePURLRepositoryURLs(ctx context.Context, purls []string) (map[string]string, error) {
+	client, err := ecosystems.NewClient(userAgent)
+	if err != nil {
+		return nil, err
+	}
+	return resolvePURLRepositoryURLs(ctx, client, purls)
+}
+
+func repositoryLookupPURL(raw string) string {
+	p, err := purl.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	p = p.WithoutVersion()
+	p.Subpath = ""
+	return p.String()
+}
+
+func resolvePURLRepositoryURLs(ctx context.Context, client *ecosystems.Client, purls []string) (map[string]string, error) {
+	identities := make([]string, 0, len(purls))
+	for _, raw := range purls {
+		if key := repositoryLookupPURL(raw); key != "" {
+			identities = append(identities, key)
+		}
+	}
+	slices.Sort(identities)
+	identities = slices.Compact(identities)
+	packages, err := client.BulkLookup(ctx, identities)
+	if err != nil {
+		return nil, err
+	}
+	byIdentity := make(map[string]string, len(packages))
+	for key, pkg := range packages {
+		if pkg == nil {
+			continue
+		}
+		if repo, err := pkg.RepositoryURL.Get(); err == nil && repo != "" {
+			byIdentity[repositoryLookupPURL(key)] = repo
+		}
+	}
+	result := make(map[string]string, len(purls))
+	for _, raw := range purls {
+		if repo := byIdentity[repositoryLookupPURL(raw)]; repo != "" {
+			result[raw] = repo
+		}
+	}
+	return result, nil
 }
 
 // ecosystemsSource describes one cached upstream payload: which columns it

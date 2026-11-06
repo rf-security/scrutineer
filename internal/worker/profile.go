@@ -378,6 +378,12 @@ func runBrief(ctx context.Context, rt ContainerRuntime, runnerImage, srcDir stri
 // deployment). The caller falls back to the default runner image.
 var ErrNoProfilesDir = errors.New("profiles dir not configured")
 
+// profileBuildTimeout caps one profile `docker build`. Sized for the heaviest
+// from-source profile; var so the integration tests lower it.
+var profileBuildTimeout = 30 * time.Minute
+
+const profileDigestTimeout = 15 * time.Second
+
 // profileBuildLocks serialises the image build per tag. Two scans
 // that both detect the same profile must not race on the local image
 // cache. One mutex per tag avoids serialising builds of distinct
@@ -497,7 +503,9 @@ func (p Profile) EnsureImage(ctx context.Context, rt ContainerRuntime, profilesD
 			return "", fmt.Errorf("profile %s: build base %s: %w", p.Name, p.BaseProfile, err)
 		}
 	} else {
-		baseDigest = resolveBaseDigest(ctx, rt, runnerImage)
+		digestCtx, cancel := context.WithTimeout(ctx, profileDigestTimeout)
+		baseDigest = resolveBaseDigest(digestCtx, rt, runnerImage)
+		cancel()
 	}
 
 	dockerfile := filepath.Join(profilesDir, p.Name, "Dockerfile")
@@ -533,8 +541,13 @@ func (p Profile) EnsureImage(ctx context.Context, rt ContainerRuntime, profilesD
 	emit(Event{Kind: KindText, Text: "profile: building " + tag + " (first build can take several minutes)"})
 	start := time.Now()
 	args := profileBuildArgs(p, tag, dockerfile, filepath.Join(profilesDir, p.Name), baseImage, baseDigest)
-	cmd := exec.CommandContext(ctx, runtimeBin(rt), args...)
+	buildCtx, cancel := context.WithTimeout(ctx, profileBuildTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(buildCtx, runtimeBin(rt), args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if ctx.Err() == nil && errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
+			err = fmt.Errorf("timed out after %s: %w", profileBuildTimeout, err)
+		}
 		return "", fmt.Errorf("%s build %s: %w\n%s", runtimeBin(rt), tag, err, out)
 	}
 	emit(Event{Kind: KindText, Text: "profile: built " + tag + " in " + time.Since(start).Round(time.Second).String()})

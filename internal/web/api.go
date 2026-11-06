@@ -160,6 +160,7 @@ func (s *Server) apiHandler() http.Handler {
 	mux.HandleFunc("PATCH /findings/{id}", s.apiPatchFinding)
 	mux.HandleFunc("GET /findings/{id}/notes", s.apiListFindingNotes)
 	mux.HandleFunc("POST /findings/{id}/notes", s.apiAddFindingNote)
+	mux.HandleFunc("GET /findings/{id}/observations", s.apiListFindingObservations)
 	mux.HandleFunc("GET /findings/{id}/reviews", s.apiListFindingReviews)
 	// /audit/queue and /audit/metrics are intentionally on the host-only
 	// /api/v1 export mux, not here: they return findings across every

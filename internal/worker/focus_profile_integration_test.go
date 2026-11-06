@@ -56,6 +56,7 @@ func TestIntegration_FocusProfile(t *testing.T) {
 	if image == "" {
 		t.Skip("set SCRUTINEER_TEST_RUNNER_IMAGE for container profile checks")
 	}
+	setIntegrationProfileBuildTimeout(t)
 	t.Run("PHP extension", func(t *testing.T) { testFocusPHPExtension(t, image) })
 	work := t.TempDir()
 	for path, content := range map[string]string{

@@ -36,7 +36,7 @@ USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gnupg lsb-release \
  && install -d -m 0755 /etc/apt/keyrings \
- && curl -fsSL https://packages.sury.org/php/apt.gpg \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors https://packages.sury.org/php/apt.gpg \
         -o /etc/apt/keyrings/sury-php.gpg \
  && chmod go+r /etc/apt/keyrings/sury-php.gpg \
  && echo "deb [signed-by=/etc/apt/keyrings/sury-php.gpg] https://packages.sury.org/php/ $(lsb_release -sc) main" \
@@ -86,7 +86,7 @@ COPY --from=composer /usr/bin/composer /usr/local/bin/composer
 ARG PIE_VERSION=1.4.5
 ARG PIE_SHA256=6cdc03b8861b290d4e2a61147082a9f21dac5af572c66f0d121f266361499662
 RUN install -d /usr/local/lib/pie && \
-    curl -fsSL -o /usr/local/lib/pie/pie.phar \
+    curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /usr/local/lib/pie/pie.phar \
         "https://github.com/php/pie/releases/download/${PIE_VERSION}/pie.phar" && \
     echo "${PIE_SHA256}  /usr/local/lib/pie/pie.phar" | sha256sum -c - && \
     chmod +x /usr/local/lib/pie/pie.phar

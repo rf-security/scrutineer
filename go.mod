@@ -6,15 +6,15 @@ toolchain go1.27.3
 
 require (
 	filippo.io/age v1.3.2
-	github.com/alpha-omega-security/harness v0.1.17
+	github.com/alpha-omega-security/harness v0.1.19
 	github.com/ecosyste-ms/ecosystems-go v0.5.0
 	github.com/git-pkgs/clone v0.7.5
 	github.com/git-pkgs/clone/gogit v0.1.2
 	github.com/git-pkgs/cwe v0.1.1
-	github.com/git-pkgs/enrichment v0.7.2
-	github.com/git-pkgs/magic v0.5.0
+	github.com/git-pkgs/enrichment v0.7.4
+	github.com/git-pkgs/magic v0.6.0
 	github.com/git-pkgs/pom v0.1.8
-	github.com/git-pkgs/purl v0.1.22
+	github.com/git-pkgs/purl v0.1.24
 	github.com/git-pkgs/sarif v0.1.3
 	github.com/git-pkgs/sbom v0.1.7
 	github.com/git-pkgs/skills v0.2.0
@@ -27,7 +27,7 @@ require (
 	github.com/yuin/goldmark v1.8.6
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/crypto v0.58.0
-	golang.org/x/net v0.61.0
+	golang.org/x/net v0.62.0
 	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.47.0
@@ -42,10 +42,10 @@ require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/cyphar/filepath-securejoin v0.7.0 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
-	github.com/git-pkgs/registries v0.11.0 // indirect
+	github.com/git-pkgs/registries v0.12.0 // indirect
 	github.com/git-pkgs/spdx v0.3.3 // indirect
 	github.com/git-pkgs/vers v0.7.2 // indirect
-	github.com/github/go-spdx/v2 v2.7.1 // indirect
+	github.com/github/go-spdx/v2 v2.8.0 // indirect
 	github.com/glebarez/go-sqlite v1.23.0 // indirect
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
 	github.com/go-git/go-billy/v5 v5.9.2 // indirect
@@ -59,7 +59,7 @@ require (
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/oapi-codegen/nullable v1.2.0 // indirect
-	github.com/oapi-codegen/runtime v1.7.0 // indirect
+	github.com/oapi-codegen/runtime v1.8.0 // indirect
 	github.com/package-url/packageurl-go v0.1.7 // indirect
 	github.com/pandatix/go-cvss v0.6.4 // indirect
 	github.com/pjbgf/sha1cd v0.7.0 // indirect
@@ -67,8 +67,8 @@ require (
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
-	modernc.org/libc v1.79.0 // indirect
+	modernc.org/libc v1.79.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
-	modernc.org/sqlite v1.60.1 // indirect
+	modernc.org/sqlite v1.61.0 // indirect
 )

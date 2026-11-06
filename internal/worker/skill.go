@@ -16,6 +16,7 @@ import (
 
 	"scrutineer/internal/coverage"
 	"scrutineer/internal/db"
+	"scrutineer/internal/ossscanner"
 	"scrutineer/internal/repoconfig"
 	"scrutineer/internal/skills"
 	"scrutineer/internal/verification"
@@ -48,6 +49,15 @@ type skillContext struct {
 	// enqueue further skills, read reports. The schema is openapi.yaml at
 	// the repo root.
 	Scrutineer skillContextScrutineer `json:"scrutineer"`
+}
+
+// skillContextOSSScanner is the project's Anthropic OSS Scanner enrolment plus
+// the workspace-relative paths of the maintainer files staged from it.
+type skillContextOSSScanner struct {
+	ossscanner.Enrollment
+	RegistryURL     string `json:"registry_url,omitempty"`
+	ThreatModelFile string `json:"threat_model_file,omitempty"`
+	DockerfileFile  string `json:"dockerfile_file,omitempty"`
 }
 
 type skillContextScrutineer struct {
@@ -94,6 +104,9 @@ type skillContextScrutineer struct {
 	// ./src; the area is the audit's scope. Empty means normal scope.
 	FocusArea   *repoconfig.FocusArea    `json:"focus_area,omitempty"`
 	Exploration *skillContextExploration `json:"exploration,omitempty"`
+	// OSSScanner describes the project's Anthropic OSS Scanner enrolment and
+	// the maintainer files staged under ./oss_scanner/. Omitted when none.
+	OSSScanner *skillContextOSSScanner `json:"oss_scanner,omitempty"`
 	// Recon is the latest completed focus-area map. It is staged only for the
 	// threat-model skill, which incorporates it into a complete scan-config
 	// proposal without letting recon overwrite analyst configuration directly.
@@ -222,6 +235,7 @@ func (w *Worker) doSkill(ctx context.Context, scan *db.Scan, emit func(Event)) (
 	if err != nil {
 		return "", err
 	}
+	w.attachOSSScanner(ctx, workRoot, skillDir, scan, &skill, &document, emit)
 
 	prompt := buildLoggedPrompt(&skill, scan.Backend)
 	scan.Prompt = prompt
@@ -276,6 +290,9 @@ func (w *Worker) runAndParseSkill(ctx context.Context, scan *db.Scan, skill *db.
 	if report != "" {
 		var err error
 		report, err = w.repairAndParseSkillOutput(ctx, skill, scan, sj, report, emit)
+		if errors.Is(err, errCostCapped) {
+			return w.finishCostCappedRun(ctx, skill, scan, sj, report, emit)
+		}
 		if err != nil {
 			return report, err
 		}
@@ -380,8 +397,12 @@ func (w *Worker) parsePartialSkillReport(ctx context.Context, skill *db.Skill, s
 func (w *Worker) repairAndParseSkillOutput(ctx context.Context, skill *db.Skill, scan *db.Scan, sj SkillJob, report string, emit func(Event)) (string, error) {
 	if skill.SchemaJSON != "" {
 		if detail := ValidateSkillReport(skill.Name, skill.SchemaJSON, skill.PoCField, report); detail != "" {
-			if repairedReport, ok := w.repairSchemaReport(ctx, skill, scan, sj, report, detail, emit); ok {
+			repairedReport, ok, err := w.repairSchemaReport(ctx, skill, scan, sj, report, detail, emit)
+			if ok {
 				report = repairedReport
+			}
+			if err != nil {
+				return report, err
 			}
 		}
 	}
@@ -391,10 +412,10 @@ func (w *Worker) repairAndParseSkillOutput(ctx context.Context, skill *db.Skill,
 	return report, nil
 }
 
-func (w *Worker) repairSchemaReport(ctx context.Context, skill *db.Skill, scan *db.Scan, sj SkillJob, report, detail string, emit func(Event)) (string, bool) {
+func (w *Worker) repairSchemaReport(ctx context.Context, skill *db.Skill, scan *db.Scan, sj SkillJob, report, detail string, emit func(Event)) (string, bool, error) {
 	outputFile := skillOutputFile(skill)
 	if scan.SessionID == "" {
-		return "", false
+		return "", false, nil
 	}
 
 	emit(Event{Kind: KindText, Text: fmt.Sprintf("validation: %s failed validation; asking the agent to repair it", outputFile)})
@@ -402,22 +423,28 @@ func (w *Worker) repairSchemaReport(ctx context.Context, skill *db.Skill, scan *
 	repairJob.ResumeSessionID = scan.SessionID
 	repairJob.ResumePrompt = buildSchemaRepairPrompt(skill, detail, report)
 	repairJob.MaxTurns = schemaRepairMaxTurns
-	res, err := w.Runner.RunSkill(ctx, repairJob, emit)
-	w.applySkillResult(scan, res)
+	res, err := w.runFollowupSkill(ctx, scan, repairJob, emit)
+	if errors.Is(err, errCostCapped) {
+		// A repair cut off mid-write may be worse than the original.
+		if res.Report != "" && ValidateSkillReport(skill.Name, skill.SchemaJSON, skill.PoCField, res.Report) == "" {
+			return res.Report, true, err
+		}
+		return "", false, err
+	}
 	if err != nil {
 		emit(Event{Kind: KindError, Text: fmt.Sprintf("validation: repair attempt for %s failed: %v; parsing original output", outputFile, err)})
-		return "", false
+		return "", false, nil
 	}
 	if res.Report == "" {
 		emit(Event{Kind: KindError, Text: fmt.Sprintf("validation: repair attempt did not produce %s; parsing original output", outputFile)})
-		return "", false
+		return "", false, nil
 	}
 	if detail = ValidateSkillReport(skill.Name, skill.SchemaJSON, skill.PoCField, res.Report); detail == "" {
 		emit(Event{Kind: KindText, Text: fmt.Sprintf("validation: repaired %s validates", outputFile)})
-		return res.Report, true
+		return res.Report, true, nil
 	}
 	emit(Event{Kind: KindText, Text: fmt.Sprintf("validation: repaired %s still does not validate; parsing original output", outputFile)})
-	return "", false
+	return "", false, nil
 }
 
 func buildSchemaRepairPrompt(skill *db.Skill, detail, report string) string {
@@ -672,6 +699,9 @@ func (w *Worker) persistFinding(scan *db.Scan, f *db.Finding) (created bool, err
 			return false, uerr
 		}
 		f.ID = existing.ID
+		if oerr := db.RecordFindingObservation(w.DB, db.ObservationFromFinding(scan, f)); oerr != nil {
+			return false, fmt.Errorf("record finding observation: %w", oerr)
+		}
 		if err := w.captureFindingPoC(scan, f); err != nil {
 			return false, &PoCCaptureError{err}
 		}
@@ -679,6 +709,9 @@ func (w *Worker) persistFinding(scan *db.Scan, f *db.Finding) (created bool, err
 	}
 	if cerr := w.DB.Create(f).Error; cerr != nil {
 		return false, fmt.Errorf("save finding: %w", cerr)
+	}
+	if oerr := db.RecordFindingObservation(w.DB, db.ObservationFromFinding(scan, f)); oerr != nil {
+		return false, fmt.Errorf("record finding observation: %w", oerr)
 	}
 	captureErr := w.captureFindingPoC(scan, f)
 	if w.OnFindingCreated != nil {

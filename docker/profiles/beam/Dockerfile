@@ -69,7 +69,7 @@ RUN apt-get update \
         unzip \
  && rm -rf /var/lib/apt/lists/* \
  # kerl: pinned single script that builds OTP from source.
- && curl -fsSL -o /usr/local/bin/kerl \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /usr/local/bin/kerl \
         "https://raw.githubusercontent.com/kerl/kerl/${KERL_VERSION}/kerl" \
  && echo "${KERL_SHA256}  /usr/local/bin/kerl" | sha256sum -c - \
  && chmod +x /usr/local/bin/kerl \
@@ -84,13 +84,13 @@ RUN apt-get update \
  && kerl install "${OTP_VERSION}" /opt/otp \
  && rm -rf /var/tmp/kerl \
  # Elixir precompiled release (BEAM bytecode, arch-independent).
- && curl -fsSL -o /tmp/elixir.zip \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /tmp/elixir.zip \
         "https://github.com/elixir-lang/elixir/releases/download/v${ELIXIR_VERSION}/elixir-otp-${ELIXIR_OTP_MAJOR}.zip" \
  && echo "${ELIXIR_SHA256}  /tmp/elixir.zip" | sha256sum -c - \
  && unzip -q /tmp/elixir.zip -d /opt/elixir \
  && rm /tmp/elixir.zip \
  # rebar3 self-contained escript.
- && curl -fsSL -o /usr/local/bin/rebar3 \
+ && curl -fsSL --connect-timeout 30 --max-time 300 --retry 3 --retry-all-errors -o /usr/local/bin/rebar3 \
         "https://github.com/erlang/rebar3/releases/download/${REBAR3_VERSION}/rebar3" \
  && echo "${REBAR3_SHA256}  /usr/local/bin/rebar3" | sha256sum -c - \
  && chmod +x /usr/local/bin/rebar3 \

@@ -1,0 +1,3822 @@
+# GENERATED from openapi.yaml and internal/sharing/openapi_auth.yaml. Do not edit.
+# Regenerate: go test ./internal/sharing -run TestPortalOpenAPIGolden -update
+openapi: 3.1.0
+info:
+  title: Scrutineer Sharing Portal API
+  version: 0.4.0
+  description: |
+    The read-only surface of scrutineer's external maintainer portal
+    (`cmd/sharing`). A GitHub visitor signs in with OAuth; every request is
+    then scoped server-side to the repositories that visitor maintains
+    (ADMIN, MAINTAIN or WRITE) plus operator-configured access grants.
+
+    The `/api/v1/ui/*` operations are the subset of scrutineer's v2 UI API
+    the portal forwards (GET only, default deny); their schemas are the same
+    as in `openapi.yaml`. An id outside the visitor's scope answers 404
+    `not_found`, exactly like an id that does not exist.
+
+    Authentication is the HttpOnly session cookie `scrutineer_sharing`; no
+    token is readable by JavaScript and there is no CORS. Every non-GET/HEAD
+    request must carry `Sec-Fetch-Site: same-origin`. The only state-changing
+    operation is `POST /auth/logout`.
+
+    API responses carry `Cache-Control: no-store`, `Vary: Cookie` and
+    `X-Portal-Scope: complete|partial`. A missing or expired session answers
+    401 `unauthorized` (never a redirect); a GitHub outage answers 503
+    `unavailable` and keeps the session.
+servers:
+  - url: /
+    description: The portal origin (paths are absolute)
+security:
+  - portalSession: []
+paths:
+  /api/v1/ui/meta:
+    get:
+      summary: Static vocabularies
+      operationId: getUIMeta
+      tags:
+        - ui-core
+      description: '`Cache-Control: max-age=3600`.'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Meta'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/meta/cwe:
+    get:
+      summary: Search CWE ids and names
+      operationId: searchUICWE
+      tags:
+        - ui-core
+      parameters:
+        - $ref: '#/components/parameters/UIQ'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 20
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CWEEntry'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories:
+    get:
+      summary: Paged repository list
+      operationId: listUIRepositories
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+        - $ref: '#/components/parameters/UISort'
+        - $ref: '#/components/parameters/UIQ'
+        - name: language
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings:
+    get:
+      summary: Paged findings list with toggle counts and optional facets
+      operationId: listUIFindings
+      description: 'Sort tokens: newest (default, id desc) | severity | repository | title | status | repo_id | cwe | model | scan | date (created_at with an id tiebreak, desc first), each with optional .asc/.desc.'
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+        - $ref: '#/components/parameters/UISort'
+        - $ref: '#/components/parameters/UIQ'
+        - name: severity
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+          description: '"" = open, `all`, or a lifecycle'
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: owner
+          in: query
+          schema:
+            type: string
+        - name: repository_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: sub_path
+          in: query
+          schema:
+            type: string
+        - name: viability
+          in: query
+          schema:
+            type: string
+        - name: missed
+          in: query
+          schema:
+            type: string
+            enum:
+              - '1'
+        - name: scanners
+          in: query
+          schema:
+            type: string
+            enum:
+              - '1'
+        - name: facets
+          in: query
+          schema:
+            type: string
+          description: Comma list of status,severity,category. Facet and toggle counts respect every other filter, including date_from/date_to.
+        - $ref: '#/components/parameters/UIDateFrom'
+        - $ref: '#/components/parameters/UIDateTo'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindingList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/scans:
+    get:
+      summary: Paged scan list with queue stats
+      operationId: listUIScans
+      tags:
+        - ui-core
+      parameters:
+        - $ref: '#/components/parameters/UIPage'
+        - name: page_size
+          in: query
+          schema:
+            oneOf:
+              - type: integer
+                minimum: 1
+                maximum: 200
+              - type: string
+                enum:
+                  - all
+          description: Rows per page (default 20, max 200; `all` = 200).
+        - name: sort
+          in: query
+          schema:
+            type: string
+          description: newest (default) | id | skill | status | repository | findings | date (created_at, id tiebreak; desc first), optional .asc/.desc
+        - $ref: '#/components/parameters/UIDateFrom'
+        - $ref: '#/components/parameters/UIDateTo'
+        - name: skill
+          in: query
+          schema:
+            type: string
+          description: Comma-separated skill names
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum:
+              - queued
+              - running
+              - paused
+              - done
+              - failed
+              - skipped
+              - cancelled
+        - name: completeness
+          in: query
+          schema:
+            type: string
+            enum:
+              - complete
+              - partial
+              - unknown
+        - name: group
+          in: query
+          schema:
+            type: string
+          description: scan_group
+        - name: repository_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: finding_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScanList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}:
+    get:
+      summary: Repository detail
+      operationId: getUIRepository
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoDetail'
+          headers:
+            ETag:
+              $ref: '#/components/headers/UIETag'
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/findings:
+    get:
+      summary: Repository findings
+      operationId: listUIRepositoryFindings
+      description: 'Sort tokens: severity (default) | newest (id) | title | status | cwe | date (created_at with an id tiebreak, desc first), each with optional .asc/.desc.'
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+        - $ref: '#/components/parameters/UISort'
+        - $ref: '#/components/parameters/UIQ'
+        - $ref: '#/components/parameters/UIPathID'
+        - name: scanners
+          in: query
+          schema:
+            type: string
+            enum:
+              - '1'
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: severity
+          in: query
+          schema:
+            type: string
+        - $ref: '#/components/parameters/UIDateFrom'
+        - $ref: '#/components/parameters/UIDateTo'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoFindingList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/scans:
+    get:
+      summary: Repository scans (latest set or full history)
+      operationId: listUIRepositoryScans
+      description: 'latest=1 (default) is the latest attempt per (skill, sub_path, focus_area), one capped set; a `sort` token (the /ui/scans tokens, e.g. date.desc) only reorders that set, and the filters (status, skill, completeness, group, finding_id, date_from, date_to) are ignored so the set never changes which attempt is latest. latest=0 is the paged full history with every /ui/scans filter and sort.'
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+        - $ref: '#/components/parameters/UISort'
+        - $ref: '#/components/parameters/UIPathID'
+        - name: latest
+          in: query
+          schema:
+            type: string
+            enum:
+              - '0'
+              - '1'
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: skill
+          in: query
+          schema:
+            type: string
+        - name: completeness
+          in: query
+          schema:
+            type: string
+        - name: group
+          in: query
+          schema:
+            type: string
+        - name: finding_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - $ref: '#/components/parameters/UIDateFrom'
+        - $ref: '#/components/parameters/UIDateTo'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoScanList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/dependencies:
+    get:
+      summary: Repository dependencies
+      operationId: listUIRepositoryDependencies
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+        - $ref: '#/components/parameters/UIQ'
+        - $ref: '#/components/parameters/UIPathID'
+        - name: all
+          in: query
+          schema:
+            type: string
+            enum:
+              - '1'
+        - name: ecosystem
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DependencyList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/packages:
+    get:
+      summary: Repository packages tab
+      operationId: listUIRepositoryPackages
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoPackageList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/dependents:
+    get:
+      summary: Repository dependents tab
+      operationId: listUIRepositoryDependents
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoDependentList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/advisories:
+    get:
+      summary: Repository advisories tab
+      operationId: listUIRepositoryAdvisories
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoAdvisoryList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/maintainers:
+    get:
+      summary: Repository maintainers tab
+      operationId: listUIRepositoryMaintainers
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoMaintainerList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/alternatives:
+    get:
+      summary: Repository alternatives tab
+      operationId: listUIRepositoryAlternatives
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoAlternativeList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/subprojects:
+    get:
+      summary: Repository subprojects tab
+      operationId: listUIRepositorySubprojects
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RepoSubprojectList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/threat-model:
+    get:
+      summary: Parsed threat model
+      operationId: getUIRepositoryThreatModel
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ThreatModelView'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/repositories/{id}/metadata:
+    get:
+      summary: Raw repository metadata JSON
+      operationId: getUIRepositoryMetadata
+      tags:
+        - ui-repositories
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}:
+    get:
+      summary: Finding detail
+      operationId: getUIFinding
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UIFindingDetail'
+          headers:
+            ETag:
+              $ref: '#/components/headers/UIETag'
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/history:
+    get:
+      summary: Field history
+      operationId: listUIFindingHistory
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FindingHistoryList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/notes:
+    get:
+      summary: List finding notes
+      operationId: listUIFindingNotes
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UIFindingNote'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/communications:
+    get:
+      summary: List finding communications
+      operationId: listUIFindingCommunications
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UIFindingCommunication'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/references:
+    get:
+      summary: List finding references
+      operationId: listUIFindingReferences
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UIFindingReference'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/reviews:
+    get:
+      summary: List finding reviews
+      operationId: listUIFindingReviews
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UIFindingReview'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/verifications:
+    get:
+      summary: Verification history
+      operationId: listUIFindingVerifications
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/VerificationView'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/observations:
+    get:
+      summary: Observations
+      operationId: listUIFindingObservations
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+        - $ref: '#/components/parameters/UIPage'
+        - $ref: '#/components/parameters/UIPageSize'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservationList'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/attack-paths:
+    get:
+      summary: Attack paths
+      operationId: listUIFindingAttackPaths
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AttackPathView'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/remediation:
+    get:
+      summary: Remediation attempts
+      operationId: getUIFindingRemediation
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RemediationView'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/findings/{id}/migration-guide:
+    get:
+      summary: Migration guide
+      operationId: getUIFindingMigrationGuide
+      tags:
+        - ui-findings
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MigrationGuide'
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/scans/{id}:
+    get:
+      summary: Scan detail
+      operationId: getUIScan
+      tags:
+        - ui-scans
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UIScanDetail'
+          headers:
+            ETag:
+              $ref: '#/components/headers/UIETag'
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/scans/{id}/log:
+    get:
+      summary: Scan log from a byte offset
+      operationId: getUIScanLog
+      tags:
+        - ui-scans
+      description: |-
+        Returns `log[offset:]` (byte offset). `X-Log-Length` is the total log length in bytes the body ends at, in the
+        same byte space as `scan-log` SSE event offsets. Protocol: subscribe to `/v1/ui/events?scan={id}` first, then
+        fetch `offset=0`, drop events whose `offset <= X-Log-Length`, and refetch `?offset=<last offset>` on a gap.
+        While the scan runs the body is served from an in-memory mirror of the published lines, so it is never behind
+        the event stream (the worker flushes the stored log only every few seconds). An offset past the end returns an
+        empty body.
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Log bytes
+          headers:
+            X-Scan-Status:
+              description: The scan's status when the log was read
+              schema:
+                type: string
+            X-Log-Length:
+              description: Total log length in bytes after this body
+              schema:
+                type: integer
+                format: int64
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+          content:
+            text/plain:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/UIBadParam'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/scans/{id}/prompt:
+    get:
+      summary: Scan prompt
+      operationId: getUIScanPrompt
+      tags:
+        - ui-scans
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: Prompt
+          content:
+            text/plain:
+              schema:
+                type: string
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /api/v1/ui/scans/{id}/report:
+    get:
+      summary: Raw scan report (streamed)
+      operationId: getUIScanReport
+      description: The stored report.json with `Content-Length`; 404 when the scan has no report. A report that is not valid JSON (some freeform skills) is served as `text/plain`.
+      tags:
+        - ui-scans
+      parameters:
+        - $ref: '#/components/parameters/UIPathID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {}
+            text/plain:
+              schema:
+                type: string
+          headers:
+            X-Portal-Scope:
+              $ref: '#/components/headers/PortalScope'
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '404':
+          $ref: '#/components/responses/UINotFound'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /auth/login:
+    get:
+      summary: Start GitHub sign-in
+      operationId: portalLogin
+      tags: [portal-auth]
+      security: []
+      description: |
+        A document navigation, not a fetch. Sets a short-lived state cookie
+        carrying `next` and redirects to GitHub's authorize page. With the
+        loopback dev identity it signs in directly and redirects to `next`.
+      parameters:
+        - name: next
+          in: query
+          required: false
+          description: |
+            Same-origin path to land on after sign-in. Honoured only when it
+            starts with a single `/` (not `//` or `/\`) and contains no
+            backslash or control character; anything else lands on `/`.
+          schema: {type: string}
+      responses:
+        '302':
+          description: Redirect to GitHub (or, in dev mode, to `next`)
+  /auth/callback:
+    get:
+      summary: GitHub OAuth callback
+      operationId: portalCallback
+      tags: [portal-auth]
+      security: []
+      parameters:
+        - {name: code, in: query, required: true, schema: {type: string}}
+        - {name: state, in: query, required: true, schema: {type: string}}
+      responses:
+        '302':
+          description: Signed in; redirect to the `next` carried in the state cookie (default `/`)
+        '400':
+          description: Invalid OAuth state or missing code (text/plain)
+        '502':
+          description: GitHub exchange or identity lookup failed (text/plain)
+  /auth/status:
+    get:
+      summary: Repository lookup progress
+      operationId: portalAccessStatus
+      tags: [portal-auth]
+      security: []
+      description: Never starts a lookup. Clears the session cookie when the state is `unauthorized`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PortalAccessStatus'}
+  /auth/session:
+    get:
+      summary: Current visitor
+      operationId: portalSession
+      tags: [portal-auth]
+      description: |
+        Never blocks and never starts a repository lookup, so it is safe to
+        poll. `access` is the lookup state `/auth/status` reports.
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PortalSession'}
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+  /auth/access:
+    get:
+      summary: The visitor's repository access
+      operationId: portalAccess
+      tags: [portal-auth]
+      description: |
+        Waits for the first repository lookup for at most 20 s, then answers
+        on the repositories found so far with `incomplete: true` (and
+        `X-Portal-Scope: partial`).
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Portal-Scope: {$ref: '#/components/headers/PortalScope'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PortalAccess'}
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /auth/logout:
+    post:
+      summary: Sign out
+      operationId: portalLogout
+      tags: [portal-auth]
+      security: []
+      description: |
+        Revokes the OAuth app's grant on GitHub (best effort), drops the
+        cached repository access and clears the session cookie. Requires
+        `Sec-Fetch-Site: same-origin`.
+      parameters:
+        - name: Accept
+          in: header
+          required: false
+          description: '`application/json` selects the 204 answer.'
+          schema: {type: string}
+      responses:
+        '204':
+          description: Signed out (Accept application/json)
+        '303':
+          description: Signed out; redirect to `/auth/login` (any other Accept)
+        '403':
+          description: Cross-site request (text/plain)
+  /repositories/{id}/report.md:
+    get:
+      summary: Repository findings report (Markdown)
+      operationId: portalRepositoryReport
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+        - name: audience
+          in: query
+          required: false
+          schema: {type: string, enum: [upstream]}
+      responses:
+        '200':
+          description: OK
+          content:
+            text/markdown: {schema: {type: string}}
+        '401': {$ref: '#/components/responses/PortalDownloadUnauthorized'}
+        '404': {$ref: '#/components/responses/PortalDownloadNotFound'}
+  /findings/{id}/report.md:
+    get:
+      summary: Finding report (Markdown)
+      operationId: portalFindingReport
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            text/markdown: {schema: {type: string}}
+        '401': {$ref: '#/components/responses/PortalDownloadUnauthorized'}
+        '404': {$ref: '#/components/responses/PortalDownloadNotFound'}
+  /findings/{id}/csaf.json:
+    get:
+      summary: Finding as a CSAF 2.0 document
+      operationId: portalFindingCSAF
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json: {schema: {type: object}}
+        '401': {$ref: '#/components/responses/PortalDownloadUnauthorized'}
+        '404': {$ref: '#/components/responses/PortalDownloadNotFound'}
+  /findings/{id}/osv.json:
+    get:
+      summary: Finding as an OSV record
+      operationId: portalFindingOSV
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json: {schema: {type: object}}
+        '401': {$ref: '#/components/responses/PortalDownloadUnauthorized'}
+        '404': {$ref: '#/components/responses/PortalDownloadNotFound'}
+  /findings/{id}/bundle.tar.gz:
+    get:
+      summary: Finding evidence bundle
+      operationId: portalFindingBundle
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/gzip: {schema: {type: string, format: binary}}
+        '401': {$ref: '#/components/responses/PortalDownloadUnauthorized'}
+        '404': {$ref: '#/components/responses/PortalDownloadNotFound'}
+  /findings/{id}/patch.diff:
+    get:
+      summary: Finding's proposed patch
+      operationId: portalFindingPatch
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            text/x-diff: {schema: {type: string}}
+        '401': {$ref: '#/components/responses/PortalDownloadUnauthorized'}
+        '404': {$ref: '#/components/responses/PortalDownloadNotFound'}
+  /scans/{id}/report.md:
+    get:
+      summary: Scan report (Markdown)
+      operationId: portalScanReport
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            text/markdown: {schema: {type: string}}
+        '401': {$ref: '#/components/responses/PortalDownloadUnauthorized'}
+        '404': {$ref: '#/components/responses/PortalDownloadNotFound'}
+components:
+  securitySchemes:
+    portalSession:
+      type: apiKey
+      in: cookie
+      name: scrutineer_sharing
+      description: Sealed, HttpOnly session cookie set by `/auth/callback` (45 min).
+  parameters:
+    UIPage:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+      description: 1-based page
+    UIPageSize:
+      name: page_size
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 20
+    UISort:
+      name: sort
+      in: query
+      schema:
+        type: string
+      description: Sort token `key` or `key.asc|.desc` (same tokens as the HTML UI); unknown keys fall back to the default
+    UIDateFrom:
+      name: date_from
+      in: query
+      schema:
+        type: string
+      description: 'Lower bound on the row''s `created_at` (inclusive). RFC3339 (any offset) or `YYYY-MM-DD` (a UTC day, from 00:00). Invalid values, or a window whose start is after its end, return 400 `bad_param`.'
+      example: '2026-10-01'
+    UIDateTo:
+      name: date_to
+      in: query
+      schema:
+        type: string
+      description: 'Upper bound on the row''s `created_at`. RFC3339 is inclusive of that instant; `YYYY-MM-DD` includes the whole (UTC) day. Invalid values return 400 `bad_param`.'
+      example: '2026-11-05'
+    UIQ:
+      name: q
+      in: query
+      schema:
+        type: string
+      description: Free-text search
+    UIPathID:
+      name: id
+      in: path
+      schema:
+        type: integer
+        format: int64
+      required: true
+    PortalID:
+      name: id
+      in: path
+      required: true
+      schema: {type: integer, minimum: 1}
+  responses:
+    UIUnauthorized:
+      description: No session, or an expired or rejected one (code unauthorized). Never a redirect.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UIError'
+    UINotFound:
+      description: Not found (code not_found)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UIError'
+    UIBadParam:
+      description: Malformed parameter or body (code bad_param)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UIError'
+    UIUnavailable:
+      description: GitHub is temporarily unavailable (code unavailable); the session is kept.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UIError'
+    UIInternal:
+      description: Internal error (code internal)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UIError'
+    PortalDownloadUnauthorized:
+      description: No session; redirected to `/auth/login?next=` instead when navigated to (text/plain)
+    PortalDownloadNotFound:
+      description: Not found or outside the visitor's scope (text/plain)
+  headers:
+    UIETag:
+      description: Quoted updated_at in RFC3339Nano; echo in If-Match
+      schema:
+        type: string
+    PortalScope:
+      description: |
+        `complete` once the visitor's GitHub repository lookup has finished;
+        `partial` while the answer is built on the repositories found so far.
+      schema: {type: string, enum: [complete, partial]}
+  schemas:
+    FindingSummary:
+      type: object
+      required: [id, scan_id, repository_id, severity, location]
+      properties:
+        id: {type: integer, format: int64}
+        scan_id: {type: integer, format: int64}
+        repository_id: {type: integer, format: int64}
+        finding_id: {type: string, description: Short id within the scan report (F1, F2: '', '...).': ''}
+        commit: {type: string, description: "Commit the producing scan analysed; location line numbers refer to it."}
+        missed_count: {type: integer, description: "Consecutive later scans of the same skill that did not report this finding again."}
+        poc_capture_error: {type: string, description: "Present on streamed publication when the finding was saved but PoC capture failed."}
+        sinks: {type: string, description: Comma-joined sink ids.}
+        title: {type: string}
+        sub_path: {type: string, description: "Monorepo sub-folder the producing scan was scoped to. The finding's location is relative to it; empty means the repo root."}
+        severity: {type: string, enum: [Critical, High, Medium, Low]}
+        severity_caps: {type: array, items: {type: string}, description: "Deterministic reasons that currently cap severity, derived from the latest reconciled verification controls and typed attacker prerequisites."}
+        severity_calibration_incomplete: {type: boolean, description: "True when an unknown severity, unknown or unattempted prerequisite, unavailable control resolution, or unresolved control assessment prevented complete calibration; unknown inputs never lower severity."}
+        status: {type: string}
+        cwe: {type: string}
+        location: {type: string}
+        vid: {type: string, description: "Code identifier (VID-...) hashed from the sink code at the scanned commit; correlates findings across tools. Empty when not computed."}
+        affected: {type: string}
+        reachability: {type: string, enum: [reachable, harness_only, unclear]}
+        quality_tier: {type: string, enum: [high, low]}
+        cve_id: {type: string}
+        ghsa_id: {type: string, description: "GitHub Security Advisory id (GHSA-xxxx-xxxx-xxxx), set once the advisory is published."}
+        cvss_vector: {type: string, description: "CVSS v3.x base vector (3.0 or 3.1)."}
+        cvss_score: {type: number, description: "Base score derived from cvss_vector."}
+        cvss_v4_vector: {type: string, description: "CVSS v4.0 base vector. Independent of cvss_vector; both may be populated."}
+        cvss_v4_score: {type: number, description: "Base score derived from cvss_v4_vector."}
+        fix_version: {type: string}
+        fix_commit: {type: string}
+        resolution: {type: string, enum: [fix, migrate, workaround, adopt, wontfix, ""]}
+        assignee: {type: string}
+        exploited_in_wild: {type: string, enum: [yes, no, ""], description: "Analyst's call on whether this finding is being exploited in the wild. Empty means unknown. Automation never sets this."}
+        dup_check: {type: string, description: "Audit agent's one-sentence rationale for why this finding is distinct from the siblings already filed under the same scan_group. Empty for findings from skills that do not emit it."}
+        novelty: {type: string, enum: [unfixed, fixed, unclear, not_checked, ""], description: "Latest upstream novelty state. A touched file remains unclear until revalidate classifies the staged history."}
+        production_viability: {type: string, enum: [VIABLE, NON_VIABLE, SAMPLE_OR_TEST, CONDITIONAL_VIABLE, ""], description: "Latest critic assessment of whether the finding can affect a real release build. Empty before assessment."}
+        novelty_checked_commit: {type: string, description: "Repository HEAD compared with the finding's scanned commit for novelty."}
+        novelty_checked_at: {type: string, format: date-time, nullable: true}
+    FindingVerification:
+      type: object
+      required: [id, scan_id, status, report, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        scan_id: {type: integer, format: int64}
+        status: {type: string, enum: [confirmed, fixed, inconclusive, deferred, not_attempted]}
+        score: {type: number, format: double, minimum: 0, maximum: 1, nullable: true, description: "Fraction of the five fixed verification criteria that passed. Null for legacy reports and reports that remain internally inconsistent after repair."}
+        report: {$ref: '#/components/schemas/VerificationReport'}
+        created_at: {type: string, format: date-time}
+    FindingAttackPath:
+      type: object
+      required: [id, scan_id, production_viability, report, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        scan_id: {type: integer, format: int64}
+        production_viability: {type: string, enum: [VIABLE, NON_VIABLE, SAMPLE_OR_TEST, CONDITIONAL_VIABLE]}
+        report: {$ref: '#/components/schemas/AttackPathReport'}
+        created_at: {type: string, format: date-time}
+    AttackPathReport:
+      type: object
+      required: [production_viability, source_state, reason, counterevidence, attacker_position, preconditions, impact, likelihood, applied_adjustments, facts_that_would_change_the_result]
+      additionalProperties: false
+      properties:
+        production_viability: {type: string, enum: [VIABLE, NON_VIABLE, SAMPLE_OR_TEST, CONDITIONAL_VIABLE]}
+        source_state: {type: string, enum: [PRESENT, MOVED, MISSING, UNKNOWN]}
+        reason: {type: string}
+        counterevidence: {type: array, items: {type: string}}
+        attacker_position: {type: string}
+        preconditions: {type: array, items: {type: string}}
+        impact: {type: string}
+        likelihood: {type: string, enum: [likely, plausible, unlikely, unknown]}
+        applied_adjustments:
+          type: array
+          maxItems: 0
+          description: "Reserved for severity-cap calibration; critic emits an empty array."
+          items:
+            type: object
+            required: [kind, reason, severity_before, severity_after]
+            additionalProperties: false
+            properties:
+              kind: {type: string}
+              reason: {type: string}
+              severity_before: {type: string, enum: [Critical, High, Medium, Low]}
+              severity_after: {type: string, enum: [Critical, High, Medium, Low]}
+        facts_that_would_change_the_result: {type: array, items: {type: string}}
+    RemediationAttempt:
+      type: object
+      required: [id, attempt, patch_scan_id, base_commit, status, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        attempt: {type: integer, minimum: 1}
+        patch_scan_id: {type: integer, format: int64}
+        base_commit: {type: string}
+        status: {type: string, enum: [verification_incomplete, bypassed_patch, verified_secure]}
+        created_at: {type: string, format: date-time}
+        validation:
+          allOf:
+            - $ref: '#/components/schemas/RemediationValidation'
+          nullable: true
+    RemediationValidation:
+      type: object
+      required: [scan_id, outcome, valid_variants, benign_control_passed, bypass_input, created_at]
+      properties:
+        scan_id: {type: integer, format: int64}
+        outcome: {type: string, enum: [failed_to_bypass, bypassed_patch, inconclusive]}
+        valid_variants: {type: integer, minimum: 0}
+        benign_control_passed: {type: boolean}
+        bypass_input: {type: string}
+        created_at: {type: string, format: date-time}
+    VerificationReport:
+      type: object
+      description: "Immutable verify output containing an evidenced attack tree, typed attacker prerequisites, three attempt records, five scored criteria, and a non-scored host-validated control-bypass gate. Historical reports may omit attack_tree, severity_prerequisites, or criteria.control_bypass. See skills/verify/schema.json for the current output contract."
+      required: [status]
+      additionalProperties: true
+      properties:
+        status: {type: string, enum: [confirmed, fixed, inconclusive, deferred, not_attempted]}
+        attack_tree:
+          type: object
+          description: "Claim-specific attack path with a rooted parent-linked node set, per-node evidence, an overall reachable/blocked/unproven/not_attempted verdict, and concrete blockers."
+          additionalProperties: true
+          properties:
+            goal: {type: string}
+            root_id: {type: string}
+            verdict: {type: string, enum: [reachable, blocked, unproven, not_attempted]}
+            nodes:
+              type: array
+              items: {type: object, additionalProperties: true}
+            blockers:
+              type: array
+              items: {type: string}
+        severity_prerequisites:
+          type: object
+          description: "Evidence-backed inputs for deterministic severity caps. Required by the current verify contract; optional here only for historical stored reports. Unknown inputs mark calibration incomplete and never lower severity."
+          required: [attacker_position, user_interaction, outcome_determinism, impact, existing_capability]
+          additionalProperties: false
+          properties:
+            attacker_position:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: {type: string, enum: [remote_unauthenticated, remote_authenticated, internal_authenticated, local, host_shell, long_term_physical, unknown, not_attempted]}
+                evidence: {type: string}
+            user_interaction:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: {type: string, enum: [none, required, unknown, not_attempted]}
+                evidence: {type: string}
+            outcome_determinism:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: {type: string, enum: [deterministic, probabilistic_llm, unknown, not_attempted]}
+                evidence: {type: string}
+            impact:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: {type: string, enum: [code_execution_or_equivalent, privilege_escalation, sensitive_data_access, availability, other, unknown, not_attempted]}
+                evidence: {type: string}
+            existing_capability:
+              type: object
+              required: [value, evidence]
+              properties:
+                value: {type: string, enum: [none, less_than_outcome, support_channel_equivalent, equivalent_or_greater, unknown, not_attempted]}
+                evidence: {type: string}
+        attempts:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items: {type: object, additionalProperties: true}
+        criteria:
+          type: object
+          additionalProperties: true
+          properties:
+            control_bypass:
+              type: object
+              required: [matched_controls, assessments]
+              properties:
+                matched_controls:
+                  type: array
+                  uniqueItems: true
+                  items: {type: string}
+                unavailable_reason:
+                  type: string
+                  description: "Exact host-staged reason control resolution failed; omitted when resolution succeeded or no controls exist."
+                assessments:
+                  type: array
+                  items:
+                    type: object
+                    required: [control_id, disposition, evidence]
+                    properties:
+                      control_id: {type: string}
+                      disposition: {type: string, enum: [bypassed, held, not_applicable, unresolved, not_attempted]}
+                      evidence: {type: string}
+    UIError:
+      type: object
+      description: Error envelope returned by every /v1/ui route on 4xx/5xx.
+      required:
+        - error
+        - code
+        - request_id
+      properties:
+        error:
+          type: string
+          description: Human-readable message (kept a string so legacy writeAPIError callers are unchanged).
+        code:
+          type: string
+          enum:
+            - unauthorized
+            - forbidden
+            - not_found
+            - bad_param
+            - validation_failed
+            - conflict
+            - in_flight
+            - precondition_failed
+            - federation_claimed
+            - network
+            - unavailable
+            - internal
+        fields:
+          type: object
+          additionalProperties:
+            type: string
+          description: Per-field messages on 422 validation_failed.
+        request_id:
+          type: string
+          description: Per-request id, also logged by the server, so toasts are greppable.
+        current:
+          description: Row projection of the entity on 409 conflict (FindingRow plus every analyst-editable finding field, RepoRow, UISkillDetail, ...).
+          type: object
+          additionalProperties: true
+        scan_id:
+          type: integer
+          format: int64
+          description: Existing in-flight scan on 409 in_flight.
+        contacts:
+          type: array
+          items:
+            type: string
+          description: Federation peer contacts on 409 federation_claimed.
+    ListPage:
+      type: object
+      description: Paging fields shared by every list envelope (`items` is added per list).
+      required:
+        - total
+        - page
+        - page_size
+      properties:
+        total:
+          type: integer
+          format: int64
+        page:
+          type: integer
+        page_size:
+          type: integer
+    RepoRef:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+    Label:
+      type: object
+      required:
+        - id
+        - name
+        - color
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        color:
+          type: string
+          description: '#rrggbb'
+    LocationRef:
+      type: object
+      description: 'One code reference parsed from a finding location. "path:N", "path:N-M" and SARIF "path:N:col" parse as on the HTML page; prose locations contribute their first "path:N[-M]" reference. A location with no file reference is returned whole in path with line_start 0.'
+      required:
+        - path
+        - line_start
+        - line_end
+        - commit
+      properties:
+        path:
+          type: string
+        line_start:
+          type: integer
+        line_end:
+          type:
+            - integer
+            - 'null'
+        commit:
+          type: string
+    LabelledValue:
+      type: object
+      required:
+        - value
+        - label
+      properties:
+        value:
+          type: string
+        label:
+          type: string
+    RepoTab:
+      type: object
+      required:
+        - name
+        - group
+      properties:
+        name:
+          type: string
+        group:
+          type: string
+    Meta:
+      type: object
+      description: Static vocabularies (per build). Enum values are the db constants; labels are display text.
+      required:
+        - finding_statuses
+        - severities
+        - scan_statuses
+        - cwe_categories
+        - themes
+        - resolutions
+        - campaign_statuses
+        - review_verdicts
+        - offered_help
+        - communication_channels
+        - communication_directions
+        - efforts
+        - model_tiers
+        - exploited_in_wild
+        - page_size_default
+        - page_size_max
+        - repo_tabs
+      properties:
+        finding_statuses:
+          type: array
+          items:
+            type: object
+            required:
+              - value
+              - label
+              - closed
+            properties:
+              value:
+                type: string
+              label:
+                type: string
+              closed:
+                type: boolean
+        severities:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        scan_statuses:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        cwe_categories:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        themes:
+          type: array
+          items:
+            type: string
+        resolutions:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        campaign_statuses:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        review_verdicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        offered_help:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        communication_channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        communication_directions:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        efforts:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        model_tiers:
+          type: array
+          items:
+            type: string
+        exploited_in_wild:
+          type: array
+          items:
+            $ref: '#/components/schemas/LabelledValue'
+        page_size_default:
+          type: integer
+        page_size_max:
+          type: integer
+        repo_tabs:
+          type: object
+          required:
+            - tabs
+            - legacy
+          properties:
+            tabs:
+              type: array
+              items:
+                $ref: '#/components/schemas/RepoTab'
+            legacy:
+              type: object
+              additionalProperties:
+                type: string
+    CWEEntry:
+      type: object
+      required:
+        - id
+        - name
+        - category
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        category:
+          type: string
+    ScanFocus:
+      type: object
+      required:
+        - name
+        - paths
+        - surface
+        - group
+      properties:
+        name:
+          type: string
+        paths:
+          type: string
+        surface:
+          type: string
+        group:
+          type: string
+    ScanRowActions:
+      type: object
+      required:
+        - cancel
+        - resume
+        - retry
+      properties:
+        cancel:
+          type: boolean
+        resume:
+          type: boolean
+        retry:
+          type: boolean
+    ScanRow:
+      type: object
+      description: scanSummary + list columns. Never carries log, report, prompt or api_token; *_bytes are LENGTH() so the UI can lazy-load.
+      required:
+        - id
+        - repository_id
+        - kind
+        - status
+        - model
+        - commit
+        - skill_name
+        - started_at
+        - finished_at
+        - max_turns_hit
+        - cost_capped
+        - error
+        - repository
+        - findings_count
+        - cost_usd
+        - turns
+        - duration_seconds
+        - created_at
+        - updated_at
+        - completeness
+        - focus
+        - scan_group
+        - resumable
+        - has_exportable_report
+        - actions
+        - log_bytes
+        - report_bytes
+        - prompt_bytes
+      properties:
+        id:
+          type: integer
+          format: int64
+        repository_id:
+          type: integer
+          format: int64
+        kind:
+          type: string
+        status:
+          type: string
+          enum:
+            - queued
+            - running
+            - paused
+            - done
+            - failed
+            - skipped
+            - cancelled
+        model:
+          type: string
+        commit:
+          type: string
+        skill_id:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        skill_name:
+          type: string
+        skill_version:
+          type: integer
+        skill_schema_version:
+          type: integer
+        started_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        finished_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        max_turns_hit:
+          type: boolean
+        max_cost_usd:
+          type: number
+        cost_capped:
+          type: boolean
+        error:
+          type: string
+        refusal_audit_warning:
+          type: boolean
+        verification_feedback:
+          type: string
+        exploration_mode:
+          type: string
+        exploration_path:
+          type: string
+        triage_scan_id:
+          type: integer
+          format: int64
+        ref:
+          type: string
+        sub_path:
+          type: string
+        rescan_mode:
+          type: string
+        diff_base_scan_id:
+          type: integer
+          format: int64
+        remediation_attempt_id:
+          type: integer
+          format: int64
+        diff_base_commit:
+          type: string
+        diff_threat_model_scan_id:
+          type: integer
+          format: int64
+        diff_stats:
+          type: string
+        coverage:
+          type: string
+        finding_id:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        repository:
+          $ref: '#/components/schemas/RepoRef'
+        findings_count:
+          type: integer
+        cost_usd:
+          type: number
+        turns:
+          type: integer
+        duration_seconds:
+          type: number
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completeness:
+          type: string
+        focus:
+          $ref: '#/components/schemas/ScanFocus'
+        scan_group:
+          type: string
+        resumable:
+          type: boolean
+        has_exportable_report:
+          type: boolean
+          description: 'List rows: findings_count>0 or a non-trivial report (cheap approximation); ScanDetail.can_export_report is exact.'
+        actions:
+          $ref: '#/components/schemas/ScanRowActions'
+        log_bytes:
+          type: integer
+          format: int64
+        report_bytes:
+          type: integer
+          format: int64
+        prompt_bytes:
+          type: integer
+          format: int64
+    ScanStats:
+      type: object
+      required:
+        - running
+        - queued
+        - paused
+        - account_paused
+        - next_account_resume
+        - model_downgraded
+        - overage_paused
+      properties:
+        running:
+          type: integer
+          format: int64
+        queued:
+          type: integer
+          format: int64
+        paused:
+          type: integer
+          format: int64
+        account_paused:
+          type: integer
+          format: int64
+        next_account_resume:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        model_downgraded:
+          type: boolean
+        overage_paused:
+          type: boolean
+    ScanList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+            - stats
+            - skills
+            - any
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/ScanRow'
+            stats:
+              $ref: '#/components/schemas/ScanStats'
+            skills:
+              type: array
+              items:
+                type: string
+            any:
+              type: object
+              required:
+                - sub_path
+                - focus_area
+                - completeness
+              properties:
+                sub_path:
+                  type: boolean
+                focus_area:
+                  type: boolean
+                completeness:
+                  type: boolean
+    FindingRepoRef:
+      type: object
+      required:
+        - id
+        - name
+        - full_name
+        - owner
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        full_name:
+          type: string
+        owner:
+          type: string
+    FindingRow:
+      allOf:
+        - $ref: '#/components/schemas/FindingSummary'
+        - type: object
+          required:
+            - title_summary
+            - repository
+            - labels
+            - model
+            - created_at
+            - updated_at
+            - location_ref
+            - locations
+            - extra_location_count
+            - skill_name
+            - expected
+            - cwe_info
+            - commit
+            - missed_count
+          properties:
+            title_summary:
+              type: string
+            repository:
+              $ref: '#/components/schemas/FindingRepoRef'
+            labels:
+              type: array
+              items:
+                $ref: '#/components/schemas/Label'
+            model:
+              type: string
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+            location_ref:
+              oneOf:
+                - $ref: '#/components/schemas/LocationRef'
+                - type: 'null'
+            locations:
+              type: array
+              description: Every linkable location; locations[0] is location_ref and the rest are the extra links. Grouped match positions map one to one; a single prose location ("a.rs:1-5 (x); also b.rs:9") yields one entry per file reference in it. Empty only when location is empty.
+              items:
+                $ref: '#/components/schemas/LocationRef'
+            extra_location_count:
+              type: integer
+              description: len(locations) - 1, floored at 0.
+            last_seen_scan_id:
+              type:
+                - integer
+                - 'null'
+              format: int64
+            skill_name:
+              type: string
+            cwe_info:
+              description: The CWE catalogue entry for cwe; null when cwe is empty or unknown.
+              oneOf:
+                - $ref: '#/components/schemas/CWEEntry'
+                - type: 'null'
+            expected:
+              type:
+                - string
+                - 'null'
+              enum:
+                - matched
+                - unexpected
+                - null
+              description: Benchmark match status when the repo has expected findings.
+      description: findingSummary + UI keys. FindingRow is a subset of UIFindingDetail.
+    RepoLastScan:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        kind:
+          type: string
+        status:
+          type: string
+        skill_name:
+          type: string
+        commit:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        finished_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+    RepoRow:
+      type: object
+      description: repositoryExport + UI keys.
+      required:
+        - id
+        - url
+        - name
+        - full_name
+        - owner
+        - findings_count
+        - created_at
+        - updated_at
+        - last_scan
+      properties:
+        id:
+          type: integer
+          format: int64
+        url:
+          type: string
+        name:
+          type: string
+        full_name:
+          type: string
+        owner:
+          type: string
+        languages:
+          type: string
+        stars:
+          type: integer
+        findings_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_scan:
+          oneOf:
+            - $ref: '#/components/schemas/RepoLastScan'
+            - type: 'null'
+        health:
+          type: object
+          properties:
+            status:
+              type: string
+            summary:
+              type: string
+        clone_error:
+          type: string
+        disk_bytes:
+          type: integer
+          format: int64
+        status_scan:
+          oneOf:
+            - type: object
+              properties:
+                id:
+                  type: integer
+                  format: int64
+                status:
+                  type: string
+                skill_name:
+                  type: string
+            - type: 'null'
+        branches:
+          type: array
+          items:
+            type: string
+        findings_total:
+          type: integer
+        default_branch:
+          type: string
+        archived:
+          type: boolean
+        pushed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        description:
+          type: string
+        license:
+          type: string
+        forks:
+          type: integer
+        federation_opted_out:
+          type: boolean
+        schedule:
+          type: object
+          properties:
+            repo:
+              type: string
+            effective:
+              type: string
+            next_at:
+              type:
+                - string
+                - 'null'
+              format: date-time
+    FindingFacetCounts:
+      type: object
+      additionalProperties:
+        type: integer
+        format: int64
+    FindingList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+            - counts
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/FindingRow'
+            counts:
+              type: object
+              required:
+                - missed
+                - scanners
+              properties:
+                missed:
+                  type: integer
+                  format: int64
+                scanners:
+                  type: integer
+                  format: int64
+            facets:
+              type: object
+              properties:
+                status:
+                  $ref: '#/components/schemas/FindingFacetCounts'
+                severity:
+                  $ref: '#/components/schemas/FindingFacetCounts'
+                category:
+                  $ref: '#/components/schemas/FindingFacetCounts'
+    FindingWorkflow:
+      type: object
+      required:
+        - verify_in_flight
+        - critic_in_flight
+        - disclose_in_flight
+        - reattack_in_flight
+        - has_dependents
+        - has_disclosure_draft
+        - disclosure_blocked
+        - vince
+        - akrites
+      properties:
+        verify_in_flight:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        critic_in_flight:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        disclose_in_flight:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        reattack_in_flight:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        has_dependents:
+          type: boolean
+        has_disclosure_draft:
+          type: boolean
+        disclosure_blocked:
+          type: boolean
+        vince:
+          type: object
+          required:
+            - ready
+            - reason
+          properties:
+            ready:
+              type: boolean
+            reason:
+              type: string
+        akrites:
+          type: object
+          required:
+            - enabled
+            - has_submissions
+          properties:
+            enabled:
+              type: boolean
+            has_submissions:
+              type: boolean
+    ExportLink:
+      type: object
+      required:
+        - url
+        - filename
+      properties:
+        url:
+          type: string
+          description: Root-absolute download path
+        filename:
+          type: string
+    UIFindingDetail:
+      allOf:
+        - $ref: '#/components/schemas/FindingRow'
+        - type: object
+          required:
+            - workflow
+            - counts
+            - exports
+            - fingerprint
+            - seen_count
+            - last_seen_commit
+            - last_missed_scan_id
+            - confidence
+            - snippet
+            - imported_from
+            - duplicate_of_id
+            - last_revalidate_verdict
+            - released_at
+            - release_tag
+            - release_url
+            - suggested_fix_commit
+            - breaking_change
+            - breaking_change_rationale
+          properties:
+            fingerprint:
+              type: string
+              description: Stable identity used to match the finding across rescans.
+            seen_count:
+              type: integer
+              description: Scans that reported this finding (the producing scan counts as one).
+            last_seen_commit:
+              type: string
+            last_missed_scan_id:
+              type: integer
+              format: int64
+              description: Latest scan that did not report the finding again; 0 when none has.
+            confidence:
+              type: string
+              description: Audit's certainty (high, medium, low); empty when not stated.
+            snippet:
+              type: string
+            imported_from:
+              type: string
+              description: Import source (e.g. a SARIF tool name); empty for native findings.
+            duplicate_of_id:
+              type: integer
+              format: int64
+              description: Finding this one duplicates; 0 when not a duplicate.
+            last_revalidate_verdict:
+              type: string
+              description: Latest revalidate skill verdict (true_positive, false_positive, already_fixed, uncertain); empty when revalidate has not run.
+            released_at:
+              type:
+                - string
+                - 'null'
+              format: date-time
+            release_tag:
+              type: string
+            release_url:
+              type: string
+            suggested_fix_commit:
+              type: string
+              description: Commit the suggested_fix diff applies to.
+            breaking_change:
+              type: string
+              description: Breaking-change skill verdict on suggested_fix (breaking, non_breaking, unknown); empty when it has not run.
+            breaking_change_rationale:
+              type: string
+            trace:
+              type: string
+            boundary:
+              type: string
+            validation:
+              type: string
+            prior_art:
+              type: string
+            reach:
+              type: string
+            rating:
+              type: string
+            disclosure_draft:
+              type: string
+            disclosure_title:
+              type: string
+            suggested_recipients:
+              type: string
+            exploited_in_wild_evidence:
+              type: string
+            mitigation:
+              type: string
+            mitigation_semgrep:
+              type: string
+            suggested_fix:
+              type: string
+            federation_claim_contacts:
+              type: string
+            federation_claim_at:
+              type:
+                - string
+                - 'null'
+              format: date-time
+            scan:
+              oneOf:
+                - $ref: '#/components/schemas/ScanRow'
+                - type: 'null'
+            cwe_info:
+              description: FindingRow's CWEEntry plus the catalogue description and MITRE URL; null for an unknown CWE.
+              oneOf:
+                - allOf:
+                    - $ref: '#/components/schemas/CWEEntry'
+                    - type: object
+                      required:
+                        - description
+                        - url
+                      properties:
+                        description:
+                          type: string
+                        url:
+                          type: string
+                - type: 'null'
+            workflow:
+              $ref: '#/components/schemas/FindingWorkflow'
+            verification:
+              oneOf:
+                - $ref: '#/components/schemas/FindingVerification'
+                - type: 'null'
+            attack_path:
+              oneOf:
+                - $ref: '#/components/schemas/FindingAttackPath'
+                - type: 'null'
+            remediation:
+              oneOf:
+                - $ref: '#/components/schemas/RemediationAttempt'
+                - type: 'null'
+            patch:
+              oneOf:
+                - type: object
+                  properties:
+                    scan_id:
+                      type: integer
+                      format: int64
+                    rationale:
+                      type: string
+                    files:
+                      type: array
+                      items:
+                        type: string
+                    base_commit:
+                      type: string
+                    includes_test:
+                      type: boolean
+                    notes:
+                      type: string
+                    error:
+                      type: string
+                - type: 'null'
+            counts:
+              type: object
+              required:
+                - notes
+                - communications
+                - references
+                - history
+                - observations
+                - reviews
+                - verifications
+                - attack_paths
+                - conversations
+                - exposures
+              properties:
+                notes:
+                  type: integer
+                communications:
+                  type: integer
+                references:
+                  type: integer
+                history:
+                  type: integer
+                observations:
+                  type: integer
+                reviews:
+                  type: integer
+                verifications:
+                  type: integer
+                attack_paths:
+                  type: integer
+                conversations:
+                  type: integer
+                exposures:
+                  type: integer
+            exports:
+              type: object
+              properties:
+                report_md:
+                  $ref: '#/components/schemas/ExportLink'
+                disclosure_md:
+                  $ref: '#/components/schemas/ExportLink'
+                disclosure_html:
+                  $ref: '#/components/schemas/ExportLink'
+                csaf_json:
+                  $ref: '#/components/schemas/ExportLink'
+                osv_json:
+                  $ref: '#/components/schemas/ExportLink'
+                patch_diff:
+                  $ref: '#/components/schemas/ExportLink'
+                bundle_tar_gz:
+                  $ref: '#/components/schemas/ExportLink'
+      description: 'FindingRow + every findingExport column + workflow/latest sub-objects. NOTE: `cwe` stays the FindingSummary string; the structured CWE object is `cwe_info` to avoid a key collision.'
+    UIFindingHistory:
+      type: object
+      required:
+        - id
+        - field
+        - old_value
+        - new_value
+        - source
+        - by
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        field:
+          type: string
+        old_value:
+          type: string
+        new_value:
+          type: string
+        source:
+          type: string
+          enum:
+            - tool
+            - model_suggested
+            - analyst
+        by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    FindingHistoryList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/UIFindingHistory'
+    UIFindingNote:
+      type: object
+      required:
+        - id
+        - body
+        - by
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        body:
+          type: string
+        by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    UIFindingCommunication:
+      type: object
+      required:
+        - id
+        - channel
+        - direction
+        - actor
+        - body
+        - at
+      properties:
+        id:
+          type: integer
+          format: int64
+        channel:
+          type: string
+        direction:
+          type: string
+        actor:
+          type: string
+        body:
+          type: string
+        offered_help:
+          type: string
+          enum: ['', pr, funding, adoption, none]
+        at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    UIFindingReference:
+      type: object
+      required:
+        - id
+        - url
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        url:
+          type: string
+        tags:
+          type: string
+        summary:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    UIFindingReview:
+      type: object
+      required:
+        - id
+        - verdict
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        verdict:
+          type: string
+        reason:
+          type: string
+        reviewer:
+          type: string
+        automated_outcome:
+          type: string
+        agreed:
+          type:
+            - boolean
+            - 'null'
+        created_at:
+          type: string
+          format: date-time
+    VerificationView:
+      allOf:
+        - $ref: '#/components/schemas/FindingVerification'
+        - type: object
+          required:
+            - score_label
+            - verification_feedback
+            - has_rubric
+            - criteria
+            - attempts
+            - prerequisites
+          properties:
+            score_label:
+              type: string
+              description: '"ungraded" or e.g. "80%"'
+            verification_feedback:
+              type: string
+            has_rubric:
+              type: boolean
+            criteria:
+              type: array
+              items:
+                type: object
+                required: [name, criterion]
+                properties:
+                  name:
+                    type: string
+                  criterion:
+                    type: object
+                    additionalProperties: true
+                    description: verdict, method, evidence, counterevidence, proof_gap, confidence
+            attempts:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+            attack_tree:
+              type:
+                - object
+                - 'null'
+              additionalProperties: true
+            control_bypass:
+              type:
+                - object
+                - 'null'
+              additionalProperties: true
+            prerequisites:
+              type: array
+              items:
+                type: object
+                required: [name, assessment]
+                properties:
+                  name:
+                    type: string
+                  assessment:
+                    type: object
+                    properties:
+                      value:
+                        type: string
+                      evidence:
+                        type: string
+      description: FindingVerification + the parsed rubric loadFindingVerificationViews builds (newest first).
+    ObservationList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+                description: findingObservationJSON (the /api observations shape) + evidence_fields [{name,value}] in page order.
+            disagreement:
+              type: boolean
+            disagreements:
+              type: array
+              items:
+                type: string
+              description: Fields (severity, reachability, rating) whose values differ across all observations.
+    AttackPathView:
+      allOf:
+        - $ref: '#/components/schemas/FindingAttackPath'
+        - type: object
+          required:
+            - parsed
+            - assessment
+          properties:
+            parsed:
+              type: boolean
+            assessment:
+              type:
+                - object
+                - 'null'
+              additionalProperties: true
+              description: attackPathReport (production_viability, source_state, reason, counterevidence, ...); null when the stored report did not parse.
+    RemediationView:
+      type: object
+      required:
+        - attempts
+      properties:
+        attempts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        current:
+          type: object
+          additionalProperties: true
+        reattack_in_flight:
+          type:
+            - integer
+            - 'null'
+          format: int64
+        patch:
+          description: Same object as UIFindingDetail.patch.
+          type:
+            - object
+            - 'null'
+          additionalProperties: true
+    MigrationGuide:
+      type: object
+      required:
+        - available
+        - health
+        - packages
+        - alternatives
+        - campaign_statuses
+        - priority_dependents
+        - known_safe_count
+        - fixed_count
+        - total_exposure_rows
+      properties:
+        available:
+          type: boolean
+          description: False when the repository warrants no guide (no alternatives, not abandoned/zombie); lists are empty.
+        health:
+          type: string
+        packages:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        alternatives:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        campaign_statuses:
+          type: array
+          items:
+            type: string
+        priority_dependents:
+          type: array
+          items:
+            type: object
+            properties:
+              dependent_id:
+                type: integer
+                format: int64
+              name:
+                type: string
+              ecosystem:
+                type: string
+              repository_url:
+                type: string
+              dependent_repos:
+                type: integer
+              status:
+                type: string
+              rationale:
+                type: string
+              updated_at:
+                type: string
+                format: date-time
+              campaign_status:
+                type: string
+              campaign_note:
+                type: string
+              campaign_updated_at:
+                type:
+                  - string
+                  - 'null'
+                format: date-time
+        known_safe_count:
+          type: integer
+        fixed_count:
+          type: integer
+        total_exposure_rows:
+          type: integer
+      description: loadFindingMigrationGuide view.
+    RepoList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+            - languages
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/RepoRow'
+            languages:
+              type: array
+              items:
+                type: string
+    RepoDetail:
+      allOf:
+        - $ref: '#/components/schemas/RepoRow'
+        - type: object
+          required:
+            - counts
+            - exports
+            - is_local
+          properties:
+            disclosure_channel:
+              type: string
+            disclosure_channel_at:
+              type:
+                - string
+                - 'null'
+              format: date-time
+            federation_opt_out:
+              oneOf:
+                - type: object
+                  properties:
+                    at:
+                      type: string
+                      format: date-time
+                    reason:
+                      type: string
+                - type: 'null'
+            scan_schedule:
+              type: string
+            upstream_url:
+              type: string
+            next_scheduled_scan_at:
+              type:
+                - string
+                - 'null'
+              format: date-time
+            global_scan_schedule:
+              type: string
+            has_threat_model_override:
+              type: boolean
+            scan_config_set:
+              type: boolean
+            total_cost_usd:
+              type: number
+              description: Sum of the repository's scans' recorded cost_usd, as the HTML repo page's spend badge. Scans run on a model without a list price record 0, so see unpriced_scan_count before showing $0.
+            unpriced_scan_count:
+              type: integer
+              description: Scans that consumed tokens but recorded no cost because their model has no list price. When non-zero, total_cost_usd is a lower bound.
+            counts:
+              type: object
+              required:
+                - active_scans
+                - paused_scans
+                - failed_scans
+                - new_findings
+                - findings
+                - scanner_findings
+                - packages
+                - alternatives
+                - dependencies
+                - hidden_dependencies
+                - advisories
+                - dependents
+                - maintainers
+                - subprojects
+                - expected
+                - expected_matched
+                - compliance
+                - conversations
+              properties:
+                active_scans:
+                  type: integer
+                paused_scans:
+                  type: integer
+                failed_scans:
+                  type: integer
+                new_findings:
+                  type: integer
+                findings:
+                  type: integer
+                scanner_findings:
+                  type: integer
+                packages:
+                  type: integer
+                alternatives:
+                  type: integer
+                dependencies:
+                  type: integer
+                hidden_dependencies:
+                  type: integer
+                advisories:
+                  type: integer
+                dependents:
+                  type: integer
+                maintainers:
+                  type: integer
+                subprojects:
+                  type: integer
+                expected:
+                  type: integer
+                expected_matched:
+                  type: integer
+                compliance:
+                  type: integer
+                conversations:
+                  type: integer
+            latest_scan:
+              oneOf:
+                - allOf:
+                    - $ref: '#/components/schemas/ScanRow'
+                    - type: object
+                      required:
+                        - findings
+                      properties:
+                        findings:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/FindingRow'
+                - type: 'null'
+            compliance:
+              oneOf:
+                - type: object
+                  properties:
+                    level:
+                      type: string
+                    passed:
+                      type: integer
+                    total:
+                      type: integer
+                - type: 'null'
+            tm_commit:
+              type: string
+            health_summary:
+              type: string
+            exports:
+              type: object
+              properties:
+                report_md:
+                  $ref: '#/components/schemas/ExportLink'
+                report_upstream_md:
+                  $ref: '#/components/schemas/ExportLink'
+            is_local:
+              type: boolean
+            local_path:
+              type: string
+    RepoFindingList:
+      allOf:
+        - $ref: '#/components/schemas/FindingList'
+        - type: object
+          properties:
+            scan_commit:
+              type: object
+              description: Producing scan id → commit, for location links.
+              additionalProperties:
+                type: string
+            scan_skill:
+              type: object
+              description: Producing scan id → skill name.
+              additionalProperties:
+                type: string
+    RepoScanList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+            - counts
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/ScanRow'
+            counts:
+              type: object
+              required:
+                - active
+                - paused
+                - failed
+              properties:
+                active:
+                  type: integer
+                  format: int64
+                paused:
+                  type: integer
+                  format: int64
+                failed:
+                  type: integer
+                  format: int64
+    UIDependency:
+      type: object
+      required:
+        - id
+        - name
+        - ecosystem
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        ecosystem:
+          type: string
+        version:
+          type: string
+        unresolved:
+          type: boolean
+        resolution:
+          type: string
+        type:
+          type: string
+        manifests:
+          type: array
+          description: One row per manifest (the SPA groups by name+ecosystem and builds blob links from the list's `commit`).
+          items:
+            type: object
+            properties:
+              path:
+                type: string
+              kind:
+                type: string
+        purl:
+          type: string
+        known_repository_id:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          description: Repository publishing this PURL, when it is in the inventory (View repository).
+    DependencyList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+            - hidden
+            - commit
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/UIDependency'
+            hidden:
+              type: integer
+              format: int64
+            commit:
+              type: string
+    ThreatModelView:
+      type: object
+      required:
+        - report
+        - commit
+        - scan_id
+      properties:
+        report:
+          type: object
+          additionalProperties: true
+        commit:
+          type: string
+        scan_id:
+          type: integer
+          format: int64
+        skill_name:
+          type: string
+          description: threat-model, or security-deep-dive when falling back to its report.
+    RepoPackage:
+      type: object
+      required:
+        - id
+        - name
+        - ecosystem
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        ecosystem:
+          type: string
+        purl:
+          type: string
+        latest_version:
+          type: string
+        downloads:
+          type: integer
+          format: int64
+        dependent_packages:
+          type: integer
+        dependent_repos:
+          type: integer
+        registry_url:
+          type: string
+        latest_release_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        sub_path:
+          type: string
+        risk_flags:
+          type: array
+          items:
+            type: string
+    RepoPackageList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/RepoPackage'
+    RepoDependent:
+      type: object
+      required:
+        - id
+        - name
+        - ecosystem
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        ecosystem:
+          type: string
+        purl:
+          type: string
+        repository_url:
+          type: string
+        downloads:
+          type: integer
+          format: int64
+        dependent_repos:
+          type: integer
+        registry_url:
+          type: string
+        latest_version:
+          type: string
+        known_repository_id:
+          type:
+            - integer
+            - 'null'
+          format: int64
+    RepoDependentList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/RepoDependent'
+    RepoAdvisory:
+      type: object
+      required:
+        - id
+        - title
+      properties:
+        id:
+          type: integer
+          format: int64
+        uuid:
+          type: string
+        url:
+          type: string
+        title:
+          type: string
+        severity:
+          type: string
+        cvss_score:
+          type: number
+        classification:
+          type: string
+        packages:
+          type: string
+        published_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        withdrawn_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+        audit_status:
+          type: string
+          description: Latest advisory-audit outcome; "" when never audited.
+        certificate_url:
+          type: string
+          description: Root-absolute certificate download when audit_status is fixed.
+    RepoAdvisoryList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/RepoAdvisory'
+    RepoMaintainer:
+      type: object
+      required:
+        - id
+        - login
+      properties:
+        id:
+          type: integer
+          format: int64
+        login:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+        status:
+          type: string
+        notes:
+          type: string
+        do_not_contact:
+          type: boolean
+    RepoMaintainerList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/RepoMaintainer'
+    RepoAlternative:
+      type: object
+      required:
+        - id
+        - repository_id
+        - purl
+        - kind
+      properties:
+        id:
+          type: integer
+          format: int64
+        repository_id:
+          type: integer
+          format: int64
+        purl:
+          type: string
+        kind:
+          type: string
+          enum:
+            - fork
+            - successor
+            - equivalent
+        note:
+          type: string
+    RepoAlternativeList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+            - show
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/RepoAlternative'
+            show:
+              type: boolean
+              description: Whether the tab is shown (repo abandoned/zombie or has rows).
+    SubprojectRow:
+      type: object
+      required:
+        - id
+        - path
+        - name
+        - scan_count
+      properties:
+        id:
+          type: integer
+          format: int64
+        repository_id:
+          type: integer
+          format: int64
+        path:
+          type: string
+        name:
+          type: string
+        kind:
+          type: string
+        description:
+          type: string
+        disclosure_channel:
+          type: string
+        sub_path:
+          type: string
+          description: The scan sub_path ("" for a root package).
+        scan_count:
+          type: integer
+    RepoSubprojectList:
+      allOf:
+        - $ref: '#/components/schemas/ListPage'
+        - type: object
+          required:
+            - items
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/SubprojectRow'
+    UIScanDetail:
+      allOf:
+        - $ref: '#/components/schemas/ScanRow'
+        - type: object
+          required:
+            - effort
+            - ref
+            - sub_path
+            - scope_mode
+            - profile
+            - egress_policy
+            - rescan_mode
+            - diff_base_commit
+            - verification_feedback
+            - skills_repo_sha
+            - tokens
+            - skill
+            - findings
+            - investigation
+            - submitted_report
+            - diff
+            - disclosure_review_finding_id
+            - can_export_report
+            - exports
+            - has_refusal_audit
+          properties:
+            effort:
+              type: string
+            ref:
+              type: string
+              description: Always present on the detail (ScanRow omits it when empty).
+            sub_path:
+              type: string
+              description: Always present on the detail ("" = repository root).
+            scope_mode:
+              type: string
+            profile:
+              type: string
+            egress_policy:
+              type: string
+            rescan_mode:
+              type: string
+            diff_base_commit:
+              type: string
+            verification_feedback:
+              type: string
+            tokens:
+              type: object
+              required:
+                - input
+                - output
+                - cache_read
+                - cache_write
+                - total_input
+                - hit_ratio
+              properties:
+                input:
+                  type: integer
+                  format: int64
+                output:
+                  type: integer
+                  format: int64
+                cache_read:
+                  type: integer
+                  format: int64
+                cache_write:
+                  type: integer
+                  format: int64
+                total_input:
+                  type: integer
+                  format: int64
+                  description: input + cache_read + cache_write; the HTML hides the token table when 0
+                hit_ratio:
+                  type: number
+            skill:
+              oneOf:
+                - type: object
+                  properties:
+                    id:
+                      type: integer
+                      format: int64
+                    name:
+                      type: string
+                    output_kind:
+                      type: string
+                - type: 'null'
+            findings:
+              type: array
+              items:
+                $ref: '#/components/schemas/FindingRow'
+            investigation:
+              description: Notes and claim assessments of an `investigate` scan; null otherwise.
+              oneOf:
+                - type: object
+                  required:
+                    - notes
+                    - assessments
+                  properties:
+                    notes:
+                      type: string
+                    assessments:
+                      type: array
+                      items:
+                        type: object
+                        required:
+                          - claim
+                          - outcome
+                          - evidence
+                        properties:
+                          claim:
+                            type: string
+                          outcome:
+                            type: string
+                          evidence:
+                            type: string
+                - type: 'null'
+            submitted_report:
+              description: The report an `investigate` scan was submitted with; null otherwise.
+              type:
+                - string
+                - 'null'
+            diff:
+              description: Diff-rescan metadata (coverage + changed files); null when the scan carried neither.
+              oneOf:
+                - $ref: '#/components/schemas/ScanDiffView'
+                - type: 'null'
+            disclosure_review_finding_id:
+              type:
+                - integer
+                - 'null'
+              format: int64
+            can_export_report:
+              type: boolean
+            skills_repo_sha:
+              type: string
+            exports:
+              type: object
+              description: report_md is present only when can_export_report.
+              properties:
+                report_md:
+                  $ref: '#/components/schemas/ExportLink'
+            has_refusal_audit:
+              type: boolean
+              description: GET /v1/ui/scans/{id}/refusal-audit has a body
+    ScanDiffView:
+      type: object
+      required:
+        - requested_mode
+        - actual_mode
+        - fallback_reason
+        - completeness
+        - completeness_reason
+        - changed_files
+        - patch_bytes
+        - files
+      properties:
+        requested_mode:
+          type: string
+        actual_mode:
+          type: string
+        fallback_reason:
+          type: string
+        completeness:
+          type: string
+        completeness_reason:
+          type: string
+        changed_files:
+          type: integer
+        patch_bytes:
+          type: integer
+          format: int64
+        files:
+          type: array
+          items:
+            type: object
+            required:
+              - status
+              - status_name
+              - path
+              - old
+              - linkable
+            properties:
+              status:
+                type: string
+                description: git --name-status letter (R100, M, ...)
+              status_name:
+                type: string
+                description: added, modified, deleted, renamed, copied, type change
+              path:
+                type: string
+              old:
+                type: string
+                description: Previous path of a rename/copy
+              linkable:
+                type: boolean
+                description: The file exists at the scan's commit (blob link)
+    PortalAccessStatus:
+      type: object
+      required: [state, found]
+      properties:
+        state:
+          type: string
+          enum: [idle, loading, ready, error, unauthorized]
+        found:
+          type: integer
+          description: Repositories GitHub has reported so far.
+        partial:
+          type: boolean
+          description: Set while loading once requests are served on the repositories found so far.
+    PortalSessionAccess:
+      type: object
+      required: [state, found, partial]
+      properties:
+        state:
+          type: string
+          enum: [idle, loading, ready, error, unauthorized]
+        found: {type: integer}
+        partial: {type: boolean}
+    PortalVersion:
+      type: object
+      required: [version, commit, commit_date]
+      properties:
+        version: {type: string}
+        commit: {type: string}
+        commit_date: {type: string}
+    PortalSession:
+      type: object
+      required: [authenticated, login, github_user_id, expires_at, access, version]
+      properties:
+        authenticated: {type: boolean, const: true}
+        login: {type: string}
+        github_user_id: {type: integer, format: int64}
+        expires_at: {type: string, format: date-time}
+        access: {$ref: '#/components/schemas/PortalSessionAccess'}
+        version: {$ref: '#/components/schemas/PortalVersion'}
+    PortalExternalRepository:
+      type: object
+      required: [name, url]
+      properties:
+        name: {type: string, description: owner/name on GitHub}
+        url: {type: string}
+    PortalInsufficientRepository:
+      type: object
+      required: [name, url, access]
+      properties:
+        name: {type: string}
+        url: {type: string}
+        access:
+          type: string
+          description: Display label, e.g. "Read access", "Triage access", "Insufficient permission".
+    PortalAccess:
+      type: object
+      required: [authorized_repo_count, scanned_repo_count, repository_ids, unscanned, insufficient, incomplete]
+      properties:
+        authorized_repo_count:
+          type: integer
+          description: External repositories the visitor may see, scanned or not.
+        scanned_repo_count:
+          type: integer
+          description: Scrutineer repositories in scope (len of repository_ids).
+        repository_ids:
+          type: array
+          items: {type: integer}
+          description: Scrutineer repository ids in scope, ascending.
+        unscanned:
+          type: array
+          items: {$ref: '#/components/schemas/PortalExternalRepository'}
+        insufficient:
+          type: array
+          items: {$ref: '#/components/schemas/PortalInsufficientRepository'}
+        incomplete:
+          type: boolean
+          description: The lookup is still running; more repositories may appear.

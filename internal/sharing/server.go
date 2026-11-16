@@ -39,46 +39,6 @@ func New(cfg *Config, gdb *gorm.DB, log *slog.Logger, inner http.Handler, grants
 	return &Server{cfg: cfg, db: gdb, log: log, inner: inner, grants: grants, access: newAccessCache(log)}
 }
 
-// resourceKind classifies a whitelisted route so the authorization middleware
-// knows how to resolve the {id} in its path to a repository ID.
-type resourceKind int
-
-const (
-	kindList    resourceKind = iota // list pages; scoped by the query filter, no {id}
-	kindRepo                        // {id} is a repository ID
-	kindFinding                     // {id} is a finding ID
-	kindScan                        // {id} is a scan ID (resolved to its repository)
-)
-
-// route is a whitelisted path forwarded to the reused handler.
-type route struct {
-	pattern string
-	kind    resourceKind
-}
-
-// sharedRoutes is the entire surface the portal exposes. It is read-only: every
-// route is a GET. Anything not listed here 404s at the portal and never reaches
-// the inner handler — in particular /api, /api/v1, /events, /settings, add-repo,
-// delete, the source blob view, and the finding status/notes and scan
-// cancel/resume/retry writes are all withheld. (The ReadOnly view scope also
-// refuses those writes at the handler as defense in depth, but the portal never
-// forwards them in the first place.) List routes (kindList) are forwarded and
-// rely on the request's view scope to filter rows to the committer's repos.
-var sharedRoutes = []route{
-	{"GET /{$}", kindList},
-	{"GET /findings", kindList},
-	{"GET /repositories/{id}", kindRepo},
-	{"GET /repositories/{id}/report.md", kindRepo},
-	{"GET /findings/{id}", kindFinding},
-	{"GET /findings/{id}/report.md", kindFinding},
-	{"GET /findings/{id}/csaf.json", kindFinding},
-	{"GET /findings/{id}/osv.json", kindFinding},
-	{"GET /findings/{id}/bundle.tar.gz", kindFinding},
-	{"GET /scans", kindList},
-	{"GET /scans/{id}", kindScan},
-	{"GET /scans/{id}/report.md", kindScan},
-}
-
 // Handler wires the portal: auth routes, the whitelisted authenticated surface,
 // and static assets, all behind the outer host/CSRF guard.
 func (s *Server) Handler() http.Handler {
@@ -95,7 +55,7 @@ func (s *Server) Handler() http.Handler {
 	// them straight through without a session.
 	mux.Handle("GET /static/", s.forward())
 
-	for _, rt := range sharedRoutes {
+	for _, rt := range append(append([]route{}, legacyPageRoutes...), downloadRoutes...) {
 		mux.Handle(rt.pattern, s.requireAuth(s.authorize(rt.kind, s.forward())))
 	}
 
@@ -195,7 +155,7 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 // routes carry no {id} and are already constrained by the scoped query.
 func (s *Server) authorize(kind resourceKind, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if kind == kindList {
+		if kind == kindList || kind == kindStatic {
 			next.ServeHTTP(w, r)
 			return
 		}

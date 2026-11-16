@@ -1,0 +1,1 @@
+import{t as e}from"../chunks/DK3Fl9T5.js";import{n as t}from"../chunks/DFqOCZf3.js";import{o as n}from"../chunks/BmY_6qpO.js";import"../chunks/xihTtKlq.js";import"../chunks/BLZcoYV4.js";import"../chunks/BZp-bRJk.js";var r=e({load:()=>i});function i(){t(307,n(`/sboms?upload=1`))}function a(e){}export{a as component,r as universal};

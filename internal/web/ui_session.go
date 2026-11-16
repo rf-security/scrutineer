@@ -42,7 +42,7 @@ func (s *Server) uiSessionGet(w http.ResponseWriter, r *http.Request) {
 		"authenticated": true,
 		"version":       map[string]string{"version": s.Version, "commit": s.Commit, "commit_date": s.CommitDate},
 		"token_file":    s.operatorTokenPath(),
-		"ui_base":       uiBasePath,
+		"ui_base":       s.uiBase(),
 		"prefs":         map[string]string{"theme": themeCookie(r), "color_scheme": resolveColorScheme(r)},
 	})
 }

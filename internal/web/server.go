@@ -309,6 +309,10 @@ type Server struct {
 	// spawnTurn runs a chat turn in the background. Field rather than a direct
 	// `go s.runChatTurn(...)` so tests can run it synchronously.
 	spawnTurn func(convID uint, message string)
+
+	// UIRoot serves UI v2 at "/" and the template UI under /legacy/
+	// (ui_root.go). Off by default: SPA under /ui/, template UI at "/".
+	UIRoot bool
 }
 
 // SetRunnerImageStatus records the boot-time runner-image staleness result so
@@ -709,12 +713,10 @@ func (s *Server) Handler() http.Handler {
 	// The SPA session routes and document sit outside requireOperator: the
 	// session check answers 401 itself and the document carries no data.
 	s.registerUISessionRoutes(root)
-	root.Handle("GET /ui/", securityHeaders(s.AllowRemote, s.uiHandler()))
 	root.Handle("/api/v1/", securityHeaders(s.AllowRemote, s.requireOperator(http.StripPrefix(exportPrefix, s.exportHandler()))))
 	// Reachable without the operator token: the login page has to be, and
 	// claim-check is called by federation peers through a reverse proxy.
 	root.Handle("GET /static/", securityHeaders(s.AllowRemote, http.FileServerFS(staticFS)))
-	root.Handle("GET /login", securityHeaders(s.AllowRemote, http.HandlerFunc(s.login)))
 	// No method in the pattern: the handler 404s non-POST itself so a
 	// federation-capable build cannot be fingerprinted by the 405 the
 	// mux would otherwise answer.
@@ -727,7 +729,8 @@ func (s *Server) Handler() http.Handler {
 	if s.ModelProxy != nil {
 		root.Handle(worker.ModelProxyPathPrefix+"/", s.ModelProxy)
 	}
-	root.Handle("/", securityHeaders(s.AllowRemote, s.requireOperator(mux)))
+	// The SPA, GET /login and the template UI: ui_root.go.
+	s.registerUIMount(root, mux)
 	return logRequests(s.Log, root)
 }
 

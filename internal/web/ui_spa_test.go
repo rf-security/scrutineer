@@ -23,7 +23,10 @@ func anonReq(path string) *http.Request {
 func TestUIServesPlaceholderWithoutOperator(t *testing.T) {
 	s, cleanup := newTestServer(t)
 	defer cleanup()
-	t.Setenv(uiDirEnv, "")
+	// The embed may hold a real build; serve the placeholder from disk.
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, uiIndexFile), `<body data-scrutineer-ui="placeholder"></body>`)
+	s.SetUIDir(dir)
 	for _, path := range []string{"/ui/", "/ui/findings/123", "/ui/repositories/5?tab=scans"} {
 		w := serveUI(t, s, anonReq(path))
 		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `data-scrutineer-ui="placeholder"`) {

@@ -87,7 +87,7 @@ func (s *Server) uiFS() fs.FS {
 func (s *Server) uiHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fsys := s.uiFS()
-		name := strings.TrimPrefix(path.Clean("/"+strings.TrimPrefix(r.URL.Path, uiBasePath)), "/")
+		name := strings.TrimPrefix(path.Clean("/"+strings.TrimPrefix(r.URL.Path, s.uiBase())), "/")
 		if name == "" || name == "." || name == uiIndexFile {
 			serveUIDocument(w, r, fsys)
 			return

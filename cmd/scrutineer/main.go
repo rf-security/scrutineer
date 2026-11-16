@@ -757,6 +757,9 @@ func newApp(f *flags, cfg *config.Config, log *slog.Logger, setup runnerSetup) (
 	}
 	srv.SkillsRepoSHA = skillsRepoSHA
 	srv.SetUIDir(cfg.Web.UIDir)
+	// The embedded SPA is built with UI_BASE=/: UI v2 is the root and the
+	// template UI lives under /legacy/.
+	srv.UIRoot = true
 	if cfg.Web.TestHooks || web.TestHooksFromEnv() {
 		srv.EnableTestHooks()
 		log.Warn("test hooks enabled — development only: POST /api/v1/ui/_test/publish can inject synthetic SSE events")

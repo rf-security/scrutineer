@@ -1,0 +1,1 @@
+import{t as e}from"../chunks/DK3Fl9T5.js";import{n as t}from"../chunks/DFqOCZf3.js";import{r as n}from"../chunks/Ce9cyLTt.js";import"../chunks/B-2mrYD3.js";import"../chunks/xihTtKlq.js";import"../chunks/BLZcoYV4.js";import"../chunks/BZp-bRJk.js";var r=e({load:()=>i}),i=()=>{t(307,`${n(`/`)}findings`)};function a(e){}export{a as component,r as universal};

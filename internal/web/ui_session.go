@@ -54,6 +54,9 @@ func themeCookie(r *http.Request) string {
 }
 
 func (s *Server) uiSessionCreate(w http.ResponseWriter, r *http.Request) {
+	if denyReadOnlyUI(w, r) {
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, sessionBodyMax)
 	var body struct {
 		Token string `json:"token"`
@@ -71,7 +74,10 @@ func (s *Server) uiSessionCreate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) uiSessionDelete(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) uiSessionDelete(w http.ResponseWriter, r *http.Request) {
+	if denyReadOnlyUI(w, r) {
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     operatorCookieName(s.OperatorToken),
 		Value:    "",

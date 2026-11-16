@@ -106,3 +106,42 @@ func applyRepoScope(q *gorm.DB, r *http.Request, col string) *gorm.DB {
 	}
 	return q.Where(col+" IN ?", sc.scopeIDs())
 }
+
+// repoInScope reports whether repoID is visible to the request: always true
+// without a scope, otherwise only for an allow-listed repository. The /api/v1/ui
+// loaders use it to answer 404 for an out-of-scope id (defence in depth behind
+// the sharing portal's own ownership check).
+func repoInScope(r *http.Request, repoID uint) bool {
+	sc, ok := viewScopeFrom(r)
+	if !ok {
+		return true
+	}
+	_, in := sc.RepoIDs[repoID]
+	return in
+}
+
+// scopeKnownRepos drops the entries of a URL/PURL -> repository id map whose
+// repository is outside the request's view scope, so a payload that
+// cross-references another Scrutineer repository (a dependency's publisher, a
+// dependent's repo) never discloses an out-of-scope repository id; the row
+// keeps its plain name, PURL and URL. A no-op without a scope.
+func scopeKnownRepos(r *http.Request, known map[string]uint) map[string]uint {
+	if _, ok := viewScopeFrom(r); !ok {
+		return known
+	}
+	for k, id := range known {
+		if !repoInScope(r, id) {
+			delete(known, k)
+		}
+	}
+	return known
+}
+
+// denyReadOnlyUI is denyReadOnly with the /api/v1/ui JSON error envelope.
+func denyReadOnlyUI(w http.ResponseWriter, r *http.Request) bool {
+	if isReadOnly(r) {
+		writeUIError(w, http.StatusForbidden, uiCodeForbidden, "read-only view", nil)
+		return true
+	}
+	return false
+}

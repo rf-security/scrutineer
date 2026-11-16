@@ -97,6 +97,26 @@ func (s *Server) loadUIScanDetail(id uint) (uiScanDetailRow, error) {
 	return row, nil
 }
 
+// uiScanInScope reports whether scan id belongs to a repository the request's
+// view scope allows, writing the 404 envelope when it does not (an
+// out-of-scope scan reads as missing). Always true without a scope; defence
+// in depth behind the sharing portal's own ownership check.
+func (s *Server) uiScanInScope(w http.ResponseWriter, r *http.Request, id uint) bool {
+	if _, scoped := viewScopeFrom(r); !scoped {
+		return true
+	}
+	var n int64
+	if err := applyRepoScope(s.DB.Model(&db.Scan{}), r, "repository_id").Where("id = ?", id).Count(&n).Error; err != nil {
+		uiInternal(w, err)
+		return false
+	}
+	if n == 0 {
+		uiNotFound(w, uiScanWhat)
+		return false
+	}
+	return true
+}
+
 // scanBlob plucks one blob column of a scan; "" when absent or NULL.
 func (s *Server) scanBlob(id uint, column string) string {
 	v, _, _ := s.scanBlobFound(id, column)
@@ -119,7 +139,7 @@ func (s *Server) scanBlobFound(id uint, column string) (string, bool, error) {
 // notices and Result data of the scan page.
 func (s *Server) uiScanDetail(w http.ResponseWriter, r *http.Request) {
 	id, ok := uiPathID(w, r, "id")
-	if !ok {
+	if !ok || !s.uiScanInScope(w, r, id) {
 		return
 	}
 	row, err := s.loadUIScanDetail(id)
@@ -245,9 +265,14 @@ func uiScanDiff(v *scanDiffView) any {
 // at, in the same byte space as scan-log event offsets. While the scan runs
 // the body comes from the in-memory mirror (ui_scans_log.go) when it is ahead
 // of the stored log, which the worker flushes only every couple of seconds.
+//
+// The sharing portal (cmd/sharing) runs as its own process with its own
+// broker that no worker publishes to, so it never has a live mirror: there a
+// running scan's log is the stored log only, trailing the worker by its flush
+// interval, and the portal UI polls this route rather than streaming.
 func (s *Server) uiScanLog(w http.ResponseWriter, r *http.Request) {
 	id, ok := uiPathID(w, r, "id")
-	if !ok {
+	if !ok || !s.uiScanInScope(w, r, id) {
 		return
 	}
 	offset, err := parseUILogOffset(r)
@@ -314,7 +339,7 @@ func (s *Server) uiScanRefusalAudit(w http.ResponseWriter, r *http.Request) {
 // missing. Prompts are text; reports and refusal audits are JSON when valid.
 func (s *Server) writeUIScanBlob(w http.ResponseWriter, r *http.Request, column, what string) {
 	id, ok := uiPathID(w, r, "id")
-	if !ok {
+	if !ok || !s.uiScanInScope(w, r, id) {
 		return
 	}
 	blob, found, err := s.scanBlobFound(id, column)

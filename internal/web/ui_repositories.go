@@ -230,6 +230,10 @@ func (s *Server) uiLoadRepo(w http.ResponseWriter, r *http.Request, extra ...str
 		return db.Repository{}, false
 	}
 	var repo db.Repository
+	if !repoInScope(r, id) {
+		uiNotFound(w, uiKeyRepository)
+		return repo, false
+	}
 	cols := append(append([]string{}, uiRepoListColumns...), extra...)
 	if err := s.DB.Select(cols).First(&repo, id).Error; err != nil {
 		uiDBError(w, err, uiKeyRepository)
@@ -265,6 +269,27 @@ func uiRepoListOrder(q *gorm.DB, token string) *gorm.DB {
 	}
 }
 
+// uiRepoListOrderFor is uiRepoListOrder plus the sharing portal's default:
+// with no sort token a read-only scope lists done, then queued, then failed
+// repositories first (portalRepoStatusOrderExpr, the legacy portal index's
+// order). The `status` token stays status_priority (running first) for both.
+func uiRepoListOrderFor(q *gorm.DB, r *http.Request) *gorm.DB {
+	token := r.URL.Query().Get("sort")
+	if col, _ := splitSort(token); isReadOnly(r) && !uiRepoListSortKnown(col) {
+		q = q.Order(portalRepoStatusOrderExpr)
+	}
+	return uiRepoListOrder(q, token)
+}
+
+// uiRepoListSortKnown reports whether col is one of uiRepoListOrder's tokens.
+func uiRepoListSortKnown(col string) bool {
+	switch col {
+	case uiKeyName, "stars", "language", "size", uiKeyFindings, "scanned", statusKey:
+		return true
+	}
+	return false
+}
+
 // uiRepoListWhere applies the repo list's q and language filters (repoList's
 // WHERE clauses).
 func uiRepoListWhere(q *gorm.DB, r *http.Request) *gorm.DB {
@@ -286,12 +311,15 @@ func (s *Server) uiRepoList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var total int64
-	if err := uiRepoListWhere(s.DB.Model(&db.Repository{}), r).Count(&total).Error; err != nil {
+	// The sharing portal's scope bounds the total and the page alike (the
+	// languages facet is scoped inside distinctLanguages).
+	base := func() *gorm.DB { return applyRepoScope(uiRepoListWhere(s.DB.Model(&db.Repository{}), r), r, "id") }
+	if err := base().Count(&total).Error; err != nil {
 		uiInternal(w, err)
 		return
 	}
 	var ids []uint
-	q := uiRepoListOrder(uiRepoListWhere(s.DB.Model(&db.Repository{}), r), r.URL.Query().Get("sort"))
+	q := uiRepoListOrderFor(base(), r)
 	if err := q.Limit(p.PageSize).Offset(p.offset()).Pluck("id", &ids).Error; err != nil {
 		uiInternal(w, err)
 		return

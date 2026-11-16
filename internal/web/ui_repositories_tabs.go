@@ -280,7 +280,7 @@ func (s *Server) uiRepoDependencies(w http.ResponseWriter, r *http.Request) {
 	for i, d := range deps {
 		groups[i] = DepGroup{Dependency: d}
 	}
-	known := s.lookupKnownPURLs(groups)
+	known := scopeKnownRepos(r, s.lookupKnownPURLs(groups))
 	items := make([]map[string]any, len(deps))
 	for i, d := range deps {
 		items[i] = uiDependencyRow(d, known)
@@ -362,7 +362,7 @@ func (s *Server) uiRepoDependents(w http.ResponseWriter, r *http.Request) {
 	s.DB.Model(&db.Dependent{}).Where("repository_id = ?", repo.ID).Count(&total)
 	var rows []db.Dependent
 	s.DB.Where("repository_id = ?", repo.ID).Order("dependent_repos desc").Limit(p.PageSize).Offset(p.offset()).Find(&rows)
-	known := s.lookupKnownURLs(rows)
+	known := scopeKnownRepos(r, s.lookupKnownURLs(rows))
 	items := make([]map[string]any, 0, len(rows))
 	for _, d := range rows {
 		var knownRepo any
@@ -396,7 +396,9 @@ func (s *Server) uiRepoAdvisories(w http.ResponseWriter, r *http.Request) {
 	for _, a := range rows {
 		status := audits[a.ID]
 		cert := ""
-		if status == "fixed" {
+		// The certificate route is operator-only; the sharing portal does not
+		// forward it, so a read-only view gets no link.
+		if status == "fixed" && !isReadOnly(r) {
 			cert = fmt.Sprintf("/advisories/%d/certificate.json", a.ID)
 		}
 		items = append(items, map[string]any{
@@ -420,11 +422,19 @@ func (s *Server) uiRepoMaintainers(w http.ResponseWriter, r *http.Request) {
 	}
 	rows := s.repoMaintainers(repo.ID)
 	slices.SortFunc(rows, func(a, b db.Maintainer) int { return strings.Compare(a.Login, b.Login) })
+	// A maintainer is shared across every repository they maintain, so the
+	// operator's free-text notes on them can name other repositories. The
+	// legacy sharing portal never showed them; a read-only view gets "".
+	readOnly := isReadOnly(r)
 	items := make([]map[string]any, 0, len(rows))
 	for _, m := range pageSlice(rows, p) {
+		notes := m.Notes
+		if readOnly {
+			notes = ""
+		}
 		items = append(items, map[string]any{
 			"id": m.ID, "login": m.Login, uiKeyName: m.Name, "email": m.Email, statusKey: string(m.Status),
-			"notes": m.Notes, "do_not_contact": m.DoNotContact,
+			"notes": notes, "do_not_contact": m.DoNotContact,
 		})
 	}
 	writeList(w, items, int64(len(rows)), p)

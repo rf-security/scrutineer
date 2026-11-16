@@ -210,7 +210,8 @@ func TestRequireOperatorSharingScope(t *testing.T) {
 		{"unscoped visitor", "GET", nil, http.StatusUnauthorized},
 		{"authorized portal visitor", "GET", &ViewScope{ReadOnly: true}, http.StatusOK},
 		{"writable scope", "GET", &ViewScope{}, http.StatusUnauthorized},
-		{"portal write", "POST", &ViewScope{ReadOnly: true}, http.StatusUnauthorized},
+		// A read-only scope refuses every write before the token check.
+		{"portal write", "POST", &ViewScope{ReadOnly: true}, http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest(tc.method, "/", nil)

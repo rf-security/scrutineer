@@ -32,6 +32,17 @@ func operatorCookieName(token string) string {
 // sent as a bearer by scripts or as the cookie /login sets for a browser.
 func (s *Server) requireOperator(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A read-only scope never writes, whatever credentials the request
+		// carries (and even with the operator token disabled): refuse every
+		// non-GET before any handler runs.
+		if isReadOnly(r) && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if strings.HasPrefix(r.URL.Path, "/api/v1/ui/") {
+				denyReadOnlyUI(w, r)
+			} else {
+				denyReadOnly(w, r)
+			}
+			return
+		}
 		if s.DisableOperatorToken {
 			h.ServeHTTP(w, r)
 			return

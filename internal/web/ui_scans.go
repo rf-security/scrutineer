@@ -96,22 +96,58 @@ func (s *Server) uiScanList(w http.ResponseWriter, r *http.Request) {
 		uiBadParam(w, err.Error())
 		return
 	}
+	// The sharing portal's scope bounds the total, the page and every extra.
+	base := func() *gorm.DB { return applyRepoScope(p.where(s.DB.Model(&db.Scan{})), r, "scans.repository_id") }
 	var total int64
-	if err := p.where(s.DB.Model(&db.Scan{})).Count(&total).Error; err != nil {
+	if err := base().Count(&total).Error; err != nil {
 		uiInternal(w, err)
 		return
 	}
-	q := s.uiScanListOrder(p.where(s.DB.Model(&db.Scan{})), p.sort).Limit(p.page.PageSize).Offset(p.page.offset())
+	q := s.uiScanListOrder(base(), p.sort).Limit(p.page.PageSize).Offset(p.page.offset())
 	rows, err := s.uiScanRows(q)
 	if err != nil {
 		uiInternal(w, err)
 		return
 	}
+	stats, skills := s.uiScanStats(), s.scanSkillNames()
+	if _, scoped := viewScopeFrom(r); scoped {
+		stats, skills = s.uiScopedScanStats(r), s.uiScopedScanSkillNames(r)
+	}
 	writeListWith(w, rows, total, p.page, map[string]any{
-		"stats":  s.uiScanStats(),
-		"skills": nonNilStrings(s.scanSkillNames()),
+		"stats":  stats,
+		"skills": nonNilStrings(skills),
 		"any":    scanListAny(rows, p.completeness),
 	})
+}
+
+// uiScopedScanStats is the ScanStats object for a scoped (sharing portal)
+// request: the running/queued/paused counters over the visible repositories
+// only. The account-pause and runner flags describe the operator's whole
+// queue and model budget, not the visitor's repositories, so they read as
+// zero/false rather than leaking instance-wide state.
+func (s *Server) uiScopedScanStats(r *http.Request) map[string]any {
+	var c struct{ Running, Queued, Paused int64 }
+	applyRepoScope(s.DB.Model(&db.Scan{}), r, "repository_id").
+		Where("status IN ?", []db.ScanStatus{db.ScanRunning, db.ScanQueued, db.ScanPaused}).
+		Select("COUNT(CASE WHEN status = ? THEN 1 END) AS running, "+
+			"COUNT(CASE WHEN status = ? THEN 1 END) AS queued, "+
+			"COUNT(CASE WHEN status = ? THEN 1 END) AS paused",
+			db.ScanRunning, db.ScanQueued, db.ScanPaused).
+		Scan(&c)
+	return map[string]any{
+		"running": c.Running, "queued": c.Queued, "paused": c.Paused,
+		"account_paused": int64(0), "next_account_resume": nil,
+		"model_downgraded": false, "overage_paused": false,
+	}
+}
+
+// uiScopedScanSkillNames is scanSkillNames over the visible repositories'
+// scans (uncached: the global cache would leak other repositories' skills).
+func (s *Server) uiScopedScanSkillNames(r *http.Request) []string {
+	var names []string
+	applyRepoScope(s.DB.Model(&db.Scan{}), r, "repository_id").Where("skill_name != ''").
+		Distinct("skill_name").Order("skill_name").Pluck("skill_name", &names)
+	return names
 }
 
 // uiScanStats is the ScanStats object: queue counters plus runner state.

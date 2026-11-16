@@ -1,0 +1,362 @@
+# Hand-written part of openapi.portal.yaml: the portal's own endpoints (auth
+# and the legacy file downloads). The generator (openapi_gen_test.go) merges it
+# with the allow-listed /api/v1/ui operations from openapi.yaml. Components
+# here take precedence over openapi.yaml components of the same name; $refs
+# to openapi.yaml components (UIError, ...) are resolved and copied in.
+#
+# Regenerate: go test ./internal/sharing -run TestPortalOpenAPIGolden -update
+info:
+  title: Scrutineer Sharing Portal API
+  description: |
+    The read-only surface of scrutineer's external maintainer portal
+    (`cmd/sharing`). A GitHub visitor signs in with OAuth; every request is
+    then scoped server-side to the repositories that visitor maintains
+    (ADMIN, MAINTAIN or WRITE) plus operator-configured access grants.
+
+    The `/api/v1/ui/*` operations are the subset of scrutineer's v2 UI API
+    the portal forwards (GET only, default deny); their schemas are the same
+    as in `openapi.yaml`. An id outside the visitor's scope answers 404
+    `not_found`, exactly like an id that does not exist.
+
+    Authentication is the HttpOnly session cookie `scrutineer_sharing`; no
+    token is readable by JavaScript and there is no CORS. Every non-GET/HEAD
+    request must carry `Sec-Fetch-Site: same-origin`. The only state-changing
+    operation is `POST /auth/logout`.
+
+    API responses carry `Cache-Control: no-store`, `Vary: Cookie` and
+    `X-Portal-Scope: complete|partial`. A missing or expired session answers
+    401 `unauthorized` (never a redirect); a GitHub outage answers 503
+    `unavailable` and keeps the session.
+
+paths:
+  /auth/login:
+    get:
+      summary: Start GitHub sign-in
+      operationId: portalLogin
+      tags: [portal-auth]
+      security: []
+      description: |
+        A document navigation, not a fetch. Sets a short-lived state cookie
+        carrying `next` and redirects to GitHub's authorize page. With the
+        loopback dev identity it signs in directly and redirects to `next`.
+      parameters:
+        - name: next
+          in: query
+          required: false
+          description: |
+            Same-origin path to land on after sign-in. Honoured only when it
+            starts with a single `/` (not `//` or `/\`) and contains no
+            backslash or control character; anything else lands on `/`.
+          schema: { type: string }
+      responses:
+        '302':
+          description: Redirect to GitHub (or, in dev mode, to `next`)
+  /auth/callback:
+    get:
+      summary: GitHub OAuth callback
+      operationId: portalCallback
+      tags: [portal-auth]
+      security: []
+      parameters:
+        - { name: code, in: query, required: true, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
+      responses:
+        '302':
+          description: Signed in; redirect to the `next` carried in the state cookie (default `/`)
+        '400':
+          description: Invalid OAuth state or missing code (text/plain)
+        '502':
+          description: GitHub exchange or identity lookup failed (text/plain)
+  /auth/status:
+    get:
+      summary: Repository lookup progress
+      operationId: portalAccessStatus
+      tags: [portal-auth]
+      security: []
+      description: Never starts a lookup. Clears the session cookie when the state is `unauthorized`.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PortalAccessStatus' }
+  /auth/session:
+    get:
+      summary: Current visitor
+      operationId: portalSession
+      tags: [portal-auth]
+      description: |
+        Never blocks and never starts a repository lookup, so it is safe to
+        poll. `access` is the lookup state `/auth/status` reports.
+      responses:
+        '200':
+          description: Signed in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PortalSession' }
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+  /auth/access:
+    get:
+      summary: The visitor's repository access
+      operationId: portalAccess
+      tags: [portal-auth]
+      description: |
+        Waits for the first repository lookup for at most 20 s, then answers
+        on the repositories found so far with `incomplete: true` (and
+        `X-Portal-Scope: partial`).
+      responses:
+        '200':
+          description: OK
+          headers:
+            X-Portal-Scope: { $ref: '#/components/headers/PortalScope' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PortalAccess' }
+        '401':
+          $ref: '#/components/responses/UIUnauthorized'
+        '500':
+          $ref: '#/components/responses/UIInternal'
+        '503':
+          $ref: '#/components/responses/UIUnavailable'
+  /auth/logout:
+    post:
+      summary: Sign out
+      operationId: portalLogout
+      tags: [portal-auth]
+      security: []
+      description: |
+        Revokes the OAuth app's grant on GitHub (best effort), drops the
+        cached repository access and clears the session cookie. Requires
+        `Sec-Fetch-Site: same-origin`.
+      parameters:
+        - name: Accept
+          in: header
+          required: false
+          description: '`application/json` selects the 204 answer.'
+          schema: { type: string }
+      responses:
+        '204':
+          description: Signed out (Accept application/json)
+        '303':
+          description: Signed out; redirect to `/auth/login` (any other Accept)
+        '403':
+          description: Cross-site request (text/plain)
+
+  /repositories/{id}/report.md:
+    get:
+      summary: Repository findings report (Markdown)
+      operationId: portalRepositoryReport
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+        - name: audience
+          in: query
+          required: false
+          schema: { type: string, enum: [upstream] }
+      responses:
+        '200':
+          description: OK
+          content:
+            text/markdown: { schema: { type: string } }
+        '401': { $ref: '#/components/responses/PortalDownloadUnauthorized' }
+        '404': { $ref: '#/components/responses/PortalDownloadNotFound' }
+  /findings/{id}/report.md:
+    get:
+      summary: Finding report (Markdown)
+      operationId: portalFindingReport
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            text/markdown: { schema: { type: string } }
+        '401': { $ref: '#/components/responses/PortalDownloadUnauthorized' }
+        '404': { $ref: '#/components/responses/PortalDownloadNotFound' }
+  /findings/{id}/csaf.json:
+    get:
+      summary: Finding as a CSAF 2.0 document
+      operationId: portalFindingCSAF
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json: { schema: { type: object } }
+        '401': { $ref: '#/components/responses/PortalDownloadUnauthorized' }
+        '404': { $ref: '#/components/responses/PortalDownloadNotFound' }
+  /findings/{id}/osv.json:
+    get:
+      summary: Finding as an OSV record
+      operationId: portalFindingOSV
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json: { schema: { type: object } }
+        '401': { $ref: '#/components/responses/PortalDownloadUnauthorized' }
+        '404': { $ref: '#/components/responses/PortalDownloadNotFound' }
+  /findings/{id}/bundle.tar.gz:
+    get:
+      summary: Finding evidence bundle
+      operationId: portalFindingBundle
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/gzip: { schema: { type: string, format: binary } }
+        '401': { $ref: '#/components/responses/PortalDownloadUnauthorized' }
+        '404': { $ref: '#/components/responses/PortalDownloadNotFound' }
+  /findings/{id}/patch.diff:
+    get:
+      summary: Finding's proposed patch
+      operationId: portalFindingPatch
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            text/x-diff: { schema: { type: string } }
+        '401': { $ref: '#/components/responses/PortalDownloadUnauthorized' }
+        '404': { $ref: '#/components/responses/PortalDownloadNotFound' }
+  /scans/{id}/report.md:
+    get:
+      summary: Scan report (Markdown)
+      operationId: portalScanReport
+      tags: [portal-downloads]
+      parameters:
+        - $ref: '#/components/parameters/PortalID'
+      responses:
+        '200':
+          description: OK
+          content:
+            text/markdown: { schema: { type: string } }
+        '401': { $ref: '#/components/responses/PortalDownloadUnauthorized' }
+        '404': { $ref: '#/components/responses/PortalDownloadNotFound' }
+
+components:
+  securitySchemes:
+    portalSession:
+      type: apiKey
+      in: cookie
+      name: scrutineer_sharing
+      description: Sealed, HttpOnly session cookie set by `/auth/callback` (45 min).
+  parameters:
+    PortalID:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+  headers:
+    PortalScope:
+      description: |
+        `complete` once the visitor's GitHub repository lookup has finished;
+        `partial` while the answer is built on the repositories found so far.
+      schema: { type: string, enum: [complete, partial] }
+  responses:
+    UIUnauthorized:
+      description: No session, or an expired or rejected one (code unauthorized). Never a redirect.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UIError'
+    UIUnavailable:
+      description: GitHub is temporarily unavailable (code unavailable); the session is kept.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UIError'
+    PortalDownloadUnauthorized:
+      description: No session; redirected to `/auth/login?next=` instead when navigated to (text/plain)
+    PortalDownloadNotFound:
+      description: Not found or outside the visitor's scope (text/plain)
+  schemas:
+    PortalAccessStatus:
+      type: object
+      required: [state, found]
+      properties:
+        state:
+          type: string
+          enum: [idle, loading, ready, error, unauthorized]
+        found:
+          type: integer
+          description: Repositories GitHub has reported so far.
+        partial:
+          type: boolean
+          description: Set while loading once requests are served on the repositories found so far.
+    PortalSessionAccess:
+      type: object
+      required: [state, found, partial]
+      properties:
+        state:
+          type: string
+          enum: [idle, loading, ready, error, unauthorized]
+        found: { type: integer }
+        partial: { type: boolean }
+    PortalVersion:
+      type: object
+      required: [version, commit, commit_date]
+      properties:
+        version: { type: string }
+        commit: { type: string }
+        commit_date: { type: string }
+    PortalSession:
+      type: object
+      required: [authenticated, login, github_user_id, expires_at, access, version]
+      properties:
+        authenticated: { type: boolean, const: true }
+        login: { type: string }
+        github_user_id: { type: integer, format: int64 }
+        expires_at: { type: string, format: date-time }
+        access: { $ref: '#/components/schemas/PortalSessionAccess' }
+        version: { $ref: '#/components/schemas/PortalVersion' }
+    PortalExternalRepository:
+      type: object
+      required: [name, url]
+      properties:
+        name: { type: string, description: owner/name on GitHub }
+        url: { type: string }
+    PortalInsufficientRepository:
+      type: object
+      required: [name, url, access]
+      properties:
+        name: { type: string }
+        url: { type: string }
+        access:
+          type: string
+          description: Display label, e.g. "Read access", "Triage access", "Insufficient permission".
+    PortalAccess:
+      type: object
+      required: [authorized_repo_count, scanned_repo_count, repository_ids, unscanned, insufficient, incomplete]
+      properties:
+        authorized_repo_count:
+          type: integer
+          description: External repositories the visitor may see, scanned or not.
+        scanned_repo_count:
+          type: integer
+          description: Scrutineer repositories in scope (len of repository_ids).
+        repository_ids:
+          type: array
+          items: { type: integer }
+          description: Scrutineer repository ids in scope, ascending.
+        unscanned:
+          type: array
+          items: { $ref: '#/components/schemas/PortalExternalRepository' }
+        insufficient:
+          type: array
+          items: { $ref: '#/components/schemas/PortalInsufficientRepository' }
+        incomplete:
+          type: boolean
+          description: The lookup is still running; more repositories may appear.

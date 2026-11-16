@@ -70,7 +70,10 @@ func (s *Server) loadUIFinding(w http.ResponseWriter, r *http.Request) (db.Findi
 	if !ok {
 		return f, false
 	}
-	if err := s.DB.WithContext(r.Context()).Preload("Labels").First(&f, id).Error; err != nil {
+	// Under a view scope an out-of-scope finding is indistinguishable from a
+	// missing one (404), behind the sharing portal's own ownership check.
+	q := applyRepoScope(s.DB.WithContext(r.Context()), r, "repository_id")
+	if err := q.Preload("Labels").First(&f, id).Error; err != nil {
 		uiDBError(w, err, uiFindingWhat)
 		return f, false
 	}
@@ -85,7 +88,7 @@ func (s *Server) uiFindingExists(w http.ResponseWriter, r *http.Request) (uint, 
 		return 0, false
 	}
 	var n int64
-	if err := s.DB.Model(&db.Finding{}).Where("id = ?", id).Count(&n).Error; err != nil {
+	if err := applyRepoScope(s.DB.Model(&db.Finding{}), r, "repository_id").Where("id = ?", id).Count(&n).Error; err != nil {
 		uiInternal(w, err)
 		return 0, false
 	}
@@ -300,8 +303,17 @@ func (s *Server) uiFindingDetailHandler(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	detail := s.uiFindingDetail(f)
+	if isReadOnly(r) {
+		// The disclosure drafts' downloads are operator routes the sharing
+		// portal does not forward; list only the ones it serves.
+		if exports, ok := detail["exports"].(map[string]any); ok {
+			delete(exports, "disclosure_md")
+			delete(exports, "disclosure_html")
+		}
+	}
 	setETag(w, f.UpdatedAt)
-	writeUIJSON(w, http.StatusOK, s.uiFindingDetail(f))
+	writeUIJSON(w, http.StatusOK, detail)
 }
 
 // wantsUIRepresentation reports `Prefer: return=representation`.

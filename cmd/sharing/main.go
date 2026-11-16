@@ -13,6 +13,17 @@
 //	SCRUTINEER_SHARING_SESSION_KEY
 //
 // The GitHub OAuth App's callback URL must be <base-url>/auth/callback.
+//
+// -ui=spa (default) serves the embedded portal SPA (internal/sharing/ui/dist,
+// or SCRUTINEER_SHARING_UI_DIR) at / over the JSON allow-list; -ui=legacy
+// keeps the server-rendered HTML portal for one release.
+//
+// For local development, -dev-login fakes the GitHub identity and repository
+// list instead of OAuth (no GitHub secrets needed). It refuses to start unless
+// -addr is a loopback address:
+//
+//	go run ./cmd/sharing -addr 127.0.0.1:8081 -dev-login octocat \
+//	  -dev-repos owner/repo,owner/other=READ -dev-repo-ids 1,2
 package main
 
 import (
@@ -23,6 +34,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"time"
 
 	"scrutineer/internal/config"
@@ -50,7 +64,13 @@ func main() {
 func run(log *slog.Logger) error {
 	configPath := flag.String("config", config.DefaultPath, "path to the scrutineer YAML config (for database + data dir)")
 	addr := flag.String("addr", "127.0.0.1:8081", "listen address for the sharing portal")
-	baseURL := flag.String("base-url", "", "public base URL of the portal, e.g. https://share.example.org (OAuth callback is <base-url>/auth/callback)")
+	baseURL := flag.String("base-url", "", "public base URL of the portal, e.g. https://share.example.org (OAuth callback is <base-url>/auth/callback); defaults to http://<addr> with -dev-login")
+	uiMode := flag.String("ui", string(sharing.UISPA), "front end: spa (embedded portal SPA) or legacy (server-rendered HTML portal)")
+	devLogin := flag.String("dev-login", "", "DEVELOPMENT ONLY: sign every visitor in as this fake GitHub login without OAuth; requires a loopback -addr")
+	devUserID := flag.Int64("dev-user-id", 1, "with -dev-login: the fake numeric GitHub user id")
+	devRepos := flag.String("dev-repos", "", "with -dev-login: comma-separated GitHub repos (owner/name[=ADMIN|MAINTAIN|WRITE|TRIAGE|READ], default ADMIN) the fake lookup reports")
+	devRepoIDs := flag.String("dev-repo-ids", "", "with -dev-login: comma-separated scrutineer repository ids granted to the fake user")
+	devDelay := flag.Duration("dev-access-delay", 0, "with -dev-login: how long the fake repository lookup takes (exercises the progress and partial states)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -61,10 +81,36 @@ func run(log *slog.Logger) error {
 		cfg = &config.Config{}
 	}
 
-	shareCfg, err := sharing.LoadConfig(*addr, *baseURL)
+	mode, err := sharing.ParseUIMode(*uiMode)
 	if err != nil {
 		return err
 	}
+	var shareCfg *sharing.Config
+	if *devLogin != "" {
+		ids, err := parseRepoIDs(*devRepoIDs)
+		if err != nil {
+			return err
+		}
+		shareCfg, err = sharing.LoadDevConfig(*addr, *baseURL, sharing.DevIdentity{
+			Login:       *devLogin,
+			UserID:      *devUserID,
+			Repos:       splitList(*devRepos),
+			RepoIDs:     ids,
+			AccessDelay: *devDelay,
+		})
+		if err != nil {
+			return err
+		}
+		log.Warn("DEV IDENTITY ENABLED: every visitor is signed in as a fake GitHub user; never expose this process",
+			"login", *devLogin, "github_user_id", *devUserID, "repos", *devRepos, "repo_ids", *devRepoIDs)
+	} else {
+		shareCfg, err = sharing.LoadConfig(*addr, *baseURL)
+		if err != nil {
+			return err
+		}
+	}
+	shareCfg.UI = mode
+	shareCfg.Version, shareCfg.Commit, shareCfg.CommitDate = buildVersion()
 
 	gdb, err := db.OpenBackend(databaseOptions(cfg))
 	if err != nil {
@@ -104,7 +150,7 @@ func run(log *slog.Logger) error {
 		Handler:           portal.Handler(),
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
-	log.Info("scrutineer sharing portal listening", "addr", shareCfg.Addr, "base_url", shareCfg.BaseURL)
+	log.Info("scrutineer sharing portal listening", "addr", shareCfg.Addr, "base_url", shareCfg.BaseURL, "ui", mode)
 	return httpSrv.ListenAndServe()
 }
 
@@ -130,4 +176,45 @@ func queueDialect(cfg *config.Config) queue.Dialect {
 		return queue.Postgres
 	}
 	return queue.SQLite
+}
+
+// version is replaced with -ldflags -X main.version=... in release builds.
+var version = "dev"
+
+// buildVersion reports the version and VCS stamp for GET /auth/session.
+func buildVersion() (v, commit, date string) {
+	v = version
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				commit = s.Value
+			case "vcs.time":
+				date = s.Value
+			}
+		}
+	}
+	return v, commit, date
+}
+
+func splitList(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func parseRepoIDs(v string) ([]uint, error) {
+	var out []uint
+	for _, part := range splitList(v) {
+		id, err := strconv.ParseUint(part, 10, 64)
+		if err != nil || id == 0 {
+			return nil, fmt.Errorf("sharing: -dev-repo-ids: %q is not a repository id", part)
+		}
+		out = append(out, uint(id))
+	}
+	return out, nil
 }

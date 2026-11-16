@@ -1,10 +1,10 @@
 # External maintainer sharing portal
 
-The `sharing` command serves a read-only subset of Scrutineer's existing web
-UI. Visitors authenticate with GitHub and can see repositories for which
-GitHub reports `WRITE`, `MAINTAIN`, or `ADMIN` permission. Every list and detail
-request is constrained to the resulting repository IDs; mutating and API
-routes are not exposed.
+The `sharing` command serves a read-only view of Scrutineer to external
+maintainers. Visitors authenticate with GitHub and can see repositories for
+which GitHub reports `WRITE`, `MAINTAIN`, or `ADMIN` permission. Every list and
+detail request is constrained to the resulting repository IDs; mutating routes
+are not exposed.
 
 Start the portal against the same configuration and data directory as the main
 Scrutineer process:
@@ -20,7 +20,84 @@ go run ./cmd/sharing -config ./scrutineer.yaml \
 Configure the GitHub OAuth App's callback URL as
 `https://share.example.org/auth/callback`. Put the portal behind a TLS reverse
 proxy when it is exposed publicly; its session and OAuth-state cookies are
-always marked `Secure`.
+always marked `Secure` (except with the loopback-only dev identity below).
+
+## Front end: `-ui=spa` (default) and `-ui=legacy`
+
+With `-ui=spa` the portal serves the portal SPA (`scrutineer-portal-ui`) at
+`/`, embedded from `internal/sharing/ui/dist`. The SPA reads a GET-only,
+default-deny allow-list of the v2 JSON API (`/api/v1/ui/*`, listed in
+`internal/sharing/routes.go`) plus the report/CSAF/OSV/bundle/patch
+downloads; every `{id}` is checked against the visitor's scope before the
+request is forwarded, and anything else answers 404. The client-facing
+contract, including the portal's own `/auth/*` endpoints, is
+`openapi.portal.yaml` at the repository root.
+
+`-ui=legacy` keeps the server-rendered HTML portal (`templates/sharing/`) for
+one release; it will then be removed.
+
+Embedding a portal build:
+
+```sh
+# in ../scrutineer-portal-ui
+UI_OUT_DIR=../scrutineer-ui-v2-api/internal/sharing/ui/dist npm run build
+# then commit internal/sharing/ui/dist:
+#   "Embed portal UI build (scrutineer-portal-ui <sha>)"
+```
+
+`SCRUTINEER_SHARING_UI_DIR=<build dir>` serves a build from disk instead of the
+embed (re-read per request, so a rebuild needs no restart). The committed
+placeholder `index.html` only says the UI is not built.
+
+Session and API behaviour the SPA relies on:
+
+- `GET /auth/session` never blocks or starts a GitHub lookup: 200
+  `{authenticated, login, github_user_id, expires_at, access:{state,found,partial}, version}`
+  or 401.
+- `GET /auth/access` returns the visitor's scope (`authorized_repo_count`,
+  `scanned_repo_count`, `repository_ids`, `unscanned`, `insufficient`,
+  `incomplete`).
+- `GET /auth/login?next=/path` lands on `next` after sign-in (same-origin paths
+  only). `POST /auth/logout` with `Accept: application/json` answers 204.
+- API failures use the same JSON envelope as the operator UI
+  (`{"code","error","request_id"}`): 401 `unauthorized` without a session
+  (never a redirect), 503 `unavailable` while GitHub is down (the session is
+  kept). Responses carry `Cache-Control: no-store`, `Vary: Cookie` and
+  `X-Portal-Scope: complete|partial`.
+- Every non-GET/HEAD request needs `Sec-Fetch-Site: same-origin`.
+- There is no SSE in the portal; scan logs come from the stored log only.
+
+Regenerate `openapi.portal.yaml` after changing the allow-list,
+`internal/sharing/openapi_auth.yaml` or `openapi.yaml`:
+
+```sh
+go test ./internal/sharing -run TestPortalOpenAPIGolden -update
+```
+
+## Local development: the dev identity
+
+`-dev-login` replaces GitHub with a fake identity, so the portal runs without
+OAuth secrets. It refuses to start unless `-addr` (and `-base-url`, which
+defaults to `http://<addr>`) is loopback, accepts any loopback `Host` (so a
+Vite proxy on `localhost:5173` works), and drops `Secure` from its cookies so
+they work over plain http.
+
+```sh
+go run ./cmd/sharing -config ./scrutineer.yaml -addr 127.0.0.1:8081 \
+  -dev-login octocat -dev-user-id 1 \
+  -dev-repos acme/widget,acme/other=READ,acme/unscanned \
+  -dev-repo-ids 3,4 -dev-access-delay 0s
+```
+
+- `-dev-repos`: GitHub `owner/name` the fake lookup reports, each optionally
+  `=ADMIN|MAINTAIN|WRITE|TRIAGE|READ` (default `ADMIN`). They match Scrutineer
+  repositories whose URL is `https://github.com/owner/name`; others appear as
+  unscanned, and `TRIAGE`/`READ` ones as insufficient.
+- `-dev-repo-ids`: Scrutineer repository IDs granted directly.
+- `-dev-access-delay`: make the lookup take this long (half the repositories
+  arrive halfway), to exercise the progress screen and the partial banner.
+
+`GET /auth/login` signs in immediately and redirects to `next`.
 
 ## Explicit repository grants
 

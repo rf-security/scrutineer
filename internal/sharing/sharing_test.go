@@ -18,8 +18,11 @@ import (
 	"scrutineer/internal/db"
 )
 
+// testConfig is a legacy-mode config: the pre-SPA tests exercise the HTML
+// portal (-ui=legacy) unchanged. spaConfig is the default mode.
 func testConfig() *Config {
 	return &Config{
+		UI:           UILegacy,
 		Addr:         "127.0.0.1:8081",
 		BaseURL:      "https://share.example.org",
 		clientID:     "id",

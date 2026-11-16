@@ -79,7 +79,7 @@ func (s *Server) accessStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if st.State == accessUnauthorized {
-		clearCookie(w, sessionCookie)
+		s.clearCookie(w, sessionCookie)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")

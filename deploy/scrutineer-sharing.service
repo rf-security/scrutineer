@@ -22,7 +22,10 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # still starts; OAuth login fails without valid credentials.
 EnvironmentFile=-/opt/scrutineer/bin/scrutineer-sharing.env
 
-ExecStart=/opt/scrutineer/bin/scrutineer-sharing -config /opt/scrutineer/bin/scrutineer.yaml -base-url https://share.scrutineer.security.rustfoundation.org -addr 0.0.0.0:8081
+# -ui legacy keeps the server-rendered portal until internal/sharing/ui/dist
+# holds a real scrutineer-portal-ui build (the committed placeholder only says
+# the UI is not built). Then drop the flag: -ui spa is the default.
+ExecStart=/opt/scrutineer/bin/scrutineer-sharing -config /opt/scrutineer/bin/scrutineer.yaml -base-url https://share.scrutineer.security.rustfoundation.org -addr 0.0.0.0:8081 -ui legacy
 
 Restart=on-failure
 RestartSec=5

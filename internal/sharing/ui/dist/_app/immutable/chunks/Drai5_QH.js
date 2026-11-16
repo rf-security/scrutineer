@@ -1,0 +1,1 @@
+function e(e){if(!e||!e.startsWith(`/`)||e.startsWith(`//`)||e.startsWith(`/\\`)||/[\\\u0000-\u001f\u007f]/.test(e))return`/`;let t=e.split(/[?#]/,1)[0]??`/`;return/^\/(auth|api)(\/|$)/.test(t)||/^\/login(\/|$)/.test(t)?`/`:e}function t(t,n={}){let r=e(t),i=new URLSearchParams(n);r!==`/`&&i.set(`next`,r);let a=i.toString();return`/login${a?`?${a}`:``}`}export{e as n,t};

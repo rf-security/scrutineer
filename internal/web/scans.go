@@ -33,9 +33,17 @@ func (s *Server) jobs(w http.ResponseWriter, r *http.Request) {
 	skillFilter := parseScanSkillFilter(r.URL.Query().Get("skill"))
 	r = requestWithScanSkillFilter(r, skillFilter.value())
 	q := skillFilter.apply(s.DB.Model(&db.Scan{}))
+	// The sharing portal restricts the list to the committer's repositories.
+	q = applyRepoScope(q, r, "repository_id")
 	q = applyScanCompletenessFilter(q, completeness)
 	status := r.URL.Query().Get(statusKey)
-	if status != "" {
+	// The portal defaults to completed scans; its filter menu emits an explicit
+	// status=all to clear that default so a committer can still see every scan.
+	// The local operator is unchanged: an empty status already means "all".
+	if status == "" && isReadOnly(r) {
+		status = string(db.ScanDone)
+	}
+	if status != "" && status != allStatusValue {
 		q = q.Where("status = ?", status)
 	}
 	group := r.URL.Query().Get("group")
@@ -633,6 +641,29 @@ func (s *Server) pauseQueuedScans() ([]db.Scan, error) {
 		}
 	}
 	return changed, nil
+}
+
+// scansCancelQueued cancels every queued scan across all repositories, leaving
+// running scans to finish. It is the global, queued-only companion to the
+// per-repo scansCancelAll (which also stops running scans) and the cancel
+// analogue of scansPauseQueued.
+func (s *Server) scansCancelQueued(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	// A single bulk UPDATE gated on status = queued: a scan the worker promotes
+	// to running no longer matches the predicate, so it keeps running, and there
+	// is no per-row round trip. RowsAffected is the number actually cancelled.
+	res := s.DB.Model(&db.Scan{}).Where("status = ?", db.ScanQueued).Updates(map[string]any{
+		statusKey:         db.ScanCancelled,
+		"status_priority": db.StatusPriorityFor(db.ScanCancelled),
+		errorKey:          "cancelled by user",
+		"finished_at":     &now,
+	})
+	if res.Error != nil {
+		http.Error(w, res.Error.Error(), http.StatusInternalServerError)
+		return
+	}
+	setFlash(w, Flash{Category: successKey, Title: fmt.Sprintf("%d queued scans cancelled", res.RowsAffected)})
+	s.redirect(w, r, "/scans?status=cancelled")
 }
 
 func scanStatusUpdates(status db.ScanStatus, msg string, finishedAt *time.Time, pausedUntil *time.Time) map[string]any {

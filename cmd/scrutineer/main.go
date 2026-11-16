@@ -135,6 +135,8 @@ type flags struct {
 	federationPeers       []string
 	subprojectScope       string
 	monorepoAttribution   bool
+	allowRemote           bool
+	noOperatorToken       bool
 	skillLocal            skillDirs
 	// Keep connection credentials out of command-line arguments.
 	dbDriver string
@@ -268,7 +270,7 @@ func registerFlags(fs *flag.FlagSet, f *flags) {
 	fs.BoolVar(&f.hardened, "hardened", false, "strict sandbox mode: container runtime required (no --no-container fallback), egress restricted to the harness's model API + host skill API, read-only rootfs, internal network")
 	fs.BoolVar(&f.hardenedRuntimeOnly, "hardened-runtime-only", false, "the non-network half of --hardened (read-only rootfs + no-new-privileges + 2 GiB post-clone workspace cap) WITHOUT the per-scan --internal network; use it when the verified sidecar path is unavailable. --cap-drop ALL + non-root user + tmpfs apply regardless. Implied by --hardened")
 	fs.BoolVar(&f.hardenedRuntimeOnly, "hardened-rootless-runtime", false, "deprecated alias for --hardened-runtime-only")
-	fs.StringVar(&f.runnerImage, "runner-image", defaultRunnerImage, "container image for per-job containers (a custom image needs curl, and on hardened sidecar runtimes the scrutineer binary; build from Dockerfile.runner)")
+	fs.StringVar(&f.runnerImage, "runner-image", defaultRunnerImage, "container image for per-job containers (a custom image needs curl, and on hardened sidecar runtimes the scrutineer binary; build from docker/runner/Dockerfile.runner)")
 	fs.StringVar(&f.profilesDir, "profiles-dir", "docker/profiles", "directory containing per-ecosystem runner profiles (Dockerfile per profile); empty disables profiles")
 	fs.StringVar(&f.skillsRepo, "skills-repo", "", "clone skills on startup; owner/repo[@ref] or https://host/path[@ref]")
 	fs.IntVar(&f.concurrency, "concurrency", queue.DefaultWorkerConcurrency, "number of scans to run in parallel")
@@ -424,6 +426,11 @@ func (f *flags) merge(cfg *config.Config) {
 	f.dbDriver = cfg.Database.Driver
 	f.dbDSN = cfg.Database.DSN
 
+	// AllowRemote is config-only (no CLI flag); the zero value keeps the
+	// localhost-only host-header check on (remote access denied).
+	f.allowRemote = cfg.AllowRemote
+	// Config-only as well; nil (unset) keeps the operator token required.
+	f.noOperatorToken = cfg.RequireOperatorToken != nil && !*cfg.RequireOperatorToken
 	f.mergeFederation(cfg)
 
 	// Seed the model pick list from the active harness's own defaults,
@@ -767,6 +774,7 @@ func newApp(f *flags, cfg *config.Config, log *slog.Logger, setup runnerSetup) (
 	applyServerDefaults(srv, f, log)
 	srv.FederationSalt = f.federationSalt
 	srv.FederationContact = f.federationContact
+	srv.AllowRemote = f.allowRemote
 	srv.MonorepoAttribution = f.monorepoAttribution
 	srv.VINCE = cfg.VINCE
 	srv.Akrites = cfg.Akrites

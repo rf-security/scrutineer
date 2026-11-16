@@ -1,0 +1,32 @@
+[Unit]
+Description=Scrutineer (web UI + scan worker)
+Documentation=https://github.com/alpha-omega-security/scrutineer
+# Needs the network up and the container runtime for per-scan containers.
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=scrutineer
+Group=scrutineer
+WorkingDirectory=/opt/scrutineer
+
+# Deploy compiles a static binary into bin/; the container runtime (docker)
+# must be on PATH for per-scan containers. HOME holds any host-side state.
+Environment=HOME=/opt/scrutineer
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# Secrets rendered by the deploy (0600, owned scrutineer:scrutineer):
+#   CLAUDE_CODE_OAUTH_TOKEN=...
+# Optional file (leading '-') so a manual restart before the first deploy
+# still starts; scrutineer exits at scan time without a usable credential.
+EnvironmentFile=-/opt/scrutineer/bin/scrutineer.env
+
+ExecStart=/opt/scrutineer/bin/scrutineer -config /opt/scrutineer/bin/scrutineer.yaml -skills /opt/scrutineer/skills
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

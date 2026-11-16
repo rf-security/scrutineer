@@ -55,6 +55,14 @@ func configureOperatorToken(srv *web.Server, f *flags, log *slog.Logger) error {
 	}
 	srv.OperatorToken = token
 	srv.OperatorTokenFile = path
+	// The token is still loaded so host-side tools that send it keep working;
+	// the server just stops requiring it.
+	srv.DisableOperatorToken = f.noOperatorToken
+	if f.noOperatorToken {
+		log.Warn("operator token NOT required (require_operator_token: false); the browser UI and /api/v1 are open to every client that reaches this server",
+			"allow_remote", f.allowRemote)
+		return nil
+	}
 	// Printed on every start: the same token is in the 0600 file, and a
 	// browser that lost its cookie has no other way back in.
 	msg := "operator token; open this link to sign in"

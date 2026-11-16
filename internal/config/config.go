@@ -261,6 +261,27 @@ type Config struct {
 	// before this instance reports a finding. Requires FederationSalt:
 	// without the shared salt the hash sent to a peer cannot match theirs.
 	FederationPeers []string `yaml:"federation_peers"`
+	// AllowRemote permits remote (non-localhost) access to the web server. It
+	// defaults to false, which keeps the localhost-only host-header check (the
+	// DNS-rebinding protection in internal/web): requests are served only when
+	// the Host header is 127.0.0.1, localhost, or ::1 (the historical
+	// behaviour). Set it to true to also serve requests for any other Host —
+	// needed when scrutineer runs behind a reverse proxy or is reached over a
+	// LAN. Only enable it when a trusted front end already restricts who can
+	// connect, since it removes the DNS-rebinding protection.
+	AllowRemote bool `yaml:"allow_remote"`
+	// RequireOperatorToken gates the browser UI and /api/v1 on the operator
+	// token (see docs/api.md). Unset or true keeps the gate on. Set false only
+	// when a trusted front end (IAP, an OAuth proxy) already authenticates
+	// every request, since it leaves the UI open to anyone who can reach it.
+	RequireOperatorToken *bool `yaml:"require_operator_token"`
+	// Sharing holds settings specific to the external maintainer portal
+	// (cmd/sharing): an optional separate database connection and explicit
+	// read-only access grants on top of the repositories GitHub reports with
+	// write, maintain, or admin permission. Unset values fall back to the
+	// matching root config, so a deployment that runs the portal against the
+	// same database as the main app needs no sharing block at all.
+	Sharing SharingConfig `yaml:"sharing"`
 }
 
 // Codex groups settings that apply only to the Codex backend.
@@ -471,6 +492,37 @@ func ParseBackendPreflightTTL(s string) (time.Duration, error) {
 	return d, nil
 }
 
+// SharingConfig holds settings specific to the external maintainer portal
+// (cmd/sharing).
+type SharingConfig struct {
+	// Database optionally points the sharing portal at a different database
+	// connection than the main app — e.g. a read replica or a least-privilege
+	// role dedicated to the portal. Its shape mirrors the root `database`
+	// block, and unset fields inherit the root database config (see
+	// Config.SharingDatabase), so setting only `dsn` reuses the root driver.
+	Database DatabaseConfig `yaml:"database"`
+	// AccessGrants are explicit, read-only additions to the repositories
+	// GitHub reports with write, maintain, or admin permission. OAuth and
+	// session secrets remain environment-only in internal/sharing.
+	AccessGrants []SharingAccessGrant `yaml:"access_grants"`
+}
+
+// SharingDatabase returns the database configuration the sharing portal
+// (cmd/sharing) should connect with: the root database config with any
+// sharing-specific `sharing.database` values overlaid on top. This lets the
+// portal default to the main database yet be pointed at its own DSN (for
+// example a separate least-privilege role) without duplicating the whole block.
+func (c *Config) SharingDatabase() DatabaseConfig {
+	d := c.Database
+	if c.Sharing.Database.Driver != "" {
+		d.Driver = c.Sharing.Database.Driver
+	}
+	if c.Sharing.Database.DSN != "" {
+		d.DSN = c.Sharing.Database.DSN
+	}
+	return d
+}
+
 // DatabaseConfig selects and locates the database backend. Driver is
 // "sqlite" (default when empty) or "postgres". DSN is required for
 // postgres (a libpq/pgx connection string or URL, e.g.
@@ -479,6 +531,17 @@ func ParseBackendPreflightTTL(s string) (time.Duration, error) {
 type DatabaseConfig struct {
 	Driver string `yaml:"driver"`
 	DSN    string `yaml:"dsn"`
+}
+
+// SharingAccessGrant gives one immutable GitHub user identity read access to
+// findings for an exact set of repositories. GitHubUserID is the numeric ID
+// returned by GET /user; a login is deliberately not accepted because it can
+// be renamed or reused. Repository entries are canonical https GitHub URLs.
+type SharingAccessGrant struct {
+	GitHubUserID int64      `yaml:"github_user_id"`
+	Repositories []string   `yaml:"repositories"`
+	Reason       string     `yaml:"reason"`
+	ExpiresAt    *time.Time `yaml:"expires_at"`
 }
 
 // ParseScanTimeout validates and parses a scan_timeout string. Empty
@@ -674,6 +737,11 @@ func Load(path string) (*Config, error) {
 	}
 	if err := ValidateEffort(c.Effort); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	// Validate the portal's resolved database (root overlaid with any
+	// sharing.database overrides) so a bad sharing block fails fast too.
+	if err := ValidateDatabase(c.SharingDatabase()); err != nil {
+		return nil, fmt.Errorf("parse config %s: sharing.%w", path, err)
 	}
 	if err := ValidateSubprojectScope(c.SubprojectScope); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)

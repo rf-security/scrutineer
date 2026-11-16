@@ -301,7 +301,7 @@ func (s *Server) uiRepoList(w http.ResponseWriter, r *http.Request) {
 		uiInternal(w, err)
 		return
 	}
-	writeListWith(w, rows, total, p, map[string]any{"languages": nonNilStrings(distinctLanguages(s.DB))})
+	writeListWith(w, rows, total, p, map[string]any{"languages": nonNilStrings(distinctLanguages(s.DB, r))})
 }
 
 // ---------------------------------------------------------------- #29 detail

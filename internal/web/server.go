@@ -102,7 +102,7 @@ var ErrInvalidRescanMode = errors.New("invalid rescan mode")
 // loudly instead of running without the egress the operator asked for.
 var ErrUnknownEgressPolicy = errors.New("unknown scan egress policy")
 
-//go:embed templates/*.html
+//go:embed templates/*.html templates/sharing/*.html
 var tmplFS embed.FS
 
 //go:embed static
@@ -196,6 +196,17 @@ type Server struct {
 	FederationMembersFeed string
 	FederationImportFeeds []string
 	FederationPeers       []string
+	// AllowRemote, when true, permits remote access by disabling
+	// securityHeaders' localhost-only host-header check, so the UI and
+	// unauthenticated /api/v1 export endpoints can be served for any Host (e.g.
+	// behind a reverse proxy or over a LAN). Defaults to false, which keeps the
+	// DNS-rebinding protection. Set from config.AllowRemote.
+	AllowRemote bool
+	// DisableOperatorToken, when true, makes requireOperator pass every
+	// request through without checking the operator token. Defaults to false
+	// (token required). Set from config.RequireOperatorToken: false, for
+	// deployments where a trusted front end already authenticates users.
+	DisableOperatorToken bool
 
 	// resolvePURL and resolvePURLs map Package URLs to source repository URLs
 	// via packages.ecosyste.ms. Field rather than direct call so tests can
@@ -384,7 +395,28 @@ func defaultResolveRemoteHead(ctx context.Context, repo db.Repository) (string, 
 	return worker.ResolveRemoteHead(ctx, url)
 }
 
-func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *worker.Worker) (*Server, error) {
+// Option customizes a Server built by New.
+type Option func(*serverOpts)
+
+type serverOpts struct {
+	// tmplGlob is the embedded glob the server parses its templates from.
+	// Defaults to the main UI's templates; the sharing portal points it at its
+	// own templates/sharing/ set so portal-specific markup stays fully separate.
+	tmplGlob string
+}
+
+// WithTemplateGlob makes the server render the embedded templates matching glob
+// instead of the default main-UI set. Used by cmd/sharing so the portal renders
+// templates/sharing/*.html.
+func WithTemplateGlob(glob string) Option {
+	return func(o *serverOpts) { o.tmplGlob = glob }
+}
+
+func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *worker.Worker, opts ...Option) (*Server, error) {
+	cfg := serverOpts{tmplGlob: "templates/*.html"}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	funcs := template.FuncMap{
 		"since": tmplSince,
 		"until": func(t *time.Time) string {
@@ -479,7 +511,7 @@ func New(gdb *gorm.DB, q *queue.Queue, log *slog.Logger, broker *Broker, w *work
 		},
 		"focus": scanFocus,
 	}
-	t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, "templates/*.html")
+	t, err := template.New("").Funcs(funcs).ParseFS(tmplFS, cfg.tmplGlob)
 	if err != nil {
 		return nil, err
 	}
@@ -634,6 +666,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /scans/{id}/retry", s.scanRetry)
 	mux.HandleFunc("POST /scans/{id}/resume", s.scanResume)
 	mux.HandleFunc("POST /scans/pause-queued", s.scansPauseQueued)
+	mux.HandleFunc("POST /scans/cancel-queued", s.scansCancelQueued)
 	mux.HandleFunc("POST /scans/resume-paused", s.scansResumePaused)
 	mux.HandleFunc("POST /scans/retry-failed", s.scansRetryFailed)
 	mux.HandleFunc("POST /scans/cancel-all", s.scansCancelAll)
@@ -671,16 +704,16 @@ func (s *Server) Handler() http.Handler {
 	// The SPA session routes and document sit outside requireOperator: the
 	// session check answers 401 itself and the document carries no data.
 	s.registerUISessionRoutes(root)
-	root.Handle("GET /ui/", securityHeaders(s.uiHandler()))
-	root.Handle("/api/v1/", securityHeaders(s.requireOperator(http.StripPrefix(exportPrefix, s.exportHandler()))))
+	root.Handle("GET /ui/", securityHeaders(s.AllowRemote, s.uiHandler()))
+	root.Handle("/api/v1/", securityHeaders(s.AllowRemote, s.requireOperator(http.StripPrefix(exportPrefix, s.exportHandler()))))
 	// Reachable without the operator token: the login page has to be, and
 	// claim-check is called by federation peers through a reverse proxy.
-	root.Handle("GET /static/", securityHeaders(http.FileServerFS(staticFS)))
-	root.Handle("GET /login", securityHeaders(http.HandlerFunc(s.login)))
+	root.Handle("GET /static/", securityHeaders(s.AllowRemote, http.FileServerFS(staticFS)))
+	root.Handle("GET /login", securityHeaders(s.AllowRemote, http.HandlerFunc(s.login)))
 	// No method in the pattern: the handler 404s non-POST itself so a
 	// federation-capable build cannot be fingerprinted by the 405 the
 	// mux would otherwise answer.
-	root.Handle("/claim-check", securityHeaders(http.HandlerFunc(s.claimCheck)))
+	root.Handle("/claim-check", securityHeaders(s.AllowRemote, http.HandlerFunc(s.claimCheck)))
 	// More specific than "/api/", so it wins the mux match and gets its own
 	// access rule rather than the scan-token auth apiHandler applies; see
 	// openAPISpecHandler.
@@ -689,7 +722,7 @@ func (s *Server) Handler() http.Handler {
 	if s.ModelProxy != nil {
 		root.Handle(worker.ModelProxyPathPrefix+"/", s.ModelProxy)
 	}
-	root.Handle("/", securityHeaders(s.requireOperator(mux)))
+	root.Handle("/", securityHeaders(s.AllowRemote, s.requireOperator(mux)))
 	return logRequests(s.Log, root)
 }
 
@@ -713,6 +746,13 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 	// full render that a POST is redirecting to is about to show.
 	if !isHX(r) {
 		data["Flash"] = popFlash(w, r)
+	}
+	// Sharing gates admin nav and mutating controls in the shared templates
+	// when the request runs under a read-only view scope (the sharing portal).
+	// Unset for the local operator, so every page renders as before.
+	data["Sharing"] = isReadOnly(r)
+	if scope, ok := viewScopeFrom(r); ok {
+		data["ScopeIncomplete"] = scope.Incomplete
 	}
 	// Seed the sorter with the handler's EFFECTIVE sort (data["Sort"]) rather
 	// than the raw ?sort param. That token is already the sanitized, defaulted
@@ -843,6 +883,17 @@ func (s *Server) redirect(w http.ResponseWriter, r *http.Request, path string) {
 	http.Redirect(w, r, path, http.StatusSeeOther)
 }
 
+// portalRepoStatusOrderExpr ranks repositories by their latest scan's status so
+// the sharing portal's default repository listing surfaces completed repos
+// first, then queued, then failed, then anything else, with never-scanned repos
+// last. It is applied only under a read-only (portal) scope; the local operator
+// keeps the recency default. Built from the db status constants so it stays in
+// lockstep with them.
+var portalRepoStatusOrderExpr = fmt.Sprintf(
+	`COALESCE((SELECT CASE s.status WHEN '%s' THEN 0 WHEN '%s' THEN 1 WHEN '%s' THEN 2 ELSE 3 END `+
+		`FROM scans s WHERE s.repository_id = repositories.id ORDER BY s.id DESC LIMIT 1), 4)`,
+	db.ScanDone, db.ScanQueued, db.ScanFailed)
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	s.repoList(w, r)
 }
@@ -940,9 +991,14 @@ type repoRow struct {
 // written by the metadata/repo-overview parsers, so the dropdown has to
 // split it rather than DISTINCT the column, otherwise every combination
 // (and ordering) of languages becomes its own filter option.
-func distinctLanguages(gdb *gorm.DB) []string {
+func distinctLanguages(gdb *gorm.DB, r *http.Request) []string {
 	var raw []string
-	gdb.Model(&db.Repository{}).Where("languages != ''").Distinct("languages").Pluck("languages", &raw)
+	q := gdb.Model(&db.Repository{}).Where("languages != ''")
+	// Restrict the facet to the request's allow-listed repositories (the
+	// sharing portal) so it does not reveal languages across repos the visitor
+	// cannot see; a no-op for the local operator.
+	q = applyRepoScope(q, r, "id")
+	q.Distinct("languages").Pluck("languages", &raw)
 	seen := map[string]struct{}{}
 	for _, joined := range raw {
 		for l := range strings.SplitSeq(joined, ",") {
@@ -961,6 +1017,9 @@ func distinctLanguages(gdb *gorm.DB) []string {
 
 func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 	q := s.DB.Model(&db.Repository{})
+	// Restrict to the request's allow-listed repositories when a view scope is
+	// set (the sharing portal); a no-op for the local operator.
+	q = applyRepoScope(q, r, "id")
 	lang := r.URL.Query().Get("language")
 	if lang != "" {
 		// languages is a ", "-joined list; wrapping both sides lets one
@@ -972,6 +1031,33 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 		like := "%" + search + "%"
 		q = q.Where("LOWER(name) LIKE LOWER(?) OR LOWER(url) LIKE LOWER(?) OR LOWER(full_name) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?)",
 			like, like, like, like)
+	}
+
+	// Filter by whether a completed security-deep-dive has run, and on the
+	// latest such run's date. ddRun is a fresh correlated subquery each call so
+	// chaining .Where on it never leaks conditions between uses.
+	deepdive := r.URL.Query().Get("deepdive") // "", "ran", "notrun"
+	ddDir := r.URL.Query().Get("dd_dir")      // "before" | "after"
+	ddDate := r.URL.Query().Get("dd_date")    // YYYY-MM-DD
+	ddRun := func() *gorm.DB {
+		return s.DB.Model(&db.Scan{}).Select("1").
+			Where("scans.repository_id = repositories.id AND skill_name = ? AND status = ?",
+				deepDiveSkillName, db.ScanDone)
+	}
+	switch deepdive {
+	case "ran":
+		q = q.Where("EXISTS (?)", ddRun())
+	case "notrun":
+		q = q.Where("NOT EXISTS (?)", ddRun())
+	}
+	if _, err := time.Parse("2006-01-02", ddDate); err == nil {
+		switch ddDir {
+		case "after": // most recent run on/after the cutoff ⟺ some run is
+			q = q.Where("EXISTS (?)", ddRun().Where("created_at >= ?", ddDate))
+		case "before": // most recent run before the cutoff ⟺ has runs, none on/after
+			q = q.Where("EXISTS (?)", ddRun()).
+				Where("NOT EXISTS (?)", ddRun().Where("created_at >= ?", ddDate))
+		}
 	}
 
 	sortCol, dir := splitSort(r.URL.Query().Get("sort"))
@@ -1007,6 +1093,12 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 		q = q.Order(orderByExpr("COALESCE((SELECT MIN(status_priority) FROM scans WHERE scans.repository_id = repositories.id), 99)", dir, false)).Order("updated_at desc")
 	default:
 		sortCol, dir = defaultSort, ""
+		// The sharing portal lands committers on completed repositories first
+		// (then queued, then failed); the local operator keeps the recency
+		// default. updated_at stays the tiebreaker in both.
+		if isReadOnly(r) {
+			q = q.Order(portalRepoStatusOrderExpr)
+		}
 		q = q.Order("updated_at desc")
 	}
 	sort := joinSort(sortCol, dir)
@@ -1118,11 +1210,17 @@ func (s *Server) repoList(w http.ResponseWriter, r *http.Request) {
 			Branches:       branchesByRepo[repo.ID],
 		})
 	}
-	languages := distinctLanguages(s.DB)
+	languages := distinctLanguages(s.DB, r)
 
 	data := map[string]any{
 		"Rows": rows, "Page": page, "Language": lang, "Sort": sort, "Languages": languages,
-		"Q": search,
+		"Q": search, "Deepdive": deepdive, "DDDir": ddDir, "DDDate": ddDate,
+	}
+	if scope, ok := viewScopeFrom(r); ok {
+		data["AuthorizedRepoCount"] = scope.AuthorizedRepoCount
+		data["ScannedRepoCount"] = len(scope.RepoIDs)
+		data["UnscannedRepositories"] = scope.UnscannedRepositories
+		data["InsufficientRepositories"] = scope.InsufficientRepositories
 	}
 	if isHX(r) {
 		s.render(w, r, "repo_list.html", data)
@@ -1379,6 +1477,9 @@ func (s *Server) findingsIndexQuery(r *http.Request, includeScanners, includeMis
 		q = q.Where("LOWER(title) LIKE LOWER(?) OR LOWER(location) LIKE LOWER(?) OR LOWER(cwe) LIKE LOWER(?) OR LOWER(cve_id) LIKE LOWER(?) OR LOWER(ghsa_id) LIKE LOWER(?) OR LOWER(affected) LIKE LOWER(?)",
 			like, like, like, like, like, like)
 	}
+	// Restrict to the request's allow-listed repositories when a view scope is
+	// set (the sharing portal); a no-op for the local operator.
+	q = applyRepoScope(q, r, "repository_id")
 	return q
 }
 
@@ -1458,7 +1559,27 @@ func findingIndexWhereSQL(r *http.Request, includeScanners, includeMissed bool) 
 		where = append(where, "(LOWER(title) LIKE LOWER(?) OR LOWER(location) LIKE LOWER(?) OR LOWER(cwe) LIKE LOWER(?) OR LOWER(cve_id) LIKE LOWER(?) OR LOWER(ghsa_id) LIKE LOWER(?) OR LOWER(affected) LIKE LOWER(?))")
 		args = append(args, like, like, like, like, like, like)
 	}
+	// Restrict to the request's allow-listed repositories when a view scope is
+	// set (the sharing portal), mirroring applyRepoScope for this raw-SQL count
+	// path so the toggle badges do not count findings across unscoped repos.
+	if clause, scopeArgs := repoScopeSQL(r); clause != "" {
+		where = append(where, clause)
+		args = append(args, scopeArgs...)
+	}
 	return where, args
+}
+
+// repoScopeSQL returns a raw WHERE fragment and its bind args restricting a
+// findings query to the request's view scope, or ("", nil) when no scope is
+// set. It mirrors applyRepoScope for code paths that build SQL by hand instead
+// of chaining a *gorm.DB. An empty scope yields "repository_id IN (NULL)",
+// matching nothing — the correct behaviour for a maintainer with no repos.
+func repoScopeSQL(r *http.Request) (string, []any) {
+	sc, ok := viewScopeFrom(r)
+	if !ok {
+		return "", nil
+	}
+	return "repository_id IN ?", []any{sc.scopeIDs()}
 }
 
 func applyFindingStatusFilter(q *gorm.DB, status string) *gorm.DB {
@@ -1662,6 +1783,9 @@ func (s *Server) addRepoAndScan(w http.ResponseWriter, r *http.Request, repoURL 
 }
 
 func (s *Server) findingStatus(w http.ResponseWriter, r *http.Request) {
+	if denyReadOnly(w, r) {
+		return
+	}
 	f, ok := loadByID[db.Finding](s, w, r)
 	if !ok {
 		return
@@ -1888,6 +2012,9 @@ func verifyAllToast(queued, skipped, errored int) Flash {
 }
 
 func (s *Server) findingNotes(w http.ResponseWriter, r *http.Request) {
+	if denyReadOnly(w, r) {
+		return
+	}
 	f, ok := loadByID[db.Finding](s, w, r)
 	if !ok {
 		return
@@ -2023,6 +2150,10 @@ type findingWorkflowData struct {
 	HasDependents      bool
 	HasDisclosureDraft bool
 	DisclosureBlocked  bool
+	// Sharing mirrors the top-level template flag: the workflow partial is
+	// rendered with this struct as its dot, so it carries its own copy to gate
+	// the skill-enqueue buttons for read-only sharing requests.
+	Sharing bool
 }
 
 func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
@@ -2146,6 +2277,7 @@ func (s *Server) findingShow(w http.ResponseWriter, r *http.Request) {
 			HasDependents:      hasDependents,
 			HasDisclosureDraft: strings.TrimSpace(f.DisclosureDraft) != "",
 			DisclosureBlocked:  db.FindingDisclosureBlocked(f),
+			Sharing:            isReadOnly(r),
 		},
 		"Exposures":     exposures,
 		"HasDependents": hasDependents,
@@ -3790,10 +3922,15 @@ func localHost(host string) bool {
 // securityHeaders enforces T3 mitigations: host header check to prevent DNS
 // rebinding, Sec-Fetch-Site check on POST to prevent cross-origin CSRF, and
 // a CSP that prevents stored XSS in any rendered content from executing JS.
-func securityHeaders(h http.Handler) http.Handler {
+//
+// allowRemote=false (the default) keeps the localhost-only host check;
+// allowRemote=true skips it so the server can be reached for any Host, for
+// deployments that front scrutineer with a trusted reverse proxy or serve it on
+// a LAN. See config.AllowRemote.
+func securityHeaders(allowRemote bool, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Security-Policy", cspPolicy)
-		if !localHost(r.Host) {
+		if !allowRemote && !localHost(r.Host) {
 			http.Error(w, "forbidden: invalid host", http.StatusForbidden)
 			return
 		}

@@ -13,7 +13,7 @@
     {
       "customType": "regex",
       "description": "Update Claude Code release assets and SHA-256 pins",
-      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "managerFilePatterns": ["/^docker/runner/Dockerfile\\.runner$/"],
       "matchStrings": [
         "ARG CLAUDE_(?:AMD64|ARM64)_LOCK=(?<currentValue>v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
       ],
@@ -26,7 +26,7 @@
       "customType": "regex",
       "description": "Update Codex CLI package assets, SHA-256 pins, and model catalog release",
       "managerFilePatterns": [
-        "/^Dockerfile\\.runner$/",
+        "/^docker/runner/Dockerfile\\.runner$/",
         "/^internal/worker/harness\\.go$/"
       ],
       "matchStrings": [
@@ -41,7 +41,7 @@
     {
       "customType": "regex",
       "description": "Update OpenCode CLI release assets and SHA-256 pins",
-      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "managerFilePatterns": ["/^docker/runner/Dockerfile\\.runner$/"],
       "matchStrings": [
         "ARG OPENCODE_(?:AMD64|ARM64)_LOCK=(?<currentValue>v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
       ],
@@ -53,7 +53,7 @@
     {
       "customType": "regex",
       "description": "Update GitHub Copilot CLI release assets and SHA-256 pins",
-      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "managerFilePatterns": ["/^docker/runner/Dockerfile\\.runner$/"],
       "matchStrings": [
         "ARG COPILOT_(?:AMD64|ARM64)_LOCK=(?<currentValue>v\\d+\\.\\d+\\.\\d+)@sha256:(?<currentDigest>[a-f0-9]{64})"
       ],
@@ -65,7 +65,7 @@
     {
       "customType": "regex",
       "description": "Update the Claude Code image version from GitHub releases",
-      "managerFilePatterns": ["/^Dockerfile$/"],
+      "managerFilePatterns": ["/^docker/cmd/Dockerfile$/"],
       "matchStrings": [
         "@anthropic-ai/claude-code@(?<currentValue>\\d+\\.\\d+\\.\\d+)"
       ],
@@ -107,8 +107,8 @@
       "customType": "regex",
       "description": "Update the semgrep container-image pins",
       "managerFilePatterns": [
-        "/^Dockerfile$/",
-        "/^Dockerfile\\.runner$/"
+        "/^docker/cmd/Dockerfile$/",
+        "/^docker/runner/Dockerfile\\.runner$/"
       ],
       "matchStrings": [
         "ARG SEMGREP_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
@@ -122,8 +122,8 @@
       "customType": "regex",
       "description": "Update the bandit container-image pins",
       "managerFilePatterns": [
-        "/^Dockerfile$/",
-        "/^Dockerfile\\.runner$/"
+        "/^docker/cmd/Dockerfile$/",
+        "/^docker/runner/Dockerfile\\.runner$/"
       ],
       "matchStrings": [
         "ARG BANDIT_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
@@ -136,7 +136,7 @@
     {
       "customType": "regex",
       "description": "Update the darnit runner-image pin",
-      "managerFilePatterns": ["/^Dockerfile\\.runner$/"],
+      "managerFilePatterns": ["/^docker/runner/Dockerfile\\.runner$/"],
       "matchStrings": [
         "ARG DARNIT_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"
       ],
@@ -149,8 +149,8 @@
       "customType": "regex",
       "description": "Update the zizmor container-image pins",
       "managerFilePatterns": [
-        "/^Dockerfile$/",
-        "/^Dockerfile\\.runner$/"
+        "/^docker/cmd/Dockerfile$/",
+        "/^docker/runner/Dockerfile\\.runner$/"
       ],
       "matchStrings": [
         "cargo install --locked --root /out zizmor@(?<currentValue>\\d+\\.\\d+\\.\\d+)"
@@ -164,8 +164,8 @@
       "customType": "regex",
       "description": "Update the betterleaks container-image pins",
       "managerFilePatterns": [
-        "/^Dockerfile$/",
-        "/^Dockerfile\\.runner$/"
+        "/^docker/cmd/Dockerfile$/",
+        "/^docker/runner/Dockerfile\\.runner$/"
       ],
       "matchStrings": [
         "ARG BETTERLEAKS_VERSION=(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
@@ -179,8 +179,8 @@
       "customType": "regex",
       "description": "Update Go CLI tool pins in container images",
       "managerFilePatterns": [
-        "/^Dockerfile$/",
-        "/^Dockerfile\\.runner$/"
+        "/^docker/cmd/Dockerfile$/",
+        "/^docker/runner/Dockerfile\\.runner$/"
       ],
       "matchStrings": [
         "go install (?<depName>github\\.com/(?:git-pkgs/git-pkgs|git-pkgs/brief|andrew/VID))(?:/cmd/(?:brief|vid))?@(?<currentValue>v\\d+\\.\\d+\\.\\d+)"

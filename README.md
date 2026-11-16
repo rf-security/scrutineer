@@ -262,7 +262,7 @@ The same applies to the Dependents tab -- you can import any dependent's reposit
 
 ## Docker
 
-    docker build --build-arg COMMIT="$(git rev-parse HEAD)" -t scrutineer .
+    docker build --build-arg COMMIT="$(git rev-parse HEAD)" -t scrutineer -f docker/cmd/Dockerfile .
     docker run -p 127.0.0.1:8080:8080 -v scrutineer-data:/data \
       -e ANTHROPIC_API_KEY=sk-ant-api03-... \
       -e ANTHROPIC_BASE_URL=https://... \
@@ -284,12 +284,12 @@ If a container runtime (docker, rootless podman, or Apple's `container`) is avai
 
 Use `--runtime podman` to run scans under podman instead of docker (see [Podman (rootless)](#podman-rootless) below), `--runtime apple` to run scans under Apple's `container` runtime on macOS (see [Apple container (experimental)](#apple-container-experimental) below), `--no-container` to disable containerised execution entirely, or `--runner-image` to specify a different image. To build the runner locally instead of pulling from GHCR (use `podman build` or `container build` instead if you run scans under those runtimes):
 
-    docker build -t scrutineer-runner -f Dockerfile.runner .
+    docker build -t scrutineer-runner -f docker/runner/Dockerfile.runner .
     go run -buildvcs=true ./cmd/scrutineer -skills ./skills --runner-image scrutineer-runner
 
 The runner's bundled Claude Code only moves when a maintainer merges Renovate's update, and Renovate waits until a Claude Code release is seven days old, so a model that needs a newer CLI takes at least a week to become usable. It takes longer on a release binary, whose default runner image only changes with the next scrutineer release. To run a newer Claude Code without falling back to `--no-container`, build the runner from a checkout of the scrutineer version you run and override the `CLAUDE_*_LOCK` build arguments with the Claude Code tag and the SHA-256 of `claude-linux-x64.tar.gz` and `claude-linux-arm64.tar.gz` from that Claude Code release's `SHASUMS256.txt`. Per-ecosystem profile images are cached by a locally built runner's tag alone, so give each version its own tag to have them rebuilt on top of it:
 
-    docker build -t scrutineer-runner:claude-2.1.284 -f Dockerfile.runner --build-arg CLAUDE_AMD64_LOCK=v2.1.284@sha256:<x64 digest> --build-arg CLAUDE_ARM64_LOCK=v2.1.284@sha256:<arm64 digest> .
+    docker build -t scrutineer-runner:claude-2.1.284 -f docker/runner/Dockerfile.runner --build-arg CLAUDE_AMD64_LOCK=v2.1.284@sha256:<x64 digest> --build-arg CLAUDE_ARM64_LOCK=v2.1.284@sha256:<arm64 digest> .
     go run -buildvcs=true ./cmd/scrutineer -skills ./skills --runner-image scrutineer-runner:claude-2.1.284
 
 The staleness check below never flags a locally built runner, so drop `--runner-image` once the published runner carries the Claude Code release you need.
@@ -514,6 +514,7 @@ See [SECURITY.md](SECURITY.md) for the reporting policy and [threatmodel.md](thr
 - [docs/encrypted-sharing.md](docs/encrypted-sharing.md) -- encrypted findings sharing between contributors (age + SSH keys, team keyring management)
 - [docs/sarif-export.md](docs/sarif-export.md) -- exporting a repository's findings as SARIF 2.1.0 and handing them to OSS-CRS as bug candidates
 - [docs/oss-crs.md](docs/oss-crs.md): running Scrutineer as an OSS-CRS auditing CRS for source-only campaigns with the `scrutineer audit` command behind it
+- [docs/sharing.md](docs/sharing.md) -- external maintainer portal, GitHub authorization, and explicit read-only repository grants
 - [docs/interchange.md](docs/interchange.md) -- federation interchange format: in-toto record envelope, salted finding hashes, the claim-check endpoint, the public and members-only feeds with their export/import syncs (threat surface: T14 in [threatmodel.md](threatmodel.md))
 - [docs/codex.md](docs/codex.md) -- the codex backend: what differs from claude, sandbox interaction, adding another backend
 - [docs/opencode.md](docs/opencode.md) -- OpenCode provider credentials, images, auth state, readiness, and egress

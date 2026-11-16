@@ -1,0 +1,374 @@
+{{define "threat_model"}}
+{{$tm := index . "TM"}}
+{{$repoID := index . "RepoID"}}
+{{$commit := index . "Commit"}}
+<section class="accordion">
+
+  {{if index $tm "description"}}
+  <div class="prose prose-sm max-w-none mb-4">{{md (index $tm "description")}}</div>
+  {{$conf := index $tm "confidence"}}{{if $conf}}
+    <p class="text-xs text-muted-foreground mb-4">{{index $conf "documented"}} documented, {{index $conf "inferred"}} inferred claims.</p>
+  {{end}}
+  {{end}}
+
+  {{if index $tm "components"}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Components
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <table class="table w-full">
+        <thead><tr><th>Name</th><th>In scope</th><th>Touches</th><th>Entry points</th><th>Source</th></tr></thead>
+        <tbody>
+        {{range index $tm "components"}}
+          <tr>
+            <td class="font-medium whitespace-normal">{{index . "name"}}</td>
+            <td>{{if index . "in_scope"}}<span class="badge-secondary">in</span>{{else}}<span class="badge-destructive">out</span>{{if index . "reason"}} <span class="text-xs text-muted-foreground">{{index . "reason"}}</span>{{end}}{{end}}</td>
+            <td class="whitespace-normal text-sm">{{range $i, $t := index . "touches"}}{{if $i}}, {{end}}{{$t}}{{end}}</td>
+            <td class="whitespace-normal text-sm">{{range $i, $e := index . "entry_points"}}{{if $i}}, {{end}}<code>{{$e}}</code>{{end}}</td>
+            <td class="text-xs text-muted-foreground">{{template "tm-prov" .}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "entry_points"}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Entry-point trust table
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <table class="table w-full">
+        <thead><tr><th>Entry point</th><th>Parameter</th><th>Attacker-controllable</th><th>Caller must enforce</th><th>Source</th></tr></thead>
+        <tbody>
+        {{range index $tm "entry_points"}}
+          <tr>
+            <td class="whitespace-normal"><code>{{index . "entry_point"}}</code></td>
+            <td class="whitespace-normal text-sm">{{index . "parameter"}}</td>
+            <td>{{$ac := index . "attacker_controllable"}}{{if eq $ac "yes"}}<span class="badge-destructive">yes</span>{{else if eq $ac "conditional"}}<span class="badge-primary">conditional</span>{{if index . "condition"}} <span class="text-xs text-muted-foreground">{{index . "condition"}}</span>{{end}}{{else}}<span class="badge-secondary">no</span>{{end}}</td>
+            <td class="whitespace-normal text-sm">{{index . "caller_must_enforce"}}</td>
+            <td class="text-xs text-muted-foreground">{{template "tm-prov" .}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "trust_boundaries"}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Trust boundaries
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <table class="table w-full mb-4">
+        <thead><tr><th>Component</th><th>Boundary</th><th>Reachability precondition</th><th>Source</th></tr></thead>
+        <tbody>
+        {{range index $tm "trust_boundaries"}}
+          <tr>
+            <td class="font-medium whitespace-normal">{{index . "component"}}</td>
+            <td class="whitespace-normal text-sm">{{with index . "boundary"}}{{.}}{{end}}</td>
+            <td class="whitespace-normal text-muted-foreground text-sm">{{index . "reachability_precondition"}}</td>
+            <td class="text-xs text-muted-foreground">{{template "tm-prov" .}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{$adv := index $tm "adversaries"}}{{if $adv}}
+      <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+        <dt class="text-muted-foreground">Adversaries in scope</dt>
+        <dd>{{range $i, $a := index $adv "in_scope"}}{{if $i}}; {{end}}{{$a}}{{end}}</dd>
+        <dt class="text-muted-foreground">Adversaries out of scope</dt>
+        <dd>{{range $i, $a := index $adv "out_of_scope"}}{{if $i}}; {{end}}{{$a}}{{end}}</dd>
+        {{if index $adv "threshold"}}<dt class="text-muted-foreground">Threshold</dt><dd>{{index $adv "threshold"}}</dd>{{end}}
+      </dl>
+      {{end}}
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "properties_provided"}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Properties
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <h4 class="text-xs font-medium text-muted-foreground uppercase mb-2">Provided</h4>
+      <table class="table w-full mb-4">
+        <thead><tr><th>Property</th><th>Conditions</th><th>Violation</th><th>Tier</th><th>Source</th></tr></thead>
+        <tbody>
+        {{range index $tm "properties_provided"}}
+          <tr>
+            <td class="font-medium whitespace-normal">{{index . "property"}}</td>
+            <td class="whitespace-normal text-sm">{{index . "conditions"}}</td>
+            <td class="whitespace-normal text-sm">{{index . "violation_symptom"}}</td>
+            <td>{{$t := index . "severity_tier"}}{{if eq $t "security"}}<span class="badge-destructive">security</span>{{else}}<span class="badge-secondary">{{$t}}</span>{{end}}</td>
+            <td class="text-xs text-muted-foreground">{{template "tm-prov" .}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{if index $tm "properties_not_provided"}}
+      <h4 class="text-xs font-medium text-muted-foreground uppercase mb-2">Not provided</h4>
+      <table class="table w-full mb-4">
+        <thead><tr><th>Property</th><th>Reason</th><th></th><th>Source</th></tr></thead>
+        <tbody>
+        {{range index $tm "properties_not_provided"}}
+          <tr>
+            <td class="font-medium whitespace-normal">{{index . "property"}}</td>
+            <td class="whitespace-normal text-sm">{{index . "reason"}}</td>
+            <td>{{if index . "false_friend"}}<span class="badge-primary">false friend</span>{{end}}</td>
+            <td class="text-xs text-muted-foreground">{{template "tm-prov" .}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{end}}
+      {{if index $tm "downstream_responsibilities"}}
+      <h4 class="text-xs font-medium text-muted-foreground uppercase mb-2">Caller responsibilities</h4>
+      <ul class="text-sm list-disc pl-5">
+        {{range index $tm "downstream_responsibilities"}}<li>{{.}}</li>{{end}}
+      </ul>
+      {{end}}
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "known_non_findings"}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Known non-findings
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <table class="table w-full">
+        <thead><tr><th>Reported as</th><th>Why safe</th><th>Cites</th></tr></thead>
+        <tbody>
+        {{range index $tm "known_non_findings"}}
+          <tr>
+            <td class="whitespace-normal text-sm">{{index . "reported_as"}}</td>
+            <td class="whitespace-normal text-sm">{{index . "why_safe"}}</td>
+            <td class="text-xs text-muted-foreground"><code>{{index . "cites"}}</code></td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "open_questions"}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Open questions
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <table class="table w-full">
+        <thead><tr><th>Field</th><th>Inferred claim</th><th>Proposed answer</th></tr></thead>
+        <tbody>
+        {{range index $tm "open_questions"}}
+          <tr>
+            <td class="text-xs text-muted-foreground"><code>{{index . "field"}}</code></td>
+            <td class="whitespace-normal text-sm">{{index . "claim"}}</td>
+            <td class="whitespace-normal text-sm">{{index . "proposed"}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "boundaries"}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Trust boundaries
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <table class="table w-full mb-4">
+        <thead><tr><th>Actor</th><th>Trusted</th><th>Controls</th><th>Source</th></tr></thead>
+        <tbody>
+        {{range index $tm "boundaries"}}
+          <tr>
+            <td class="font-medium whitespace-normal">{{index . "actor"}}</td>
+            <td>{{$t := index . "trusted"}}{{if eq $t "no"}}<span class="badge-destructive">no</span>{{else if eq $t "conditional"}}<span class="badge-primary">conditional</span>{{else}}<span class="badge-secondary">yes</span>{{end}}</td>
+            <td class="whitespace-normal text-sm">{{index . "controls"}}</td>
+            <td class="whitespace-normal text-muted-foreground text-xs">{{index . "source"}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{if index $tm "boundaries_narrative"}}
+        <pre class="log">{{index $tm "boundaries_narrative"}}</pre>
+      {{end}}
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "sink_primitives"}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Sink primitives
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm">
+        {{range $class, $prims := index $tm "sink_primitives"}}
+          <dt class="text-muted-foreground">{{$class}}</dt>
+          <dd>{{range $i, $p := $prims}}{{if $i}}, {{end}}<code>{{$p}}</code>{{end}}</dd>
+        {{end}}
+      </dl>
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "inventory"}}
+  <details open class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Sink inventory
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <table class="table w-full">
+        <thead><tr><th class="w-16">ID</th><th>Boundary</th><th>Location</th><th>Class</th><th>Primitive</th><th>Consumes</th></tr></thead>
+        <tbody>
+        {{range index $tm "inventory"}}
+          <tr>
+            <td><code>{{index . "id"}}</code></td>
+            <td class="whitespace-normal text-sm">{{index . "boundary"}}</td>
+            {{$loc := index . "location"}}
+            <td class="whitespace-normal">{{template "loc-link" (dict "RepoID" $repoID "Commit" $commit "Location" $loc)}}</td>
+            <td class="whitespace-normal"><span class="badge-outline">{{index . "class"}}</span></td>
+            <td class="whitespace-normal text-sm">{{index . "primitive"}}</td>
+            <td class="whitespace-normal text-muted-foreground text-sm">{{index . "consumes"}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{if index $tm "inventory_notes"}}
+        <pre class="log mt-4">{{index $tm "inventory_notes"}}</pre>
+      {{end}}
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "method"}}
+  {{$method := index $tm "method"}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Inventory method
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-2 text-sm mb-4">
+        <dt class="text-muted-foreground">Scope</dt><dd>{{index $method "scope"}}</dd>
+        <dt class="text-muted-foreground">Inventory</dt><dd>{{index $method "inventory_count"}} entries</dd>
+        <dt class="text-muted-foreground">Ruled out</dt><dd>{{index $method "ruled_out_count"}} entries</dd>
+        <dt class="text-muted-foreground">Unresolved</dt><dd>{{index $method "unresolved_count"}} entries</dd>
+      </dl>
+      {{if index $method "grep_patterns"}}
+      <table class="table w-full">
+        <thead><tr><th>Class</th><th>Primitive</th><th>Command</th><th>Hits</th><th>Inventory sinks</th><th>Excluded hits</th></tr></thead>
+        <tbody>
+        {{range index $method "grep_patterns"}}
+          <tr>
+            <td class="whitespace-normal"><span class="badge-outline">{{index . "class"}}</span></td>
+            <td class="whitespace-normal"><code>{{index . "primitive"}}</code></td>
+            <td class="whitespace-normal text-xs"><code>{{index . "command"}}</code></td>
+            <td>{{index . "hit_count"}}</td>
+            <td class="whitespace-normal text-sm">{{range $i, $sink := index . "inventory_sinks"}}{{if $i}}, {{end}}<code>{{$sink}}</code>{{end}}</td>
+            <td class="whitespace-normal text-sm">{{range $i, $hit := index . "excluded_hits"}}{{if $i}}; {{end}}<code>{{index $hit "location"}}</code> ({{index $hit "category"}}: {{index $hit "reason"}}){{end}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+      {{end}}
+      {{if index $method "notes"}}<pre class="log mt-4">{{range index $method "notes"}}{{.}}
+{{end}}</pre>{{end}}
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "ruled_out"}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Ruled out
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4">
+      <table class="table w-full">
+        <thead><tr><th class="w-24">Sinks</th><th class="w-16">Step</th><th>Summary</th></tr></thead>
+        <tbody>
+        {{range index $tm "ruled_out"}}
+          <tr>
+            <td><code>{{range $i, $s := index . "sinks"}}{{if $i}}, {{end}}{{$s}}{{end}}</code></td>
+            <td class="text-muted-foreground">{{index . "step"}}</td>
+            <td class="whitespace-normal text-sm">{{if index . "summary"}}{{index . "summary"}}{{else}}{{index . "reason"}}{{end}}</td>
+          </tr>
+        {{end}}
+        </tbody>
+      </table>
+    </section>
+  </details>
+  {{end}}
+
+  {{if index $tm "prior_art"}}
+  <details class="group border-b">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Prior art
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4"><pre class="log">{{index $tm "prior_art"}}</pre></section>
+  </details>
+  {{end}}
+
+  {{if index $tm "reach"}}
+  <details class="group border-b last:border-b-0">
+    <summary class="w-full outline-none rounded-md focus-visible:ring-ring/50 focus-visible:ring-[3px]">
+      <h3 class="flex flex-1 items-center justify-between gap-4 py-4 text-sm font-medium hover:underline">
+        Reach
+        <i data-lucide="chevron-down" class="text-muted-foreground size-4 shrink-0 transition-transform duration-200 group-open:rotate-180"></i>
+      </h3>
+    </summary>
+    <section class="pb-4"><pre class="log">{{index $tm "reach"}}</pre></section>
+  </details>
+  {{end}}
+
+</section>
+{{end}}
+
+{{define "tm-prov"}}{{$p := index . "provenance"}}{{if eq $p "documented"}}{{if index . "source"}}<code>{{index . "source"}}</code>{{else}}documented{{end}}{{else if $p}}<span class="italic">{{$p}}</span>{{end}}{{end}}

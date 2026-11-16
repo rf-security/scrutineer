@@ -15,9 +15,9 @@ const sessionBodyMax = 4 << 10
 // registerUISessionRoutes registers the session routes on the root mux. The
 // patterns carry the full /api/v1 prefix because they bypass exportHandler.
 func (s *Server) registerUISessionRoutes(root *http.ServeMux) {
-	root.Handle("GET /api/v1/ui/session", securityHeaders(http.HandlerFunc(s.uiSessionGet)))
-	root.Handle("POST /api/v1/ui/session", securityHeaders(http.HandlerFunc(s.uiSessionCreate)))
-	root.Handle("DELETE /api/v1/ui/session", securityHeaders(http.HandlerFunc(s.uiSessionDelete)))
+	root.Handle("GET /api/v1/ui/session", securityHeaders(s.AllowRemote, http.HandlerFunc(s.uiSessionGet)))
+	root.Handle("POST /api/v1/ui/session", securityHeaders(s.AllowRemote, http.HandlerFunc(s.uiSessionCreate)))
+	root.Handle("DELETE /api/v1/ui/session", securityHeaders(s.AllowRemote, http.HandlerFunc(s.uiSessionDelete)))
 }
 
 // operatorRequestToken is the operator token the request presents, as a

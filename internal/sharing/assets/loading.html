@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script src="/static/theme-init.js"></script>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <noscript><meta http-equiv="refresh" content="3"></noscript>
+  <title>scrutineer · loading your repositories</title>
+  <script src="/static/vendor/tailwindcss-browser-4.3.0.js"></script>
+  <link rel="stylesheet" href="/static/vendor/basecoat-0.3.11.min.css">
+  <link rel="stylesheet" href="/static/theme.css">
+  <script src="/auth/loading.js" defer></script>
+  <style>
+    .spinner { border: 4px solid var(--muted); border-top-color: var(--primary); border-radius: 9999px; animation: spin 0.9s linear infinite; }
+    .track { background: var(--muted); }
+    .slide { background: var(--primary); animation: slide 1.4s ease-in-out infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(300%); } }
+    @media (prefers-reduced-motion: reduce) { .spinner, .slide { animation-duration: 3s; } }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-6">
+  <div class="card w-full max-w-md">
+    <section class="flex flex-col items-center gap-5 text-center py-4">
+      <div id="spinner" class="spinner size-12" aria-hidden="true"></div>
+      <div class="grid gap-2">
+        <h1 id="title" class="text-lg font-semibold">Loading your repositories</h1>
+        <p id="detail" class="text-muted-foreground text-sm" role="status" aria-live="polite">
+          Asking GitHub which repositories you have access to…
+        </p>
+      </div>
+      <div id="bar" class="track h-1.5 w-full overflow-hidden rounded-full">
+        <div class="slide h-full w-1/3 rounded-full"></div>
+      </div>
+      <p id="hint" class="text-muted-foreground text-xs">
+        This only happens on your first visit after signing in. Members of large
+        GitHub organizations may wait a little longer.
+      </p>
+      <button id="retry" type="button" class="btn-outline" hidden>Try again</button>
+    </section>
+  </div>
+</body>
+</html>

@@ -147,6 +147,13 @@ scan_timeout: 30m
 max_turns: 200
 fork_org: fork-central
 metadata_dir: .ossprey/
+sharing:
+  access_grants:
+    - github_user_id: 583231
+      repositories:
+        - https://github.com/acme/widget
+      reason: External reviewer
+      expires_at: 2030-01-02T03:04:05Z
 vince:
   base_url: https://kb.cert.example
   api_key: secret-token
@@ -196,6 +203,16 @@ vince:
 	}
 	if c.MetadataDir != ".ossprey/" {
 		t.Errorf("metadata_dir=%q, want .ossprey/", c.MetadataDir)
+	}
+	if len(c.Sharing.AccessGrants) != 1 {
+		t.Fatalf("sharing access grants: %+v", c.Sharing.AccessGrants)
+	}
+	grant := c.Sharing.AccessGrants[0]
+	if grant.GitHubUserID != 583231 || len(grant.Repositories) != 1 || grant.Repositories[0] != "https://github.com/acme/widget" {
+		t.Errorf("sharing access grant: %+v", grant)
+	}
+	if grant.Reason != "External reviewer" || grant.ExpiresAt == nil || !grant.ExpiresAt.Equal(time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)) {
+		t.Errorf("sharing access grant metadata: %+v", grant)
 	}
 	if c.VINCE.BaseURL != "https://kb.cert.example" || c.VINCE.APIKey != "secret-token" {
 		t.Errorf("vince endpoint config: %+v", c.VINCE)
@@ -697,6 +714,76 @@ func TestLoad_rejectsInvalidScanEgressPolicies(t *testing.T) {
 				t.Errorf("error %q lacks the scan_egress_policies key", err)
 			}
 		})
+	}
+}
+
+func TestSharingDatabase_resolution(t *testing.T) {
+	cases := []struct {
+		name       string
+		root, shar DatabaseConfig
+		want       DatabaseConfig
+	}{
+		{"unset falls back to root",
+			DatabaseConfig{Driver: "postgres", DSN: "root-dsn"}, DatabaseConfig{},
+			DatabaseConfig{Driver: "postgres", DSN: "root-dsn"}},
+		{"dsn-only override inherits root driver",
+			DatabaseConfig{Driver: "postgres", DSN: "root-dsn"}, DatabaseConfig{DSN: "portal-dsn"},
+			DatabaseConfig{Driver: "postgres", DSN: "portal-dsn"}},
+		{"full override",
+			DatabaseConfig{Driver: "postgres", DSN: "root-dsn"}, DatabaseConfig{Driver: "postgres", DSN: "portal-dsn"},
+			DatabaseConfig{Driver: "postgres", DSN: "portal-dsn"}},
+		{"root sqlite, portal unset stays sqlite",
+			DatabaseConfig{}, DatabaseConfig{}, DatabaseConfig{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{Database: tc.root, Sharing: SharingConfig{Database: tc.shar}}
+			if got := c.SharingDatabase(); got != tc.want {
+				t.Errorf("SharingDatabase() = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_sharingDatabaseOverridesDSN(t *testing.T) {
+	path := write(t, "database:\n  driver: postgres\n  dsn: postgres://root@db/scrutineer\n"+
+		"sharing:\n  database:\n    dsn: postgres://portal_ro@db/scrutineer\n")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.SharingDatabase()
+	if got.Driver != "postgres" || got.DSN != "postgres://portal_ro@db/scrutineer" {
+		t.Errorf("resolved sharing db = %+v, want postgres + portal dsn", got)
+	}
+	// The main app's database is untouched.
+	if c.Database.DSN != "postgres://root@db/scrutineer" {
+		t.Errorf("root db dsn changed: %q", c.Database.DSN)
+	}
+}
+
+func TestLoad_rejectsInvalidSharingDatabase(t *testing.T) {
+	// Portal overrides driver to postgres but supplies no dsn (root is sqlite).
+	path := write(t, "sharing:\n  database:\n    driver: postgres\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for sharing postgres without a dsn")
+	}
+}
+
+func TestLoad_requireOperatorToken(t *testing.T) {
+	c, err := Load(write(t, "addr: 127.0.0.1:8080\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequireOperatorToken != nil {
+		t.Errorf("unset require_operator_token = %v, want nil", *c.RequireOperatorToken)
+	}
+	c, err = Load(write(t, "require_operator_token: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequireOperatorToken == nil || *c.RequireOperatorToken {
+		t.Errorf("require_operator_token: false parsed as %v", c.RequireOperatorToken)
 	}
 }
 

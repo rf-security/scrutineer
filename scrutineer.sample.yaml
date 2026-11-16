@@ -12,6 +12,20 @@
 # Listen address for the web UI + skill API.
 # addr: 127.0.0.1:8080
 
+# Allow remote (non-localhost) access to the web UI + skill API. Default false
+# keeps the localhost-only host-header check (the DNS-rebinding protection):
+# requests are served only when the Host is 127.0.0.1, localhost, or ::1. Set
+# true to also accept any other Host — needed behind a reverse proxy or on a
+# LAN. Only enable it when a trusted front end already restricts who can connect.
+# allow_remote: false
+
+# Require the operator token (written to <data>/operator-token and printed as
+# a /login?token=... link at startup) for the web UI and /api/v1. Default true.
+# Set false only when a trusted front end (IAP, an OAuth proxy) already
+# authenticates every request; otherwise anyone who can reach the server can
+# use the UI.
+# require_operator_token: true
+
 # Where scan workspaces and (for the default sqlite backend) the database
 # file live.
 # data: ./data
@@ -26,6 +40,20 @@
 # database:
 #   driver: postgres
 #   dsn: postgres://scrutineer:scrutineer@127.0.0.1:5432/scrutineer?sslmode=disable
+
+# Settings for the external maintainer portal (cmd/sharing). Optional; anything
+# omitted here falls back to the matching root config. By default the portal
+# shares the root database above.
+#
+# sharing.database points the portal at its own connection — for example a
+# read replica or a least-privilege role scoped to the portal — while the main
+# app keeps using the root database. Its shape matches the database block, and
+# unset fields inherit the root, so you can override just the dsn to reuse the
+# root driver. Only the driver/dsn differ; sqlite still lives under <data>.
+# sharing:
+#   database:
+#     driver: postgres
+#     dsn: postgres://portal_ro:secret@db:5432/scrutineer?sslmode=disable
 
 # Claude effort level for model-backed skills.
 # effort: high

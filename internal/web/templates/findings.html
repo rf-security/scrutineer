@@ -21,7 +21,7 @@
       {{if .Missed}}<input type="hidden" name="missed" value="1">{{end}}
       {{if .Scanners}}<input type="hidden" name="scanners" value="1">{{end}}
     </form>
-    {{if gt .ScannerTotal 0}}
+    {{if and (not .Sharing) (gt .ScannerTotal 0)}}
       {{if .Scanners}}
         <a class="btn-outline" aria-pressed="true"
            href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&missed={{$mp}}&viability={{$pv}}">
@@ -34,7 +34,7 @@
         </a>
       {{end}}
     {{end}}
-    {{if gt .MissedTotal 0}}
+    {{if and (not .Sharing) (gt .MissedTotal 0)}}
       {{if .Missed}}
         <a class="btn-outline" aria-pressed="true"
            href="/findings?q={{.Q}}&severity={{.Severity}}&status={{$st}}&category={{.Category}}&sort={{.Sort}}&scanners={{$sc}}&viability={{$pv}}">

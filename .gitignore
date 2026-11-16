@@ -2,6 +2,8 @@
 /data-*/
 /scrutineer
 *.test
+# Compiled helper binaries (build from source under scripts/ instead).
+/migrate-sqlite-to-postgres
 *.db
 *.db-shm
 *.db-wal
@@ -11,9 +13,11 @@ __pycache__/
 .idea/
 .vscode/
 .claude/
+/CLAUDE.md
 scrutineer.yaml
 scrutineer.*.yaml
 !scrutineer.sample.yaml
+!deploy/scrutineer.yaml
 
 # Vim swap/session/temp files
 [._]*.s[a-v][a-z]

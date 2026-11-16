@@ -22,12 +22,12 @@
 # Built on demand by the worker (EnsureImage), tagged
 # scrutineer-profile-ruby-ext:<dockerfile-sha>, RUNNER_IMAGE wired via
 # --build-arg. The toolchain installs with apt, so RUNNER_IMAGE must resolve
-# to the Debian runner built from ./Dockerfile.runner.
+# to the Debian runner built from docker/runner/Dockerfile.runner.
 #
 # To build it manually the way the project does, from the repo root:
 #
 #   # 1. Build the base runner image locally (Debian/glibc, ships brief etc.):
-#   docker build -t scrutineer-runner:local -f Dockerfile.runner .
+#   docker build -t scrutineer-runner:local -f docker/runner/Dockerfile.runner .
 #
 #   # 2. Build this Ruby-extension profile on top of that local runner
 #   #    (compiles Ruby from source with ASan/UBSan; takes several minutes):
